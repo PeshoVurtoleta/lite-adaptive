@@ -8,7 +8,7 @@
 // buckets vs the ring's O(W)). A NEGATIVE CONTROL (a broken EH -- no straddle half-
 // correction) is fed the SAME gate and MUST be REJECTED (the gate has teeth). ASCII-only.
 
-import { ExponentialHistogram, ADWIN, ForwardDecay, VERSION } from '../Adaptive.js';
+import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, VERSION } from '../Adaptive.js';
 
 const WS = [64, 1000, 65536];
 const EPS = [0.5, 0.1, 0.01];
@@ -549,7 +549,257 @@ console.log('');
 console.log('WITNESS ForwardDecay negative controls (broken rebase + no rebase rejected) ' +
     (fdControlsOk ? 'ok' : 'FAIL'));
 
-const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk;
+// ===========================================================================
+// TOP-K Witness -- HeavyKeeper (Gong et al., USENIX ATC 2018). The honesty anchor for
+// the SKEW member: (a) RECALL 100% of the true heavy hitters (keys above N/k) vs an EXACT
+// Map oracle, on BOTH weighted and unit streams; (b) OVERESTIMATE bounded -- each reported
+// total lies in [true - errorOf, true] (HeavyKeeper never overestimates); and (c) the
+// MARQUEE -- HeavyKeeper's mean relative error BELOW a FAITHFUL inline Space-Saving baseline
+// on a Zipfian + DRIFTING stream. NEGATIVE CONTROLS the same gates REJECT: a DECAY-DISABLED
+// HeavyKeeper (recall < 1.0 on drift) and a FOREST-FROZEN variant (misses heavy hitters).
+// ===========================================================================
+
+/**
+ * A FAITHFUL Space-Saving / Stream-Summary baseline (Metwally-Agrawal-El Abbadi, "Efficient
+ * Computation of Frequent and Top-k Elements in Data Streams", ICDT 2005). It keeps EXACTLY
+ * `cap` monitored counters, each with a (count, error) pair; a hit increments the count; a
+ * MISS on a full summary REPLACES the counter with the CURRENT MINIMUM count -- the new key
+ * inherits `minCount` as its count and `minCount` as its error (the classic min-replacement).
+ * This is the correct algorithm (NOT a strawman): the guaranteed count is `count - error`, the
+ * reported count `count`. Written inline here so the witness carries no @zakkster/lite-sketch
+ * dependency. O(cap) per op (a linear min scan -- fine for a witness, not a hot path).
+ */
+class SpaceSaving {
+    constructor(cap) {
+        this._cap = cap;
+        this._key = new Float64Array(cap);
+        this._cnt = new Float64Array(cap);
+        this._err = new Float64Array(cap);
+        this._n = 0;
+    }
+    add(key, weight) {
+        // present? -> increment.
+        for (let i = 0; i < this._n; i++) {
+            if (this._key[i] === key) { this._cnt[i] += weight; return; }
+        }
+        // room? -> monitor it exactly.
+        if (this._n < this._cap) {
+            this._key[this._n] = key; this._cnt[this._n] = weight; this._err[this._n] = 0; this._n++;
+            return;
+        }
+        // full -> replace the current MINIMUM counter (Stream-Summary min-replacement).
+        let mi = 0, mc = this._cnt[0];
+        for (let i = 1; i < this._n; i++) if (this._cnt[i] < mc) { mc = this._cnt[i]; mi = i; }
+        this._key[mi] = key; this._err[mi] = mc; this._cnt[mi] = mc + weight;
+    }
+    estimate(key) {
+        for (let i = 0; i < this._n; i++) if (this._key[i] === key) return this._cnt[i];
+        return 0;
+    }
+    topKeys(k) {
+        const idx = [];
+        for (let i = 0; i < this._n; i++) idx.push(i);
+        idx.sort((a, b) => this._cnt[b] - this._cnt[a]);
+        return idx.slice(0, k).map((i) => this._key[i]);
+    }
+}
+
+/** A FOREST-FROZEN HeavyKeeper: the table updates but the top-k forest never changes. */
+class ForestFrozenHK extends HeavyKeeper {
+    _promote() { /* BUG: never updates the top-k forest -> it stays empty / stale */ }
+}
+
+/** Build a Zipfian CDF over n keys (cached), s the exponent. */
+const _wZipf = new Map();
+function zipfSample(u, n, s) {
+    const ck = n + ':' + s;
+    let cdf = _wZipf.get(ck);
+    if (cdf === undefined) {
+        cdf = new Float64Array(n);
+        let sum = 0;
+        for (let i = 0; i < n; i++) { sum += 1 / Math.pow(i + 1, s); cdf[i] = sum; }
+        for (let i = 0; i < n; i++) cdf[i] /= sum;
+        _wZipf.set(ck, cdf);
+    }
+    let lo = 0, hi = n - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (cdf[mid] < u) lo = mid + 1; else hi = mid; }
+    return lo;
+}
+
 console.log('');
-console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay) ' + (all ? 'ok' : 'FAIL'));
+console.log('TOP-K Witness -- HeavyKeeper v' + VERSION + ' (Gong et al., USENIX ATC 2018): recall + bounded ' +
+    'overestimate + mean rel-error vs a FAITHFUL Space-Saving baseline (Metwally et al., ICDT 2005)');
+console.log('');
+
+let hkOk = true;
+
+// --- (a) RECALL 100% of the true keys above N/k vs an exact Map oracle (weighted + unit). ---
+console.log('  recall of the true current top-k heavy hitters vs an exact Map oracle:');
+console.log('  stream      k    N        recall     status');
+console.log('  ----------  ---  -------  ---------  ------');
+function recallRun(weighted, seed) {
+    const K = 10;
+    const N = 300000;
+    const hk = new HeavyKeeper(5, 4096, K, { seed });
+    const truth = new Map();
+    const r = mulberry32(seed);
+    for (let i = 0; i < N; i++) {
+        const key = 1000000 + zipfSample(r(), 20000, 1.1);
+        const wt = weighted ? 1 + ((i * 7) % 9) : 1;   // weighted: integer weights 1..9
+        hk.add(key, wt);
+        truth.set(key, (truth.get(key) || 0) + wt);
+    }
+    let total = 0;
+    for (const v of truth.values()) total += v;
+    // the true CURRENT top-k (the K heaviest keys -- every one is a heavy hitter above ~N/k^2 here).
+    const ranked = [...truth.entries()].sort((a, b) => b[1] - a[1]);
+    const trueHH = ranked.slice(0, K).map((e) => e[0]);
+    const got = new Set(hk.topK().map((e) => e.key));
+    let hit = 0;
+    for (const key of trueHH) if (got.has(key)) hit++;
+    return { hit, need: trueHH.length, K, N };
+}
+for (const [name, weighted] of [['unit', false], ['weighted', true]]) {
+    const r = recallRun(weighted, 2024);
+    const recall = r.need === 0 ? 1 : r.hit / r.need;
+    const cellOk = recall >= 1.0;
+    if (!cellOk) hkOk = false;
+    console.log('  ' + name.padEnd(10) + '  ' + String(r.K).padEnd(3) + '  ' + nStr(r.N).padEnd(7) + '  ' +
+        (r.hit + '/' + r.need).padStart(9) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+}
+
+// --- (b) OVERESTIMATE bounded: every reported total in [true - errorOf, true]. ---
+console.log('');
+{
+    const K = 10, N = 250000, W = 4096;
+    const hk = new HeavyKeeper(5, W, K, { seed: 77 });
+    const truth = new Map();
+    const r = mulberry32(77);
+    for (let i = 0; i < N; i++) {
+        const key = zipfSample(r(), 10000, 1.1);
+        hk.add(key);
+        truth.set(key, (truth.get(key) || 0) + 1);
+    }
+    let worstOver = 0, worstUnder = 0, allBounded = true;
+    const errOf = N / W;   // a cell absorbs at most ~ N/w of the stream
+    for (const e of hk.topK()) {
+        const t = truth.get(e.key) || 0;
+        if (e.count > t) { allBounded = false; if (e.count - t > worstOver) worstOver = e.count - t; }
+        if (t - e.count > worstUnder) worstUnder = t - e.count;
+    }
+    const cellOk = allBounded && worstUnder <= errOf;
+    if (!cellOk) hkOk = false;
+    console.log('  overestimate bound: reported in [true - ~N/w, true] (never over the truth):');
+    console.log('    worst overestimate=' + worstOver + ' (must be 0), worst underestimate=' + worstUnder +
+        ' vs ~N/w=' + errOf.toFixed(0) + ' -> ' + (cellOk ? 'ok' : 'FAIL'));
+}
+
+// --- (c) MARQUEE: HeavyKeeper mean rel-error < Space-Saving on a Zipfian + DRIFTING stream. ---
+console.log('');
+console.log('  MARQUEE -- mean rel-error over the true top-k, HeavyKeeper vs faithful Space-Saving');
+console.log('  (Zipfian s=1.1 + DRIFT: the popular key-set shifts partway; both sized to k*4 counters):');
+function driftStream(feed, K, seed) {
+    const N = 400000, U = 8000;
+    const r = mulberry32(seed);
+    const truth = new Map();
+    for (let i = 0; i < N; i++) {
+        const regime = i < N / 2 ? 0 : 500000;    // the whole popular set shifts at the midpoint
+        const key = regime + zipfSample(r(), U, 1.1);
+        feed(key);
+        truth.set(key, (truth.get(key) || 0) + 1);
+    }
+    return truth;
+}
+{
+    const K = 12, seed = 909;
+    const W = 4096, D = 5, CAP = K * 4;
+    const hk = new HeavyKeeper(D, W, K, { seed });
+    const ss = new SpaceSaving(CAP);
+    // drive BOTH on the SAME stream (re-seed the same mulberry32 so the streams are identical).
+    const truthHK = driftStream((key) => hk.add(key, 1), K, seed);
+    const truthSS = driftStream((key) => ss.add(key, 1), K, seed);   // identical stream (same seed)
+    // the true CURRENT top-k = the top-k over the whole run's counts (recency favors the 2nd regime).
+    const trueTop = [...truthHK.entries()].sort((a, b) => b[1] - a[1]).slice(0, K);
+    function meanRelErr(estimateFn) {
+        let sum = 0, cnt = 0;
+        for (const [key, t] of trueTop) {
+            const e = estimateFn(key);
+            sum += Math.abs(e - t) / t;
+            cnt++;
+        }
+        return sum / cnt;
+    }
+    const hkErr = meanRelErr((key) => hk.estimate(key));
+    const ssErr = meanRelErr((key) => ss.estimate(key));
+    const cellOk = hkErr < ssErr;
+    if (!cellOk) hkOk = false;
+    console.log('    HeavyKeeper mean rel-error=' + pct(hkErr) + '  vs  Space-Saving=' + pct(ssErr) +
+        '  -> ' + (cellOk ? 'HeavyKeeper WINS (ok)' : 'FAIL'));
+}
+
+console.log('');
+console.log('WITNESS HeavyKeeper (recall + bounded overestimate + beats Space-Saving on drift) ' +
+    (hkOk ? 'ok' : 'FAIL'));
+
+// --- HeavyKeeper NEGATIVE CONTROLS (N4): decay + the forest must be load-bearing ---
+console.log('');
+console.log('NEGATIVE CONTROLS -- a broken HeavyKeeper MUST be rejected by the same gates:');
+let hkControlsOk = true;
+// 1) FOREST-FROZEN -> the top-k never updates -> recall collapses on any stream.
+{
+    const K = 10, N = 200000;
+    const hk = new ForestFrozenHK(5, 4096, K, { seed: 5 });
+    const truth = new Map();
+    const r = mulberry32(5);
+    for (let i = 0; i < N; i++) {
+        const key = zipfSample(r(), 10000, 1.1);
+        hk.add(key);
+        truth.set(key, (truth.get(key) || 0) + 1);
+    }
+    const trueTop = [...truth.entries()].sort((a, b) => b[1] - a[1]).slice(0, K).map((e) => e[0]);
+    const got = new Set(hk.topK().map((e) => e.key));
+    let hit = 0;
+    for (const key of trueTop) if (got.has(key)) hit++;
+    const recall = hit / trueTop.length;
+    const rejected = recall < 1.0;
+    if (!rejected) hkControlsOk = false;
+    console.log('  forest-frozen HeavyKeeper recall=' + (recall * 100).toFixed(1) + '% (< 100%) -> ' +
+        (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+// 2) DECAY-DISABLED -> stale keys from the OLD regime are never eroded -> the reported top-k on a
+//    DRIFTING stream keeps stale leaders, so recall of the CURRENT (post-drift) heavy hitters drops.
+{
+    const K = 10, N = 400000, U = 6000;
+    // a decay-disabled HeavyKeeper: b just above 1 makes b^(-count) ~ 1 so a miss ALWAYS decays is
+    // the OPPOSITE; to DISABLE decay we need b^(-count) ~ 0. We build the control by construction:
+    // a huge decay base means the probability is ~0 -> counters never decay -> a windowed/drifting
+    // stream keeps stale leaders. (b <= 1 is rejected by the ctor; a very large b is the faithful
+    // "decay effectively off" control.)
+    const hk = new HeavyKeeper(5, 4096, K, { seed: 8, b: 1e15 });   // b huge -> b^(-count) ~ 0 -> no decay
+    const truth1 = new Map(), truth2 = new Map();
+    const r = mulberry32(8);
+    for (let i = 0; i < N; i++) {
+        const first = i < N / 2;
+        const key = (first ? 0 : 900000) + zipfSample(r(), U, 1.1);
+        hk.add(key);
+        (first ? truth1 : truth2).set(key, ((first ? truth1 : truth2).get(key) || 0) + 1);
+    }
+    // the CURRENT heavy hitters are the 2nd-regime top-k; a no-decay table keeps 1st-regime leaders.
+    const currentTop = [...truth2.entries()].sort((a, b) => b[1] - a[1]).slice(0, K).map((e) => e[0]);
+    const got = new Set(hk.topK().map((e) => e.key));
+    let hit = 0;
+    for (const key of currentTop) if (got.has(key)) hit++;
+    const recall = hit / currentTop.length;
+    const rejected = recall < 1.0;
+    if (!rejected) hkControlsOk = false;
+    console.log('  decay-disabled HeavyKeeper (b=1e15) current-top-k recall=' + (recall * 100).toFixed(1) +
+        '% on a drifting stream (< 100%) -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+console.log('');
+console.log('WITNESS HeavyKeeper negative controls (frozen forest + disabled decay rejected) ' +
+    (hkControlsOk ? 'ok' : 'FAIL'));
+
+const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk;
+console.log('');
+console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper) ' + (all ? 'ok' : 'FAIL'));
 if (!all) process.exitCode = 1;

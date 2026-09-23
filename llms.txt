@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 0.3.0
+Version: 0.4.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -22,11 +22,15 @@ v0.1.0 ships the reference member -- ExponentialHistogram (sliding-window count 
 (concept-drift detection + adaptive windowing). v0.3.0 adds ForwardDecay (time-decayed
 count / sum / mean / rate; Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009) -- smooth
 exponential decay in O(1) space (two scalar accumulators, no pool), EXACT modulo FP via
-a periodic landmark rebase. Roster to 1.0.0: ExponentialHistogram (0.1.0) -> ADWIN
-(0.2.0, drift) -> ForwardDecay (0.3.0, decay) -> HeavyKeeper (0.4.0, decayed top-k) ->
-1.0.0 (API stable at four members). Future members are pure-appended below these classes
-+ the shared substrate; prior members stay byte-identical, only the header + VERSION
-change (tree-shakeable named exports).
+a periodic landmark rebase. v0.4.0 adds HeavyKeeper (decayed / windowed heavy hitters --
+the top-k keys dominating the stream RIGHT NOW; Gong et al., USENIX ATC 2018) and a zero-box
+`ADWIN.addFrom(buf, i)`. The four-member roster is now COMPLETE: ExponentialHistogram (0.1.0)
+-> ADWIN (0.2.0, drift) -> ForwardDecay (0.3.0, decay) -> HeavyKeeper (0.4.0, decayed top-k)
+-> 1.0.0 (API freeze, no new member). The time-based members (ExponentialHistogram,
+ForwardDecay) and the item-based members (ADWIN, HeavyKeeper) each expose a zero-box
+`addFrom(buf, i)` for callers whose inputs are read from a Float64Array. Members are
+tree-shakeable named exports; prior members stay byte-identical on append (only the header +
+VERSION change).
 
 ## Exports (from the single main file Adaptive.js)
 
@@ -51,7 +55,9 @@ change (tree-shakeable named exports).
   and SHRINKS to the new concept on a change; the stationary false-alarm rate is bounded by
   `delta`. Item-indexed (no clock). `mean` / `variance` / `width` report the current
   adaptive window. Fail closed on a bad delta (throws before allocation); a non-finite `x`
-  is a byte-identical no-op; getters never throw (0 on empty).
+  is a byte-identical no-op; getters never throw (0 on empty). `addFrom(buf, i) -> boolean`
+  is a zero-box sibling of `add(x)` (reads `x = buf[i]` unboxed; same drift flag), for a
+  caller whose fractional `x` would box at a non-inlined boundary.
 - `ForwardDecay` -- class. A zero-GC, O(1)-space time-decayed COUNT / SUM / MEAN / RATE
   summary (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009). Each element's weight decays
   exponentially with its AGE (halves every `halfLife` time units), measured FORWARD from a
@@ -66,7 +72,22 @@ change (tree-shakeable named exports).
   before allocation), a mode switch, a non-finite / decreasing `now`, or a non-finite value;
   a query time before the last add throws (can't un-decay); otherwise queries never throw
   (0 on empty).
-- `VERSION` -- string, '0.3.0'.
+- `HeavyKeeper` -- class. A zero-GC decayed / windowed TOP-K (heavy hitters right now; Gong
+  et al., USENIX ATC 2018). A `d x w` table of `(fingerprint, count)` cells (SoA `Uint32Array`
+  columns) + an intrusive top-k min-forest (design-parity with lite-o1 `FreqO1`, never a dep).
+  `add(key, weight = 1) -> this` hashes `key` to `d` cells via an inline two-lane hash; a
+  matching fingerprint adds the weight, a colliding one is DECAYED with probability `b^(-count)`
+  (a seeded xorshift32 draw) and evicted at count 0 -- so cold keys erode and the top-k tracks
+  the CURRENT concept. Amortized O(1), 0 B/op incl. the decay draw + the forest sift.
+  `estimate(key)` is the max matching cell (0, never throws, for an unseen key); `forEach(fn)`
+  iterates the current top-k allocation-free; `topKInto(buf)` fills a caller buffer 0-alloc;
+  `topK()` is a COLD convenience that may allocate. `addFrom(buf, i)` is the zero-box entry
+  (`key = buf[i]`, `weight = buf[i+1]` -- a large u32 key would box as a plain argument). Weight
+  is a positive integer (rank by count, total time, bytes, ...). Keys are safe integers; a bad
+  key/weight/buffer throws [lite-adaptive] typeof-first (byte-identical no-op). Far lower error
+  than Space-Saving on skewed / evolving streams. No `merge` (it decays natively). Getters:
+  `d` / `w` / `k` / `b` / `seed` / `bytes` / `size`.
+- `VERSION` -- string, '0.4.0'.
 
 ## ExponentialHistogram
 
@@ -233,6 +254,48 @@ directly from every stored (t_i, value_i) at each query time and GATES |fd - ora
 Negative controls: fdNoRescale (rebase without the C,Sv rescale -> diverges) and fdNoRebase
 (never rebases -> overflows to Inf) are both rejected by the same gate.
 
+## HeavyKeeper (ADR 0005)
+
+    new HeavyKeeper(d, w, k, options?)
+    HeavyKeeper.withAccuracy(k, targetError, options?)   // static; derives d, w from k + error
+
+- d: number of hash rows (~4-8). w: cells per row. k: the top-k size. options:
+  `{ seed, b }` -- `seed` a Uint32 for the decay PRNG (default a fixed nonzero constant;
+  seed=0 is valid), `b` the decay base (default ~1.08). A bad d / w / k / seed / b / option
+  throws [lite-adaptive] typeof-first BEFORE any allocation.
+- add(key, weight = 1) -> this   HOT, amortized O(1), 0 B/op incl. the decay draw + the forest
+                                 sift. `key` a SAFE INTEGER; `weight` a positive integer
+                                 (rank by count when 1, or by total time / bytes / any additive
+                                 weight). Hashes key to d cells (inline two-lane hash); a matching
+                                 fingerprint += weight; a colliding one is DECAYED once with prob
+                                 b^(-count) (seeded xorshift32), count -= weight (clamped), and
+                                 the fingerprint is replaced when count hits 0. Fail closed: a
+                                 non-safe-integer key / non-positive-integer weight throws
+                                 [lite-adaptive] (byte-identical no-op).
+- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX entry: key = buf[i], weight = buf[i+1] read
+                                 UNBOXED from a packed [key, weight] Float64Array (a large u32 key
+                                 >= 2^31 would box as a plain argument). Same validation + inline
+                                 accumulate as add().
+- estimate(key) -> number        COLD; the max matching cell count (0 for an unseen key). Never throws.
+- forEach(fn) -> void            ALLOC-FREE iteration over the current top-k: fn(key, estimate).
+                                 The render path (topK() may allocate; forEach never does).
+- topKInto(buf) -> number        Fill a caller Uint32Array/Float64Array with the top-k keys, 0-alloc;
+                                 returns the count written.
+- topK() -> Array                COLD convenience; MAY allocate. Not for the hot/render path.
+- clear() -> this                0-alloc reset (reuse the table + forest arrays).
+- d / w / k / b / seed / bytes / size    Getters: the shape, the decay base, the PRNG seed, the
+                                 fixed memory figure (bytes), and the live top-k size.
+
+Top-k contract (the honesty anchor): the witness gates 100% RECALL of the true current top-k
+above N/k vs an exact Map oracle (weighted AND unit streams), a BOUNDED overestimate (each
+reported total in [true - ~N/w, true], never over the truth), and the marquee claim -- MEASURED
+mean rel-error over the true top-k LOWER than a faithful Space-Saving baseline (Metwally et al.
+Stream-Summary) on a Zipfian + DRIFTING stream (measured 0.001% vs 36.75%). Negative controls
+rejected by the same gate: a frozen-forest variant (recall 0%) and a decay-disabled variant
+(b huge -> recall ~40% on drift). No `merge` (HeavyKeeper decays natively -- no rotation needed).
+ADR 0005 records the weighted-miss decay rule (decay ONCE with prob b^(-count) then count -= weight;
+per-weight-unit rejected as non-O(1)) and the seeded-PRNG choice.
+
 ## The time source + the bucket pool (ADR 0001)
 
 A caller-supplied MONOTONE `now` (logical tick or ms; count-mode convenience when
@@ -258,6 +321,6 @@ rate()=count*lambda definition. ForwardDecay keeps NO pool (two scalar accumulat
 
 ExponentialHistogram (0.1.0, sliding-window count / sum) -> ADWIN (0.2.0, drift +
 adaptive window) -> ForwardDecay (0.3.0, time-decayed aggregates) -> HeavyKeeper
-(0.4.0, decayed / windowed heavy hitters) -> 1.0.0 (API declared stable at four
-members). Post-1.0: SlidingHyperLogLog, a scalar DriftDetector, a decayed Reservoir,
-windowed Count-Min / quantiles -- one per release.
+(0.4.0, decayed / windowed heavy hitters) -> 1.0.0 (API freeze -- the four-member roster
+is COMPLETE, no new member; a docs / stability milestone). Post-1.0: SlidingHyperLogLog,
+a scalar DriftDetector, a decayed Reservoir, windowed Count-Min / quantiles -- one per release.

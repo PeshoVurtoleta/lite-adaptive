@@ -356,4 +356,43 @@ maintainer commits/publishes; /release gate + catalog card sync after -- identic
 8. **Package scope / name**: `@zakkster/lite-adaptive`, folder `LiteAdaptive`, main file
    `Adaptive.js`. Confirm before the GitHub wire-up.
 
+---
+
+## 12. Post-1.0 warnings -- the evidence behind ROADMAP section 6 (2026-09-23)
+
+The same failure repeated across four sibling audits in one day. Each package passed its own
+zero-GC gates while still boxing, or while failing open, because the gate inputs were friendlier
+than real inputs. The lite-adaptive members take fractional timestamps on every call, so they are
+more exposed than any of those packages.
+
+| Lesson | Where it was measured | What it means here |
+| --- | --- | --- |
+| A fractional double passed to a non-inlined call boxes (~16 B); measureAllocs cannot see it | lite-hud M2: DDSketch.add, paired 24 -> 43 scaling scavenges; fixed by addFrom (lite-sketch 1.1.0) | R1: every `now`/value-taking method ships `addFrom` |
+| Small-integer inputs hide boxing | lite-hud M2 gates were Smi-only; lite-lru torture TTL clock counted up from 0 | R2: epoch-ms and performance.now scales, large keys, keys read from typed arrays |
+| A helper that RETURNS a computed double boxes once its call site goes polymorphic | lite-lru 1.18.0 A1: `expiryFor` 0 in a fresh process, ~31.5 B/op after a TTL-off instance ran; inlining fixed it | R3: warm up with other configs first; never return a computed double from a hot-path helper |
+| A default argument is part of the hot path | lite-lru A2: default `Date.now` 15.7-31.5 B/op | the members never read a clock (law); keep it that way |
+| Integer keys beyond Smi range box | lite-lru A8: W-TinyLFU keys below -2^30, 15.7 B/op | R2 key-magnitude lane; HeavyKeeper and SlidingHLL keys go through addFrom |
+| NaN slips through `>=`-style guards | lite-lru A6: a NaN clock meant entries never expired | R5 |
+| A second door skips the first door's checks | lite-lru A4 (DirectLru options), A3/A5 (restore) | R6 |
+| A "read-only" query that expires state is a mutation | lite-lru A11 | R7 |
+| Configuration learned by catching errors | lite-sketch N1, lite-filter N2-N3 | R8 (already law since 2026-09-23) |
+
+Design warnings specific to the Tier-2 members (numbers from the ROADMAP 6.2 sizing):
+- **SlidingHLL memory.** A per-register ring is the only honest zero-GC form (open question 4), and
+  it multiplies HLL's m bytes by ~9 x ringCap. p=12 with ring 8 is ~288 KB. The default must be
+  chosen for a consumer running many instances, and ring overflow must be visible.
+- **Windowed Count-Min memory.** An EH per cell is ~6 MB at ordinary sizes, so panes (a jumping
+  window with a disclosed edge error) or forward decay are the viable designs. Settle it in an ADR
+  before code.
+- **Sliding quantiles are a compatibility problem more than an algorithm problem.** If the accepted
+  value band, the zero/negative policy or the empty-window readout differs from lite-sketch
+  DDSketch, every consumer's pre-check (lite-hud M2's getter-driven band) is silently wrong. Reuse
+  the mapping.
+- **DriftDetector modes have different input domains** (real x vs 0/1 error bit). One class with a
+  mode flag must validate per mode, or the bundled form is a fail-open trap. Post-alarm reset
+  semantics decide whether a consumer's "regime changed" marker fires once or keeps firing.
+- **Decayed Reservoir** must never hold caller objects. A sample array of references is retention
+  outside the member's control. Store numbers and ids only.
+
+
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com> -- never "Karadjov".

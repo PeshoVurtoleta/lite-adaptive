@@ -10,7 +10,7 @@
 // proving teeth.
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { ExponentialHistogram, ADWIN, ForwardDecay } from '../../Adaptive.js';
+import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper } from '../../Adaptive.js';
 
 const W = 1000;
 const EPS = 0.01;
@@ -177,6 +177,89 @@ const fdAddFromStream = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** Zero-alloc counter for HeavyKeeper: the counts column's byte length -- fixed at construction. */
+function growsHk(s) { return s.hk._cnt.buffer.byteLength; }
+
+/**
+ * HeavyKeeper add on a skewed integer stream: the two-lane hash + d cell touches (fp-hit
+ * increment / fp-miss probabilistic decay via the seeded PRNG) + the intrusive forest sift,
+ * all in-pool. Integer keys stay Smi (no key box), so this isolates the hot-body cost.
+ */
+const hkAddStream = {
+    name: 'HeavyKeeper add skewed (two-lane hash + d cells + decay draw + forest sift)',
+    setup() {
+        const hk = new HeavyKeeper(4, 512, 16, { seed: 3 });
+        for (let k = 0; k < 40000; k++) hk.add((k * 2654435761) % 4000, (k & 7) + 1);
+        return { hk, i: 40000, sink: 0 };
+    },
+    hot(s, n) {
+        const hk = s.hk;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            hk.add((i * 2654435761) % 4000, (i & 7) + 1);
+            i = (i + 1) | 0;
+            sink = (sink + hk.size) | 0;   // observe state (defeat DCE)
+        }
+        s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsHk(s) }; },
+};
+
+/**
+ * HeavyKeeper addFrom on LARGE u32 keys read UNBOXED from a packed [key, weight] Float64Array
+ * -- the zero-box entry (a plain-arg add() would box a key >= 2^31). Same d cell touches +
+ * decay + forest; must stay flat + 0 old-gen.
+ */
+const hkAddFromStream = {
+    name: 'HeavyKeeper addFrom large-u32 [key,weight] (zero-box hash + decay + forest)',
+    setup() {
+        const hk = new HeavyKeeper(4, 512, 16, { seed: 4 });
+        const buf = new Float64Array(2);
+        for (let k = 0; k < 40000; k++) { buf[0] = 4294967295 - ((k * 2654435761) % 4000); buf[1] = (k & 7) + 1; hk.addFrom(buf, 0); }
+        return { hk, buf, i: 40000, sink: 0 };
+    },
+    hot(s, n) {
+        const hk = s.hk, buf = s.buf;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            buf[0] = 4294967295 - ((i * 2654435761) % 4000);
+            buf[1] = (i & 7) + 1;
+            hk.addFrom(buf, 0);
+            i = (i + 1) | 0;
+            sink = (sink + hk.size) | 0;   // observe state (defeat DCE)
+        }
+        s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsHk(s) }; },
+};
+
+/**
+ * The teeth for the HeavyKeeper lane: add + a fresh escaping array per op -- it MUST trip the
+ * gate, proving the HeavyKeeper scenarios' flat result is a real 0-alloc measurement.
+ */
+const hkMustFailAlloc = {
+    name: 'HeavyKeeper add + a fresh escaping array per op (MUST allocate)',
+    setup() {
+        const hk = new HeavyKeeper(4, 512, 16, { seed: 3 });
+        for (let k = 0; k < 40000; k++) hk.add((k * 2654435761) % 4000, 1);
+        return { hk, i: 40000, leak: null, sink: 0 };
+    },
+    hot(s, n) {
+        const hk = s.hk;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            hk.add((i * 2654435761) % 4000, 1);
+            i = (i + 1) | 0;
+            const arr = new Array(64);
+            arr[0] = i;
+            s.leak = arr;
+            sink = (sink + arr[0]) | 0;
+        }
+        s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 /**
  * The teeth: a per-op call that builds a FRESH array each op -- it MUST trip the gate
  * (scavenges scale with n), proving the instrument catches a real allocation.
@@ -247,6 +330,9 @@ zgcSuite({
     // the ExponentialHistogram(1000, 0.01) pool is cap=366 buckets x (3 Float64 + 3 Int32) ~= 13 KB;
     // setup builds each scenario's state twice + harness overhead. grows delta 0 is the leak invariant.
     maxRetainedKB: 512,
-    scenarios: [addCountStream, addTimeStream, adwinDriftStream, fdAddStream, addFromStream, fdAddFromStream],
-    mustFail: [mustFailAlloc, fdMustFailAlloc],
+    scenarios: [
+        addCountStream, addTimeStream, adwinDriftStream, fdAddStream, addFromStream, fdAddFromStream,
+        hkAddStream, hkAddFromStream,
+    ],
+    mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc],
 });

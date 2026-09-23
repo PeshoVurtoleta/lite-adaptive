@@ -16,7 +16,7 @@ function mulberry32(seed) {
 }
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '0.3.0');
+    assert.equal(VERSION, '0.4.0');
 });
 
 test('constructor validates delta fail-closed BEFORE allocation', () => {

@@ -8,6 +8,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.4.0] - 2026-09-23
+
+The fourth and FINAL member -- **HeavyKeeper** (Gong et al., USENIX ATC 2018): decayed /
+windowed heavy hitters (the top-k keys dominating the stream RIGHT NOW). Completes the
+four-member roster; 1.0.0 (the API freeze) is next. Pure append: `ExponentialHistogram` and
+`ForwardDecay` are byte-identical, and `ADWIN`'s `add(x)` hot body is unchanged (it gains an
+additive `addFrom`); only the file header and `VERSION` change otherwise.
+
+### Added
+
+- **`HeavyKeeper`** -- a decayed top-k over a `d x w` table of `(fingerprint, count)` cells
+  (SoA `Uint32Array` columns) plus an intrusive top-k min-forest (design-parity with lite-o1
+  `FreqO1`, never a dependency). `add(key, weight = 1)` hashes the key to `d` cells via an
+  inline two-lane hash; a matching fingerprint adds the weight, a colliding one is decayed
+  with probability `b^(-count)` (a seeded xorshift32 draw) and evicted at count 0 -- so cold
+  keys erode and the live top-k tracks the CURRENT concept. Amortized O(1), **0 B/op including
+  the decay draw and the forest sift**. `estimate(key)` is the max matching cell (0, never
+  throws, for an unseen key); `forEach(fn)` iterates the current top-k allocation-free (the
+  render path); `topKInto(buf)` fills a caller buffer 0-alloc; `topK()` is a COLD convenience
+  that may allocate. Weight is a positive integer (rank by count, or by total time / bytes /
+  any additive weight). Far lower error than Space-Saving on skewed, evolving streams.
+- **`HeavyKeeper.addFrom(buf, i)`** -- the zero-box hot entry: `key = buf[i]`,
+  `weight = buf[i+1]` read UNBOXED from a caller-owned `Float64Array`. A large `u32` tag id
+  (>= 2^31) passed as a plain argument boxes into a ~16 B HeapNumber at a non-inlined call
+  boundary; `addFrom` avoids it (torture-gated 0 B/op on keys near 2^31 / 2^32 - 1).
+- **`ADWIN.addFrom(buf, i)`** -- a zero-box sibling of `ADWIN.add(x)` (reads `x = buf[i]`
+  unboxed, returns the same boolean drift flag). ADWIN 0.2.0 had only `add(x)`, which boxes a
+  fractional `x` at the peer boundary; this lands before the 1.0.0 freeze so the drift member's
+  surface is complete. `ADWIN.add(x)` is byte-identical.
+- **The top-k witness** (`test/witness.mjs`) -- the honesty anchor for HeavyKeeper: 100% recall
+  of the true current top-k above `N/k` vs an exact `Map` oracle (weighted and unit streams),
+  a bounded overestimate (each reported total in `[true - ~N/w, true]`, never over the truth),
+  and the marquee claim -- measured mean rel-error over the true top-k of **0.001% vs a faithful
+  Space-Saving baseline's 36.75%** (Metwally et al. Stream-Summary, hand-rolled inline and cited,
+  not a strawman) on a Zipfian (`s = 1.1`) + DRIFTING stream. Negative controls the same gate
+  rejects: a frozen-forest variant (recall 0%) and a decay-disabled variant (`b` huge; recall
+  40% on drift).
+
+### Changed
+
+- `VERSION` -> `0.4.0` (package.json / `Adaptive.js` / llms.txt trinity); the file header
+  documents the complete four-member roster.
+
 ## [0.3.0] - 2026-09-23
 
 The third member -- **ForwardDecay** (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009):

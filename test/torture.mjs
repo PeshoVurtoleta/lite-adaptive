@@ -21,7 +21,7 @@ async function main() {
     }
     const { GcProfiler, checkNoGc, measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { ExponentialHistogram, ADWIN, ForwardDecay } = await import('../Adaptive.js');
+    const { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper } = await import('../Adaptive.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -51,6 +51,13 @@ async function main() {
             fd.count(); fd.sum(); fd.mean(); fd.rate();   // exercise the cold queries (0 alloc)
             fd.clear();
             tracker.track(fd, noop, 'forwarddecay', { audit: true });
+
+            const hk = new HeavyKeeper(4, 512, 8, { seed: 1 });
+            // a skewed stream over large u32 keys -> exercise fp-hit + fp-miss decay + the forest.
+            for (let k = 0; k < 4096; k++) hk.add(4000000000 + ((k * 2654435761) % 3000), (k & 7) + 1);
+            hk.estimate(4000000001); hk.forEach(noop); hk.topK();   // cold reads (topK may alloc, cold)
+            hk.clear();
+            tracker.track(hk, noop, 'heavykeeper', { audit: true });
         }
         return tracker.size();
     }
@@ -213,12 +220,110 @@ async function main() {
     const fdBoxedBytes = Math.max(0, Math.round(
         (r => r.bytesPerCall === null ? 0 : r.bytesPerCall)(measureAllocs(fdBoxedStep, { iterations: 100000, batches: 8 }))));
 
+    // ---- phase 2a-ter: HeavyKeeper -- add (fp-hit / fp-miss decay draw + forest sift) + the
+    // ZERO-BOX addFrom on FRACTIONAL-buffer LARGE u32 keys (near 2^31, 2^32-1) + ADWIN.addFrom. ----
+    // HeavyKeeper add: a churning skewed stream over integer keys (Smi -> no key box on the plain
+    // add), so every measured add touches the d cells (hit + miss decay draw via the PRNG) and
+    // re-heaps the forest. Primed first so the table + forest are hot.
+    const hkAdd = new HeavyKeeper(4, 512, 16, { seed: 3 });
+    let hkI = 0;
+    for (let k = 0; k < 40000; k++) { hkAdd.add((hkI * 2654435761) % 4000, (hkI & 7) + 1); hkI++; }
+    let hkSink = 0;
+    const hkStep = () => {
+        hkAdd.add((hkI * 2654435761) % 4000, (hkI & 7) + 1);
+        hkI = (hkI + 1) | 0;
+        hkSink = (hkSink + hkAdd.size) | 0;   // observe state (defeat DCE)
+    };
+    const hkRes = measureAllocs(hkStep, { iterations: 100000, batches: 8 });
+    const hkBpc = hkRes.bytesPerCall === null ? 0 : hkRes.bytesPerCall;
+    const hkBytes = Math.max(0, Math.round(hkBpc));
+    const hkOk = hkBytes === 0;
+
+    // HeavyKeeper addFrom: LARGE u32 keys (near 2^31 / 2^32-1) read UNBOXED from a packed
+    // [key, weight] Float64Array -- the case where a plain-arg add() would box the key. This is
+    // the gated zero-box floor for the lite-hud tag-id driver.
+    const hkFrom = new HeavyKeeper(4, 512, 16, { seed: 4 });
+    const HKBUF = new Float64Array(2);
+    let hkfI = 0;
+    for (let k = 0; k < 40000; k++) {
+        HKBUF[0] = 4294967295 - ((hkfI * 2654435761) % 4000);   // near 2^32-1
+        HKBUF[1] = (hkfI & 7) + 1;
+        hkFrom.addFrom(HKBUF, 0);
+        hkfI++;
+    }
+    let hkFromSink = 0;
+    const hkFromStep = () => {
+        // alternate two large-u32 bands (near 2^31 and near 2^32-1) so both boxing regimes run.
+        HKBUF[0] = (hkfI & 1) ? (4294967295 - ((hkfI * 2654435761) % 4000))
+                             : ((2 ** 31) + ((hkfI * 40503) % 4000));
+        HKBUF[1] = (hkfI & 7) + 1;
+        hkFrom.addFrom(HKBUF, 0);
+        hkfI = (hkfI + 1) | 0;
+        hkFromSink = (hkFromSink + hkFrom.size) | 0;   // observe state (defeat DCE)
+    };
+    const hkFromRes = measureAllocs(hkFromStep, { iterations: 100000, batches: 8 });
+    const hkFromBpc = hkFromRes.bytesPerCall === null ? 0 : hkFromRes.bytesPerCall;
+    const hkFromBytes = Math.max(0, Math.round(hkFromBpc));
+    const hkFromOk = hkFromBytes === 0;
+
+    // HeavyKeeper add DIAGNOSTIC (LARGE u32 key as a BOXED plain arg) -- printed, NOT a gate.
+    const hkBoxed = new HeavyKeeper(4, 512, 16, { seed: 5 });
+    let hkbI = 0;
+    for (let k = 0; k < 40000; k++) { hkBoxed.add(4294967295 - ((hkbI * 2654435761) % 4000), (hkbI & 7) + 1); hkbI++; }
+    let hkBoxedSink = 0;
+    const hkBoxedStep = () => {
+        hkBoxed.add(4294967295 - ((hkbI * 2654435761) % 4000), (hkbI & 7) + 1);
+        hkbI = (hkbI + 1) | 0;
+        hkBoxedSink = (hkBoxedSink + hkBoxed.size) | 0;
+    };
+    const hkBoxedBytes = Math.max(0, Math.round(
+        (r => r.bytesPerCall === null ? 0 : r.bytesPerCall)(measureAllocs(hkBoxedStep, { iterations: 100000, batches: 8 }))));
+
+    // ADWIN addFrom: a drifting FRACTIONAL stream read UNBOXED from a Float64Array(1) scratch --
+    // the zero-box sibling of add(x). Primed to a churning window first.
+    const adFrom = new ADWIN(0.1);
+    const ADBUF = new Float64Array(1);
+    let adfI = 0;
+    for (let k = 0; k < 40000; k++) { ADBUF[0] = ((adfI >> 9) & 1) ? 1000.5 : 0.25; adFrom.addFrom(ADBUF, 0); adfI++; }
+    let adFromSink = 0;
+    const adFromStep = () => {
+        ADBUF[0] = ((adfI >> 9) & 1) ? 1000.5 : 0.25;   // fractional drifting value
+        const cut = adFrom.addFrom(ADBUF, 0);
+        adfI = (adfI + 1) | 0;
+        adFromSink = (adFromSink + (cut ? 1 : 0) + adFrom.bucketCount) | 0;   // observe (defeat DCE)
+    };
+    const adFromRes = measureAllocs(adFromStep, { iterations: 100000, batches: 8 });
+    const adFromBpc = adFromRes.bytesPerCall === null ? 0 : adFromRes.bytesPerCall;
+    const adFromBytes = Math.max(0, Math.round(adFromBpc));
+    const adFromOk = adFromBytes === 0;
+
+    // ---- phase 2a-quater: HeavyKeeper.clear() zero-alloc (planner assertion: clear() 0-alloc) ----
+    // Re-fill between clears so every measured clear() actually resets non-trivial live state
+    // (fps/cnt/mapKey fills + heap/map reset), not a no-op on an already-empty instance.
+    const hkClear = new HeavyKeeper(4, 512, 16, { seed: 11 });
+    for (let k = 0; k < 20000; k++) hkClear.add((k * 2654435761) % 4000, (k & 7) + 1);
+    let hkClearSink = 0, hkClearI = 0;
+    const hkClearStep = () => {
+        hkClear.clear();
+        hkClear.add((hkClearI * 2654435761) % 4000, (hkClearI & 7) + 1);   // re-seed live state
+        hkClearI = (hkClearI + 1) | 0;
+        hkClearSink = (hkClearSink + hkClear.size) | 0;   // observe state (defeat DCE)
+    };
+    const hkClearRes = measureAllocs(hkClearStep, { iterations: 100000, batches: 8 });
+    const hkClearBpc = hkClearRes.bytesPerCall === null ? 0 : hkClearRes.bytesPerCall;
+    const hkClearBytes = Math.max(0, Math.round(hkClearBpc));
+    const hkClearOk = hkClearBytes === 0;
+
     // ---- phase 2b: GC budget over a long hot run (millions of add + reshaping ops) ----
     const gc = new GcProfiler().start();
     const HOT = 4000000;
     let SINK = 0;
-    for (let i = 0; i < HOT; i++) { addStep(); addTStep(); adStep(); fdStep(); fdRebStep(); ehFromStep(); fdFromStep(); }
-    SINK += addSink + addTSink + adSink + fpSink + frSink + ehFromSink + fdFromSink + ehBoxedSink + fdBoxedSink;
+    for (let i = 0; i < HOT; i++) {
+        addStep(); addTStep(); adStep(); fdStep(); fdRebStep(); ehFromStep(); fdFromStep();
+        hkStep(); hkFromStep(); adFromStep(); hkClearStep();
+    }
+    SINK += addSink + addTSink + adSink + fpSink + frSink + ehFromSink + fdFromSink + ehBoxedSink + fdBoxedSink +
+        hkSink + hkFromSink + hkBoxedSink + adFromSink + hkClearSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -227,6 +332,7 @@ async function main() {
     const abBefore = process.memoryUsage().arrayBuffers;
     const reuse = new ExponentialHistogram(2048, 0.01);
     const reuseAd = new ADWIN(0.1);
+    const reuseHk = new HeavyKeeper(4, 512, 16, { seed: 9 });
     for (let c = 0; c < 500; c++) {
         for (let k = 0; k < 8192; k++) reuse.add();     // full window -> expire + cascade
         reuse.count();
@@ -235,6 +341,9 @@ async function main() {
         for (let k = 0; k < 8192; k++) reuseAd.add(((k >> 9) & 1) ? 1000 : 0);  // drift -> shrink
         reuseAd.mean; reuseAd.variance;
         reuseAd.clear();                                // reuse the pool, no new store
+        for (let k = 0; k < 8192; k++) reuseHk.add((k * 2654435761) % 3000, (k & 7) + 1);  // skew + decay
+        reuseHk.forEach(noop);
+        reuseHk.clear();                                // reuse the arrays, no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -243,7 +352,8 @@ async function main() {
 
     // ---- verdict + GATE line ----
     const ok = trackedOk && live === 0 && findings.length === 0 &&
-        addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk && report.ok && abOk;
+        addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk &&
+        hkOk && hkFromOk && adFromOk && hkClearOk && report.ok && abOk;
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=0' +
@@ -254,10 +364,15 @@ async function main() {
         fdBytes + ' B/op (ForwardDecay add) ' +
         fdRebBytes + ' B/op (ForwardDecay add rebase-heavy) ' +
         ehFromBytes + ' B/op (ExponentialHistogram addFrom fractional) ' +
-        fdFromBytes + ' B/op (ForwardDecay addFrom fractional)' +
+        fdFromBytes + ' B/op (ForwardDecay addFrom fractional) ' +
+        hkBytes + ' B/op (HeavyKeeper add + decay + forest) ' +
+        hkFromBytes + ' B/op (HeavyKeeper addFrom large-u32) ' +
+        adFromBytes + ' B/op (ADWIN addFrom fractional) ' +
+        hkClearBytes + ' B/op (HeavyKeeper clear)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta +
-        ' diag: add-boxed-fractional EH=' + ehBoxedBytes + ' B/op FD=' + fdBoxedBytes + ' B/op)');
+        ' diag: add-boxed-fractional EH=' + ehBoxedBytes + ' B/op FD=' + fdBoxedBytes +
+        ' B/op HeavyKeeper add-boxed-large-u32=' + hkBoxedBytes + ' B/op)');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' (expected > 0)');
@@ -270,6 +385,10 @@ async function main() {
         if (!fdRebOk) console.error('  alloc ' + fdRebBytes + ' B/op ForwardDecay rebase-heavy (raw ' + fdRebBpc + ')');
         if (!ehFromOk) console.error('  alloc ' + ehFromBytes + ' B/op ExponentialHistogram addFrom (raw ' + ehFromBpc + ')');
         if (!fdFromOk) console.error('  alloc ' + fdFromBytes + ' B/op ForwardDecay addFrom (raw ' + fdFromBpc + ')');
+        if (!hkOk) console.error('  alloc ' + hkBytes + ' B/op HeavyKeeper add (raw ' + hkBpc + ')');
+        if (!hkFromOk) console.error('  alloc ' + hkFromBytes + ' B/op HeavyKeeper addFrom (raw ' + hkFromBpc + ')');
+        if (!adFromOk) console.error('  alloc ' + adFromBytes + ' B/op ADWIN addFrom (raw ' + adFromBpc + ')');
+        if (!hkClearOk) console.error('  alloc ' + hkClearBytes + ' B/op HeavyKeeper clear (raw ' + hkClearBpc + ')');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

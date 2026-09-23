@@ -7,7 +7,7 @@ import { ForwardDecay, VERSION } from '../Adaptive.js';
 const LN2 = Math.LN2;
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '0.3.0');
+    assert.equal(VERSION, '0.4.0');
 });
 
 test('constructor validates halfLife fail-closed BEFORE any field init', () => {

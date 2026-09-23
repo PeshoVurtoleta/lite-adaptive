@@ -194,7 +194,148 @@ M1 is the heaviest (it builds the package + the substrate); M2-M4 are appends on
   lower error than a Space-Saving baseline on a Zipfian + drifting stream.
 - NON-GOALS: no exact top-k (impossible in sublinear space); no cumulative-only mode (that is
   lite-sketch Space-Saving).
+- CONSUMER REQUIREMENTS (lite-hud M3 drop-in, settled with the maintainer 2026-09-23):
+  1. WEIGHTED add: `add(key, weight = 1)`, where weight is a positive integer (lite-hud passes
+     integer MICROSECONDS so it can rank by total time; weight 1 is classic HeavyKeeper). The decay
+     rule for a weighted miss must be written down in the ADR (e.g. decay applied per weight unit,
+     or once with probability b^-count). The witness covers both weighted and unit streams.
+  2. ZERO-BOX entry from day one: `addFrom(buf, i)` reads key = buf[i] and weight = buf[i+1]. A u32
+     tag id >= 2^31, or a key read from a Float64Array, can box as a plain argument (LiteLru
+     RESEARCH 9 measured an integer below -2^30 boxing). The scaling lane drives keys near 2^31 and
+     2^32-1, plus large weights.
+  3. ALLOC-FREE read: `forEach(fn)` over the top-k set (or `topKInto(buf)`). `topK()` may allocate
+     (COLD), but the HUD render never calls it.
+  4. SEEDED internal PRNG for the probabilistic decay (a Uint32 xorshift state, `seed` option +
+     getter), never Math.random. This gives a reproducible witness and a deterministic demo.
+  5. Documented key domain (safe integer) + fail-closed throws, so a consumer can pre-check without
+     try/catch. Getters: d, w, k, decay base b, seed, and a memory figure. `estimate(key)` never
+     throws. `clear()` is 0-alloc. `merge` is optional (lite-hud does not rotate HeavyKeeper).
+- lite-hud M3 ships on lite-sketch SpaceSaving first and injects HeavyKeeper later as a duck-typed
+  drop-in. HeavyKeeper does NOT block M3.
+- BEFORE 1.0.0 (the API freeze): add `ADWIN.addFrom(buf, i)`. ADWIN 0.2.0 has only `add(x)` with a
+  fractional x, which boxes. lite-hud M6 drift markers feed it HUD-computed durations. It is
+  additive, but it belongs in the frozen surface.
 - After M4: declare 1.0.0, API stable; post-1.0 backlog (SlidingHLL, scalar DriftDetector, decayed
   Reservoir, windowed Count-Min / quantiles), one per release.
+- POST-1.0: every member is bound by section 6 (shared requirements R1-R10 + a per-member
+  checklist). Read it before the member's planner session.
+
+---
+
+## 6. Post-1.0 members -- requirements + warnings (added 2026-09-23)
+
+Source: the 2026-09-23 audits of lite-hud M2, lite-sketch, lite-filter and lite-lru (the evidence is
+in RESEARCH.md section 12). The first consumer is lite-hud, which waits for these members before
+its later sessions. Each member's planner copies R1-R10 into its brief as gates.
+
+### 6.1 Shared requirements (every post-1.0 member)
+
+- **R1 Zero-box entry.** `addFrom(buf, i)` with a FIXED, documented layout (now, then key or value,
+  then count where one applies). It is the same validation and the same throws as `add`. The plain
+  `add(...)` stays, and it is the lane's CONTROL: it must show the box on fractional inputs.
+- **R2 Realistic magnitudes in the scaling lane** (3.5b, extended):
+  - `now` at both performance.now() scale (~1e3-1e7, fractional) and epoch-ms scale (~1.7e12,
+    fractional);
+  - keys near 2^30, 2^31, 2^32-1, -2^31 and 2^53-1, and keys read back from a Float64Array;
+  - counts near 2^30.
+  Small-integer-only lanes are not evidence. lite-lru 1.18.0 passed every gate and still boxed on
+  TTL `put` with an epoch clock.
+- **R3 Polymorphic warm-up.** Run each ON lane in a process where a differently-configured instance
+  of the same class (and a sibling member) ran first. V8 inlines a helper only while its call site is
+  monomorphic. Never RETURN a computed double from a hot-path helper: compute it inline, or write it
+  to a typed-array slot (lite-lru A1).
+- **R4 Monotone-time contract a consumer can pre-check.** `lastNow` is a getter. A decreasing `now`
+  throws (the existing law). The ADR states what a consumer does when its clock jumps back: lite-scope
+  `setClockOffset` and OP_EPOCH do exactly that, and lite-hud calls `clear()` on an epoch. Also
+  settle whether `now - W` stays exact at epoch-ms magnitude with microsecond detail (2^53 ~ 9.0e15).
+- **R5 NaN fails closed by construction.** Write comparisons so NaN lands on the rejecting side
+  (`!(x < bound)`, not `x >= bound`). Validate every computed stamp or threshold, not only inputs
+  (lite-lru A6: a NaN clock meant "never expires").
+- **R6 Every door is the same door.** Static factories (`withError`, `withAccuracy`, ...) and any
+  wrapper that rebuilds an options object run the SAME unknown-option check, with its did-you-mean
+  hint (lite-lru A4: a DirectLru typo silently disabled TTL). A `restore`/`fromJSON`, if one ever
+  ships, validates like the constructor: unique keys, typed stamps, and `null` rejected (lite-lru
+  A3/A5).
+- **R7 Allocation-free readers.** Any result a consumer reads at 10-15 Hz has a `forEach(fn)` or an
+  `xxxInto(buf)` form. The array-returning form may exist but is COLD and documented as allocating.
+  A query that EXPIRES state is a mutation: say so in the docs (lite-lru A11: "has/peek cannot
+  mutate" was false under TTL).
+- **R8 Getters for every knob and all pre-checkable state:** window, epsilon or alpha, pool/ring
+  capacity, saturation/overflow counters, seed, `lastNow`, and a memory figure. A consumer never
+  learns configuration by catching an error.
+- **R9 Seeded randomness.** Any randomized member (HeavyKeeper, the reservoir) uses an internal
+  Uint32 PRNG with a `seed` option and getter, never Math.random. The witness and the demo must be
+  reproducible.
+- **R10 The space triple in the README memory table:** bytes at the default AND at a
+  consumer-realistic size (lite-hud: per channel x ~10-50 channels). A member whose default costs
+  more than ~64 KB per instance says so in its headline.
+
+### 6.2 Per-member checklist
+
+**SlidingHyperLogLog** (Chabchoub-Hebrail; fixed per-register ring)
+- `addFrom(buf, i)`: now = buf[i], key = buf[i+1] (safe integer). Use the SAME key domain, hash and
+  default seed as lite-sketch `HyperLogLog`, so a consumer can cross-check windowed against
+  cumulative.
+- The ring bound is the zero-GC trade. A ring overflow must be COUNTED (an `overflows` getter) and
+  the estimate flagged as degraded. Never drop silently (null is not zero).
+- MEMORY WARNING: m x ringCap x (8 B stamp + 1 B rho). p=12 with ring 8 is ~288 KB per instance.
+  Disclose it and pick a consumer-friendly default (p=10 with ring 8 is ~72 KB). If stamps are
+  stored relative to a landmark in a narrower type, prove the precision at epoch-ms scale (R4).
+- `count(w?)` answers any w <= W (cold, never throws, 0 on empty). Say whether the query expires
+  registers (R7).
+- Witness: within 3 x (1.04/sqrt(m)) of an exact windowed Set, including right at the window
+  edge and just after a burst of expiries.
+
+**DriftDetector** (scalar Page-Hinkley / CUSUM / DDM / EDDM)
+- The modes have DIFFERENT input domains: PH and CUSUM take a real x; DDM and EDDM take a 0/1 error
+  bit. Validate per mode and expose a `mode` getter. A 0.5 fed to DDM is a throw, never a silent
+  round.
+- The result must carry DDM's warning level. Lean: `addFrom` returns a boolean (drift) to match
+  ADWIN, plus a `state` getter (0 none, 1 warning, 2 drift) and a `lastDriftIndex` getter.
+- State the post-alarm semantics (auto-reset vs sticky until `clear()`), the direction (one-sided
+  up by default? a two-sided option?) and the warm-up count (a getter). PH keeps alarming if not
+  reset, and a HUD marker must fire once per regime change.
+- Item-indexed, no clock. The docs say that a consumer with irregular cadence gets item-latency,
+  not time-latency.
+- Witness (3.2): stationary false-alarm rate and step-change detection delay per mode, as NUMBERS,
+  beside ADWIN on the same streams.
+
+**Decayed Reservoir** (Aggarwal VLDB'06, exponential bias)
+- No lite-hud use yet (a possible demo "recent samples" strip), so it is lowest priority.
+- Samples live in a Float64Array (+ an optional Int32/Float64 id column). NEVER store caller objects:
+  retention would be the consumer's leak, and it breaks the zero-GC story.
+- R9 applies directly. State the fill semantics (the probability p_in while filling, the bias
+  lambda vs capacity n constraint), with `size` vs `capacity` getters, and empty reads as
+  size 0, not a zero sample.
+- Reader: `forEach(fn)` / `copyInto(buf)` (R7).
+
+**Windowed Count-Min** (settle the design in an ADR FIRST)
+- MEMORY WARNING for the naive design: an EH per cell costs d x w x EH_CAP x 16 B. At d=4, w=1024,
+  eps 0.1, W 1e4 (EH_CAP ~93) that is ~6 MB per instance. Not viable for a per-channel consumer.
+- Honest alternatives, each stating its recency model:
+  - (a) PANES: B CMS panes rotated by time. The query sums them. The error adds at most one
+    pane's worth at the edge. Memory B x d x w x 4 B. This generalizes lite-hud's A/B rotation (B=2).
+  - (b) forward-decayed float counters (a decay model, not a window).
+  - Lean: (a) as the hard-ish window, with B a knob and the edge error disclosed.
+- Match lite-sketch CountMinSketch: the same key domain, hash, seed and d/w sizing
+  (`withAccuracy`), SATURATION at 2^32-1 (never wrap), and `estimate` that never throws, so it can
+  be swapped in for a windowed use.
+- `addFrom(buf, i)`: now, key, count.
+
+**Sliding-window quantiles** (pane-based DDSketch; Arasu-Manku only if zero-GC is proven)
+- The SAME mapping and accuracy contract as lite-sketch DDSketch: alpha, gamma, the collapsing lowest
+  bins, and the getters `alpha`, `strict`, `minIndexable`, `maxIndexable`, `collapsed`. A consumer
+  pre-checks exactly as lite-hud M2 does. Any divergence in the accepted band is a breaking surprise.
+- `addFrom(buf, i)`: now = buf[i], value = buf[i+1]. State the policy for zero, -0 and negatives
+  in the same words as DDSketch.
+- An empty window reads NaN with n = 0, never 0. `quantileInto(qs, out)` or a single-q `quantile`
+  answers at render without allocating.
+- The pane merge is O(B x bins) at query (cold, disclosed). Memory B x maxBins x 8 B (+ a scratch).
+- lite-hud replaces its M2 A/B only if this member offers more: a pane granularity finer than
+  W/2 and a stated edge error.
+
+**HeavyKeeper** (0.4.0): see the M4 brief. Weighted `add(key, weight)`, `addFrom`, `forEach`, a
+seeded PRNG, getters, a 0-alloc `clear`, and `merge` optional. **ADWIN.addFrom** lands before
+1.0.0.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

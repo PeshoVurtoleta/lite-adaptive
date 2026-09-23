@@ -27,9 +27,23 @@
  * -- the numeric-stability edge over backward decay). O(1) SPACE (two scalar accumulators
  * C, Sv -- no pool), EXACT modulo FP via a periodic alloc-free landmark rebase, and a
  * SMOOTH recency model (data fades, never drops). `add(now?, value?)` is 0 B/op INCLUDING
- * the rebase branch; values may be any finite real (signed). The last roster member
- * (HeavyKeeper, decayed top-k) is PURE-APPENDED below; prior members stay byte-identical,
- * only this header + VERSION change.
+ * the rebase branch; values may be any finite real (signed).
+ *
+ * v0.4.0 adds HeavyKeeper (Gong-Yang-Chen-et al., USENIX ATC 2018): decayed / windowed
+ * HEAVY HITTERS (top-k right now), far lower error than Space-Saving on skewed / evolving
+ * streams. A d x w SoA table of (fingerprint, count) with PROBABILISTIC exponential decay
+ * of a counter on a fingerprint MISS (a seeded xorshift32 PRNG, base b), plus an intrusive
+ * top-k min-forest (design-parity with lite-o1 FreqO1, an open-addressed backshift map +
+ * a binary min-heap over the k current leaders -- never a dep). WEIGHTED `add(key, weight)`
+ * (integer weights, e.g. lite-hud microseconds) with the SETTLED weighted-miss decay rule
+ * (decay ONCE with prob b^(-count), then count -= weight clamped at 0). `add` / the ZERO-BOX
+ * `addFrom(buf, i)` (large u32 keys read UNBOXED) are 0 B/op incl. the decay draw + the forest
+ * sift. This COMPLETES the four-member roster (1.0.0 = the API-freeze milestone, next).
+ *
+ * v0.4.0 also adds ADWIN.addFrom(buf, i) (a ZERO-BOX sibling of ADWIN.add(x): reads x = buf[i]
+ * UNBOXED from a caller-owned Float64Array; ADWIN.add(x)'s hot body stays byte-identical).
+ * Prior members (ExponentialHistogram, ForwardDecay) stay BYTE-IDENTICAL; only this header +
+ * VERSION change above the append point (plus the additive ADWIN.addFrom inside the ADWIN class).
  *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
@@ -38,7 +52,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -792,6 +806,94 @@ export class ADWIN {
     }
 
     /**
+     * Add one value read UNBOXED from a caller-owned Float64Array. HOT, 0 B/op -- the ZERO-BOX
+     * sibling of `add(x)` for a caller whose `x` is a FRACTIONAL double (the lite-hud M6 drift
+     * driver: a HUD-computed duration). `add(x)` boxes a fractional argument into a ~16 B
+     * HeapNumber at a non-inlined call boundary; this reads `x = buf[i]` UNBOXED straight from
+     * the array. ADWIN is ITEM-INDEXED (a single value, no `now`), so only `buf[i]` is read.
+     * Identical validation, throws, byte-identical-no-op-on-reject, and reshaping (the drift
+     * detection + cut-scan + drop-older shrink) as `add(x)`; it differs ONLY in how the scalar
+     * crosses the boundary. The body is DUPLICATED from `add` (not delegated) to keep `add`'s
+     * hot body byte-identical and avoid re-boxing at an internal call boundary.
+     *
+     * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer /
+     * negative / out-of-range `i` (needs `i < buf.length`) throws [lite-adaptive]. A NaN /
+     * +-Infinity `buf[i]` throws (a byte-identical no-op).
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = the value.
+     * @param {number} i the index of the value to read.
+     * @returns {boolean} true iff a cut fired (drift detected) this add.
+     */
+    addFrom(buf, i) {
+        // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badBuf(buf, i);
+        const x = buf[i];   // UNBOXED Float64Array read -- the whole point (no argument box).
+        // --- validate x FIRST (mirror add(); a Float64Array read is always a number, so add()'s
+        // typeof branch is unreachable here and omitted). BYTE-IDENTICAL no-op on reject. ---
+        if (x !== x || x === Infinity || x === -Infinity) return this._badValue(x);
+        // running range over ALL x seen (widens monotonically; NOT rolled back on a shrink).
+        if (x < this._min) this._min = x;
+        if (x > this._max) this._max = x;
+
+        // --- open a fresh level-0 bucket (count 1, sum x, sumSq x*x) at the newest end --
+        //     DUPLICATED from add() to keep add()'s hot body byte-identical. ---
+        const node = this._freeHead;
+        if (node === -1) return this._badOverflow();
+        this._freeHead = this._next[node];
+        this._sum[node] = x;
+        this._sumSq[node] = x * x;
+        this._bcount[node] = 1;
+        this._lvl[node] = 0;
+        const tail0 = this._tail[0];
+        this._prev[node] = tail0;
+        this._next[node] = -1;
+        if (tail0 === -1) this._head[0] = node; else this._next[tail0] = node;
+        this._tail[0] = node;
+        this._lcount[0]++;
+        this._count++;
+        if (this._maxLevel < 0) this._maxLevel = 0;
+        this._total += 1;
+        this._wsum += x;
+        this._wsumSq += x * x;
+
+        // --- the bounded merge cascade (see add() for the full commentary) ---
+        const M = this._M;
+        let L = 0;
+        while (this._lcount[L] > M) {
+            const a = this._head[L];
+            const b2 = this._next[a];
+            const after = this._next[b2];
+            this._head[L] = after;
+            if (after === -1) this._tail[L] = -1; else this._prev[after] = -1;
+            this._lcount[L] -= 2;
+            this._sum[a] += this._sum[b2];
+            this._sumSq[a] += this._sumSq[b2];
+            this._bcount[a] += this._bcount[b2];
+            const nl = L + 1;
+            this._lvl[a] = nl;
+            this._next[b2] = this._freeHead;
+            this._freeHead = b2;
+            this._count--;
+            const tnl = this._tail[nl];
+            this._prev[a] = tnl;
+            this._next[a] = -1;
+            if (tnl === -1) this._head[nl] = a; else this._next[tnl] = a;
+            this._tail[nl] = a;
+            this._lcount[nl]++;
+            if (nl > this._maxLevel) this._maxLevel = nl;
+            L = nl;
+        }
+
+        // --- the ADWIN2 cut-scan + adaptive shrink (see add() for the full commentary) ---
+        let changed = false;
+        while (this._total > 1 && this._scanCut()) {
+            this._dropOldest();
+            changed = true;
+        }
+        return changed;
+    }
+
+    /**
      * @private Scan every boundary split of the window into W0 (older) | W1 (newer) for a
      * significant mean difference (the ADWIN2 variance-aware epsCut). Returns true on the
      * first split that cuts. 0 alloc -- indices + scalars only. Cold relative to the whole
@@ -874,6 +976,13 @@ export class ADWIN {
         throw new RangeError(
             '[lite-adaptive] ADWIN bucket pool overflow (cap=' + this._cap +
             '); this is a bug -- please report the delta + stream length used');
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] ADWIN.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index (0 <= i < buf.length), got ' + String(buf) + ', ' + String(i));
     }
 }
 
@@ -1278,5 +1387,640 @@ export class ForwardDecay {
         throw new TypeError(
             '[lite-adaptive] ForwardDecay.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
             'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+}
+
+// ===========================================================================
+// HeavyKeeper (ADR 0005) -- decayed / windowed heavy hitters, top-k (Gong et al., ATC 2018)
+// ===========================================================================
+//
+// HeavyKeeper answers "which keys are the heaviest RIGHT NOW?" -- a top-k over a SKEWED,
+// EVOLVING stream, at far lower error than Space-Saving because it PROTECTS heavy counters
+// and PROBABILISTICALLY DECAYS light ones instead of blindly evicting the min. A d x w SoA
+// table of (fingerprint, count) columns (Uint32, row-major) plus an intrusive top-k
+// min-forest: an open-addressed backshift map (key -> heap slot) over a binary MIN-HEAP of
+// the k current leaders (design-parity with lite-o1 FreqO1's intrusive index surgery -- a
+// COPIED technique, never a dep). Nothing about the table or the forest allocates per op.
+//
+// HOT add(key, weight): the two-lane murmur (mirrored INLINE from lite-sketch Sketch.js, ADR
+// 0001 there) derives a fingerprint fp + d column positions; per row r at cell (r, col_r):
+//   (a) count == 0 (empty) -> fp = fpKey, count = weight;
+//   (b) fp == fpKey        -> count += weight (clamped at uint32 max);
+//   (c) fp != fpKey        -> DECAY: draw the seeded xorshift32 PRNG, and with probability
+//       b^(-count) do `count -= weight` clamped at 0, replacing fp = fpKey / count = weight
+//       when it hits 0. estimate(key) = the max count over the d cells whose fp == fpKey.
+// After the table update the top-k min-forest is maintained (insert / update / evict-the-min),
+// an intrusive sift with 0 allocation.
+//
+// WEIGHTED-MISS DECAY RULE (SETTLED, ADR 0005): decay ONCE with probability b^(-count), THEN
+// count -= weight (clamped). The REJECTED alternative -- decay per weight UNIT (a draw per
+// microsecond) -- is O(weight), not O(1), and not 0-alloc; recorded in the ADR.
+//
+// PRNG: a seeded xorshift32 (state kept as a SIGNED int32 so the module never boxes a uint32
+// >= 2^31 into a field). The decay probability b^(-count) is a Float64Array LUT for counts in
+// [0, HK_LUT_SIZE); above the LUT the probability is astronomically small, so a heavy counter
+// effectively never decays (a cheap Math.pow fallback, 0-alloc). No Math.random, no per-op
+// Math.pow allocation on the common path.
+
+/** Default decay base b (~1.08; the ATC 2018 paper's small-base regime). b^(-count) in (0,1). */
+const HK_DEFAULT_B = 1.08;
+/** Default per-instance seed (a uint32, nonzero). Two default-seeded HeavyKeepers behave identically. */
+const HK_DEFAULT_SEED = 0x9e3779b1;
+/** The decay-probability LUT size: lut[c] = b^(-c) for c in [0, HK_LUT_SIZE). */
+const HK_LUT_SIZE = 256;
+/** Max simultaneous rows d (a sane ceiling; the paper uses d ~ 4-8). */
+const HK_D_MAX = 64;
+
+/** MurmurHash3 mixing constants (SMIs) -- mirrored INLINE from lite-sketch Sketch.js (ADR 0001 there). */
+const HK_C1 = 0xcc9e2d51 | 0;
+const HK_C2 = 0x1b873593 | 0;
+/** MurmurHash3 fmix32 finalizer constants (SMIs). */
+const HK_FC1 = 0x85ebca6b | 0;
+const HK_FC2 = 0xc2b2ae35 | 0;
+/** Lane / row / map decorrelation salts (SMIs). */
+const HK_LANE_SALT = 0x85ebca6b | 0;
+const HK_ODD = 0x9e3779b1 | 0;
+const HK_MAP_SALT = 0x27d4eb2f | 0;
+const HK_RNG_SALT = 0x165667b1 | 0;
+
+/** Frozen marker of the known HeavyKeeper ctor option keys -- an unknown key is a throw. */
+const HK_KNOWN_OPTS = Object.freeze({ seed: true, b: true });
+
+/**
+ * The two hash lanes of the last hkHash call: HK_H1 = fingerprint lane, HK_H2 = position base
+ * lane. Written by hkHash, read by the caller on the immediately following synchronous line
+ * -- the alloc-free "return two uint32s" trick. Held as SIGNED int32 so a lane >= 2^31 never
+ * boxes a HeapNumber into a module slot; readers recover the unsigned value with `>>> 0`.
+ */
+let HK_H1 = 0;
+let HK_H2 = 0;
+
+/** One MurmurHash3 body round (pure int32, zero-alloc). */
+function hkRound(h, k) {
+    k = Math.imul(k, HK_C1);
+    k = (k << 15) | (k >>> 17);
+    k = Math.imul(k, HK_C2);
+    h = h ^ k;
+    h = (h << 13) | (h >>> 19);
+    h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+    return h;
+}
+
+/** MurmurHash3 fmix32 finalizer -- the avalanche step (pure int32, zero-alloc). */
+function hkFinal(h) {
+    h = h ^ (h >>> 16);
+    h = Math.imul(h, HK_FC1);
+    h = h ^ (h >>> 13);
+    h = Math.imul(h, HK_FC2);
+    h = h ^ (h >>> 16);
+    return h;
+}
+
+/**
+ * Hash a numeric (safe-integer) key with a uint32 seed into HK_H1 (fingerprint lane) and
+ * HK_H2 (position base lane): the key's low + high words folded through TWO independently
+ * seeded murmur3 bodies. Zero allocation, no BigInt, no ref retained.
+ */
+function hkHash(key, seed) {
+    let a = key, neg = 0;
+    if (a < 0) { a = -a; neg = 1; }
+    const lo = a >>> 0;                        // low 32 bits (ToUint32)
+    const hi = ((a - lo) / 4294967296) >>> 0;  // high word (exact for safe integers)
+    const s = seed >>> 0;
+    let h = s | 0;
+    h = hkRound(h, lo);
+    h = hkRound(h, hi ^ neg);
+    h = h ^ 8;
+    HK_H1 = hkFinal(h) | 0;
+    let g = (s ^ HK_LANE_SALT) | 0;
+    g = hkRound(g, lo);
+    g = hkRound(g, hi ^ neg);
+    g = g ^ 8;
+    HK_H2 = hkFinal(g) | 0;
+}
+
+/** Column position of row r: a per-row salt of the position base lane, mod w. Zero-alloc. */
+function hkPos(base, r, w) {
+    return (hkFinal((base ^ Math.imul(r, HK_ODD)) | 0) >>> 0) % w;
+}
+
+/** A standalone map-index hash of a key (does NOT touch HK_H1 / HK_H2). Zero-alloc uint32. */
+function hkMapHash(key, seed) {
+    let a = key, neg = 0;
+    if (a < 0) { a = -a; neg = 1; }
+    const lo = a >>> 0;
+    const hi = ((a - lo) / 4294967296) >>> 0;
+    let h = (seed ^ HK_MAP_SALT) | 0;
+    h = hkRound(h, lo);
+    h = hkRound(h, hi ^ neg);
+    h = h ^ 8;
+    return hkFinal(h) >>> 0;
+}
+
+/**
+ * HeavyKeeper -- decayed / windowed HEAVY HITTERS (top-k right now), Gong-Yang-Chen et al.,
+ * "HeavyKeeper: An Accurate Algorithm for Finding Top-k Elephant Flows" (USENIX ATC 2018).
+ * A d x w SoA table of (fingerprint, count) columns with PROBABILISTIC exponential decay on a
+ * fingerprint MISS -- heavy counters are protected, light ones fade -- plus an intrusive top-k
+ * min-forest (an open-addressed backshift map over a binary min-heap of the k leaders,
+ * design-parity with lite-o1 FreqO1). Far lower error than Space-Saving on a skewed / evolving
+ * stream because it does not blindly evict the current minimum.
+ *
+ * Headline (the recency TRIPLE):
+ *   - SPACE: a FIXED d x w Uint32 table + a k-slot heap + a 2k-ish map. Never grows.
+ *   - ERROR: bounded OVERESTIMATE (a reported count is in [true - err, true] for the current
+ *     leaders); recall of the true heavy hitters is high on skew (witnessed vs Space-Saving).
+ *   - RECENCY: a DECAY model -- a counter for a key that stops arriving is probabilistically
+ *     eroded by other keys' misses, so the top-k tracks the CURRENT distribution.
+ *
+ * Hot path (`add` / `addFrom`, 0 B/op): the two-lane murmur, d cell touches (empty-fill /
+ * fp-hit increment / fp-miss probabilistic decay via the seeded xorshift32 PRNG), and the
+ * intrusive forest sift -- every step an index manipulation on preallocated columns.
+ *
+ * Fail closed: a bad d / w / k / seed / b / option throws `[lite-adaptive]` at the ctor door
+ * BEFORE any allocation; `add` / `addFrom` validate the key (a SAFE INTEGER) + weight (a
+ * positive integer) typeof-first, BEFORE any state mutation -- a rejected add is a BYTE-
+ * IDENTICAL no-op; `estimate` / `forEach` / getters never throw (null is not zero). No `merge`
+ * (a consumer does not rotate a HeavyKeeper; noted post-1.0 in ADR 0005).
+ */
+export class HeavyKeeper {
+    /**
+     * @param {number} d  table depth (rows / independent hashes); an integer in [1, 64]. d ~ 4-8.
+     * @param {number} w  table width (columns per row); an integer >= 1.
+     * @param {number} k  the top-k size; an integer >= 1.
+     * @param {object} [options] { seed?: uint32 (default 0x9e3779b1; seed=0 is a valid distinct
+     *                seed -- guarded as `undefined`, not falsy), b?: decay base (a finite number
+     *                > 1, default 1.08) }. An unknown key throws [lite-adaptive].
+     */
+    constructor(d, w, k, options) {
+        // typeof guards FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
+        if (typeof d !== 'number' || !Number.isInteger(d) || d < 1 || d > HK_D_MAX) {
+            throw new RangeError(
+                '[lite-adaptive] HeavyKeeper d must be an integer in [1, ' + HK_D_MAX + '], got ' + String(d));
+        }
+        if (typeof w !== 'number' || !Number.isInteger(w) || w < 1) {
+            throw new RangeError(
+                '[lite-adaptive] HeavyKeeper w must be an integer >= 1, got ' + String(w));
+        }
+        if (typeof k !== 'number' || !Number.isInteger(k) || k < 1) {
+            throw new RangeError(
+                '[lite-adaptive] HeavyKeeper k must be an integer >= 1, got ' + String(k));
+        }
+        let seed = HK_DEFAULT_SEED;
+        let b = HK_DEFAULT_B;
+        if (options !== undefined) {
+            if (typeof options !== 'object' || options === null) {
+                throw new TypeError('[lite-adaptive] HeavyKeeper options must be an object');
+            }
+            for (const key in options) {
+                if (!(key in HK_KNOWN_OPTS)) {
+                    throw new RangeError('[lite-adaptive] HeavyKeeper unknown option "' + key + '"');
+                }
+            }
+            // seed=0 is a VALID distinct seed -- guard `undefined`, not falsy (null is not zero).
+            if (options.seed !== undefined) {
+                const s = options.seed;
+                if (typeof s !== 'number' || !Number.isInteger(s) || s < 0 || s > 4294967295) {
+                    throw new RangeError(
+                        '[lite-adaptive] HeavyKeeper seed must be a uint32 (integer in [0, 2^32-1]), got ' + String(s));
+                }
+                seed = s;
+            }
+            if (options.b !== undefined) {
+                const bb = options.b;
+                if (typeof bb !== 'number' || bb !== bb || bb === Infinity || bb <= 1) {
+                    throw new RangeError(
+                        '[lite-adaptive] HeavyKeeper b (decay base) must be a finite number > 1, got ' + String(bb));
+                }
+                b = bb;
+            }
+        }
+
+        this._d = d;
+        this._w = w;
+        this._k = k;
+        this._seed = seed >>> 0;
+        this._b = b;
+
+        // the d x w SoA table (row-major, cell(r,c) = r*w + c): fingerprints + counts.
+        this._fp = new Uint32Array(d * w);
+        this._cnt = new Uint32Array(d * w);
+
+        // the intrusive top-k min-heap (root = the minimum estimate among the k leaders).
+        this._hkKey = new Float64Array(k);   // heap slot -> key
+        this._hkEst = new Float64Array(k);   // heap slot -> estimate
+        this._hkN = 0;                       // live heap size (<= k)
+
+        // the open-addressed backshift map (key -> heap slot). Power-of-two cap >= 2k (LF <= 0.5).
+        let mc = 16;
+        while (mc < 2 * k) mc <<= 1;
+        this._mapCap = mc;
+        this._mapKey = new Float64Array(mc);  // NaN = empty slot (a valid key is a finite integer)
+        this._mapPos = new Int32Array(mc);    // key -> heap slot
+        this._mapKey.fill(NaN);
+        this._mapSize = 0;
+
+        // the decay-probability LUT: lut[c] = b^(-c) in (0, 1] for c in [0, HK_LUT_SIZE).
+        this._decayLut = new Float64Array(HK_LUT_SIZE);
+        for (let i = 0; i < HK_LUT_SIZE; i++) this._decayLut[i] = Math.pow(b, -i);
+
+        // the seeded xorshift32 state (kept SIGNED int32 so it never boxes). Derived from the
+        // seed via a nonzero-forcing mix so seed=0 is a valid distinct, non-degenerate seed.
+        this._rng0 = (hkFinal((seed ^ HK_RNG_SALT) | 0) | 1) | 0;
+        this._rng = this._rng0;
+
+        // a fixed memory figure (bytes): table + heap + map + LUT.
+        this._bytes = (d * w) * 8 + k * 16 + mc * 12 + HK_LUT_SIZE * 8;
+    }
+
+    /**
+     * Derive a HeavyKeeper from a target top-k size and a target relative error. Sets d = 4
+     * (the paper's small-depth sweet spot) and a table width w = max(2k, ceil(1/targetError))
+     * so collisions inject at most ~ targetError * N of the stream into any cell. Throws
+     * [lite-adaptive] typeof-first on a bad k / targetError / option BEFORE any allocation.
+     * @param {number} k  the top-k size; an integer >= 1.
+     * @param {number} targetError  the target relative error; a number in (0, 1).
+     * @param {object} [options] { seed?, b? } -- as the explicit constructor.
+     * @returns {HeavyKeeper}
+     */
+    static withAccuracy(k, targetError, options) {
+        if (typeof k !== 'number' || !Number.isInteger(k) || k < 1) {
+            throw new RangeError(
+                '[lite-adaptive] HeavyKeeper.withAccuracy k must be an integer >= 1, got ' + String(k));
+        }
+        if (typeof targetError !== 'number' || targetError !== targetError ||
+            targetError <= 0 || targetError >= 1) {
+            throw new RangeError(
+                '[lite-adaptive] HeavyKeeper.withAccuracy targetError must be a number in (0, 1), got ' +
+                String(targetError));
+        }
+        const d = 4;
+        const w = Math.max(2 * k, Math.ceil(1 / targetError));
+        return new HeavyKeeper(d, w, k, options);
+    }
+
+    /** Table depth d (rows / independent hashes). O(1). */
+    get d() { return this._d; }
+    /** Table width w (columns per row). O(1). */
+    get w() { return this._w; }
+    /** The top-k size. O(1). */
+    get k() { return this._k; }
+    /** The decay base b. O(1). */
+    get b() { return this._b; }
+    /** The hash / PRNG seed (uint32). O(1). */
+    get seed() { return this._seed >>> 0; }
+    /** A fixed memory figure in bytes (table + heap + map + LUT). O(1). */
+    get bytes() { return this._bytes; }
+    /** The number of keys currently in the top-k forest (<= k). O(1). */
+    get size() { return this._hkN; }
+
+    /**
+     * Add `weight` occurrences of `key` (default 1). HOT, 0 B/op INCLUDING the decay draw and
+     * the forest sift. `key` is a SAFE INTEGER; `weight` a positive integer (lite-hud passes
+     * integer microseconds so it can rank by total time). Fail closed: a non-safe-integer key,
+     * or a non-positive / non-integer / non-finite weight, throws [lite-adaptive] (typeof-first,
+     * a BYTE-IDENTICAL no-op -- nothing is touched on a rejected add).
+     * @param {number} key    a safe integer.
+     * @param {number} [weight] a positive integer (default 1).
+     * @returns {HeavyKeeper} this
+     */
+    add(key, weight) {
+        // typeof-first validation, BEFORE any state mutation.
+        if (typeof key !== 'number' || !Number.isSafeInteger(key)) return this._badKey(key);
+        let wt = weight;
+        if (wt === undefined) {
+            wt = 1;
+        } else if (typeof wt !== 'number' || !Number.isSafeInteger(wt) || wt <= 0) {
+            return this._badWeight(wt);
+        }
+
+        // --- the accumulate body (DUPLICATED in addFrom to keep this hot body byte-identical). ---
+        hkHash(key, this._seed);
+        const fp = HK_H1 >>> 0;
+        const base = HK_H2;
+        const d = this._d, w = this._w;
+        const fps = this._fp, cnt = this._cnt;
+        const lut = this._decayLut, b = this._b;
+        let best = 0;
+        for (let r = 0; r < d; r++) {
+            const cell = r * w + hkPos(base, r, w);
+            const c = cnt[cell];
+            if (c === 0) {
+                fps[cell] = fp;
+                cnt[cell] = wt;
+                if (wt > best) best = wt;
+            } else if (fps[cell] === fp) {
+                let nc = c + wt;
+                if (nc > 4294967295) nc = 4294967295;   // clamp at uint32 max (no wrap on store)
+                cnt[cell] = nc;
+                if (nc > best) best = nc;
+            } else {
+                // fp MISS -> decay ONCE with probability b^(-count) (the SETTLED weighted rule).
+                let x = this._rng | 0;
+                x ^= x << 13; x ^= x >>> 17; x ^= x << 5;   // xorshift32 on a signed int32 (no box)
+                this._rng = x | 0;
+                const thr = c < HK_LUT_SIZE ? lut[c] : Math.pow(b, -c);
+                if ((x >>> 0) / 4294967296 < thr) {
+                    const dec = c - wt;
+                    if (dec <= 0) { fps[cell] = fp; cnt[cell] = wt; if (wt > best) best = wt; }
+                    else { cnt[cell] = dec; }
+                }
+            }
+        }
+        this._promote(key, best);
+        return this;
+    }
+
+    /**
+     * Add from a caller-owned PACKED `[key, weight]` Float64Array pair. HOT, 0 B/op ZERO-BOX --
+     * key = buf[i], weight = buf[i+1] read UNBOXED. A large u32 key (near 2^31 or 2^32-1) boxes
+     * as a plain `add` argument (a ~16 B HeapNumber at the non-inlined call boundary); this
+     * reads it straight from the Float64Array. Same validation, throws, byte-identical-no-op-on-
+     * reject, and accumulate as `add(key, weight)`; the body is DUPLICATED (not delegated) to
+     * keep `add`'s hot body byte-identical and avoid re-boxing at an internal call boundary.
+     *
+     * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer /
+     * negative / out-of-range `i` (needs `i + 1 < buf.length`) throws [lite-adaptive]. A
+     * non-safe-integer key or a non-positive-integer weight then throws (a byte-identical no-op).
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = key, `buf[i+1]` = weight.
+     * @param {number} i the base index of the [key, weight] pair (0, 2, 4, ...).
+     * @returns {HeavyKeeper} this
+     */
+    addFrom(buf, i) {
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        const key = buf[i];         // UNBOXED Float64Array reads -- the whole point (no arg box).
+        const wt = buf[i + 1];      // packed [key, weight]
+        if (!Number.isSafeInteger(key)) return this._badKey(key);
+        if (!Number.isSafeInteger(wt) || wt <= 0) return this._badWeight(wt);
+
+        // --- the accumulate body -- DUPLICATED from add() to keep add()'s hot body byte-identical. ---
+        hkHash(key, this._seed);
+        const fp = HK_H1 >>> 0;
+        const base = HK_H2;
+        const d = this._d, w = this._w;
+        const fps = this._fp, cnt = this._cnt;
+        const lut = this._decayLut, b = this._b;
+        let best = 0;
+        for (let r = 0; r < d; r++) {
+            const cell = r * w + hkPos(base, r, w);
+            const c = cnt[cell];
+            if (c === 0) {
+                fps[cell] = fp;
+                cnt[cell] = wt;
+                if (wt > best) best = wt;
+            } else if (fps[cell] === fp) {
+                let nc = c + wt;
+                if (nc > 4294967295) nc = 4294967295;
+                cnt[cell] = nc;
+                if (nc > best) best = nc;
+            } else {
+                let x = this._rng | 0;
+                x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+                this._rng = x | 0;
+                const thr = c < HK_LUT_SIZE ? lut[c] : Math.pow(b, -c);
+                if ((x >>> 0) / 4294967296 < thr) {
+                    const dec = c - wt;
+                    if (dec <= 0) { fps[cell] = fp; cnt[cell] = wt; if (wt > best) best = wt; }
+                    else { cnt[cell] = dec; }
+                }
+            }
+        }
+        this._promote(key, best);
+        return this;
+    }
+
+    /**
+     * The estimated count of `key` -- the max count over the d cells whose fingerprint matches
+     * (0 if none match). COLD, O(d). NEVER throws: a bad / unseen key reads 0 (null is not zero).
+     * @param {number} key a safe integer.
+     * @returns {number}
+     */
+    estimate(key) {
+        if (typeof key !== 'number' || !Number.isSafeInteger(key)) return 0;
+        hkHash(key, this._seed);
+        const fp = HK_H1 >>> 0;
+        const base = HK_H2;
+        const d = this._d, w = this._w;
+        const fps = this._fp, cnt = this._cnt;
+        let best = 0;
+        for (let r = 0; r < d; r++) {
+            const cell = r * w + hkPos(base, r, w);
+            if (fps[cell] === fp) {
+                const c = cnt[cell];
+                if (c > best) best = c;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Iterate the current top-k, calling `fn(key, estimate)` per leader. HOT-SAFE, alloc-free
+     * (HeavyKeeper allocates nothing; the order is heap order, NOT sorted). The PRIMARY read for
+     * a render loop. NEVER throws (a non-function `fn` is a cold throw before iteration).
+     * @param {(key: number, estimate: number) => void} fn
+     */
+    forEach(fn) {
+        if (typeof fn !== 'function') return this._badFn(fn);
+        const n = this._hkN, hk = this._hkKey, he = this._hkEst;
+        for (let i = 0; i < n; i++) fn(hk[i], he[i]);
+    }
+
+    /**
+     * Write the current top-k as packed [key, estimate] pairs into `buf`, returning the number
+     * of pairs written (heap order, NOT sorted). 0-alloc. Writes min(size, floor(buf.length/2))
+     * pairs. Throws [lite-adaptive] on a non-Float64Array `buf` (a cold throw before any write).
+     * @param {Float64Array} buf a caller-owned Float64Array (>= 2*size for the full set).
+     * @returns {number} the number of [key, estimate] pairs written.
+     */
+    topKInto(buf) {
+        if (!(buf instanceof Float64Array)) return this._badBuf(buf, 0);
+        const cap = buf.length >> 1;
+        let n = this._hkN;
+        if (n > cap) n = cap;
+        const hk = this._hkKey, he = this._hkEst;
+        for (let i = 0; i < n; i++) { buf[i * 2] = hk[i]; buf[i * 2 + 1] = he[i]; }
+        return n;
+    }
+
+    /**
+     * The current top-k as an Array of { key, count }, sorted by count DESCENDING. COLD, MAY
+     * ALLOCATE (a fresh array + objects) -- the hot / render path uses forEach / topKInto. NEVER
+     * throws.
+     * @returns {Array<{ key: number, count: number }>}
+     */
+    topK() {
+        const n = this._hkN, hk = this._hkKey, he = this._hkEst;
+        const out = new Array(n);
+        for (let i = 0; i < n; i++) out[i] = { key: hk[i], count: he[i] };
+        out.sort((a, c) => c.count - a.count);
+        return out;
+    }
+
+    /**
+     * Reset to empty; reuse every array (0-alloc), and reset the PRNG to its seeded initial
+     * state (a cleared HeavyKeeper replays identically). O(d*w + mapCap).
+     * @returns {HeavyKeeper} this
+     */
+    clear() {
+        this._fp.fill(0);
+        this._cnt.fill(0);
+        this._mapKey.fill(NaN);
+        this._mapSize = 0;
+        this._hkN = 0;
+        this._rng = this._rng0;
+        return this;
+    }
+
+    /** @private Advance + return the xorshift32 PRNG as a uint32. Kept for tests / determinism. */
+    _rand32() {
+        let x = this._rng | 0;
+        x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+        this._rng = x | 0;
+        return x >>> 0;
+    }
+
+    /**
+     * @private Maintain the top-k min-forest after `key`'s estimate became `est`. If `key` is
+     * already a leader, update its estimate + re-heapify; else if the heap has room, insert it;
+     * else if `est` beats the current minimum leader, evict the min and insert `key`. 0-alloc.
+     */
+    _promote(key, est) {
+        const pos = this._mapFind(key);
+        if (pos >= 0) {
+            this._hkEst[pos] = est;
+            // est may have risen (fp hit) or fallen (a cell it relied on was decayed by another
+            // key between adds) -- siftUp handles a decrease, siftDown the resulting/increase.
+            this._siftDown(this._siftUp(pos));
+            return;
+        }
+        // a brand-new key with NO table representation this add (every row an fp-miss with no
+        // decay-replacement) is not a leader -- do not pollute the heap with a 0-estimate slot.
+        if (est === 0) return;
+        const n = this._hkN;
+        if (n < this._k) {
+            this._hkKey[n] = key;
+            this._hkEst[n] = est;
+            this._mapSet(key, n);
+            this._hkN = n + 1;
+            this._siftUp(n);
+        } else if (est > this._hkEst[0]) {
+            this._mapDel(this._hkKey[0]);
+            this._hkKey[0] = key;
+            this._hkEst[0] = est;
+            this._mapSet(key, 0);
+            this._siftDown(0);
+        }
+    }
+
+    /** @private Swap heap slots a, b and keep the map positions in sync. 0-alloc. */
+    _hswap(a, b) {
+        const hk = this._hkKey, he = this._hkEst;
+        const ka = hk[a], ea = he[a], kb = hk[b], eb = he[b];
+        hk[a] = kb; he[a] = eb; hk[b] = ka; he[b] = ea;
+        this._mapSet(kb, a);
+        this._mapSet(ka, b);
+    }
+
+    /** @private Sift heap slot i toward the root while it is smaller than its parent. Returns its final index. */
+    _siftUp(i) {
+        const he = this._hkEst;
+        while (i > 0) {
+            const p = (i - 1) >> 1;
+            if (he[p] <= he[i]) break;
+            this._hswap(i, p);
+            i = p;
+        }
+        return i;
+    }
+
+    /** @private Sift heap slot i toward the leaves while a child is smaller (min-heap). 0-alloc. */
+    _siftDown(i) {
+        const n = this._hkN, he = this._hkEst;
+        for (;;) {
+            const l = 2 * i + 1, r = 2 * i + 2;
+            let m = i;
+            if (l < n && he[l] < he[m]) m = l;
+            if (r < n && he[r] < he[m]) m = r;
+            if (m === i) break;
+            this._hswap(i, m);
+            i = m;
+        }
+    }
+
+    /** @private Find `key`'s heap slot in the map, or -1. Linear probing. 0-alloc. */
+    _mapFind(key) {
+        const mask = this._mapCap - 1;
+        const mk = this._mapKey, mp = this._mapPos;
+        let i = hkMapHash(key, this._seed) & mask;
+        while (mk[i] === mk[i]) {           // occupied (a NaN slot fails self-equality)
+            if (mk[i] === key) return mp[i];
+            i = (i + 1) & mask;
+        }
+        return -1;
+    }
+
+    /** @private Insert `key` -> `pos`, or update its stored pos if already present. 0-alloc. */
+    _mapSet(key, pos) {
+        const mask = this._mapCap - 1;
+        const mk = this._mapKey, mp = this._mapPos;
+        let i = hkMapHash(key, this._seed) & mask;
+        while (mk[i] === mk[i]) {
+            if (mk[i] === key) { mp[i] = pos; return; }
+            i = (i + 1) & mask;
+        }
+        mk[i] = key;
+        mp[i] = pos;
+        this._mapSize++;
+    }
+
+    /** @private Delete `key` with Knuth backward-shift so the probe chains stay contiguous. 0-alloc. */
+    _mapDel(key) {
+        const mask = this._mapCap - 1;
+        const mk = this._mapKey, mp = this._mapPos;
+        let i = hkMapHash(key, this._seed) & mask;
+        while (mk[i] === mk[i]) {
+            if (mk[i] === key) break;
+            i = (i + 1) & mask;
+        }
+        if (mk[i] !== mk[i]) return;   // not found
+        this._mapSize--;
+        let j = i;
+        for (;;) {
+            mk[i] = NaN;
+            do {
+                j = (j + 1) & mask;
+                if (mk[j] !== mk[j]) return;         // hit an empty slot -> chain closed
+                const home = hkMapHash(mk[j], this._seed) & mask;
+                // keep mk[j] iff its home does NOT lie cyclically in (i, j] (it must not shift back).
+                if (i <= j ? (home <= i || home > j) : (home <= i && home > j)) break;
+            } while (true);
+            mk[i] = mk[j]; mp[i] = mp[j]; i = j;
+        }
+    }
+
+    /** @private Cold thrower for a bad key. */
+    _badKey(key) {
+        throw new TypeError(
+            '[lite-adaptive] HeavyKeeper key must be a safe integer, got ' + String(key));
+    }
+
+    /** @private Cold thrower for a bad weight. */
+    _badWeight(w) {
+        throw new TypeError(
+            '[lite-adaptive] HeavyKeeper weight must be a positive integer, got ' + String(w));
+    }
+
+    /** @private Cold thrower for a bad addFrom / topKInto buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] HeavyKeeper.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+
+    /** @private Cold thrower for a non-function forEach callback. */
+    _badFn(fn) {
+        throw new TypeError(
+            '[lite-adaptive] HeavyKeeper.forEach(fn) needs a function, got ' + String(fn));
     }
 }

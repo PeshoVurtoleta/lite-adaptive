@@ -45,6 +45,7 @@ last1000.count();                          // ~1000  (an exact ring would hold 1
 - [ExponentialHistogram](#exponentialhistogram)
 - [ADWIN](#adwin)
 - [ForwardDecay](#forwarddecay)
+- [HeavyKeeper](#heavykeeper)
 - [API reference](#api-reference)
 - [Composability](#composability)
 - [Zero-GC design notes](#zero-gc-design-notes)
@@ -63,6 +64,7 @@ A recency summary is a promise: "I use `X` bytes and my answer about the last `W
 - **ExponentialHistogram** -- sliding-window count / sum ("how many / how much in the last `W`?") in a fixed pool of `(timestamp, size)` buckets, with a *hard* windowed relative-error bound `<= epsilon`. The reference member; DGIM (the 0/1 count stream) is its `value = 1` special case.
 - **ADWIN** -- concept-drift detection with NO fixed window size (Bifet-Gavalda, SDM 2007): `add(x) -> boolean` tells you the moment the stream's mean *changed*, and the adaptive window GROWS while stable and SHRINKS to the new concept on a detected change. `mean` / `variance` / `width` report the current stable window. The marquee member.
 - **ForwardDecay** -- time-decayed count / sum / mean / rate (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009) in **O(1) space** (two scalar accumulators, no pool): every element's weight halves every `halfLife`, so recent data dominates and old data *fades* smoothly instead of dropping at an edge. `add(now?, value?)` accepts any finite real (signed); `count` / `sum` / `mean` / `rate` are O(1) queries, EXACT modulo floating point.
+- **HeavyKeeper** -- decayed / windowed heavy hitters (Gong et al., USENIX ATC 2018): the top-k keys dominating the stream *right now*. A `d x w` fingerprint table with probabilistic exponential decay on collision (cold keys erode) + an intrusive top-k min-forest. `add(key, weight = 1)` ranks by count or any additive weight; `forEach` / `topKInto` read the leaders 0-alloc. Far lower error than Space-Saving on skewed, evolving streams. The final member.
 - **A caller-owned time source** -- `add(now)` with a monotone `now` (a logical tick or ms), or `add()` in count mode for the "last N items" window. The member never reads the clock, so witnesses are exactly reproducible.
 - **The recency witness** -- measured windowed error vs the theoretical bound, printed side by side, with the exact-ring foil whose memory climbs O(W) while the histogram stays a fixed sliver.
 - **Zero runtime dependencies**, ESM, tree-shakeable named exports, TypeScript types, and a **0 bytes/op hot path** -- *including* the amortized bucket merge / expire reshaping -- proven by a leak + GC-profiler torture gate.
@@ -152,6 +154,31 @@ Because `g` grows without bound, `add` REBASES the landmark to `t` whenever `lam
 **Signed values are allowed** (unlike ExponentialHistogram's positive-only sum): because `C` and `Sv` are separate accumulators, a negative value lowers the decayed sum / mean while still contributing ONE decayed event to the count. The exact-aggregate witness recomputes the decayed aggregate directly from every stored `(t_i, value_i)` and gates `|fd - oracle| / |oracle| <= 1e-9` on every query across 3 `halfLife` x 3 stream-shapes; two broken-rebase controls are rejected by the same gate -- see [Testing](#testing).
 </details>
 
+## HeavyKeeper
+
+Find the few keys dominating the stream *right now*, with far lower error than Space-Saving on skewed and evolving traffic. `HeavyKeeper(d, w, k)` keeps a `d x w` table of `(fingerprint, count)` cells and a top-k min-forest. `add(key, weight = 1)` hashes the key to one cell per row: a matching fingerprint adds the weight; a colliding one is *probabilistically decayed* and, at count 0, evicted and replaced. So a key that stops arriving decays away and the live top-k tracks the current concept -- no window to size, no rotation to schedule.
+
+```js
+import { HeavyKeeper } from '@zakkster/lite-adaptive';
+
+const hk = new HeavyKeeper(4, 1024, 16, { seed: 1 });   // d rows, w cells/row, k leaders
+for (const [tag, us] of spans) hk.add(tag, us);          // rank tags by TOTAL microseconds (weighted)
+
+const topN = new Uint32Array(16);
+const n = hk.topKInto(topN);                             // 0-alloc read of the current leaders
+hk.forEach((key, est) => { /* render key with est */ }); // 0-alloc iteration (topK() allocates)
+```
+
+<details>
+<summary><b>The probabilistic decay (why it beats Space-Saving on drift) + the weighted-miss rule</b></summary>
+
+On `add(key, weight)`, for each of the `d` rows at the key's cell: an empty cell is claimed `(fp, weight)`; a fingerprint match does `count += weight`; a fingerprint *miss* decays the resident count **once** with probability `b^(-count)` (`b ~ 1.08`, a seeded xorshift32 draw), then `count -= weight` (clamped at 0), replacing the fingerprint when it reaches 0. `estimate(key)` is the largest matching cell. Because a heavy key's count is large, `b^(-count)` is tiny, so it is almost never decayed -- while a cold key's small count erodes quickly. That asymmetry is why HeavyKeeper's error on the true heavy hitters is far below Space-Saving's on a Zipfian + drifting stream (the witness measures **0.001% vs 36.75%** mean relative error over the true top-k).
+
+The weighted-miss rule decays **once** (not once per weight unit): a per-unit decay would draw `weight` random numbers per miss -- with `weight` in microseconds that is thousands of draws, breaking the O(1), 0-alloc hot path. Decaying once then subtracting the weight keeps `add` amortized O(1) and **0 B/op including the decay draw and the forest sift** (see [ADR 0005](./decisions/0005-heavy-keeper.md)).
+
+The PRNG is a seeded `Uint32` xorshift (`seed` option + getter, never `Math.random`), so the decay -- and therefore the top-k and the witness -- is fully reproducible. Keys are safe integers; a bad key / weight / buffer throws `[lite-adaptive]` typeof-first (a byte-identical no-op). There is no `merge`: HeavyKeeper decays natively, so it needs no A/B rotation. The witness gates 100% recall of the true top-k above `N/k` vs an exact `Map` oracle (weighted and unit streams) and a bounded overestimate; a frozen-forest and a decay-disabled variant are rejected by the same gate -- see [Testing](#testing).
+</details>
+
 ## API reference
 
 ```js
@@ -187,6 +214,7 @@ Constants that shape the pool:
 new ADWIN(delta, options?)
 
 add(x) -> boolean           // HOT, amortized O(1), 0 B/op incl. cut-scan + shrink; true iff a change was detected on this item
+addFrom(buf, i) -> boolean  // HOT, 0 B/op: zero-box entry, reads x = buf[i] unboxed; same drift flag as add(x)
 clear() -> this             // reset to empty; reuse the pool
 
 // getters
@@ -195,6 +223,7 @@ mean   variance   width   bucketCount   capacity   delta
 
 - **`delta`** -- the confidence / false-alarm knob in `(0, 1)`; smaller means fewer false alarms and (disclosed) longer detection latency. Throws `[lite-adaptive]` before allocation on a bad `delta`.
 - **`add(x)`** -- append a finite real `x` (item-indexed; no clock), run the ADWIN2 variance-aware cut over the bucket boundaries, and on a change DROP the older sub-window. Returns `true` exactly on the item that detects the change. Fail closed: a non-finite / non-number `x` is a byte-identical no-op.
+- **`addFrom(buf, i)`** -- the ZERO-BOX sibling of `add(x)`: reads `x = buf[i]` UNBOXED from a caller-owned `Float64Array`, for a caller whose fractional `x` (a HUD-computed duration) would box as a plain argument at a non-inlined boundary. Same drift-detection logic and boolean return as `add(x)`; a non-`Float64Array` `buf` or an out-of-range `i` throws `[lite-adaptive]`, and a non-finite `x` is a byte-identical no-op.
 - **`mean` / `variance` / `width`** -- the mean, variance, and item count of the CURRENT adaptive window; `width` shrinks on a detected change, then regrows while stable. Getters never throw (0 on an empty detector).
 
 ```js
@@ -225,6 +254,37 @@ Constants that shape the decay:
 | `FD_EXP_CAP` | `40` | the `exp()` argument ceiling that triggers a landmark rebase (keeps the accumulator bounded) |
 | space | `O(1)` | two scalar accumulators `C`, `Sv` -- no pool |
 | error | EXACT (mod FP) | the decayed aggregate equals the definition; the rebase is exact |
+
+```js
+new HeavyKeeper(d, w, k, options?)          // options: { seed, b }
+HeavyKeeper.withAccuracy(k, targetError, options?)   // static: derive d, w from k + target error
+
+add(key, weight = 1) -> this   // HOT, amortized O(1), 0 B/op incl. the decay draw + the forest sift
+addFrom(buf, i) -> this        // HOT, 0 B/op: zero-box entry, key = buf[i], weight = buf[i+1] (unboxed)
+estimate(key) -> number        // COLD: max matching cell count (0 for an unseen key); never throws
+forEach(fn) -> void            // ALLOC-FREE iteration over the current top-k: fn(key, estimate)
+topKInto(buf) -> number        // fill a caller buffer with the top-k keys, 0-alloc; returns the count
+topK() -> Array                // COLD convenience; MAY allocate (not for the render path)
+clear() -> this                // 0-alloc reset (reuse the table + forest)
+
+// getters
+d   w   k   b   seed   bytes   size
+```
+
+- **`d` / `w` / `k`** -- hash rows (`~4-8`), cells per row, and the top-k size. `HeavyKeeper.withAccuracy(k, targetError)` derives `d` / `w` from a target relative error. A bad `d` / `w` / `k` / `seed` / `b` / option throws `[lite-adaptive]` typeof-first, before any allocation.
+- **`options.seed`** -- the `Uint32` seed for the decay PRNG (a seeded xorshift32, never `Math.random`); the decay, top-k, and witness are fully reproducible. `seed = 0` is a valid distinct seed. **`options.b`** -- the decay base (default `~1.08`).
+- **`add(key, weight = 1)`** -- `key` a SAFE INTEGER; `weight` a positive integer (rank by count when 1, or by total time / bytes / any additive weight). Fail closed: a non-safe-integer key or non-positive-integer weight throws `[lite-adaptive]` (a byte-identical no-op).
+- **`addFrom(buf, i)`** -- the ZERO-BOX entry: reads `key = buf[i]` and `weight = buf[i+1]` UNBOXED from a caller-owned packed `Float64Array`, avoiding the HeapNumber that a large `u32` key (`>= 2^31`) boxes as a plain argument. Same validation / byte-identical-no-op-on-reject as `add`; a non-`Float64Array` `buf` or an out-of-range `i` throws `[lite-adaptive]`.
+- **`forEach(fn)` / `topKInto(buf)`** -- the ALLOC-FREE reads for a render path; `topK()` is a cold convenience that may allocate. There is no `merge` -- HeavyKeeper decays natively, so it needs no A/B rotation.
+
+Constants that shape the table:
+
+| Symbol | Value | Meaning |
+|--------|-------|---------|
+| `d` | rows (~4-8) | independent hash rows; `estimate` is the max matching cell over them |
+| `w` | cells / row | more cells -> fewer collisions -> lower overestimate (`~ N/w`) |
+| `b` | `~1.08` | decay base; a fingerprint miss decays with probability `b^(-count)` |
+| space | `O(d * w + k)` | two `Uint32Array` table columns + the min-forest; fixed at construction |
 
 ## Composability
 
@@ -306,7 +366,8 @@ Gated quality numbers (`npm run verify`):
 - **Not an exact windowed aggregator.** For an EXACT sliding-window sum / min / max over a monoid, use `@zakkster/lite-o1` (`WindowFold`, `MonoDeque`, `RingLog`) -- bounded-capacity and exact. `lite-adaptive` is the approximate, unbounded-window complement.
 - **Not a cumulative sketch.** For whole-stream distinct-count / frequency / quantiles / top-k with no forgetting, use `@zakkster/lite-sketch`. The line is recency.
 - **Not a wall-clock timer.** The member never reads the clock; the caller supplies a monotone `now`.
-- **Not (yet) decayed top-k.** Time decay ships as of 0.3.0 (ForwardDecay -- decayed count / sum / mean / rate); HeavyKeeper (decayed / windowed heavy hitters) is the remaining roadmap to 1.0.0.
+- **Not exact top-k.** HeavyKeeper (0.4.0) estimates the current heavy hitters in sublinear space -- exact top-k over an evolving stream is impossible in fixed memory. The four-member roster (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper) is now COMPLETE; 1.0.0 is the API-freeze milestone, not a new member.
+- **Not a cumulative top-k.** HeavyKeeper decays, so it answers "who dominates *now*"; the whole-stream heavy hitters that never forget are `@zakkster/lite-sketch`'s SpaceSaving.
 
 ## Ecosystem
 

@@ -5,10 +5,10 @@
  * `npm run test:types`. Not executed; only type-checked.
  */
 
-import { ExponentialHistogram, ADWIN, ForwardDecay, VERSION } from '../../Adaptive.js';
+import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, VERSION } from '../../Adaptive.js';
 import type {
     ExponentialHistogramMode, ExponentialHistogramOptions, ADWINOptions,
-    ForwardDecayMode, ForwardDecayOptions,
+    ForwardDecayMode, ForwardDecayOptions, HeavyKeeperOptions, HeavyKeeperEntry,
 } from '../../Adaptive.js';
 
 // VERSION is a string.
@@ -89,6 +89,17 @@ const drift: boolean = ad.add(3.14);
 const drift2: boolean = ad2.add(-5);
 void drift; void drift2;
 
+// addFrom: zero-box entry, returns the boolean drift flag
+const adBuf = new Float64Array([3.14]);
+const driftFrom: boolean = ad.addFrom(adBuf, 0);
+void driftFrom;
+
+// @ts-expect-error -- addFrom buf must be a Float64Array.
+ad.addFrom([3.14], 0);
+
+// @ts-expect-error -- addFrom index must be a number.
+ad.addFrom(adBuf, 'x');
+
 // clear is chainable
 const adCleared: ADWIN = ad.clear();
 void adCleared;
@@ -157,3 +168,63 @@ fd.add(1, 'x');
 
 // @ts-expect-error -- query time must be a number.
 fd.count('now');
+
+// --- HeavyKeeper ------------------------------------------------------------
+const hk = new HeavyKeeper(4, 1024, 16);
+const hk2 = new HeavyKeeper(4, 512, 8, { seed: 1, b: 1.08 });
+const hk3 = HeavyKeeper.withAccuracy(16, 0.001, { seed: 0 });   // seed=0 is valid
+
+// getters
+const hkD: number = hk.d;
+const hkW: number = hk.w;
+const hkK: number = hk.k;
+const hkB: number = hk.b;
+const hkSeed: number = hk.seed;
+const hkBytes: number = hk.bytes;
+const hkSize: number = hk.size;
+void hkD; void hkW; void hkK; void hkB; void hkSeed; void hkBytes; void hkSize;
+
+// add: chainable, weight optional
+const hkChained: HeavyKeeper = hk.add(42).add(4000000000, 5);
+const hkCounted: HeavyKeeper = hk2.add(7);
+void hkChained; void hkCounted;
+
+// addFrom: zero-box packed [key, weight] entry, chainable
+const hkBuf = new Float64Array([4000000000, 5]);
+const hkFrom: HeavyKeeper = hk2.addFrom(hkBuf, 0).addFrom(hkBuf, 0);
+void hkFrom;
+
+// reads
+const hkEst: number = hk.estimate(42);
+hk.forEach((key: number, est: number) => { void key; void est; });
+const hkInto: number = hk.topKInto(new Float64Array(16));
+const hkTop: HeavyKeeperEntry[] = hk.topK();
+const hkTopKey: number = hkTop[0].key;
+const hkTopCount: number = hkTop[0].count;
+void hkEst; void hkInto; void hkTopKey; void hkTopCount; void hk3;
+
+// clear is chainable
+const hkCleared: HeavyKeeper = hk.clear();
+void hkCleared;
+
+// options type is assignable
+const hkOpts: HeavyKeeperOptions = { seed: 3, b: 1.1 };
+void hkOpts;
+
+// @ts-expect-error -- d must be a number.
+new HeavyKeeper('4', 1024, 16);
+
+// @ts-expect-error -- add key must be a number.
+hk.add('x');
+
+// @ts-expect-error -- addFrom buf must be a Float64Array.
+hk.addFrom([1, 2], 0);
+
+// @ts-expect-error -- forEach needs a function.
+hk.forEach(42);
+
+// @ts-expect-error -- topKInto needs a Float64Array.
+hk.topKInto([]);
+
+// @ts-expect-error -- withAccuracy targetError must be a number.
+HeavyKeeper.withAccuracy(16, 'tight');

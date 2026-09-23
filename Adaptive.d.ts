@@ -136,6 +136,16 @@ export class ADWIN {
      */
     add(x: number): boolean;
 
+    /**
+     * Add one finite value read UNBOXED from a caller-owned Float64Array (`x = buf[i]`). HOT,
+     * 0 B/op -- the ZERO-BOX sibling of `add(x)` for a caller whose fractional `x` (e.g. a
+     * HUD-computed duration) would box as a plain argument at a non-inlined call boundary.
+     * Runs the identical drift-detection logic and returns the same boolean drift flag. Throws
+     * [lite-adaptive] on a non-Float64Array `buf` or a non-integer / out-of-range `i`; a
+     * non-finite `x` at `buf[i]` is a byte-identical no-op.
+     */
+    addFrom(buf: Float64Array, i: number): boolean;
+
     /** Reset to the empty window; reuse the pool. */
     clear(): this;
 }
@@ -211,5 +221,103 @@ export class ForwardDecay {
     rate(now?: number): number;
 
     /** Reset to empty; keep halfLife / lambda, unlock the mode. */
+    clear(): this;
+}
+
+/**
+ * Constructor options for HeavyKeeper. `seed=0` is a valid distinct seed (guarded as
+ * `undefined`, not falsy); an unknown key throws [lite-adaptive].
+ */
+export interface HeavyKeeperOptions {
+    /** The uint32 seed for the decay PRNG (default 0x9e3779b1). seed=0 is valid. */
+    seed?: number;
+    /** The decay base b; a finite number > 1 (default 1.08). A fingerprint miss decays with prob b^(-count). */
+    b?: number;
+}
+
+/** One leader returned by HeavyKeeper.topK(): the key and its estimated total. */
+export interface HeavyKeeperEntry {
+    key: number;
+    count: number;
+}
+
+/**
+ * HeavyKeeper -- a zero-GC decayed / windowed TOP-K (heavy hitters "right now"; Gong et al.,
+ * USENIX ATC 2018). A d x w table of (fingerprint, count) cells (SoA Uint32Array columns) plus
+ * an intrusive top-k min-forest (design-parity with lite-o1 FreqO1, never a dependency).
+ * `add(key, weight)` hashes the key to one cell per row via an inline two-lane hash: a matching
+ * fingerprint adds the weight, a colliding one is probabilistically decayed (prob b^(-count),
+ * a seeded xorshift32 draw) and evicted at count 0 -- so cold keys erode and the top-k tracks
+ * the CURRENT concept. Amortized O(1), 0 B/op incl. the decay draw + the forest sift. Far lower
+ * error than Space-Saving on skewed / evolving streams. No `merge` (it decays natively).
+ */
+export class HeavyKeeper {
+    /**
+     * @param d       table depth (rows / independent hashes); an integer in [1, 64]. d ~ 4-8.
+     * @param w       table width (cells per row); an integer >= 1. More cells -> fewer collisions.
+     * @param k       the top-k size; an integer >= 1.
+     * @param options { seed?, b? }; an unknown key throws [lite-adaptive].
+     * Throws [lite-adaptive] on a bad d / w / k / seed / b / option BEFORE any allocation.
+     */
+    constructor(d: number, w: number, k: number, options?: HeavyKeeperOptions);
+
+    /**
+     * Derive a HeavyKeeper from a target top-k size and a target relative error (sets d = 4 and
+     * w = max(2k, ceil(1/targetError))). Throws [lite-adaptive] typeof-first on a bad k /
+     * targetError / option BEFORE any allocation.
+     */
+    static withAccuracy(k: number, targetError: number, options?: HeavyKeeperOptions): HeavyKeeper;
+
+    /** The table depth d (rows). O(1). */
+    readonly d: number;
+
+    /** The table width w (cells per row). O(1). */
+    readonly w: number;
+
+    /** The top-k size k. O(1). */
+    readonly k: number;
+
+    /** The decay base b. O(1). */
+    readonly b: number;
+
+    /** The uint32 PRNG seed. O(1). */
+    readonly seed: number;
+
+    /** The fixed memory figure in bytes (table + heap + map + LUT). O(1). */
+    readonly bytes: number;
+
+    /** The live top-k size (<= k). O(1). */
+    readonly size: number;
+
+    /**
+     * Add `weight` occurrences of `key`. HOT, amortized O(1), 0 B/op incl. the decay draw + the
+     * forest sift. `key` must be a SAFE INTEGER; `weight` a positive integer (default 1 -- rank
+     * by count, or by total time / bytes / any additive weight). Throws [lite-adaptive] on a
+     * non-safe-integer key or a non-positive-integer weight (a byte-identical no-op).
+     */
+    add(key: number, weight?: number): this;
+
+    /**
+     * Add one (key, weight) pair read UNBOXED from a caller-owned PACKED Float64Array
+     * (`key = buf[i]`, `weight = buf[i+1]`). HOT, 0 B/op -- the ZERO-BOX entry that avoids the
+     * ~16 B HeapNumber a large u32 key (>= 2^31) boxes as a plain argument. Same validation /
+     * byte-identical-no-op-on-reject as `add`. Throws [lite-adaptive] on a non-Float64Array
+     * `buf` or a non-integer / out-of-range `i`.
+     */
+    addFrom(buf: Float64Array, i: number): this;
+
+    /** The estimated total for `key` (the max matching cell; 0 for an unseen key). COLD. Never throws. */
+    estimate(key: number): number;
+
+    /** Iterate the current top-k allocation-free: `fn(key, estimate)` per leader. The render path. */
+    forEach(fn: (key: number, estimate: number) => void): void;
+
+    /** Fill `buf` with the current top-k keys (0-alloc); returns the count written. */
+    topKInto(buf: Float64Array): number;
+
+    /** The current top-k as an array of { key, count }. COLD -- MAY allocate (not the render path). */
+    topK(): HeavyKeeperEntry[];
+
+    /** Reset to empty; reuse the table + forest arrays (0-alloc). */
     clear(): this;
 }
