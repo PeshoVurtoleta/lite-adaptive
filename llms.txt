@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 0.2.0
+Version: 0.3.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -19,11 +19,14 @@ approximate aggregates, and lite-adaptive is the WINDOWED / DECAYED / drift comp
 
 v0.1.0 ships the reference member -- ExponentialHistogram (sliding-window count / sum)
 -- plus the shared time-source + fixed bucket-pool substrate. v0.2.0 adds ADWIN
-(concept-drift detection + adaptive windowing). Roster to 1.0.0: ExponentialHistogram
-(0.1.0) -> ADWIN (0.2.0, drift) -> ForwardDecay (0.3.0, decay) -> HeavyKeeper (0.4.0,
-decayed top-k) -> 1.0.0 (API stable at four members). Future members are pure-appended
-below this class + the shared substrate; prior members stay byte-identical, only the
-header + VERSION change (tree-shakeable named exports).
+(concept-drift detection + adaptive windowing). v0.3.0 adds ForwardDecay (time-decayed
+count / sum / mean / rate; Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009) -- smooth
+exponential decay in O(1) space (two scalar accumulators, no pool), EXACT modulo FP via
+a periodic landmark rebase. Roster to 1.0.0: ExponentialHistogram (0.1.0) -> ADWIN
+(0.2.0, drift) -> ForwardDecay (0.3.0, decay) -> HeavyKeeper (0.4.0, decayed top-k) ->
+1.0.0 (API stable at four members). Future members are pure-appended below these classes
++ the shared substrate; prior members stay byte-identical, only the header + VERSION
+change (tree-shakeable named exports).
 
 ## Exports (from the single main file Adaptive.js)
 
@@ -37,7 +40,33 @@ header + VERSION change (tree-shakeable named exports).
   HARD relative error `<= epsilon`. DGIM (the 0/1 count stream) is the `value = 1`
   special case. Fail closed on a bad W / epsilon (throws before allocation), a mode
   switch, a non-finite / decreasing `now`, or a non-positive value; queries never throw.
-- `VERSION` -- string, '0.2.0'.
+- `ADWIN` -- class. A zero-GC concept-drift detector with NO fixed window size (Bifet-
+  Gavalda, SDM 2007). It keeps the most-recent values in an EH-style bucket list over its
+  OWN variance-carrying `(sum, sumSq, count)` columns (design-parity with EH, a SEPARATE
+  fixed pool). `add(x) -> boolean` appends a finite real, compresses buckets (at most 5 per
+  level), scans every bucket-boundary split of the window into an older `W0` and a newer
+  `W1` with the ADWIN2 variance-aware (Bernstein) cut, and on a detected mean shift DROPS
+  the older sub-window -- returning `true` on the detecting item. Amortized O(1), 0 B/op
+  incl. the cut-scan + the drop-older shrink. The window GROWS while the stream is stable
+  and SHRINKS to the new concept on a change; the stationary false-alarm rate is bounded by
+  `delta`. Item-indexed (no clock). `mean` / `variance` / `width` report the current
+  adaptive window. Fail closed on a bad delta (throws before allocation); a non-finite `x`
+  is a byte-identical no-op; getters never throw (0 on empty).
+- `ForwardDecay` -- class. A zero-GC, O(1)-space time-decayed COUNT / SUM / MEAN / RATE
+  summary (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009). Each element's weight decays
+  exponentially with its AGE (halves every `halfLife` time units), measured FORWARD from a
+  fixed landmark, so a weight is computed once at insert and never revised (the numeric-
+  stability edge over backward decay). Two scalar accumulators `C` (decayed count) + `Sv`
+  (decayed weighted sum) are maintained incrementally; a periodic alloc-free landmark rebase
+  keeps them finite while the decayed aggregate stays EXACT modulo FP. `add(now?, value?)`
+  is 0 B/op INCLUDING the rebase branch. Driven by a caller-supplied MONOTONE `now` (or
+  count mode when omitted); accepts ANY finite real value (signed -- it contributes to the
+  decayed sum / mean but counts as one decayed event). `count()` / `sum()` / `mean()` /
+  `rate()` are O(1) queries at an optional query time. Fail closed on a bad halfLife (throws
+  before allocation), a mode switch, a non-finite / decreasing `now`, or a non-finite value;
+  a query time before the last add throws (can't un-decay); otherwise queries never throw
+  (0 on empty).
+- `VERSION` -- string, '0.3.0'.
 
 ## ExponentialHistogram
 
@@ -66,6 +95,15 @@ Hot surface (add is amortized O(1), zero allocation incl. the merge / expire res
                               window edge. Fail closed: a mode switch, a non-finite /
                               decreasing `now`, or a non-positive value throws
                               [lite-adaptive] (typeof-first, BYTE-IDENTICAL no-op).
+- addFrom(buf, i) -> this     The ZERO-BOX entry: read `now = buf[i]` and `value = buf[i+1]`
+                              UNBOXED from a caller-owned PACKED [now, value] Float64Array
+                              (a batch steps `i` by 2), then run the identical accumulate as
+                              `add(now, value)`. For a caller whose `now` AND `value` are both
+                              FRACTIONAL doubles (e.g. lite-hud's time-window sum/mean/rate):
+                              `add` boxes each ~16 B HeapNumber at a non-inlined boundary; this
+                              stays 0 B/op. EXPLICIT-time ONLY (a count-locked instance throws;
+                              the first addFrom locks EXPLICIT). Same validation / throws /
+                              byte-identical-no-op-on-reject; a bad buf/index throws typeof-first.
 - count() -> number           The windowed COUNT (population) over the last W. COLD,
                               O(levels). Relative error <= epsilon. Never throws (0 on empty).
 - sum() -> number             The windowed SUM (of values) over the last W. COLD,
@@ -84,6 +122,117 @@ a broken EH (no straddle half-correction) is REJECTED by the same gate. Space
 co-headline: the fixed bucket pool vs the exact ring's O(W). The window is HARD (EH
 forgets EXACTLY at the edge); the error is relative and hard (not statistical).
 
+## ADWIN (ADR 0003)
+
+    new ADWIN(delta, options?)
+
+- delta: confidence knob in (0, 1). The stationary false-alarm rate is bounded by delta.
+  Smaller -> fewer false alarms, longer detection latency.
+- options: reserved object; an unknown key throws [lite-adaptive].
+- Constructor throws [lite-adaptive] typeof-first on a bad delta / option BEFORE the pool
+  is allocated. The pool is FIXED at CAP = (M+1)*LEVELS + 2 = 386 buckets (M = 5, LEVELS =
+  64) and never grows.
+
+Item-indexed (NO clock): the adaptive window is measured in ITEMS, not time. `add(x)` takes
+one finite real value per item and returns true iff a cut fired (drift detected) this add.
+
+The ADWIN2 variance-aware cut: after the insert + merge cascade, every boundary split of
+the window into W0 (older, n0 items) | W1 (newer, n1 items) is tested; a cut fires when
+|mean(W0) - mean(W1)| > epsCut, where
+
+    m       = 1 / (1/n0 + 1/n1)                          (harmonic mean of the sub-window counts)
+    deltaP  = delta / ln(width)                          (Bifet-Gavalda multiple-testing correction)
+    epsCut  = sqrt( (2/m) * sigmaHat^2 * ln(2/deltaP) ) + (2/3) * (R/m) * ln(2/deltaP)
+
+sigmaHat^2 is the whole-window variance and R = max - min is the running observed range
+(over ALL x seen). On a detected cut the oldest bucket(s) are DROPPED (shrink W0 away) and
+the scan repeats until no cut remains -- amortized O(1), 0 B/op incl. the cut-scan + shrink.
+
+Hot surface:
+
+- add(x) -> boolean           Append a finite real, run the merge cascade + the cut-scan,
+                              drop the older sub-window on a cut. Returns true on the
+                              detecting item. Fail closed: a non-finite / non-number x
+                              throws [lite-adaptive] (typeof-first, BYTE-IDENTICAL no-op).
+- clear() -> this             Reset to the empty window; reuse the pool.
+- delta (getter)              The confidence knob.
+- width (getter)             The current adaptive window size in items.
+- mean / variance (getters)  The mean / variance over the current window (0 on empty).
+- bucketCount / capacity      The live bucket count; the fixed pool capacity (386).
+
+Change-response contract (the honesty anchor): the witness injects a known changepoint and
+GATES the stationary false-alarm rate <= delta, a detection latency that scales with shift
+magnitude, ~0 missed detections on a large shift, and adapted-window correctness (after a
+cut the mean/width reflect the NEW concept only). Negative controls: a bound-disabled ADWIN
+must false-alarm; a no-shrink ADWIN must fail to adapt -- both rejected by the same gates.
+
+## ForwardDecay (ADR 0004)
+
+    new ForwardDecay(halfLife, options?)
+
+- halfLife: the decay half-life; a finite number > 0 (an element's weight halves over this
+  span). lambda = ln2 / halfLife (getter `lambda`).
+- options: reserved object; an unknown key throws [lite-adaptive].
+- Constructor throws [lite-adaptive] typeof-first on a bad halfLife / option BEFORE any
+  field init. O(1) SPACE: two scalar accumulators C, Sv -- there is NO pool.
+
+Model: exponential decay g(x) = exp(lambda*x) measured FORWARD from a fixed landmark L. Two
+accumulators are maintained incrementally: C = sum g(t_i - L) (decayed count) and Sv = sum
+value_i * g(t_i - L) (decayed weighted sum). A query at time `now` folds in the common age:
+
+    decayedCount(now) = C  * exp(-lambda * (now - L))
+    decayedSum(now)   = Sv * exp(-lambda * (now - L))
+    mean(now)         = Sv / C                          (the age factor CANCELS -> now-invariant)
+    rate(now)         = decayedCount(now) * lambda       (a DEFINITION: decayed events / unit time)
+
+REBASE: when lambda*(t - L) would exceed FD_EXP_CAP = 40 (small on purpose: a single weight
+stays <= exp(40) ~ 2.35e17, so the ACCUMULATOR sum has ~7.6e290x head-room under Double.MAX --
+overflow needs a physically unreachable term count), `add` moves the landmark to t and rescales
+C *= f; Sv *= f (f = exp(-lambda*(t - L))) -- EXACT modulo FP (it factors one common constant
+out of every term). 0 B/op. The pathological tail (a single value within exp(40) of Double.MAX)
+is caught FAIL-CLOSED: count/sum/mean/rate throw [lite-adaptive] on a non-finite accumulator.
+
+Time modes (LOCKED at the first add, a switch throws [lite-adaptive]): EXPLICIT (add(now) /
+add(now, value), `now` finite + non-decreasing) or COUNT (add() / add(undefined, value),
+auto-tick). VALUE domain: ANY finite real (signed OK -- because C and Sv are separate, a
+negative value lowers the decayed sum / mean but still counts as one decayed event; a
+documented difference from EH's positive-only sum). Value defaults to 1.
+
+Hot surface (add is O(1), 0 B/op incl. the rebase branch):
+
+- add(now?, value?) -> this   Accumulate the forward-decayed weight (rebasing the landmark
+                              if exp() would approach overflow). Fail closed: a mode switch,
+                              a non-finite / decreasing `now`, or a non-finite value throws
+                              [lite-adaptive] (typeof-first, BYTE-IDENTICAL no-op).
+- addFrom(buf, i) -> this     The ZERO-BOX entry: read `now = buf[i]` and `value = buf[i+1]`
+                              UNBOXED from a caller-owned PACKED [now, value] Float64Array
+                              (a batch steps `i` by 2), then run the identical accumulate (incl.
+                              the landmark rebase) as `add(now, value)`. For a caller whose `now`
+                              AND `value` are both FRACTIONAL doubles (the lite-hud decayed-stats
+                              idiom): `add` boxes each ~16 B HeapNumber at a non-inlined boundary;
+                              this stays 0 B/op. EXPLICIT-time ONLY (a count-locked instance
+                              throws; the first addFrom locks EXPLICIT + sets the landmark). Same
+                              validation / throws / byte-identical-no-op-on-reject; a bad
+                              buf/index throws typeof-first.
+- count(now?) -> number       Decayed count at `now` (default = last add time). O(1).
+- sum(now?) -> number         Decayed weighted sum at `now`. O(1).
+- mean(now?) -> number        Decayed mean (Sv/C; landmark- and now-invariant). O(1).
+- rate(now?) -> number        Decayed rate = decayedCount(now) * lambda (a definition). O(1).
+- clear() -> this             Reset to empty; keep halfLife / lambda, unlock the mode.
+- halfLife / lambda (getters) The decay half-life; the decay rate.
+- landmark (getter)           The current landmark time L.
+- mode (getter)               'unset' | 'explicit' | 'count'.
+
+Query-now contract: an explicit query time must be a finite number >= the last add time (a
+query in the PAST would un-decay -> throws [lite-adaptive]); in count mode queries take no
+arg (use the internal tick). Queries never throw on empty (return 0) or a valid future now.
+
+Exact-aggregate contract (the honesty anchor): the witness recomputes the decayed aggregate
+directly from every stored (t_i, value_i) at each query time and GATES |fd - oracle| /
+|oracle| <= 1e-9 on every query across 3 halfLife x 3 stream-shapes (>= 5000 queries).
+Negative controls: fdNoRescale (rebase without the C,Sv rescale -> diverges) and fdNoRebase
+(never rebases -> overflows to Inf) are both rejected by the same gate.
+
 ## The time source + the bucket pool (ADR 0001)
 
 A caller-supplied MONOTONE `now` (logical tick or ms; count-mode convenience when
@@ -91,7 +240,10 @@ omitted); the member never reads the wall clock (deterministic, testable). A fix
 preallocated bucket pool over a Struct-of-Arrays (Float64 timestamp / earliest-time /
 size, Int32 per-level linkage + free-list) with no per-op allocation -- the lite-o1
 fixed-capacity zero-GC discipline on the recency axis. ADR 0002 records the EH merge /
-expire / query + the error bound + the DGIM note + the mode-lock.
+expire / query + the error bound + the DGIM note + the mode-lock; ADR 0003 the ADWIN2
+variance-aware cut + the adaptive shrink; ADR 0004 the ForwardDecay landmark rebase
+(exact modulo FP), the FD_EXP_CAP=40 bounded-accumulator + fail-closed-query argument, the signed-value call, and the
+rate()=count*lambda definition. ForwardDecay keeps NO pool (two scalar accumulators).
 
 ## Scripts
 

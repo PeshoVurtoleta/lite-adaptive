@@ -10,7 +10,7 @@
 // proving teeth.
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { ExponentialHistogram, ADWIN } from '../../Adaptive.js';
+import { ExponentialHistogram, ADWIN, ForwardDecay } from '../../Adaptive.js';
 
 const W = 1000;
 const EPS = 0.01;
@@ -60,6 +60,35 @@ const addTimeStream = {
     statsOf(s) { return { grows: grows(s) }; },
 };
 
+/**
+ * EH addFrom on a FRACTIONAL packed [now, value] stream: the zero-box entry -- reads now +
+ * value UNBOXED from a Float64Array(2) scratch instead of boxing two fractional arguments at
+ * the call boundary. Same open + merge cascade + expire; must stay flat + 0 old-gen.
+ */
+const addFromStream = {
+    name: 'ExponentialHistogram addFrom fractional [now,value] (zero-box open + cascade + expire)',
+    setup() {
+        const eh = new ExponentialHistogram(W, EPS);
+        const buf = new Float64Array(2);
+        let t = 0;
+        for (let k = 0; k < 4 * W; k++) { t += 1.5; buf[0] = t; buf[1] = k * 0.5 + 0.25; eh.addFrom(buf, 0); }
+        return { eh, buf, t, i: 4 * W, sink: 0 };
+    },
+    hot(s, n) {
+        const eh = s.eh, buf = s.buf;
+        let t = s.t, i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            t += 1.5;
+            buf[0] = t; buf[1] = i * 0.5 + 0.25;
+            eh.addFrom(buf, 0);
+            i = (i + 1) | 0;
+            sink = (sink + eh.bucketCount) | 0;      // observe state (defeat DCE)
+        }
+        s.t = t; s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: grows(s) }; },
+};
+
 /** Zero-alloc counter for ADWIN: the sum column's byte length -- fixed at construction. */
 function growsAd(s) { return s.ad._sum.buffer.byteLength; }
 
@@ -90,6 +119,65 @@ const adwinDriftStream = {
 };
 
 /**
+ * ForwardDecay add on a REBASE-HEAVY explicit-time stream: lambda*(t-L) crosses FD_EXP_CAP
+ * on every add, so the cold rebase branch (C *= f; Sv *= f; L = t) runs each op -- one exp()
+ * + a rescale + two accumulations, all on scalars (no pool). The `grows` counter is a constant
+ * 0: ForwardDecay allocates no TypedArray store at all. halfLife 0.01 -> lambda ~ 69.3, so a
+ * step of just 11 gives arg ~ 762 > FD_EXP_CAP each add while `t` stays a small integer (smi)
+ * across the whole run -- the plain-number monotone driver never boxes a HeapNumber (no int32
+ * masking on a timestamp: a mask would wrap negative past 2^31 and break monotonicity).
+ */
+const fdAddStream = {
+    name: 'ForwardDecay add rebase-heavy (exp + landmark rebase + two scalar accumulations)',
+    setup() {
+        const fd = new ForwardDecay(0.01);
+        let t = 0;
+        for (let k = 0; k < 4000; k++) { t += 11; fd.add(t, k & 7); }   // prime past the first rebase
+        return { fd, t, sink: 0 };
+    },
+    hot(s, n) {
+        const fd = s.fd;
+        let t = s.t, sink = s.sink | 0;   // plain-number monotone time (stays smi at step 11)
+        for (let i = 0; i < n; i++) {
+            t += 11;
+            fd.add(t, t & 7);
+            sink = (sink + (fd.landmark === t ? 1 : 0)) | 0;   // observe the rebase (defeat DCE)
+        }
+        s.t = t; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+/**
+ * FD addFrom on a FRACTIONAL packed [now, value] stream: the zero-box entry -- reads now +
+ * value UNBOXED from a Float64Array(2) scratch. Large half-life so no rebase fires; one exp()
+ * + two scalar accumulations. FD keeps no pool, so `grows` is a constant 0.
+ */
+const fdAddFromStream = {
+    name: 'ForwardDecay addFrom fractional [now,value] (zero-box exp + two scalar accumulations)',
+    setup() {
+        const fd = new ForwardDecay(1e9);
+        const buf = new Float64Array(2);
+        let t = 0;
+        for (let k = 0; k < 4000; k++) { t += 1.5; buf[0] = t; buf[1] = k * 0.5 + 0.25; fd.addFrom(buf, 0); }
+        return { fd, buf, t, i: 4000, sink: 0 };
+    },
+    hot(s, n) {
+        const fd = s.fd, buf = s.buf;
+        let t = s.t, i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            t += 1.5;
+            buf[0] = t; buf[1] = i * 0.5 + 0.25;
+            fd.addFrom(buf, 0);
+            i = (i + 1) | 0;
+            sink = (sink + (fd.landmark | 0)) | 0;   // observe state (defeat DCE)
+        }
+        s.t = t; s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+/**
  * The teeth: a per-op call that builds a FRESH array each op -- it MUST trip the gate
  * (scavenges scale with n), proving the instrument catches a real allocation.
  */
@@ -115,6 +203,34 @@ const mustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The teeth for the ForwardDecay lane: add + a fresh escaping array per op -- it MUST trip
+ * the gate, proving the FD scenario's flat result is a real 0-alloc measurement.
+ */
+const fdMustFailAlloc = {
+    name: 'ForwardDecay add + a fresh escaping array per op (MUST allocate)',
+    setup() {
+        const fd = new ForwardDecay(1e9);
+        let t = 0;
+        for (let k = 0; k < 4000; k++) { t += 1; fd.add(t, 1); }
+        return { fd, t, leak: null, sink: 0 };
+    },
+    hot(s, n) {
+        const fd = s.fd;
+        let t = s.t, sink = s.sink | 0;   // plain-number monotone time
+        for (let i = 0; i < n; i++) {
+            t += 1;
+            fd.add(t, 1);
+            const arr = new Array(64);
+            arr[0] = i;
+            s.leak = arr;
+            sink = (sink + arr[0]) | 0;
+        }
+        s.t = t; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 // maxScavenges: the AUTHORITATIVE 0-B/op proof is test/torture.mjs (measureAllocs = 0 B/op on
 // add count-mode AND explicit-time, gc major 0). This perf gate proves the other invariants
 // strictly -- NO old-gen GC, NO arrayBuffer growth (grows delta 0: the fixed bucket pool never
@@ -131,6 +247,6 @@ zgcSuite({
     // the ExponentialHistogram(1000, 0.01) pool is cap=366 buckets x (3 Float64 + 3 Int32) ~= 13 KB;
     // setup builds each scenario's state twice + harness overhead. grows delta 0 is the leak invariant.
     maxRetainedKB: 512,
-    scenarios: [addCountStream, addTimeStream, adwinDriftStream],
-    mustFail: [mustFailAlloc],
+    scenarios: [addCountStream, addTimeStream, adwinDriftStream, fdAddStream, addFromStream, fdAddFromStream],
+    mustFail: [mustFailAlloc, fdMustFailAlloc],
 });

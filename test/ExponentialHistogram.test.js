@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { ExponentialHistogram, VERSION } from '../Adaptive.js';
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '0.2.0');
+    assert.equal(VERSION, '0.3.0');
 });
 
 test('constructor validates W fail-closed BEFORE allocation', () => {
@@ -186,6 +186,122 @@ test('count() === sum() when every add uses value=1', () => {
     const eh = new ExponentialHistogram(200, 0.05);
     for (let i = 1; i <= 1000; i++) eh.add(i);   // value defaults to 1
     assert.equal(eh.count(), eh.sum());
+});
+
+// --- addFrom: the zero-box packed [now, value] entry -------------------------------------
+
+test('addFrom(buf, i) produces state IDENTICAL to add(now, value) across a stream (parity)', () => {
+    const W = 512, eps = 0.05;
+    const a = new ExponentialHistogram(W, eps);   // driven by add(now, value)
+    const b = new ExponentialHistogram(W, eps);   // driven by addFrom(buf, i)
+    const buf = new Float64Array(2);
+    let now = 0;
+    for (let i = 1; i <= 4 * W; i++) {
+        now += 1.5;                                // fractional monotone time
+        const v = 0.25 + (i % 7) * 0.5;            // fractional value > 0
+        a.add(now, v);
+        buf[0] = now; buf[1] = v;
+        b.addFrom(buf, 0);
+        assert.equal(b.bucketCount, a.bucketCount, 'bucketCount parity at i=' + i);
+        assert.equal(b.count(), a.count(), 'count parity at i=' + i);
+        assert.equal(b.sum(), a.sum(), 'sum parity at i=' + i);
+    }
+    assert.equal(b.mode, a.mode);
+});
+
+test('addFrom reads the pair at an arbitrary in-bounds base index (batch layout)', () => {
+    const a = new ExponentialHistogram(100, 0.1);
+    const b = new ExponentialHistogram(100, 0.1);
+    const buf = new Float64Array([0, 0, 3.5, 2.5, 4.0, 1.5]);   // pairs at i = 2, 4
+    a.add(3.5, 2.5); a.add(4.0, 1.5);
+    b.addFrom(buf, 2); b.addFrom(buf, 4);
+    assert.equal(b.sum(), a.sum());
+    assert.equal(b.count(), a.count());
+});
+
+test('addFrom rejects a non-Float64Array buf fail-closed', () => {
+    const eh = new ExponentialHistogram(100, 0.1);
+    for (const bad of [[1, 2], new Float32Array([1, 2]), null, undefined, {}, 'x', new ArrayBuffer(16)]) {
+        assert.throws(() => eh.addFrom(bad, 0), /\[lite-adaptive\]/, 'buf=' + String(bad));
+    }
+    assert.equal(eh.bucketCount, 0, 'a rejected addFrom opened no bucket');
+    assert.equal(eh.mode, 'unset', 'a rejected addFrom did not lock the mode');
+});
+
+test('addFrom rejects a bad index (negative, non-integer, i+1 >= length) fail-closed', () => {
+    const eh = new ExponentialHistogram(100, 0.1);
+    const buf = new Float64Array([1, 2]);
+    for (const bad of [-1, 1.5, NaN, '0', 1, 2, 100]) {   // i=1 -> i+1=2 == length; i>=length
+        assert.throws(() => eh.addFrom(buf, bad), /\[lite-adaptive\]/, 'i=' + String(bad));
+    }
+    assert.equal(eh.bucketCount, 0);
+    assert.equal(eh.mode, 'unset');
+});
+
+test('addFrom with NaN / Infinity in buf[i] or buf[i+1] is a byte-identical no-op', () => {
+    const eh = new ExponentialHistogram(100, 0.1);
+    const buf = new Float64Array([5, 2]);
+    eh.addFrom(buf, 0);                     // one good add -> explicit mode, _lastNow = 5
+    const bc = eh.bucketCount, before = eh.count(), lastNow = 5;
+    // bad value (buf[i+1])
+    buf[0] = 6; buf[1] = NaN;
+    assert.throws(() => eh.addFrom(buf, 0), /\[lite-adaptive\]/);
+    buf[1] = Infinity;
+    assert.throws(() => eh.addFrom(buf, 0), /\[lite-adaptive\]/);
+    buf[1] = 0;                             // non-positive rejected too
+    assert.throws(() => eh.addFrom(buf, 0), /\[lite-adaptive\]/);
+    // bad now (buf[i])
+    buf[0] = NaN; buf[1] = 2;
+    assert.throws(() => eh.addFrom(buf, 0), /\[lite-adaptive\]/);
+    buf[0] = Infinity;
+    assert.throws(() => eh.addFrom(buf, 0), /\[lite-adaptive\]/);
+    assert.equal(eh.bucketCount, bc, 'bucketCount unchanged');
+    assert.equal(eh.count(), before, 'count unchanged');
+    // _lastNow not advanced: a valid now just above the last good one is still accepted
+    buf[0] = lastNow; buf[1] = 1;
+    assert.doesNotThrow(() => eh.addFrom(buf, 0), 'monotone guard not advanced by a rejected addFrom');
+});
+
+test('addFrom enforces monotone now: a decreasing buf[i] throws', () => {
+    const eh = new ExponentialHistogram(100, 0.1);
+    const buf = new Float64Array([10, 1]);
+    eh.addFrom(buf, 0);
+    buf[0] = 10; eh.addFrom(buf, 0);        // equal is allowed
+    buf[0] = 9.5;
+    assert.throws(() => eh.addFrom(buf, 0), /\[lite-adaptive\].*non-decreasing/);
+});
+
+test('a rejected FIRST addFrom does not lock the mode', () => {
+    const eh = new ExponentialHistogram(100, 0.1);
+    const buf = new Float64Array([5, -1]);   // bad value on the very first addFrom
+    assert.throws(() => eh.addFrom(buf, 0), /\[lite-adaptive\]/);
+    assert.equal(eh.mode, 'unset', 'a rejected first addFrom must not lock the mode');
+    // still free to choose EITHER mode
+    assert.doesNotThrow(() => eh.add());
+    assert.equal(eh.mode, 'count');
+});
+
+test('addFrom is explicit-time only: a count-locked instance rejects it, an addFrom-locked instance rejects count add()', () => {
+    const counted = new ExponentialHistogram(100, 0.1);
+    counted.add();                           // locks COUNT mode
+    const buf = new Float64Array([5, 1]);
+    assert.throws(() => counted.addFrom(buf, 0), /\[lite-adaptive\].*locked to count/);
+
+    const explicit = new ExponentialHistogram(100, 0.1);
+    explicit.addFrom(buf, 0);                // locks EXPLICIT mode via addFrom
+    assert.equal(explicit.mode, 'explicit');
+    assert.throws(() => explicit.add(), /\[lite-adaptive\].*locked to explicit/);
+    // and a normal explicit add() interleaves fine with addFrom
+    buf[0] = 6;
+    assert.doesNotThrow(() => explicit.add(7));
+    buf[0] = 8;
+    assert.doesNotThrow(() => explicit.addFrom(buf, 0));
+});
+
+test('addFrom returns this (chainable)', () => {
+    const eh = new ExponentialHistogram(100, 0.1);
+    const buf = new Float64Array([1, 2]);
+    assert.equal(eh.addFrom(buf, 0), eh);
 });
 
 test('bucket pool never overflows across a long shifting stream (all sweep cells)', () => {

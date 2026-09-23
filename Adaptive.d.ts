@@ -65,6 +65,17 @@ export class ExponentialHistogram {
      */
     add(now?: number, value?: number): this;
 
+    /**
+     * Add one element from a caller-owned PACKED `[now, value]` Float64Array pair
+     * (`buf[i]` = now, `buf[i+1]` = value). HOT, 0 B/op -- the ZERO-BOX entry for a caller
+     * whose `now` AND `value` are both FRACTIONAL doubles (reads them UNBOXED, avoiding the
+     * ~16 B HeapNumber per boxed argument at a non-inlined call boundary). EXPLICIT-time
+     * only: a count-locked instance throws, the first addFrom locks EXPLICIT mode. Same
+     * validation / throws / byte-identical-no-op-on-reject as `add(now, value)`. Throws
+     * [lite-adaptive] on a non-Float64Array `buf` or a non-integer / out-of-range `i`.
+     */
+    addFrom(buf: Float64Array, i: number): this;
+
     /** The windowed COUNT (population) estimate over the last W. COLD, O(levels). Never throws. */
     count(): number;
 
@@ -126,5 +137,79 @@ export class ADWIN {
     add(x: number): boolean;
 
     /** Reset to the empty window; reuse the pool. */
+    clear(): this;
+}
+
+/** The locked time mode of a ForwardDecay. */
+export type ForwardDecayMode = 'unset' | 'explicit' | 'count';
+
+/** Reserved constructor options for ForwardDecay (no keys yet; an unknown key throws). */
+export interface ForwardDecayOptions {}
+
+/**
+ * ForwardDecay -- a zero-GC, O(1)-space time-decayed COUNT / SUM / MEAN / RATE summary
+ * (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009). Each element's weight decays exponentially
+ * with its age (halves every `halfLife` time units), measured FORWARD from a fixed landmark,
+ * so weights are computed once at insert and never revised. Two scalar accumulators are
+ * maintained incrementally; a periodic alloc-free landmark rebase keeps them finite while
+ * the decayed aggregate stays EXACT modulo floating point. Driven by a caller-supplied
+ * MONOTONE `now` (or count mode when omitted); accepts ANY finite real value (signed). `add`
+ * is 0 B/op INCLUDING the rebase branch; `count` / `sum` / `mean` / `rate` are O(1) queries.
+ */
+export class ForwardDecay {
+    /**
+     * @param halfLife the decay half-life; a finite number > 0 (weight halves over this span).
+     * @param options  reserved; an unknown key throws [lite-adaptive].
+     * Throws [lite-adaptive] on a bad halfLife / option BEFORE any field init.
+     */
+    constructor(halfLife: number, options?: ForwardDecayOptions);
+
+    /** The decay half-life (weight halves every halfLife time units). O(1). */
+    readonly halfLife: number;
+
+    /** The decay rate lambda = ln2 / halfLife. O(1). */
+    readonly lambda: number;
+
+    /** The current landmark time L (weights are measured forward from here). O(1). */
+    readonly landmark: number;
+
+    /** The locked time mode: 'unset' before the first add, then 'explicit' or 'count'. O(1). */
+    readonly mode: ForwardDecayMode;
+
+    /**
+     * Add one element. HOT, 0 B/op incl. the landmark rebase. The mode LOCKS at the first
+     * call: pass `now` (a finite, non-decreasing number) for EXPLICIT mode, or omit it for
+     * COUNT mode (the member auto-ticks). `value` defaults to 1 and may be ANY finite real
+     * (signed: it contributes to the decayed sum / mean but counts as one decayed event).
+     * Throws [lite-adaptive] on a mode switch, a non-finite / decreasing `now`, or a
+     * non-finite / non-number value (a byte-identical no-op).
+     */
+    add(now?: number, value?: number): this;
+
+    /**
+     * Add one element from a caller-owned PACKED `[now, value]` Float64Array pair
+     * (`buf[i]` = now, `buf[i+1]` = value). HOT, 0 B/op -- the ZERO-BOX entry for a caller
+     * whose `now` AND `value` are both FRACTIONAL doubles (reads them UNBOXED, avoiding the
+     * ~16 B HeapNumber per boxed argument at a non-inlined call boundary; the lite-hud
+     * decayed-stats idiom). EXPLICIT-time only: a count-locked instance throws, the first
+     * addFrom locks EXPLICIT mode. Same validation / throws / byte-identical-no-op-on-reject
+     * as `add(now, value)`. Throws [lite-adaptive] on a non-Float64Array `buf` or a
+     * non-integer / out-of-range `i`.
+     */
+    addFrom(buf: Float64Array, i: number): this;
+
+    /** The decayed COUNT at `now` (defaults to the last add time). COLD, O(1). Never throws on empty. */
+    count(now?: number): number;
+
+    /** The decayed weighted SUM at `now` (defaults to the last add time). COLD, O(1). Never throws on empty. */
+    sum(now?: number): number;
+
+    /** The decayed MEAN (Sv / C; landmark- and now-invariant). COLD, O(1). Never throws on empty. */
+    mean(now?: number): number;
+
+    /** The decayed RATE at `now` -- decayedCount(now) * lambda (a definition). COLD, O(1). */
+    rate(now?: number): number;
+
+    /** Reset to empty; keep halfLife / lambda, unlock the mode. */
     clear(): this;
 }

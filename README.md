@@ -44,6 +44,7 @@ last1000.count();                          // ~1000  (an exact ring would hold 1
 - [What you get](#what-you-get)
 - [ExponentialHistogram](#exponentialhistogram)
 - [ADWIN](#adwin)
+- [ForwardDecay](#forwarddecay)
 - [API reference](#api-reference)
 - [Composability](#composability)
 - [Zero-GC design notes](#zero-gc-design-notes)
@@ -61,6 +62,7 @@ A recency summary is a promise: "I use `X` bytes and my answer about the last `W
 
 - **ExponentialHistogram** -- sliding-window count / sum ("how many / how much in the last `W`?") in a fixed pool of `(timestamp, size)` buckets, with a *hard* windowed relative-error bound `<= epsilon`. The reference member; DGIM (the 0/1 count stream) is its `value = 1` special case.
 - **ADWIN** -- concept-drift detection with NO fixed window size (Bifet-Gavalda, SDM 2007): `add(x) -> boolean` tells you the moment the stream's mean *changed*, and the adaptive window GROWS while stable and SHRINKS to the new concept on a detected change. `mean` / `variance` / `width` report the current stable window. The marquee member.
+- **ForwardDecay** -- time-decayed count / sum / mean / rate (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009) in **O(1) space** (two scalar accumulators, no pool): every element's weight halves every `halfLife`, so recent data dominates and old data *fades* smoothly instead of dropping at an edge. `add(now?, value?)` accepts any finite real (signed); `count` / `sum` / `mean` / `rate` are O(1) queries, EXACT modulo floating point.
 - **A caller-owned time source** -- `add(now)` with a monotone `now` (a logical tick or ms), or `add()` in count mode for the "last N items" window. The member never reads the clock, so witnesses are exactly reproducible.
 - **The recency witness** -- measured windowed error vs the theoretical bound, printed side by side, with the exact-ring foil whose memory climbs O(W) while the histogram stays a fixed sliver.
 - **Zero runtime dependencies**, ESM, tree-shakeable named exports, TypeScript types, and a **0 bytes/op hot path** -- *including* the amortized bucket merge / expire reshaping -- proven by a leak + GC-profiler torture gate.
@@ -111,12 +113,52 @@ epsCut  = sqrt( (2/m) * sigmaHat^2 * ln(2/deltaP) )   +   (2/3) * (R/m) * ln(2/d
 ADWIN is ITEM-INDEXED: `add(x)` per item, no clock -- the adaptive window is measured in items and is data-driven (unlike ExponentialHistogram's caller-supplied `now`). The change-response witness injects a known changepoint and gates the false-alarm rate `<= delta`, a detection latency that scales with shift magnitude, ~0 missed detections on a large shift, and that the adapted window reflects only the new concept -- see [Testing](#testing).
 </details>
 
+## ForwardDecay
+
+Weight recent data more, forget old data *smoothly*. `ForwardDecay(halfLife)` maintains a time-decayed count / sum / mean / rate where each element's weight halves every `halfLife` time units -- there is no window edge, old data just fades. Unlike a backward decay (which re-weights the whole history on every query), ForwardDecay measures each element's age FORWARD from a fixed landmark, so its weight is computed ONCE at insert and folded into two running scalars (`C` = decayed count, `Sv` = decayed weighted sum). That is what makes it O(1) space *and* numerically stable.
+
+```js
+import { ForwardDecay } from '@zakkster/lite-adaptive';
+
+// a decayed average latency where a 5-minute-old sample counts half as much
+const fd = new ForwardDecay(5 * 60_000);   // halfLife = 5 minutes (ms)
+fd.add(Date.now(), 42);                     // add(now, value); caller owns the monotone clock
+fd.add(Date.now(), 88);                     // ... 0 bytes/op, incl. the periodic landmark rebase
+fd.mean();                                  // decayed mean latency (recent samples dominate)
+fd.rate();                                  // decayed events per ms (see the rate() note below)
+
+// no clock? omit `now` for a decayed "recent items" summary (count mode auto-ticks)
+const recent = new ForwardDecay(1000);
+for (let i = 0; i < 5000; i++) recent.add(undefined, Math.random());
+recent.mean();                              // mean weighted toward the last ~1000 items
+```
+
+<details>
+<summary><b>The landmark rebase (why the accumulators stay bounded) + the rate() definition</b></summary>
+
+For exponential decay `g(x) = exp(lambda * x)`, `lambda = ln2 / halfLife`, the accumulators are `C = sum g(t_i - L)` and `Sv = sum value_i * g(t_i - L)` from a landmark `L`. A query at `now` folds the common age factor back in:
+
+```
+decayedCount(now) = C  * exp(-lambda * (now - L))
+decayedSum(now)   = Sv * exp(-lambda * (now - L))
+mean(now)         = Sv / C                          // the age factor CANCELS -> now-invariant, EXACT
+rate(now)         = decayedCount(now) * lambda
+```
+
+Because `g` grows without bound, `add` REBASES the landmark to `t` whenever `lambda*(t - L)` would exceed `FD_EXP_CAP = 40`: it rescales `C *= exp(-lambda*(t - L))`, `Sv *= ...`, `L = t`. This is EXACT modulo floating point -- it factors one common constant out of every accumulated term -- and 0 B/op. The cap is deliberately small so a single weight stays `<= exp(40) ~ 2.35e17`, leaving the accumulator ~7.6e290x of head-room under `Double.MAX` -- so overflow needs a physically unreachable term count. The one case no cap can cover -- a single value within a factor of `exp(40)` of `Double.MAX` -- is caught **fail-closed**: `count` / `sum` / `mean` / `rate` throw `[lite-adaptive]` on a non-finite accumulator rather than returning `Infinity`.
+
+> **`rate()` is a DEFINITION, not a theorem.** `rate(now) = decayedCount(now) * lambda` is *defined* as the decayed events per unit time under the exponential kernel: a steady arrival of `r` events/unit converges to `decayedCount -> r / lambda`, so `rate() -> r`. It is exact only in that steady-state limit, not a guaranteed instantaneous rate.
+
+**Signed values are allowed** (unlike ExponentialHistogram's positive-only sum): because `C` and `Sv` are separate accumulators, a negative value lowers the decayed sum / mean while still contributing ONE decayed event to the count. The exact-aggregate witness recomputes the decayed aggregate directly from every stored `(t_i, value_i)` and gates `|fd - oracle| / |oracle| <= 1e-9` on every query across 3 `halfLife` x 3 stream-shapes; two broken-rebase controls are rejected by the same gate -- see [Testing](#testing).
+</details>
+
 ## API reference
 
 ```js
 new ExponentialHistogram(W, epsilon, options?)
 
 add(now?, value?) -> this   // HOT, 0 B/op incl. merge cascade + expire
+addFrom(buf, i) -> this     // HOT, 0 B/op: zero-box packed [now, value] entry (now = buf[i], value = buf[i+1])
 count() -> number           // COLD, O(levels): windowed population estimate
 sum() -> number             // COLD, O(buckets): windowed value-sum estimate
 query() -> number           // COLD: alias of count()
@@ -129,6 +171,7 @@ windowSize   epsilon   bucketCount   capacity   k   levels   mode
 - **`W`** -- window size; a finite number `> 0` (items in count mode, or the `now`-unit span in explicit mode).
 - **`epsilon`** -- relative-error knob in `(0, 1)`; smaller means more buckets and tighter windowed error.
 - **`add(now?, value?)`** -- the mode LOCKS at the first call: pass a finite, non-decreasing `now` for EXPLICIT mode, or omit it for COUNT mode (the member auto-ticks). `value` defaults to 1 (the DGIM count case) and must be a finite number `> 0`. Fail closed: a mode switch, a non-finite / decreasing `now`, or a non-positive value throws `[lite-adaptive]` (a byte-identical no-op).
+- **`addFrom(buf, i)`** -- the ZERO-BOX entry for a caller whose `now` AND `value` are both FRACTIONAL doubles. Reads `now = buf[i]` and `value = buf[i+1]` UNBOXED from a caller-owned PACKED `[now, value]` `Float64Array` (a batch steps `i` by 2), avoiding the ~16 B HeapNumber that `add(now, value)` boxes per fractional argument at a non-inlined call boundary. The lite-hud idiom: write a per-channel `Float64Array(2)` scratch each tick and call `addFrom(scratch, 0)`. EXPLICIT-time only (a count-locked instance throws; the first `addFrom` locks EXPLICIT mode). Same validation / throws / byte-identical-no-op-on-reject as `add(now, value)`; a non-`Float64Array` `buf` or a non-integer / out-of-range `i` throws `[lite-adaptive]`.
 - **`count()` / `sum()` / `query()`** -- COLD windowed estimates; never throw (0 on an empty window).
 
 Constants that shape the pool:
@@ -153,6 +196,35 @@ mean   variance   width   bucketCount   capacity   delta
 - **`delta`** -- the confidence / false-alarm knob in `(0, 1)`; smaller means fewer false alarms and (disclosed) longer detection latency. Throws `[lite-adaptive]` before allocation on a bad `delta`.
 - **`add(x)`** -- append a finite real `x` (item-indexed; no clock), run the ADWIN2 variance-aware cut over the bucket boundaries, and on a change DROP the older sub-window. Returns `true` exactly on the item that detects the change. Fail closed: a non-finite / non-number `x` is a byte-identical no-op.
 - **`mean` / `variance` / `width`** -- the mean, variance, and item count of the CURRENT adaptive window; `width` shrinks on a detected change, then regrows while stable. Getters never throw (0 on an empty detector).
+
+```js
+new ForwardDecay(halfLife, options?)
+
+add(now?, value?) -> this   // HOT, 0 B/op incl. the landmark rebase; value defaults to 1 (any finite real)
+addFrom(buf, i) -> this     // HOT, 0 B/op: zero-box packed [now, value] entry (now = buf[i], value = buf[i+1])
+count(now?) -> number       // COLD, O(1): decayed count at `now` (default = last add time)
+sum(now?) -> number         // COLD, O(1): decayed weighted sum at `now`
+mean(now?) -> number        // COLD, O(1): decayed mean (Sv/C); landmark- and now-invariant
+rate(now?) -> number        // COLD, O(1): decayedCount(now) * lambda (a definition -- see note)
+clear() -> this             // reset to empty; keep halfLife/lambda, unlock the mode
+
+// getters
+halfLife   lambda   landmark   mode
+```
+
+- **`halfLife`** -- the decay half-life; a finite number `> 0` (an element's weight halves over this span). `lambda = ln2 / halfLife`.
+- **`add(now?, value?)`** -- the mode LOCKS at the first call: pass a finite, non-decreasing `now` for EXPLICIT mode, or omit it for COUNT mode (the member auto-ticks). `value` defaults to 1 and may be ANY finite real (signed: it lowers the decayed sum / mean but still counts as one decayed event). Fail closed: a mode switch, a non-finite / decreasing `now`, or a non-finite value throws `[lite-adaptive]` (a byte-identical no-op).
+- **`addFrom(buf, i)`** -- the ZERO-BOX entry for a caller whose `now` AND `value` are both FRACTIONAL doubles (the lite-hud decayed-stats idiom: a per-channel fractional record time + a fractional value). Reads `now = buf[i]` and `value = buf[i+1]` UNBOXED from a caller-owned PACKED `[now, value]` `Float64Array` (write a `Float64Array(2)` scratch each tick and call `addFrom(scratch, 0)`; a batch steps `i` by 2), avoiding the ~16 B HeapNumber that `add(now, value)` boxes per fractional argument at a non-inlined call boundary. EXPLICIT-time only (a count-locked instance throws; the first `addFrom` locks EXPLICIT mode and sets the landmark). Same validation / throws / byte-identical-no-op-on-reject as `add(now, value)`; a non-`Float64Array` `buf` or a non-integer / out-of-range `i` throws `[lite-adaptive]`.
+- **`count()` / `sum()` / `mean()` / `rate()`** -- COLD O(1) decayed queries at an optional query time (default = the last add time). An explicit query time BEFORE the last add throws `[lite-adaptive]` (can't un-decay); otherwise they never throw (0 on an empty summary).
+
+Constants that shape the decay:
+
+| Symbol | Value | Meaning |
+|--------|-------|---------|
+| `lambda` | `ln2 / halfLife` | the decay rate; weight `= exp(-lambda * age)` |
+| `FD_EXP_CAP` | `40` | the `exp()` argument ceiling that triggers a landmark rebase (keeps the accumulator bounded) |
+| space | `O(1)` | two scalar accumulators `C`, `Sv` -- no pool |
+| error | EXACT (mod FP) | the decayed aggregate equals the definition; the rebase is exact |
 
 ## Composability
 
@@ -215,12 +287,15 @@ Gated quality numbers (`npm run verify`):
 - **The mode locks at the first add.** Explicit-`now` and count mode are mutually exclusive for a histogram's life (until `clear()`); mixing a tick clock with caller timestamps would corrupt the window edge silently, so a switch is a throw, never a silent reinterpretation.
 - **The straddle correction is conditional.** Half the oldest bucket is subtracted ONLY when it genuinely straddles the window edge -- so a not-yet-full window and every population-1 bucket are EXACT, and the error bound holds from the very first query.
 - **DGIM is not a separate member.** The 0/1 count stream is `value = 1` (the default) -- see ADR 0002.
-- **Fail closed, typeof-first, before allocation.** A bad `W` / `epsilon` / option throws at the constructor door before the pool is built; `null` is not zero; queries never throw.
+- **Forward decay, not backward decay.** ForwardDecay measures each element's age FORWARD from a fixed landmark, so its weight is computed once at insert and never revised -- a running scalar, not a per-query re-weighting of the whole history. That is the numeric-stability call (see ADR 0004).
+- **ForwardDecay accepts signed values; ExponentialHistogram does not.** Because the decayed count `C` and the decayed sum `Sv` are separate accumulators, a negative value gives a proper decayed weighted mean without corrupting the count. EH's positive-only sum is a deliberate contrast.
+- **`rate()` is a definition, not a theorem.** `rate = decayedCount * lambda` is the decayed events per unit time under the exponential kernel, exact only in the steady-state limit -- documented, never oversold.
+- **Fail closed, typeof-first, before allocation.** A bad `W` / `epsilon` / `halfLife` / option throws at the constructor door before any allocation; `null` is not zero; a query before the last add time throws (can't un-decay); other queries never throw.
 
 ## Testing
 
-- `npm test` -- the `node:test` behavioral + fail-closed suite (17 tests: ctor validation, CAP/k/levels formulas, mode-lock both ways, monotone-`now`, exact ramp-up, full-window error, sum mode, pool-never-overflows).
-- `npm run witness` -- the recency witness: measured windowed error vs the `epsilon` bound across the sweep + a shifting stream + the space-vs-oracle bar + a rejected broken-EH negative control.
+- `npm test` -- the `node:test` behavioral + fail-closed suite across all three members (ExponentialHistogram, ADWIN, ForwardDecay): ctor validation before allocation, mode-lock both ways, monotone-`now`, signed values, the landmark rebase, query-now contract, and the M1 no-op regressions (a rejected add is byte-identical).
+- `npm run witness` -- the recency witness: the windowed error vs the `epsilon` bound (EH) + the change-response gates (ADWIN) + the exact-aggregate gate `|fd - oracle| / |oracle| <= 1e-9` (ForwardDecay) across 3 `halfLife` x 3 stream-shapes, each with rejected negative controls.
 - `npm run torture` -- the 0 B/op leak + GC-profiler gate on `add` including the merge / expire reshaping (`node --expose-gc`).
 - `npm run test:perf` -- the flat-throughput perf gate + a must-allocate control.
 - `npm run test:types` -- the ambient type-surface compile check.
@@ -231,7 +306,7 @@ Gated quality numbers (`npm run verify`):
 - **Not an exact windowed aggregator.** For an EXACT sliding-window sum / min / max over a monoid, use `@zakkster/lite-o1` (`WindowFold`, `MonoDeque`, `RingLog`) -- bounded-capacity and exact. `lite-adaptive` is the approximate, unbounded-window complement.
 - **Not a cumulative sketch.** For whole-stream distinct-count / frequency / quantiles / top-k with no forgetting, use `@zakkster/lite-sketch`. The line is recency.
 - **Not a wall-clock timer.** The member never reads the clock; the caller supplies a monotone `now`.
-- **Not (yet) decay or decayed top-k.** ADWIN (drift + adaptive window) ships as of 0.2.0; ForwardDecay (time-decay) and HeavyKeeper (decayed top-k) are the remaining roadmap to 1.0.0.
+- **Not (yet) decayed top-k.** Time decay ships as of 0.3.0 (ForwardDecay -- decayed count / sum / mean / rate); HeavyKeeper (decayed / windowed heavy hitters) is the remaining roadmap to 1.0.0.
 
 ## Ecosystem
 

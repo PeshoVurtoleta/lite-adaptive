@@ -8,6 +8,75 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.3.0] - 2026-09-23
+
+The third member -- **ForwardDecay** (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009):
+the TIME-DECAY axis (recent weighs more), the complement to the EH hard window and the
+ADWIN adaptive window. The `ADWIN` class is byte-identical; `ExponentialHistogram` gains
+an additive zero-box `addFrom(buf, i)` entry (its `add()` hot body is unchanged); only
+the file header and `VERSION` change otherwise.
+
+### Added
+
+- **`ForwardDecay`** -- a zero-GC, O(1)-space time-decayed COUNT / SUM / MEAN / RATE.
+  It weights each item at time `t` by `g(t - L)` measured FORWARD from a landmark `L`
+  (exponential decay `g(x) = exp(lambda * x)`, `lambda = ln2 / halfLife`), maintaining
+  two scalar accumulators -- `C` (decayed weights) and `Sv` (decayed weighted values) --
+  incrementally. `add(now, value)` is amortized O(1), **0 B/op including the landmark
+  rebase**: when the forward weight's exponent would exceed `FD_EXP_CAP = 40`, the
+  landmark is advanced by rescaling `C` and `Sv` by a single constant factor (EXACT
+  modulo floating point), which keeps the accumulator finite for any physically reachable
+  stream (overflow would require ~7.6e290 weighted terms since a rebase). For the
+  pathological tail -- a single value within a factor of `exp(40)` of `Double.MAX` --
+  the cold query guard fails **closed**: the queries throw `[lite-adaptive]` on a
+  non-finite accumulator rather than returning `Infinity`. `count(now?)` / `sum(now?)` /
+  `mean(now?)` / `rate(now?)` are cold, O(1), evaluated at an optional query time
+  `now >= lastAddNow` (decayed values keep changing as time passes); `mean` is
+  landmark-invariant and EXACT.
+  Mirrors EH's time model (explicit monotone `now` + a count-mode auto-tick, mode locks
+  at the first add). Unlike EH it accepts ANY finite real value (signed included) -- `C`
+  and `Sv` are separate, so a signed value gives a proper decayed weighted mean without
+  corrupting the decayed count. Fail closed: a bad `halfLife` / option throws before
+  allocation, a mode switch / non-finite or decreasing `now` / non-finite value throws
+  `[lite-adaptive]` (byte-identical no-op), a query `now` before the last add throws;
+  queries never throw on an empty detector (return 0). `rate() = count * lambda` is
+  documented as a DEFINITION (decayed events per unit time), not a statistical bound.
+  See [`decisions/0004`](./decisions/0004-forward-decay.md).
+- **`addFrom(buf, i)`** -- a zero-box hot entry on **`ExponentialHistogram`** and
+  **`ForwardDecay`** that reads `now = buf[i]` and `value = buf[i+1]` UNBOXED from a
+  caller-owned PACKED `[now, value]` `Float64Array` (a batch steps `i` by 2), then runs the
+  IDENTICAL accumulate (merge cascade / expire for EH, the landmark rebase for FD) as
+  `add(now, value)`. It unblocks a caller whose `now` AND `value` are both FRACTIONAL doubles
+  (e.g. lite-hud's time-window sum/mean/rate, where `now` is a fractional record time the
+  caller computes itself): `add(now, value)` boxes each argument into a ~16 B HeapNumber at a
+  non-inlined peer call boundary, whereas `addFrom` stays **0 B/op** (torture-gated on both
+  members with fractional inputs). EXPLICIT-time only (it always carries a `now`): a
+  count-locked instance throws, and the first `addFrom` locks EXPLICIT mode (setting FD's
+  landmark). Same fail-closed validation, throws, and byte-identical-no-op-on-reject as
+  `add`; a non-`Float64Array` `buf` or a non-integer / out-of-range `i` (needs
+  `i + 1 < buf.length`) throws `[lite-adaptive]` typeof-first. EH's `add()` hot body is
+  unchanged (the accumulate body is duplicated into `addFrom`, not shared, to avoid a boxing
+  call boundary). Same idiom as lite-sketch's `DDSketch.addFrom(buf, i)` (N7).
+- **The exact-aggregate witness** (`test/witness.mjs`) -- the honesty anchor unique to
+  the decay member: a brute-force oracle stores every `(t, value)` and recomputes the
+  decayed aggregate directly at each query, and the gate asserts the incrementally
+  maintained result matches it to `<= 1e-9` relative error on every query across a
+  `halfLife x stream-shape` sweep (worst observed `6.35e-14` over 5382 queries) -- with
+  negative controls (a rebase that omits the `C, Sv` rescale; a detector that never
+  rebases and overflows to `Infinity`) that the same gate rejects.
+
+### Changed
+
+- `VERSION` -> `0.3.0` (package.json / `Adaptive.js` / llms.txt trinity); the file
+  header documents the three-member roster.
+
+### Fixed
+
+- **llms.txt** now documents all three members: the `ADWIN` export bullet and its API
+  detail block were absent at 0.2.0 (the shipped Exports section listed only
+  `ExponentialHistogram` + `VERSION`); both are added, alongside the new `ForwardDecay`
+  export bullet and API section.
+
 ## [0.2.0] - 2026-09-23
 
 The second member -- the marquee one: **ADWIN** (Bifet-Gavalda, SDM 2007), concept-drift

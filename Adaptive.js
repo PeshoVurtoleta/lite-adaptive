@@ -19,8 +19,17 @@
  * (design-parity with the EH substrate, a SEPARATE pool, not a shared one).
  * `add(x) -> boolean` grows the window while the stream is stable and SHRINKS it on a
  * detected mean shift (the ADWIN2 variance-aware cut), 0 B/op incl. the cut-scan +
- * drop-older shrink. Future members (ForwardDecay, HeavyKeeper) are PURE-APPENDED
- * below; prior members stay byte-identical, only this header + VERSION change.
+ * drop-older shrink.
+ *
+ * v0.3.0 adds ForwardDecay (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009): time-decayed
+ * COUNT / SUM / MEAN / RATE where an element's weight halves every `halfLife` time units,
+ * measured FORWARD from a fixed landmark (weights computed once at insert, never revised
+ * -- the numeric-stability edge over backward decay). O(1) SPACE (two scalar accumulators
+ * C, Sv -- no pool), EXACT modulo FP via a periodic alloc-free landmark rebase, and a
+ * SMOOTH recency model (data fades, never drops). `add(now?, value?)` is 0 B/op INCLUDING
+ * the rebase branch; values may be any finite real (signed). The last roster member
+ * (HeavyKeeper, decayed top-k) is PURE-APPENDED below; prior members stay byte-identical,
+ * only this header + VERSION change.
  *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
@@ -29,7 +38,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -334,6 +343,126 @@ export class ExponentialHistogram {
     }
 
     /**
+     * Add one element from a caller-owned PACKED `[now, value]` Float64Array pair. HOT,
+     * 0 B/op -- the ZERO-BOX entry for a caller whose `now` AND `value` are both FRACTIONAL
+     * doubles (e.g. lite-hud's per-channel time-window sum/mean/rate: `now` is a fractional
+     * record time it computes itself, `value` a fractional ms stat). `add(now, value)` boxes
+     * each fractional argument into a ~16 B HeapNumber at a non-inlined call boundary; this
+     * reads `now = buf[i]` / `value = buf[i + 1]` UNBOXED straight from the array. The caller
+     * writes a `Float64Array(2)` scratch and calls `addFrom(scratch, 0)` (a batch steps `i`
+     * by 2). Identical validation, throws, byte-identical-no-op-on-reject, and reshaping as
+     * `add(now, value)`; it differs ONLY in how the two scalars cross the boundary.
+     *
+     * EXPLICIT-time ONLY: addFrom always carries a `now`, so a COUNT-locked instance rejects
+     * it (the way `add(now)` rejects a count-locked instance) and the first addFrom locks
+     * EXPLICIT mode. The value is validated FIRST (mirroring `add`), then the mode, then the
+     * monotone `now` -- all BEFORE any state mutation, so a rejected addFrom is a byte-
+     * identical no-op. The accumulate body is DUPLICATED from `add` (not delegated) to keep
+     * `add`'s hot body byte-identical and avoid re-boxing at an internal call boundary.
+     *
+     * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer /
+     * negative / out-of-range `i` (needs `i + 1 < buf.length`) throws [lite-adaptive].
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now, `buf[i+1]` = value.
+     * @param {number} i the base index of the [now, value] pair (0, 2, 4, ...).
+     * @returns {ExponentialHistogram} this
+     */
+    addFrom(buf, i) {
+        // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        const now = buf[i];       // UNBOXED Float64Array reads -- the whole point (no argument box).
+        const v = buf[i + 1];     // packed [now, value]
+        // --- validate the value FIRST (mirror add(); a Float64Array read is always a number,
+        // so add()'s typeof branch is unreachable here and omitted). BYTE-IDENTICAL no-op. ---
+        if (v !== v || v === Infinity || v <= 0) return this._badValue(v);
+        // --- addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify
+        // EXPLICIT + the monotone `now` (typeof-first, no alloc). ---
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+        }
+        this._now = t;
+
+        // --- expire buckets that fell out of [t - W, t] (oldest first) -- DUPLICATED from add()
+        //     to keep add()'s hot body byte-identical and avoid a boxing call boundary. ---
+        const cutoff = t - this._W;
+        const ts = this._ts;
+        while (this._count > 0) {
+            const L = this._maxLevel;
+            const b = this._head[L];
+            if (ts[b] > cutoff) break;   // globally-oldest still in-window -> nothing to expire
+            const after = this._next[b];
+            this._head[L] = after;
+            if (after === -1) this._tail[L] = -1; else this._prev[after] = -1;
+            this._lcount[L]--;
+            this._count--;
+            this._next[b] = this._freeHead;
+            this._freeHead = b;
+            if (this._head[L] === -1) {
+                let m = L;
+                while (m >= 0 && this._head[m] === -1) m--;
+                this._maxLevel = m;
+            }
+        }
+
+        // --- open a fresh level-0 bucket (population 1, size v) at the newest end ---
+        const node = this._freeHead;
+        if (node === -1) return this._badOverflow();
+        this._freeHead = this._next[node];
+        this._ts[node] = t;
+        this._start[node] = t;
+        this._size[node] = v;
+        this._lvl[node] = 0;
+        const tail0 = this._tail[0];
+        this._prev[node] = tail0;
+        this._next[node] = -1;
+        if (tail0 === -1) this._head[0] = node; else this._next[tail0] = node;
+        this._tail[0] = node;
+        this._lcount[0]++;
+        this._count++;
+        if (this._maxLevel < 0) this._maxLevel = 0;
+
+        // --- the bounded merge cascade (see add() for the full commentary) ---
+        const k = this._k;
+        let L = 0;
+        while (this._lcount[L] > k) {
+            const a = this._head[L];
+            const b2 = this._next[a];
+            const after = this._next[b2];
+            this._head[L] = after;
+            if (after === -1) this._tail[L] = -1; else this._prev[after] = -1;
+            this._lcount[L] -= 2;
+            this._size[a] += this._size[b2];
+            this._ts[a] = this._ts[b2];
+            const nl = L + 1;
+            this._lvl[a] = nl;
+            this._next[b2] = this._freeHead;
+            this._freeHead = b2;
+            this._count--;
+            const tnl = this._tail[nl];
+            this._prev[a] = tnl;
+            this._next[a] = -1;
+            if (tnl === -1) this._head[nl] = a; else this._next[tnl] = a;
+            this._tail[nl] = a;
+            this._lcount[nl]++;
+            if (nl > this._maxLevel) this._maxLevel = nl;
+            L = nl;
+        }
+        return this;
+    }
+
+    /**
      * The windowed COUNT (population) estimate: the number of elements in the last W.
      * The standard EH estimate -- every live bucket's population (a level-L bucket
      * holds 2^L) minus HALF the oldest (straddling) bucket, whose in-window portion is
@@ -426,6 +555,13 @@ export class ExponentialHistogram {
         throw new RangeError(
             '[lite-adaptive] ExponentialHistogram bucket pool overflow (cap=' + this._cap +
             '); this is a bug -- please report the W/epsilon used');
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] ExponentialHistogram.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
     }
 }
 
@@ -738,5 +874,409 @@ export class ADWIN {
         throw new RangeError(
             '[lite-adaptive] ADWIN bucket pool overflow (cap=' + this._cap +
             '); this is a bug -- please report the delta + stream length used');
+    }
+}
+
+// ===========================================================================
+// ForwardDecay (ADR 0004) -- time-decayed aggregates (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009)
+// ===========================================================================
+//
+// ForwardDecay weights each element by an increasing function of its OWN age measured
+// FORWARD from a fixed landmark L (never backward from "now"), so the weights are
+// computed ONCE at insert and never revised -- the source of its numeric stability. For
+// exponential decay g(x) = exp(lambda * x), lambda = ln2 / halfLife, two scalar
+// accumulators are maintained incrementally from the landmark:
+//   C  = sum_i g(t_i - L)               (decayed COUNT / total weight)
+//   Sv = sum_i value_i * g(t_i - L)     (decayed weighted value SUM)
+// A query at time `now` folds the common factor g(now - L) back in:
+//   decayedCount(now) = C  * exp(-lambda * (now - L))
+//   decayedSum(now)   = Sv * exp(-lambda * (now - L))
+//   mean(now)         = Sv / C          (the g(now - L) factor CANCELS -> landmark/now-invariant)
+//   rate(now)         = decayedCount(now) * lambda   (a DEFINITION: decayed events per unit time)
+// Because g grows without bound, `add` REBASES the landmark to the current t whenever
+// lambda*(t - L) would exceed FD_EXP_CAP (so exp() never overflows): a cold, O(1),
+// alloc-free rescale C *= exp(-lambda*(t - L)); Sv *= ...; L = t -- EXACT modulo FP, since
+// it factors one constant from every accumulated term. The hot body allocates 0 bytes.
+
+/** Frozen marker of the known ForwardDecay ctor option keys -- an unknown key is a throw. */
+const FD_KNOWN_OPTS = Object.freeze(Object.create(null));
+
+/**
+ * FD_EXP_CAP -- the exp() argument ceiling that triggers a landmark rebase. Above this the
+ * hot path rebases the landmark to t (arg -> 0) BEFORE accumulating. It is deliberately small
+ * so the ACCUMULATOR keeps astronomical head-room, not merely a single weight: a single term
+ * is at most exp(40) ~= 2.35e17, so C = sum(w) and Sv = sum(value*w) overflow to Infinity only
+ * when the running (value-weighted) term count since the last rebase exceeds Double.MAX / exp(40)
+ * ~= 7.6e290 -- physically unreachable. (The earlier 700 was WRONG: exp(700) ~= 1.01e304 sits only
+ * ~1.77e4x under Double.MAX ~= 1.798e308, so an ordinary value >= 1.798e308 / exp(700) ~= 17725 at
+ * arg = 700, or ~17724 same-timestamp adds pinned at arg = 700, overflowed the accumulator silently.)
+ * A rebase then fires only every FD_EXP_CAP / ln2 ~= 57.7 half-lives of elapsed time -- an item that
+ * old carries weight 2^-57.7 ~= 4e-18, so the rescale discards nothing measurable. The remaining
+ * pathological tail (a single value within ~1e17 of Double.MAX) is caught fail-closed by the query
+ * guard `_guardFinite`, never returned as Infinity.
+ */
+const FD_EXP_CAP = 40;
+
+/**
+ * ForwardDecay -- time-decayed COUNT / SUM / MEAN / RATE where every element's weight
+ * decays with its AGE (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009). Unlike
+ * ExponentialHistogram's HARD last-W window or ADWIN's adaptive window, ForwardDecay
+ * FORGETS SMOOTHLY: an element's influence shrinks by half every `halfLife` time units,
+ * so recent data dominates without any hard cutoff. Exponential decay g(x) = exp(lambda*x),
+ * lambda = ln2 / halfLife, is measured FORWARD from a fixed landmark -- so each weight is
+ * computed once at insert and never revised (the source of the method's numeric stability
+ * vs backward decay, whose per-query re-weighting drifts). Two scalar accumulators (C, Sv)
+ * are maintained incrementally; the query folds in the age at `now`.
+ *
+ * Headline (the recency TRIPLE):
+ *   - SPACE: O(1) -- TWO scalars (C, Sv) plus the landmark + the time-mode state. No pool.
+ *   - ERROR: EXACT modulo floating point -- the decayed aggregate equals the definition;
+ *     the periodic landmark rebase factors a constant from every term (no approximation).
+ *   - RECENCY: SMOOTH exponential decay (a soft "effective window" ~ halfLife / ln2, vs
+ *     EH's hard edge or ADWIN's data-driven boundary) -- old data fades, never drops.
+ *
+ * Time model (mirrors ExponentialHistogram): a caller-supplied MONOTONE `now`, or count
+ * mode (auto-tick) when `now` is omitted; the mode LOCKS at the first add and a switch
+ * throws. Value domain: ANY finite real (signed OK) -- because C and Sv are separate, a
+ * negative value lowers the decayed SUM / MEAN without corrupting the decayed COUNT (a
+ * deliberate, documented difference from EH's positive-only sum).
+ *
+ * Hot path (`add`, 0 B/op incl. the rebase branch): a typeof value guard, the mode
+ * resolve + monotone-`now` guard, one exp(), and two scalar accumulations -- with a cold
+ * O(1) landmark rebase when the exp argument would exceed FD_EXP_CAP. No objects, no
+ * closures, no arrays.
+ *
+ * Fail closed: a bad `halfLife` / option throws `[lite-adaptive]` at the ctor door BEFORE
+ * any field init; `add` validates the value + resolves/validates `now` BEFORE any state
+ * mutation (a rejected add is a BYTE-IDENTICAL no-op); a query at a time BEFORE the last
+ * add throws (can't un-decay) -- otherwise queries never throw and an empty summary reads
+ * 0 (null is not zero).
+ */
+export class ForwardDecay {
+    /**
+     * @param {number} halfLife  the decay half-life; a finite number > 0 (the time span
+     *                           over which an element's weight halves). lambda = ln2/halfLife.
+     * @param {object} [options] reserved; an unknown key throws [lite-adaptive].
+     */
+    constructor(halfLife, options) {
+        // typeof guard FIRST, BEFORE any field init.
+        if (typeof halfLife !== 'number' || halfLife !== halfLife || halfLife === Infinity || halfLife <= 0) {
+            throw new RangeError(
+                '[lite-adaptive] ForwardDecay halfLife must be a finite number > 0, got ' + String(halfLife));
+        }
+        if (options !== undefined) {
+            if (typeof options !== 'object' || options === null) {
+                throw new TypeError('[lite-adaptive] ForwardDecay options must be an object');
+            }
+            for (const key in options) {
+                if (!(key in FD_KNOWN_OPTS)) {
+                    throw new RangeError('[lite-adaptive] ForwardDecay unknown option "' + key + '"');
+                }
+            }
+        }
+        this._halfLife = halfLife;
+        this._lambda = Math.LN2 / halfLife;   // g(x) = exp(lambda * x); halves every halfLife
+        this._initState();
+    }
+
+    /** @private Reset the accumulators + landmark + time mode to empty. Reused by clear(). 0 alloc. */
+    _initState() {
+        this._C = 0;             // decayed count  = sum g(t_i - L)
+        this._Sv = 0;            // decayed sum    = sum value_i * g(t_i - L)
+        this._L = 0;             // the landmark time (weights are measured forward from here)
+        this._mode = MODE_UNSET; // time mode, locked at the first add
+        this._tick = 0;          // count-mode logical clock
+        this._lastNow = -Infinity; // explicit-mode monotone guard
+        this._now = 0;           // the last applied t (the default query time)
+    }
+
+    /** The decay half-life (weight halves every halfLife time units). O(1). */
+    get halfLife() { return this._halfLife; }
+    /** The decay rate lambda = ln2 / halfLife. O(1). */
+    get lambda() { return this._lambda; }
+    /** The current landmark time L (weights are measured forward from here). O(1). */
+    get landmark() { return this._L; }
+    /** The locked time mode: 'unset' | 'explicit' | 'count'. O(1). */
+    get mode() {
+        return this._mode === MODE_EXPLICIT ? 'explicit' : this._mode === MODE_COUNT ? 'count' : 'unset';
+    }
+
+    /**
+     * Add one element with the given value. HOT, 0 B/op INCLUDING the landmark rebase.
+     *
+     * Time modes (LOCKED at the first add, a switch throws):
+     *   - EXPLICIT: add(now) / add(now, value). `now` is a finite number, strictly
+     *     NON-DECREASING across calls (a decrease throws [lite-adaptive]).
+     *   - COUNT: add() / add(undefined, value). The member auto-increments an internal
+     *     tick per add (the "last N items" convenience).
+     *
+     * `value` (both modes) defaults to 1; a supplied value must be a FINITE real (signed
+     * is allowed -- it contributes to the decayed SUM / MEAN but still counts as ONE
+     * decayed event in the decayed COUNT).
+     *
+     * Fail closed: a mode switch, a non-finite `now`, a `now` going backwards, or a
+     * non-finite / non-number value throws [lite-adaptive] (typeof-first, BYTE-IDENTICAL
+     * no-op -- nothing is accumulated on a rejected add).
+     * @param {number} [now]   the monotone time (omit for count mode).
+     * @param {number} [value] the element's value (default 1; any finite real).
+     * @returns {ForwardDecay} this
+     */
+    add(now, value) {
+        // --- resolve + validate the value FIRST, before ANY state mutation, so every
+        // rejected add is a BYTE-IDENTICAL no-op. Any finite real is legal (signed OK);
+        // only a non-number / NaN / +-Infinity is rejected. typeof-first, no alloc. ---
+        let v = value;
+        if (v === undefined) {
+            v = 1;
+        } else if (typeof v !== 'number' || v !== v || v === Infinity || v === -Infinity) {
+            return this._badValue(v);
+        }
+        // --- resolve the timestamp + lock/verify the mode (typeof-first, no alloc) ---
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            if (now !== undefined) return this._badMode('count', 'explicit');
+            t = ++this._tick;
+        } else if (mode === MODE_EXPLICIT) {
+            if (now === undefined) return this._badMode('explicit', 'count');
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badNow(now);
+            }
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            // first add: lock the mode + set the landmark to the first element's time.
+            if (now === undefined) {
+                this._mode = MODE_COUNT;
+                t = ++this._tick;
+            } else {
+                if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                    return this._badNow(now);
+                }
+                this._mode = MODE_EXPLICIT;
+                t = now;
+                this._lastNow = now;
+            }
+            this._L = t;
+        }
+        this._now = t;
+
+        // --- accumulate the forward-decayed weight (rebase the landmark if exp() would
+        //     approach overflow -- a cold, O(1), EXACT rescale that factors a constant out) ---
+        const lambda = this._lambda;
+        if (lambda * (t - this._L) > FD_EXP_CAP) this._rebase(t);
+        const w = Math.exp(lambda * (t - this._L));
+        this._C += w;
+        this._Sv += v * w;
+        return this;
+    }
+
+    /**
+     * Add one element from a caller-owned PACKED `[now, value]` Float64Array pair. HOT,
+     * 0 B/op -- the ZERO-BOX entry for a caller whose `now` AND `value` are both FRACTIONAL
+     * doubles (the lite-hud decayed-stats idiom: a per-channel fractional record time + a
+     * fractional value). `add(now, value)` boxes each fractional argument into a ~16 B
+     * HeapNumber at a non-inlined call boundary; this reads `now = buf[i]` / `value = buf[i + 1]`
+     * UNBOXED straight from the array. The caller writes a `Float64Array(2)` scratch and calls
+     * `addFrom(scratch, 0)` (a batch steps `i` by 2). Identical validation, throws, byte-
+     * identical-no-op-on-reject, and accumulation (incl. the landmark rebase) as `add(now,
+     * value)`; it differs ONLY in how the two scalars cross the boundary.
+     *
+     * EXPLICIT-time ONLY: addFrom always carries a `now`, so a COUNT-locked instance rejects
+     * it (the way `add(now)` rejects a count-locked instance) and the first addFrom locks
+     * EXPLICIT mode (setting the landmark to the first element's time). The value is validated
+     * FIRST (mirroring `add`), then the mode, then the monotone `now` -- all BEFORE any state
+     * mutation, so a rejected addFrom is a byte-identical no-op. The accumulate body is
+     * DUPLICATED from `add` (not delegated) to keep `add`'s hot body byte-identical and avoid
+     * re-boxing at an internal call boundary.
+     *
+     * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer /
+     * negative / out-of-range `i` (needs `i + 1 < buf.length`) throws [lite-adaptive].
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now, `buf[i+1]` = value.
+     * @param {number} i the base index of the [now, value] pair (0, 2, 4, ...).
+     * @returns {ForwardDecay} this
+     */
+    addFrom(buf, i) {
+        // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        const now = buf[i];       // UNBOXED Float64Array reads -- the whole point (no argument box).
+        const v = buf[i + 1];     // packed [now, value]
+        // --- validate the value FIRST (mirror add(); any finite real is legal, signed OK; a
+        // Float64Array read is always a number so add()'s typeof branch is omitted). ---
+        if (v !== v || v === Infinity || v === -Infinity) return this._badValue(v);
+        // --- addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify
+        // EXPLICIT + the monotone `now` (typeof-first, no alloc). ---
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._L = t;   // first add: set the landmark to the first element's time
+        }
+        this._now = t;
+
+        // --- accumulate the forward-decayed weight -- DUPLICATED from add() to keep add()'s
+        //     hot body byte-identical and avoid a boxing call boundary. ---
+        const lambda = this._lambda;
+        if (lambda * (t - this._L) > FD_EXP_CAP) this._rebase(t);
+        const w = Math.exp(lambda * (t - this._L));
+        this._C += w;
+        this._Sv += v * w;
+        return this;
+    }
+
+    /**
+     * @private Rebase the landmark to `t`. Cold, O(1), 0 B/op. Multiplies both accumulators
+     * by exp(-lambda*(t - L)) and moves the landmark to `t` -- factoring one common constant
+     * out of every accumulated term, so the decayed aggregates are UNCHANGED modulo FP.
+     */
+    _rebase(t) {
+        const f = Math.exp(-this._lambda * (t - this._L));
+        this._C *= f;
+        this._Sv *= f;
+        this._L = t;
+    }
+
+    /**
+     * @private Resolve + validate the query time. `undefined` -> the last add time (the
+     * default). An explicit query time must be a finite number >= the last add time (a query
+     * in the past can't un-decay -> throw). 0 alloc.
+     */
+    _queryTime(now) {
+        if (now === undefined) return this._now;
+        if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity || now < this._now) {
+            return this._badQueryTime(now);
+        }
+        return now;
+    }
+
+    /**
+     * The decayed COUNT (total decayed weight) at `now`. C * exp(-lambda*(now - L)). COLD,
+     * O(1). `now` defaults to the last add time; a query before it throws. Returns 0 when
+     * empty (null is not zero).
+     * @param {number} [now] the query time (>= the last add time).
+     * @returns {number}
+     */
+    count(now) {
+        if (this._C === 0) return 0;
+        this._guardFinite();
+        const t = this._queryTime(now);
+        return this._C * Math.exp(-this._lambda * (t - this._L));
+    }
+
+    /**
+     * The decayed weighted SUM of the values at `now`. Sv * exp(-lambda*(now - L)). COLD,
+     * O(1). `now` defaults to the last add time; a query before it throws. Returns 0 when
+     * empty.
+     * @param {number} [now] the query time (>= the last add time).
+     * @returns {number}
+     */
+    sum(now) {
+        if (this._C === 0) return 0;
+        this._guardFinite();
+        const t = this._queryTime(now);
+        return this._Sv * Math.exp(-this._lambda * (t - this._L));
+    }
+
+    /**
+     * The decayed MEAN (Sv / C). The age factor exp(-lambda*(now - L)) is common to the
+     * numerator and denominator, so it CANCELS -- the decayed mean is landmark- AND
+     * now-invariant (EXACT). COLD, O(1). Returns 0 when empty.
+     * @param {number} [now] the query time (validated for contract uniformity; the result
+     *                       does not depend on it).
+     * @returns {number}
+     */
+    mean(now) {
+        if (this._C === 0) return 0;
+        this._guardFinite();
+        this._queryTime(now);
+        return this._Sv / this._C;
+    }
+
+    /**
+     * The decayed RATE at `now` -- decayedCount(now) * lambda. This is a DEFINITION (decayed
+     * events per unit time under the exponential kernel), NOT a theorem: with lambda = ln2 /
+     * halfLife, a steady arrival of `r` events/unit converges to decayedCount -> r / lambda,
+     * so rate() -> r. COLD, O(1). Returns 0 when empty.
+     * @param {number} [now] the query time (>= the last add time).
+     * @returns {number}
+     */
+    rate(now) {
+        if (this._C === 0) return 0;
+        this._guardFinite();
+        const t = this._queryTime(now);
+        return this._C * Math.exp(-this._lambda * (t - this._L)) * this._lambda;
+    }
+
+    /** Reset to empty; keep halfLife / lambda, unlock the mode. O(1). @returns {ForwardDecay} this */
+    clear() {
+        this._initState();
+        return this;
+    }
+
+    /** @private Cold thrower for a mode switch after the mode locked. */
+    _badMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] ForwardDecay mode is locked to ' + locked +
+            ' at the first add; got a ' + attempted + '-mode add');
+    }
+
+    /** @private Cold thrower for a non-finite `now`. */
+    _badNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] ForwardDecay add now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone `now`. */
+    _badMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] ForwardDecay add now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad value. */
+    _badValue(v) {
+        throw new TypeError(
+            '[lite-adaptive] ForwardDecay add value must be a finite number, got ' + String(v));
+    }
+
+    /** @private Cold thrower for a query time before the last add (can't un-decay). */
+    _badQueryTime(now) {
+        throw new RangeError(
+            '[lite-adaptive] ForwardDecay query time must be a finite number >= the last add time (' +
+            String(this._now) + '), got ' + String(now));
+    }
+
+    /**
+     * @private Fail-closed guard for the query path: an accumulator that overflowed to a
+     * non-finite value (only reachable from a value within ~1e17 of Double.MAX -- see
+     * FD_EXP_CAP) must THROW, never silently return Infinity / NaN. Cold path, 0 hot cost.
+     */
+    _guardFinite() {
+        const c = this._C, s = this._Sv;
+        if (c !== c || c === Infinity || c === -Infinity ||
+            s !== s || s === Infinity || s === -Infinity) {
+            throw new RangeError(
+                '[lite-adaptive] ForwardDecay accumulator overflowed to a non-finite value ' +
+                '(a value near Double.MAX was added); the summary is fail-closed -- call clear() to reuse');
+        }
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] ForwardDecay.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
     }
 }

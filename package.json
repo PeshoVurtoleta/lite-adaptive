@@ -1,8 +1,8 @@
 {
   "name": "@zakkster/lite-adaptive",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.2.0",
-  "description": "Zero-dependency, zero-GC family of APPROXIMATE, sublinear-space streaming summaries over the TIME / RECENCY axis that witnesses its RECENCY against the paper's theoretical bound: ExponentialHistogram (sliding-window count / sum) + ADWIN (concept-drift detection + adaptive windowing) over a preallocated fixed bucket pool. Tree-shakeable named exports.",
+  "version": "0.3.0",
+  "description": "Zero-dependency, zero-GC family of APPROXIMATE, sublinear-space streaming summaries over the TIME / RECENCY axis that witnesses its RECENCY against the paper's theoretical bound: ExponentialHistogram (sliding-window count / sum) + ADWIN (concept-drift detection + adaptive windowing) + ForwardDecay (time-decayed count / sum / mean / rate) over a preallocated fixed bucket pool. Tree-shakeable named exports.",
   "type": "module",
   "main": "./Adaptive.js",
   "module": "./Adaptive.js",

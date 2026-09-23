@@ -8,7 +8,7 @@
 // buckets vs the ring's O(W)). A NEGATIVE CONTROL (a broken EH -- no straddle half-
 // correction) is fed the SAME gate and MUST be REJECTED (the gate has teeth). ASCII-only.
 
-import { ExponentialHistogram, ADWIN, VERSION } from '../Adaptive.js';
+import { ExponentialHistogram, ADWIN, ForwardDecay, VERSION } from '../Adaptive.js';
 
 const WS = [64, 1000, 65536];
 const EPS = [0.5, 0.1, 0.01];
@@ -354,7 +354,202 @@ let adControlsOk = true;
 console.log('');
 console.log('WITNESS ADWIN negative controls (broken bound + broken shrink rejected) ' + (adControlsOk ? 'ok' : 'FAIL'));
 
-const all = ok && controlsOk && adOk && adControlsOk;
+// ===========================================================================
+// EXACT-AGGREGATE Witness -- ForwardDecay (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009).
+// The honesty anchor for the DECAY member: not "close to a bound" but EXACT modulo FP.
+// A brute-force oracle stores EVERY (t_i, value_i) and recomputes the decayed aggregate
+// directly at each query time; GATE |fd - oracle| / |oracle| <= 1e-9 on EVERY query across
+// 3 halfLife x 3 stream-shapes (>= 5000 queries). NEGATIVE CONTROLS the same gate REJECTS:
+//   - fdNoRescale: rebases the landmark but SKIPS the C,Sv rescale -> the aggregate diverges.
+//   - fdNoRebase:  never rebases -> a long increasing-t stream overflows the accumulator to Inf.
+// Both the rebase branch AND its rescale are load-bearing.
+// ===========================================================================
+
+const FD_TOL = 1e-9;
+
+/** A ForwardDecay whose rebase moves the landmark but FORGETS to rescale C,Sv (diverges). */
+class FDNoRescale extends ForwardDecay {
+    _rebase(t) { this._L = t; }   // BUG: no C *= f; Sv *= f
+}
+/** A ForwardDecay that NEVER rebases -> exp(lambda*(t-L)) overflows on a long stream. */
+class FDNoRebase extends ForwardDecay {
+    _rebase() { /* BUG: never rebases + never moves the landmark -> overflow to Inf */ }
+}
+
+/** Build a stream of `n` (t, value) points of a given shape. Values are positive (0.5..2). */
+function fdStream(shape, n) {
+    const times = new Float64Array(n);
+    const vals = new Float64Array(n);
+    let t = 0;
+    for (let i = 0; i < n; i++) {
+        if (shape === 0) { t += 1; vals[i] = 1; }                                   // steady, unit
+        else if (shape === 1) { t += 1 + (i % 5); vals[i] = 0.5 + ((i % 4) * 0.5); } // variable gaps + values
+        else { t += (i % 13 === 0 ? 50 : 1); vals[i] = 0.75 + ((i % 7) * 0.125); }   // bursty gaps
+        times[i] = t;
+    }
+    return { times, vals };
+}
+
+/** The exact decayed (count, sum) at `now` over the first `n` stored points. */
+function fdOracle(times, vals, n, lambda, now) {
+    let c = 0, s = 0;
+    for (let i = 0; i < n; i++) {
+        const wd = Math.exp(-lambda * (now - times[i]));
+        c += wd; s += vals[i] * wd;
+    }
+    return { c, s };
+}
+
+/**
+ * Drive `Ctor` over the shape's stream, query every `qEvery` adds once warmed, and return
+ * the max relative error over count / sum / mean vs the oracle + the number of queries. A
+ * non-finite estimate is scored Infinity (so the gate rejects it via !(rel <= tol)).
+ */
+function fdMeasure(Ctor, halfLife, shape, n, qEvery) {
+    const { times, vals } = fdStream(shape, n);
+    const fd = new Ctor(halfLife);
+    const lambda = Math.LN2 / halfLife;
+    let maxRel = 0, queries = 0;
+    for (let i = 0; i < n; i++) {
+        fd.add(times[i], vals[i]);
+        if (i >= 20 && (i % qEvery === 0)) {
+            const now = times[i];
+            const o = fdOracle(times, vals, i + 1, lambda, now);
+            let rel;
+            try {
+                // A fail-closed throw (the query guard on a non-finite accumulator) counts as
+                // REJECTED by the gate -- score it Infinity, same as a non-finite result.
+                const relC = Math.abs(fd.count(now) - o.c) / Math.abs(o.c);
+                const relS = Math.abs(fd.sum(now) - o.s) / Math.abs(o.s);
+                const relM = Math.abs(fd.mean(now) - o.s / o.c) / Math.abs(o.s / o.c);
+                rel = Math.max(relC, relS, relM);
+                if (!Number.isFinite(rel)) rel = Infinity;
+            } catch (e) {
+                rel = Infinity;
+            }
+            if (!(rel <= maxRel)) maxRel = rel;
+            queries++;
+        }
+    }
+    return { maxRel, queries };
+}
+
 console.log('');
-console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN) ' + (all ? 'ok' : 'FAIL'));
+console.log('EXACT-AGGREGATE Witness -- ForwardDecay v' + VERSION + ' (Cormode-Shkapenyuk-Srivastava-Xu, ' +
+    'ICDE 2009): decayed count/sum/mean vs a brute-force oracle (theoretical: EXACT modulo FP, rel <= 1e-9)');
+console.log('');
+console.log('  halfLife  shape         maxRel err   theo (1e-9)  queries  status');
+console.log('  --------  ------------  -----------  -----------  -------  ------');
+
+let fdOk = true;
+let fdTotalQueries = 0, fdWorst = 0;
+const SHAPE_NAME = ['steady', 'variable-gap', 'bursty'];
+for (const halfLife of [10, 100, 1000]) {
+    for (let shape = 0; shape < 3; shape++) {
+        const r = fdMeasure(ForwardDecay, halfLife, shape, 6000, 10);
+        const cellOk = r.maxRel <= FD_TOL;
+        if (!cellOk) fdOk = false;
+        fdTotalQueries += r.queries;
+        if (r.maxRel > fdWorst) fdWorst = r.maxRel;
+        console.log('  ' + String(halfLife).padEnd(8) + '  ' + SHAPE_NAME[shape].padEnd(12) + '  ' +
+            r.maxRel.toExponential(2).padStart(11) + '  ' + '1.00e-9'.padStart(11) + '  ' +
+            String(r.queries).padStart(7) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+    }
+}
+const enoughQueries = fdTotalQueries >= 5000;
+if (!enoughQueries) fdOk = false;
+console.log('');
+console.log('  total queries=' + fdTotalQueries + ' (>= 5000 required: ' + (enoughQueries ? 'ok' : 'FAIL') +
+    '), worst rel err=' + fdWorst.toExponential(2));
+console.log('');
+console.log('WITNESS ForwardDecay (exact decayed aggregate) ' + (fdOk ? 'ok' : 'FAIL'));
+
+// --- ForwardDecay TEETH: large-value + same-timestamp-flood lanes that REJECT at the buggy
+//     cap 700 and stay EXACT at 40. Both use lambda=1 and seed L=0 with add(0,1), then act at
+//     now=700 so arg=700 -- which does NOT trip `> 700` (no rebase at the old cap), but DOES trip
+//     `> 40` (rebase at the shipped cap). At cap 700 the non-rebased weight exp(700)~1.01e304 makes
+//     large-value overflow Sv in one add and flood overflow C in ~1.8e4 adds -> the query guard
+//     throws -> scored Infinity -> the lane REJECTS. At cap 40 the rebase bounds every weight, so
+//     the aggregate is finite and EXACT vs the oracle. (Verified: flipping FD_EXP_CAP to 700 turns
+//     both lanes red.) ---
+console.log('');
+console.log('TEETH -- ForwardDecay large-value + same-timestamp-flood (EXACT at cap 40; REJECT at the buggy cap 700):');
+let fdTeethOk = true;
+{
+    // add(0,1); add(700, 2e4) -- mirrors the node:test regression. At 700: exp(700)*2e4 > Double.MAX.
+    const halfLife = Math.LN2, lambda = 1;   // lambda = ln2/halfLife = 1
+    const times = Float64Array.of(0, 700), vals = Float64Array.of(1, 2e4);
+    const fd = new ForwardDecay(halfLife);
+    let rel;
+    try {
+        fd.add(times[0], vals[0]);
+        fd.add(times[1], vals[1]);
+        const now = 700;
+        const o = fdOracle(times, vals, 2, lambda, now);
+        rel = Math.max(
+            Math.abs(fd.count(now) - o.c) / Math.abs(o.c),
+            Math.abs(fd.sum(now) - o.s) / Math.abs(o.s),
+            Math.abs(fd.mean(now) - o.s / o.c) / Math.abs(o.s / o.c));
+        if (!Number.isFinite(rel)) rel = Infinity;
+    } catch (e) { rel = Infinity; }   // a fail-closed overflow throw at cap 700 -> REJECT
+    const cellOk = rel <= FD_TOL;
+    if (!cellOk) fdTeethOk = false;
+    console.log('  large-value (add(0,1); add(700,2e4), lambda=1) maxRel=' +
+        (Number.isFinite(rel) ? rel.toExponential(2) : 'Infinity') +
+        ' -> ' + (cellOk ? 'EXACT (ok)' : 'FAIL'));
+}
+{
+    // add(0,1) seeds L=0, then FLOOD adds at now=700. At cap 700 each flood weight is exp(700), so
+    // ~1.8e4 of them overflow C; at cap 40 the first flood add rebases (arg 0 after) -> finite/exact.
+    const halfLife = Math.LN2, lambda = 1;
+    const flood = 20000, n = 1 + flood;
+    const times = new Float64Array(n), vals = new Float64Array(n);
+    times[0] = 0; vals[0] = 1;
+    for (let i = 1; i < n; i++) { times[i] = 700; vals[i] = 3; }
+    const fd = new ForwardDecay(halfLife);
+    let rel;
+    try {
+        for (let i = 0; i < n; i++) fd.add(times[i], vals[i]);
+        const now = 700;
+        const o = fdOracle(times, vals, n, lambda, now);
+        rel = Math.max(
+            Math.abs(fd.count(now) - o.c) / Math.abs(o.c),
+            Math.abs(fd.sum(now) - o.s) / Math.abs(o.s));
+        if (!Number.isFinite(rel)) rel = Infinity;
+    } catch (e) { rel = Infinity; }
+    const cellOk = rel <= FD_TOL;
+    if (!cellOk) fdTeethOk = false;
+    console.log('  flood (add(0,1) then ' + flood + ' at now=700, lambda=1) maxRel=' +
+        (Number.isFinite(rel) ? rel.toExponential(2) : 'Infinity') +
+        ' -> ' + (cellOk ? 'EXACT (ok)' : 'FAIL'));
+}
+console.log('');
+console.log('WITNESS ForwardDecay teeth (large-value + flood: exact at 40, reject at 700) ' + (fdTeethOk ? 'ok' : 'FAIL'));
+
+// --- ForwardDecay NEGATIVE CONTROLS (N4): the rebase + its rescale must be load-bearing ---
+console.log('');
+console.log('NEGATIVE CONTROLS -- ForwardDecay with a broken rebase MUST be rejected by the same gate:');
+let fdControlsOk = true;
+// A stream long enough (small half-life) to force many rebase-cap crossings.
+{
+    const r = fdMeasure(FDNoRescale, 10, 0, 40000, 25);
+    const rejected = !(r.maxRel <= FD_TOL);   // the exact-aggregate gate must REJECT it
+    if (!rejected) fdControlsOk = false;
+    console.log('  fdNoRescale (rebase without the C,Sv rescale) maxRel=' + r.maxRel.toExponential(2) +
+        ' vs tol=1e-9 -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+{
+    const r = fdMeasure(FDNoRebase, 10, 0, 40000, 25);
+    const rejected = !(r.maxRel <= FD_TOL);   // overflow to Inf -> rejected
+    if (!rejected) fdControlsOk = false;
+    console.log('  fdNoRebase (never rebases -> accumulator overflows to Inf) maxRel=' + r.maxRel.toExponential(2) +
+        ' vs tol=1e-9 -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+console.log('');
+console.log('WITNESS ForwardDecay negative controls (broken rebase + no rebase rejected) ' +
+    (fdControlsOk ? 'ok' : 'FAIL'));
+
+const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk;
+console.log('');
+console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay) ' + (all ? 'ok' : 'FAIL'));
 if (!all) process.exitCode = 1;
