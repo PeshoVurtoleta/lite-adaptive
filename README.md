@@ -43,6 +43,7 @@ last1000.count();                          // ~1000  (an exact ring would hold 1
 - [Why this exists](#why-this-exists)
 - [What you get](#what-you-get)
 - [ExponentialHistogram](#exponentialhistogram)
+- [ADWIN](#adwin)
 - [API reference](#api-reference)
 - [Composability](#composability)
 - [Zero-GC design notes](#zero-gc-design-notes)
@@ -59,6 +60,7 @@ A recency summary is a promise: "I use `X` bytes and my answer about the last `W
 ## What you get
 
 - **ExponentialHistogram** -- sliding-window count / sum ("how many / how much in the last `W`?") in a fixed pool of `(timestamp, size)` buckets, with a *hard* windowed relative-error bound `<= epsilon`. The reference member; DGIM (the 0/1 count stream) is its `value = 1` special case.
+- **ADWIN** -- concept-drift detection with NO fixed window size (Bifet-Gavalda, SDM 2007): `add(x) -> boolean` tells you the moment the stream's mean *changed*, and the adaptive window GROWS while stable and SHRINKS to the new concept on a detected change. `mean` / `variance` / `width` report the current stable window. The marquee member.
 - **A caller-owned time source** -- `add(now)` with a monotone `now` (a logical tick or ms), or `add()` in count mode for the "last N items" window. The member never reads the clock, so witnesses are exactly reproducible.
 - **The recency witness** -- measured windowed error vs the theoretical bound, printed side by side, with the exact-ring foil whose memory climbs O(W) while the histogram stays a fixed sliver.
 - **Zero runtime dependencies**, ESM, tree-shakeable named exports, TypeScript types, and a **0 bytes/op hot path** -- *including* the amortized bucket merge / expire reshaping -- proven by a leak + GC-profiler torture gate.
@@ -76,6 +78,37 @@ The same invariant fixes the memory: the number of levels is `ceil(log2(W/(k+1))
 `CAP = (k+1) * (ceil(log2(W/(k+1))) + 2) + 2` buckets -- preallocated at construction, never grown. At `W = 65536, epsilon = 0.01` that is 678 buckets (~24 KB) versus an exact ring of 65536 timestamps (512 KB).
 
 The measured windowed relative error tracks `1/(2k)` and stays under `epsilon` across the whole `W in {64, 1000, 65536} x epsilon in {0.5, 0.1, 0.01}` sweep -- see [Testing](#testing).
+</details>
+
+## ADWIN
+
+Detect when an unbounded stream's mean has CHANGED, with no window size to guess. `ADWIN(delta)` maintains a variance-carrying bucket list of recent values; `add(x)` appends `x`, compresses the buckets (at most 5 per level), and scans every bucket-boundary split of the window into an older sub-window `W0` and a newer `W1`. When their means differ by more than a statistically justified threshold it flags a change (`add` returns `true`) and DROPS the older sub-window -- so the window automatically GROWS while the stream is stable and SHRINKS to the new concept on a change. `mean` / `variance` / `width` always describe the current, stable window.
+
+```js
+import { ADWIN } from '@zakkster/lite-adaptive';
+
+const adwin = new ADWIN(0.002);            // delta = false-alarm confidence
+for (const x of latencies) {
+    if (adwin.add(x)) {                     // true the moment the mean shifts
+        console.log('drift! new mean', adwin.mean, 'over', adwin.width, 'items');
+    }
+}
+```
+
+<details>
+<summary><b>The ADWIN2 variance-aware cut (why the false-alarm rate is bounded)</b></summary>
+
+A split of the window into `W0` (older, `n0` items) and `W1` (newer, `n1` items) is a *change* when `|mean(W0) - mean(W1)| > epsCut`, where
+
+```
+m       = 1 / (1/n0 + 1/n1)                 (harmonic mean of the two counts)
+deltaP  = delta / ln(width)                 (Bonferroni over the tested splits)
+epsCut  = sqrt( (2/m) * sigmaHat^2 * ln(2/deltaP) )   +   (2/3) * (R/m) * ln(2/deltaP)
+```
+
+`sigmaHat^2` is the total-window variance and `R` is the running observed range (`max - min`). This is the **ADWIN2 variance-aware bound** (Bifet-Gavalda, SDM 2007): the variance term dominates on low-variance streams, so it detects small, real shifts faster than a range-only Hoeffding bound while keeping the stationary **false-alarm rate `<= delta`** (a Bernstein guarantee). Only bucket boundaries are tested (`O(log width)` splits), and on a detected cut the oldest bucket is dropped and the scan repeats -- so `add` is amortized O(1) and **0 B/op including the cut-scan and the shrink**.
+
+ADWIN is ITEM-INDEXED: `add(x)` per item, no clock -- the adaptive window is measured in items and is data-driven (unlike ExponentialHistogram's caller-supplied `now`). The change-response witness injects a known changepoint and gates the false-alarm rate `<= delta`, a detection latency that scales with shift magnitude, ~0 missed detections on a large shift, and that the adapted window reflects only the new concept -- see [Testing](#testing).
 </details>
 
 ## API reference
@@ -106,6 +139,20 @@ Constants that shape the pool:
 | `levels` | `ceil(log2(W/(k+1))) + 2` | number of size-class levels the pool can occupy |
 | `capacity` | `(k+1) * levels + 2` | the fixed bucket-pool size (never grows) |
 | error | `~ 1/(2k) <= epsilon` | windowed relative error, HARD, on every query |
+
+```js
+new ADWIN(delta, options?)
+
+add(x) -> boolean           // HOT, amortized O(1), 0 B/op incl. cut-scan + shrink; true iff a change was detected on this item
+clear() -> this             // reset to empty; reuse the pool
+
+// getters
+mean   variance   width   bucketCount   capacity   delta
+```
+
+- **`delta`** -- the confidence / false-alarm knob in `(0, 1)`; smaller means fewer false alarms and (disclosed) longer detection latency. Throws `[lite-adaptive]` before allocation on a bad `delta`.
+- **`add(x)`** -- append a finite real `x` (item-indexed; no clock), run the ADWIN2 variance-aware cut over the bucket boundaries, and on a change DROP the older sub-window. Returns `true` exactly on the item that detects the change. Fail closed: a non-finite / non-number `x` is a byte-identical no-op.
+- **`mean` / `variance` / `width`** -- the mean, variance, and item count of the CURRENT adaptive window; `width` shrinks on a detected change, then regrows while stable. Getters never throw (0 on an empty detector).
 
 ## Composability
 
@@ -184,7 +231,7 @@ Gated quality numbers (`npm run verify`):
 - **Not an exact windowed aggregator.** For an EXACT sliding-window sum / min / max over a monoid, use `@zakkster/lite-o1` (`WindowFold`, `MonoDeque`, `RingLog`) -- bounded-capacity and exact. `lite-adaptive` is the approximate, unbounded-window complement.
 - **Not a cumulative sketch.** For whole-stream distinct-count / frequency / quantiles / top-k with no forgetting, use `@zakkster/lite-sketch`. The line is recency.
 - **Not a wall-clock timer.** The member never reads the clock; the caller supplies a monotone `now`.
-- **Not (yet) drift or decay.** ADWIN (drift + adaptive window), ForwardDecay (time-decay), and HeavyKeeper (decayed top-k) are the roadmap to 1.0.0.
+- **Not (yet) decay or decayed top-k.** ADWIN (drift + adaptive window) ships as of 0.2.0; ForwardDecay (time-decay) and HeavyKeeper (decayed top-k) are the remaining roadmap to 1.0.0.
 
 ## Ecosystem
 

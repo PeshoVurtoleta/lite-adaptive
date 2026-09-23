@@ -8,7 +8,7 @@
 // buckets vs the ring's O(W)). A NEGATIVE CONTROL (a broken EH -- no straddle half-
 // correction) is fed the SAME gate and MUST be REJECTED (the gate has teeth). ASCII-only.
 
-import { ExponentialHistogram, VERSION } from '../Adaptive.js';
+import { ExponentialHistogram, ADWIN, VERSION } from '../Adaptive.js';
 
 const WS = [64, 1000, 65536];
 const EPS = [0.5, 0.1, 0.01];
@@ -158,7 +158,203 @@ for (const [W, eps] of [[1000, 0.01], [65536, 0.01], [1000, 0.1]]) {
 console.log('');
 console.log('WITNESS negative control (broken EH rejected) ' + (controlsOk ? 'ok' : 'FAIL'));
 
-const all = ok && controlsOk;
+// ===========================================================================
+// CHANGE-RESPONSE Witness -- ADWIN (RESEARCH.md 2.2). The anchor unique to this axis:
+// not "how close to a number" but "how well does it track CHANGE." Inject a KNOWN
+// changepoint, then MEASURE, against ground truth:
+//   - false-alarm rate on a STATIONARY run (GATE <= delta)
+//   - detection LATENCY per shift magnitude (small shifts allowed to take longer)
+//   - MISSED detection (~0 for a large shift)
+//   - adapted-window correctness (after a cut, mean/width reflect the NEW concept only)
+// plus the N4 NEGATIVE CONTROLS: a detector with the bound DISABLED must false-alarm,
+// and a NO-SHRINK variant must fail to adapt. Values are Bernoulli(p) (range R = 1).
+// ===========================================================================
+
+/** A deterministic mulberry32 PRNG -- every latency / false-alarm number is reproducible. */
+function mulberry32(seed) {
+    let a = seed >>> 0;
+    return () => {
+        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// A bound-DISABLED ADWIN: the cut test always fires while the window can be split, so it
+// shrinks to nothing every add -> on a STATIONARY stream it MUST false-alarm (rate >> delta).
+class BoundDisabledADWIN extends ADWIN {
+    _scanCut() { return this._total > 1; }   // BUG: no statistical bound -> cut always
+}
+// A NO-SHRINK ADWIN: the cut test never fires, so the window never drops the old regime ->
+// after a shift its mean stays a BLEND of both concepts. It MUST fail to adapt.
+class NoShrinkADWIN extends ADWIN {
+    _scanCut() { return false; }             // BUG: never shrinks -> never adapts
+}
+
+/** Flags raised on a stationary Bernoulli(0.5) stream / N -- the false-alarm rate. */
+function falseAlarmRate(Ctor, delta, N, seed) {
+    const ad = new Ctor(delta);
+    const r = mulberry32(seed);
+    let flags = 0;
+    for (let i = 0; i < N; i++) if (ad.add(r() < 0.5 ? 1 : 0)) flags++;
+    return flags / N;
+}
+
+/** Detection latency for a Bernoulli p1 -> p2 shift at CP; {lat, mean, width}, lat = Infinity if missed. */
+function detect(delta, p1, p2, CP, post, seed) {
+    const ad = new ADWIN(delta);
+    const r = mulberry32(seed);
+    for (let i = 0; i < CP; i++) ad.add(r() < p1 ? 1 : 0);
+    for (let j = 0; j < post; j++) {
+        if (ad.add(r() < p2 ? 1 : 0)) return { lat: j, mean: ad.mean, width: ad.width };
+    }
+    return { lat: Infinity, mean: ad.mean, width: ad.width };
+}
+
+let adOk = true;
+
 console.log('');
-console.log('WITNESS lite-adaptive (ExponentialHistogram) ' + (all ? 'ok' : 'FAIL'));
+console.log('CHANGE-RESPONSE Witness -- ADWIN v' + VERSION + ' (Bifet-Gavalda, SDM 2007): drift detection + ' +
+    'adaptive window (theoretical: false-alarm rate <= delta on a stationary stream)');
+console.log('');
+
+// --- false-alarm rate on a stationary stream: GATE <= delta ---
+console.log('  stationary false-alarm rate (Bernoulli(0.5), N=100k; theoretical <= delta):');
+console.log('  delta    false-alarm   theo (delta)  status');
+console.log('  -------  ------------  ------------  ------');
+for (const delta of [0.05, 0.1, 0.3]) {
+    let worst = 0;
+    for (const seed of [1, 2, 3]) {
+        const fa = falseAlarmRate(ADWIN, delta, 100000, seed);
+        if (fa > worst) worst = fa;
+    }
+    const cellOk = worst <= delta;
+    if (!cellOk) adOk = false;
+    console.log('  ' + String(delta).padEnd(7) + '  ' + pct(worst).padStart(12) + '  ' +
+        pct(delta).padStart(12) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+}
+
+// --- detection latency per shift magnitude (small shifts allowed to take longer) ---
+console.log('');
+console.log('  detection latency per shift magnitude (Bernoulli 0.5 -> 0.5+shift at item 60k; delta=0.1):');
+console.log('  shift    p1 -> p2      latency (items)  window mean after  missed  status');
+console.log('  -------  ------------  ---------------  -----------------  ------  ------');
+const CP = 60000, POST = 200000, DELTA = 0.1;
+for (const shift of [0.05, 0.1, 0.2, 0.3, 0.5]) {
+    const p2 = 0.5 + shift;
+    const d = detect(DELTA, 0.5, p2, CP, POST, 4242);
+    const missed = !Number.isFinite(d.lat);
+    // GATE: a large shift (>= 0.2) must NEVER be missed; every shift eventually detected here.
+    const cellOk = !missed;
+    const largeShiftOk = shift < 0.2 || (!missed && d.lat < 5000);
+    if (!cellOk || !largeShiftOk) adOk = false;
+    console.log('  ' + String(shift).padEnd(7) + '  ' +
+        ('0.50 -> ' + p2.toFixed(2)).padEnd(12) + '  ' +
+        (missed ? 'MISSED' : String(d.lat)).padStart(15) + '  ' +
+        (missed ? '--' : d.mean.toFixed(3)).padStart(17) + '  ' +
+        (missed ? 'yes' : 'no').padStart(6) + '  ' + (cellOk && largeShiftOk ? 'ok' : 'FAIL'));
+}
+
+// --- missed-detection ~0 for a large shift (repeat across seeds) ---
+console.log('');
+{
+    let misses = 0, runs = 0;
+    for (const seed of [10, 11, 12, 13, 14, 15, 16, 17]) {
+        const d = detect(DELTA, 0.2, 0.8, CP, POST, seed);
+        runs++;
+        if (!Number.isFinite(d.lat)) misses++;
+    }
+    const cellOk = misses === 0;
+    if (!cellOk) adOk = false;
+    console.log('  missed-detection over ' + runs + ' large-shift runs (0.2 -> 0.8): ' + misses +
+        ' missed -> ' + (cellOk ? 'ok' : 'FAIL'));
+}
+
+// --- adapted-window correctness: with the stream SETTLED on the new concept, the mean/width
+//     reflect the NEW concept only (measured after the full post-change run, not at the
+//     detection instant when only a handful of new items have been seen). ---
+console.log('');
+{
+    const settleCP = 40000, settlePost = 40000;
+    const ad = new ADWIN(DELTA);
+    const r = mulberry32(777);
+    let detectedAt = -1;
+    for (let i = 0; i < settleCP; i++) ad.add(r() < 0.2 ? 1 : 0);
+    for (let j = 0; j < settlePost; j++) if (ad.add(r() < 0.8 ? 1 : 0) && detectedAt < 0) detectedAt = j;
+    const meanOk = Math.abs(ad.mean - 0.8) < 0.05;   // window mean has moved to the new concept
+    const widthOk = ad.width <= settleCP;            // the old (mean-0.2) regime has been dropped
+    const cellOk = meanOk && widthOk;
+    if (!cellOk) adOk = false;
+    console.log('  adapted-window (0.2 -> 0.8): detected at +' + detectedAt +
+        ' items; after settling, window mean=' + ad.mean.toFixed(3) + ' (true new 0.800), width=' +
+        ad.width + ' (old regime dropped) -> ' + (cellOk ? 'ok' : 'FAIL'));
+}
+
+// --- true-vs-detected changepoint timeline ---
+console.log('');
+console.log('  true-vs-detected changepoint timeline (delta=0.1, 5 injected changepoints, mean shifts):');
+{
+    const ad = new ADWIN(DELTA);
+    const r = mulberry32(555);
+    const seg = 40000;
+    const means = [0, 1, 0.3, 1.5, 0.5, 2];   // 5 changepoints between 6 segments
+    let idx = 0;
+    let line = '';
+    for (let s = 0; s < means.length; s++) {
+        const mu = means[s];
+        const trueCP = s * seg;
+        let detectedAt = -1;
+        for (let i = 0; i < seg; i++) {
+            const cut = ad.add(mu + (r() - 0.5));   // tight noise around the segment mean
+            if (cut && detectedAt < 0 && s > 0 && idx >= trueCP) detectedAt = idx;
+            idx++;
+        }
+        if (s === 0) {
+            line += '    segment ' + s + ' mean=' + mu.toFixed(1) + ' (start, no change)\n';
+        } else {
+            const lat = detectedAt < 0 ? 'MISSED' : ('+' + (detectedAt - trueCP));
+            line += '    changepoint ' + s + ' @item ' + trueCP + ' (mean ' + means[s - 1].toFixed(1) +
+                ' -> ' + mu.toFixed(1) + ')  detected ' + lat + '\n';
+        }
+    }
+    process.stdout.write(line);
+}
+
+console.log('');
+console.log('WITNESS ADWIN (change response: false-alarm <= delta, latency, adapted window) ' + (adOk ? 'ok' : 'FAIL'));
+
+// --- ADWIN NEGATIVE CONTROLS (N4): the bound + the shrink must be load-bearing ---
+console.log('');
+console.log('NEGATIVE CONTROLS -- ADWIN with a broken part MUST be rejected by the same gates:');
+let adControlsOk = true;
+// 1) bound disabled -> MUST false-alarm on a stationary stream.
+{
+    const delta = 0.1;
+    const fa = falseAlarmRate(BoundDisabledADWIN, delta, 20000, 1);
+    const rejected = fa > delta;   // the false-alarm gate must REJECT it
+    if (!rejected) adControlsOk = false;
+    console.log('  bound-disabled ADWIN false-alarm=' + pct(fa) + ' vs delta=' + pct(delta) +
+        ' -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+// 2) no-shrink -> MUST fail to adapt (its mean stays a blend, not the new concept).
+{
+    const ad = new NoShrinkADWIN(0.1);
+    const r = mulberry32(9);
+    const cp = 40000, post = 40000;
+    for (let i = 0; i < cp; i++) ad.add(r() < 0.2 ? 1 : 0);
+    for (let j = 0; j < post; j++) ad.add(r() < 0.8 ? 1 : 0);
+    // true new concept mean is 0.8; a working detector adapts to it. no-shrink stays near
+    // the blend (0.2*cp + 0.8*post)/(cp+post) = 0.5 -- far from 0.8.
+    const adaptedFail = Math.abs(ad.mean - 0.8) > 0.1;
+    if (!adaptedFail) adControlsOk = false;
+    console.log('  no-shrink ADWIN post-shift mean=' + ad.mean.toFixed(3) + ' (true new 0.800, blend ~0.500)' +
+        ' -> ' + (adaptedFail ? 'REJECTED (fails to adapt, ok)' : 'adapted (FAIL)'));
+}
+console.log('');
+console.log('WITNESS ADWIN negative controls (broken bound + broken shrink rejected) ' + (adControlsOk ? 'ok' : 'FAIL'));
+
+const all = ok && controlsOk && adOk && adControlsOk;
+console.log('');
+console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN) ' + (all ? 'ok' : 'FAIL'));
 if (!all) process.exitCode = 1;

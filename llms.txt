@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 0.1.0
+Version: 0.2.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -18,11 +18,12 @@ approximate aggregates, and lite-adaptive is the WINDOWED / DECAYED / drift comp
 (cumulative -> lite-sketch; recency -> lite-adaptive).
 
 v0.1.0 ships the reference member -- ExponentialHistogram (sliding-window count / sum)
--- plus the shared time-source + fixed bucket-pool substrate. Roster to 1.0.0:
-ExponentialHistogram (0.1.0) -> ADWIN (0.2.0, drift) -> ForwardDecay (0.3.0, decay)
--> HeavyKeeper (0.4.0, decayed top-k) -> 1.0.0 (API stable at four members). Future
-members are pure-appended below this class + the shared substrate; prior members stay
-byte-identical, only the header + VERSION change (tree-shakeable named exports).
+-- plus the shared time-source + fixed bucket-pool substrate. v0.2.0 adds ADWIN
+(concept-drift detection + adaptive windowing). Roster to 1.0.0: ExponentialHistogram
+(0.1.0) -> ADWIN (0.2.0, drift) -> ForwardDecay (0.3.0, decay) -> HeavyKeeper (0.4.0,
+decayed top-k) -> 1.0.0 (API stable at four members). Future members are pure-appended
+below this class + the shared substrate; prior members stay byte-identical, only the
+header + VERSION change (tree-shakeable named exports).
 
 ## Exports (from the single main file Adaptive.js)
 
@@ -36,7 +37,7 @@ byte-identical, only the header + VERSION change (tree-shakeable named exports).
   HARD relative error `<= epsilon`. DGIM (the 0/1 count stream) is the `value = 1`
   special case. Fail closed on a bad W / epsilon (throws before allocation), a mode
   switch, a non-finite / decreasing `now`, or a non-positive value; queries never throw.
-- `VERSION` -- string, '0.1.0'.
+- `VERSION` -- string, '0.2.0'.
 
 ## ExponentialHistogram
 

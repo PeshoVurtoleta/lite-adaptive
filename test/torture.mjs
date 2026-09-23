@@ -2,8 +2,9 @@
 //
 // Proves the ZERO-GC claim the family sells: the ExponentialHistogram hot path -- add,
 // INCLUDING the amortized bucket merge cascade AND the expire sweep over MANY pool
-// wraps -- allocates 0 B/op after construction, retains nothing, and triggers no major
-// GC over a long run. Uses:
+// wraps -- AND the ADWIN hot path -- add, INCLUDING the cut-scan AND the drop-older
+// SHRINK on a drifting stream -- each allocates 0 B/op after construction, retains
+// nothing, and triggers no major GC over a long run. Uses:
 //   - @zakkster/lite-gc-profiler -- measureAllocs (bytes/op) + GcProfiler + checkNoGc
 //   - @zakkster/lite-leak        -- retention: do instances outlive their scope?
 // No gate output is a FAIL. ASCII-only.
@@ -20,7 +21,7 @@ async function main() {
     }
     const { GcProfiler, checkNoGc, measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { ExponentialHistogram } = await import('../Adaptive.js');
+    const { ExponentialHistogram, ADWIN } = await import('../Adaptive.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -35,6 +36,13 @@ async function main() {
             eh.sum();                                    // exercise the cold O(buckets) walk
             eh.clear();
             tracker.track(eh, noop, 'exponentialhistogram', { audit: true });
+
+            const ad = new ADWIN(0.1);
+            // a drifting stream: alternate the mean every 512 items -> forces cut-scan + shrink.
+            for (let k = 0; k < 4096; k++) ad.add(((k >> 9) & 1) ? 1000 : 0);
+            ad.mean; ad.variance; ad.width;              // exercise the cold getters (0 alloc)
+            ad.clear();
+            tracker.track(ad, noop, 'adwin', { audit: true });
         }
         return tracker.size();
     }
@@ -76,12 +84,30 @@ async function main() {
     const addTBytes = Math.max(0, Math.round(addTBpc));
     const addTOk = addTBytes === 0;
 
+    // ADWIN add: the important case is a DRIFTING stream, so every measured add runs the
+    // cut-scan AND periodically the drop-older SHRINK -- the amortized reshaping must not
+    // allocate. The mean alternates every 512 items (integer levels -> no arg boxing), which
+    // forces ADWIN to detect + shrink over and over. Primed to a churning window first.
+    const adwin = new ADWIN(0.1);
+    let adI = 0;
+    for (let k = 0; k < 40000; k++) { adwin.add(((adI >> 9) & 1) ? 1000 : 0); adI++; }
+    let adSink = 0;
+    const adStep = () => {
+        const cut = adwin.add(((adI >> 9) & 1) ? 1000 : 0);
+        adI = (adI + 1) | 0;
+        adSink = (adSink + (cut ? 1 : 0) + adwin.bucketCount) | 0;   // observe state (defeat DCE)
+    };
+    const adRes = measureAllocs(adStep, { iterations: 100000, batches: 8 });
+    const adBpc = adRes.bytesPerCall === null ? 0 : adRes.bytesPerCall;
+    const adBytes = Math.max(0, Math.round(adBpc));
+    const adOk = adBytes === 0;
+
     // ---- phase 2b: GC budget over a long hot run (millions of add + reshaping ops) ----
     const gc = new GcProfiler().start();
     const HOT = 4000000;
     let SINK = 0;
-    for (let i = 0; i < HOT; i++) { addStep(); addTStep(); }
-    SINK += addSink + addTSink;
+    for (let i = 0; i < HOT; i++) { addStep(); addTStep(); adStep(); }
+    SINK += addSink + addTSink + adSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -89,11 +115,15 @@ async function main() {
     // ---- phase 2c: arrayBuffers growth (the fixed pool grows no store across reuse) ----
     const abBefore = process.memoryUsage().arrayBuffers;
     const reuse = new ExponentialHistogram(2048, 0.01);
+    const reuseAd = new ADWIN(0.1);
     for (let c = 0; c < 500; c++) {
         for (let k = 0; k < 8192; k++) reuse.add();     // full window -> expire + cascade
         reuse.count();
         reuse.sum();
         reuse.clear();                                  // reuse the pool, no new store
+        for (let k = 0; k < 8192; k++) reuseAd.add(((k >> 9) & 1) ? 1000 : 0);  // drift -> shrink
+        reuseAd.mean; reuseAd.variance;
+        reuseAd.clear();                                // reuse the pool, no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -102,22 +132,24 @@ async function main() {
 
     // ---- verdict + GATE line ----
     const ok = trackedOk && live === 0 && findings.length === 0 &&
-        addOk && addTOk && report.ok && abOk;
+        addOk && addTOk && adOk && report.ok && abOk;
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=0' +
         ' | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) +
         ' | alloc=' + addBytes + ' B/op (ExponentialHistogram add count-mode) ' +
-        addTBytes + ' B/op (ExponentialHistogram add explicit-time)' +
+        addTBytes + ' B/op (ExponentialHistogram add explicit-time) ' +
+        adBytes + ' B/op (ADWIN add + cut-scan + shrink)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' (expected > 0)');
-        if (live !== 0) console.error('  retain: ' + live + ' ExponentialHistogram instances survived');
+        if (live !== 0) console.error('  retain: ' + live + ' instances survived');
         for (const f of findings) console.error('  finding ' + f.kind + ':' + f.reason);
         if (!addOk) console.error('  alloc ' + addBytes + ' B/op add count-mode (raw ' + addBpc + ')');
         if (!addTOk) console.error('  alloc ' + addTBytes + ' B/op add explicit-time (raw ' + addTBpc + ')');
+        if (!adOk) console.error('  alloc ' + adBytes + ' B/op ADWIN add (raw ' + adBpc + ')');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

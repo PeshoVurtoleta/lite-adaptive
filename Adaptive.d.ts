@@ -77,3 +77,54 @@ export class ExponentialHistogram {
     /** Reset to the empty window; reuse the pool (also unlocks the mode). */
     clear(): this;
 }
+
+/** Reserved constructor options for ADWIN (no keys yet; an unknown key throws). */
+export interface ADWINOptions {}
+
+/**
+ * ADWIN -- ADaptive WINdowing (Bifet-Gavalda, SDM 2007): a zero-GC concept-drift detector
+ * with NO fixed window size. It keeps the most-recent values in an exponential-histogram
+ * bucket list (its OWN (sum, sumSq, count) columns -- design-parity with ExponentialHistogram,
+ * a SEPARATE pool), grows the window while the stream is stationary, and SHRINKS it from the
+ * old end when a mean shift is statistically significant (the ADWIN2 variance-aware cut).
+ * ITEM-INDEXED: `add(x)` per item (no `now`); returns true iff a cut fired this add. The
+ * false-alarm rate on a stationary stream is bounded by `delta`. `add` is 0 B/op INCLUDING
+ * the cut-scan + the drop-older shrink; `mean` / `variance` / `width` are O(1) getters.
+ */
+export class ADWIN {
+    /**
+     * @param delta   confidence knob in (0, 1); the stationary false-alarm rate is bounded by
+     *                delta. Smaller -> fewer false alarms, longer detection latency.
+     * @param options reserved; an unknown key throws [lite-adaptive].
+     * Throws [lite-adaptive] on a bad delta / option BEFORE the pool is allocated.
+     */
+    constructor(delta: number, options?: ADWINOptions);
+
+    /** The confidence knob delta. O(1). */
+    readonly delta: number;
+
+    /** The current adaptive window size in items. O(1). */
+    readonly width: number;
+
+    /** The live bucket count (<= capacity). O(1). */
+    readonly bucketCount: number;
+
+    /** The fixed pool capacity in buckets. O(1). */
+    readonly capacity: number;
+
+    /** The mean over the current window (0 on an empty window). O(1). Never throws. */
+    readonly mean: number;
+
+    /** The variance over the current window (0 on an empty window, FP-clamped >= 0). O(1). Never throws. */
+    readonly variance: number;
+
+    /**
+     * Add one finite value to the window. HOT, 0 B/op incl. the merge cascade, the cut-scan,
+     * and the drop-older shrink. Returns true iff a cut fired (drift detected) this add.
+     * Throws [lite-adaptive] on a non-number / NaN / +-Infinity x (a byte-identical no-op).
+     */
+    add(x: number): boolean;
+
+    /** Reset to the empty window; reuse the pool. */
+    clear(): this;
+}

@@ -1,15 +1,16 @@
 // @zakkster/lite-adaptive -- the perf gate (repo-only; run:
 //   node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs).
 //
-// The zero-GC allocation gate as a test: the ExponentialHistogram hot path -- add,
-// INCLUDING the amortized merge cascade + expire sweep at a full, churning window --
+// The zero-GC allocation gate as a test: the ExponentialHistogram hot path (add + the
+// amortized merge cascade + expire sweep) AND the ADWIN hot path (add + the cut-scan +
+// the drop-older shrink on a drifting stream) --
 // must run N + kN ops with 0 old-gen GC / 0 arrayBuffer growth (the bucket pool is
 // fixed at construction, so `grows` -- a pool column's byte length -- shows a 0 delta)
 // and flat throughput. A `mustFail` control that allocates per op MUST trip the gate,
 // proving teeth.
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { ExponentialHistogram } from '../../Adaptive.js';
+import { ExponentialHistogram, ADWIN } from '../../Adaptive.js';
 
 const W = 1000;
 const EPS = 0.01;
@@ -59,6 +60,35 @@ const addTimeStream = {
     statsOf(s) { return { grows: grows(s) }; },
 };
 
+/** Zero-alloc counter for ADWIN: the sum column's byte length -- fixed at construction. */
+function growsAd(s) { return s.ad._sum.buffer.byteLength; }
+
+/**
+ * ADWIN add on a DRIFTING stream: open a bucket + merge cascade + the cut-scan + the
+ * drop-older SHRINK, all in-pool. The mean alternates every 512 items (integer levels ->
+ * no arg boxing), which forces ADWIN to detect + shrink repeatedly -- the amortized
+ * reshaping path that must stay flat + 0 old-gen.
+ */
+const adwinDriftStream = {
+    name: 'ADWIN add drifting stream (open + merge cascade + cut-scan + drop-older shrink)',
+    setup() {
+        const ad = new ADWIN(0.1);
+        for (let k = 0; k < 40000; k++) ad.add(((k >> 9) & 1) ? 1000 : 0);   // prime a churning window
+        return { ad, i: 40000, sink: 0 };
+    },
+    hot(s, n) {
+        const ad = s.ad;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            const cut = ad.add(((i >> 9) & 1) ? 1000 : 0);
+            i = (i + 1) | 0;
+            sink = (sink + (cut ? 1 : 0) + ad.bucketCount) | 0;   // observe state (defeat DCE)
+        }
+        s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsAd(s) }; },
+};
+
 /**
  * The teeth: a per-op call that builds a FRESH array each op -- it MUST trip the gate
  * (scavenges scale with n), proving the instrument catches a real allocation.
@@ -101,6 +131,6 @@ zgcSuite({
     // the ExponentialHistogram(1000, 0.01) pool is cap=366 buckets x (3 Float64 + 3 Int32) ~= 13 KB;
     // setup builds each scenario's state twice + harness overhead. grows delta 0 is the leak invariant.
     maxRetainedKB: 512,
-    scenarios: [addCountStream, addTimeStream],
+    scenarios: [addCountStream, addTimeStream, adwinDriftStream],
     mustFail: [mustFailAlloc],
 });

@@ -5,8 +5,8 @@
  * `npm run test:types`. Not executed; only type-checked.
  */
 
-import { ExponentialHistogram, VERSION } from '../../Adaptive.js';
-import type { ExponentialHistogramMode, ExponentialHistogramOptions } from '../../Adaptive.js';
+import { ExponentialHistogram, ADWIN, VERSION } from '../../Adaptive.js';
+import type { ExponentialHistogramMode, ExponentialHistogramOptions, ADWINOptions } from '../../Adaptive.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -56,3 +56,38 @@ eh.add(1, 'x');
 
 // @ts-expect-error -- count takes no arguments.
 eh.count(1);
+
+// --- ADWIN ------------------------------------------------------------------
+const ad = new ADWIN(0.1);
+const ad2 = new ADWIN(0.05, {});
+
+// getters
+const adDelta: number = ad.delta;
+const adWidth: number = ad.width;
+const adBc: number = ad.bucketCount;
+const adCap: number = ad.capacity;
+const adMean: number = ad.mean;
+const adVar: number = ad.variance;
+void adDelta; void adWidth; void adBc; void adCap; void adMean; void adVar;
+
+// add returns a boolean (drift detected?)
+const drift: boolean = ad.add(3.14);
+const drift2: boolean = ad2.add(-5);
+void drift; void drift2;
+
+// clear is chainable
+const adCleared: ADWIN = ad.clear();
+void adCleared;
+
+// options type is assignable
+const adOpts: ADWINOptions = {};
+void adOpts;
+
+// @ts-expect-error -- delta must be a number.
+new ADWIN('0.1');
+
+// @ts-expect-error -- add value must be a number.
+ad.add('x');
+
+// @ts-expect-error -- add takes exactly one argument.
+ad.add(1, 2);

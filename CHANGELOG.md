@@ -8,6 +8,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.2.0] - 2026-09-23
+
+The second member -- the marquee one: **ADWIN** (Bifet-Gavalda, SDM 2007), concept-drift
+detection with a data-driven adaptive window. Pure append: the `ExponentialHistogram`
+class and the M1 substrate are byte-identical; only the file header and `VERSION` change.
+
+### Added
+
+- **`ADWIN`** -- an item-indexed drift detector over its own variance-carrying
+  `(sum, sumSq, count)` bucket columns (design-parity with the EH pool, a separate fixed
+  pool). `add(x) -> boolean` appends a value, compresses buckets (at most 5 per level),
+  scans every bucket-boundary split for a statistically significant mean difference with
+  the **ADWIN2 variance-aware bound** at confidence `delta`, and on a detected cut DROPS
+  the older sub-window (the adaptive shrink) -- returning `true` on the detecting item.
+  Amortized O(1), **0 B/op including the cut-scan and the shrink**. The window GROWS while
+  the stream is stable and SHRINKS to the new concept on a change; `mean` / `variance` /
+  `width` getters report the current adaptive window. Accepts any finite real; the bound's
+  range tracks the running observed `[min, max]`. Fail closed: a bad `delta` throws before
+  allocation, a non-finite `x` is a byte-identical no-op, queries never throw. See
+  [`decisions/0003`](./decisions/0003-adwin.md).
+- **The change-response witness** (`test/witness.mjs`) -- the honesty anchor unique to the
+  drift members: against an injected changepoint it gates the stationary false-alarm rate
+  `<= delta`, a detection latency that scales with shift magnitude, ~0 missed detections on
+  a large shift, and adapted-window correctness -- with negative controls (a bound-disabled
+  detector must false-alarm; a no-shrink detector must fail to adapt) that are rejected by
+  the same gate.
+
+### Changed
+
+- `VERSION` -> `0.2.0` (package.json / `Adaptive.js` / llms.txt trinity); the file header
+  documents the two-member roster.
+
 ## [0.1.0] - 2026-09-23
 
 The first release -- the new package scaffold, the shared time-source + fixed
