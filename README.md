@@ -12,12 +12,15 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+![Stable](https://img.shields.io/badge/API-stable%201.0-brightgreen?style=flat-square)
 
 ## The recency family the ecosystem was missing
 
 Exact analytics over an unbounded, EVOLVING stream cost unbounded memory: to answer "how many events in the last W" exactly you must buffer the whole window (O(W) items). Worse, most summaries are CUMULATIVE -- they fold the whole stream and never forget, so they cannot tell you what is happening *right now*. `lite-adaptive` is a zero-dependency, zero-GC family of streaming summaries over the **time / recency** axis: it answers a recency question in *fixed* memory, and it can **forget**. Its signature is a shipped **recency witness** -- every member proves its MEASURED windowed error against the paper's THEORETICAL bound, next to the memory it saves.
 
 It is the fourth corner of the suite: **[@zakkster/lite-o1](https://www.npmjs.com/package/@zakkster/lite-o1)** is *exact* O(1), **[@zakkster/lite-filter](https://www.npmjs.com/package/@zakkster/lite-filter)** is approximate *membership*, **[@zakkster/lite-sketch](https://www.npmjs.com/package/@zakkster/lite-sketch)** is *cumulative* approximate aggregates, and `lite-adaptive` is the *windowed / decayed / drift* complement. The line is recency: cumulative -> lite-sketch; last-W / decayed / drift -> lite-adaptive.
+
+**Stable at 1.0.0.** The four-member core -- `ExponentialHistogram`, `ADWIN`, `ForwardDecay`, `HeavyKeeper` -- is frozen: signatures, options, and valid-input behavior will not change under 1.x (additive members may still land later; the core does not break). Follows semver from here.
 
 ```bash
 npm i @zakkster/lite-adaptive
@@ -164,8 +167,8 @@ import { HeavyKeeper } from '@zakkster/lite-adaptive';
 const hk = new HeavyKeeper(4, 1024, 16, { seed: 1 });   // d rows, w cells/row, k leaders
 for (const [tag, us] of spans) hk.add(tag, us);          // rank tags by TOTAL microseconds (weighted)
 
-const topN = new Uint32Array(16);
-const n = hk.topKInto(topN);                             // 0-alloc read of the current leaders
+const topN = new Float64Array(2 * 16);                   // 2*k floats: [key, estimate] pairs
+const n = hk.topKInto(topN);                             // 0-alloc: packs n pairs, returns entry count
 hk.forEach((key, est) => { /* render key with est */ }); // 0-alloc iteration (topK() allocates)
 ```
 
@@ -222,8 +225,8 @@ mean   variance   width   bucketCount   capacity   delta
 ```
 
 - **`delta`** -- the confidence / false-alarm knob in `(0, 1)`; smaller means fewer false alarms and (disclosed) longer detection latency. Throws `[lite-adaptive]` before allocation on a bad `delta`.
-- **`add(x)`** -- append a finite real `x` (item-indexed; no clock), run the ADWIN2 variance-aware cut over the bucket boundaries, and on a change DROP the older sub-window. Returns `true` exactly on the item that detects the change. Fail closed: a non-finite / non-number `x` is a byte-identical no-op.
-- **`addFrom(buf, i)`** -- the ZERO-BOX sibling of `add(x)`: reads `x = buf[i]` UNBOXED from a caller-owned `Float64Array`, for a caller whose fractional `x` (a HUD-computed duration) would box as a plain argument at a non-inlined boundary. Same drift-detection logic and boolean return as `add(x)`; a non-`Float64Array` `buf` or an out-of-range `i` throws `[lite-adaptive]`, and a non-finite `x` is a byte-identical no-op.
+- **`add(x)`** -- append a finite real `x` (item-indexed; no clock; `|x| <= sqrt(Number.MAX_VALUE)` so its square never overflows the variance), run the ADWIN2 variance-aware cut over the bucket boundaries, and on a change DROP the older sub-window. Returns `true` exactly on the item that detects the change. Fail closed: a non-finite / non-number `x`, or a finite `|x|` whose square would overflow, is a byte-identical no-op that throws `[lite-adaptive]`.
+- **`addFrom(buf, i)`** -- the ZERO-BOX sibling of `add(x)`: reads `x = buf[i]` UNBOXED from a caller-owned `Float64Array`, for a caller whose fractional `x` (a HUD-computed duration) would box as a plain argument at a non-inlined boundary. Same drift-detection logic and boolean return as `add(x)`; a non-`Float64Array` `buf` or an out-of-range `i` throws `[lite-adaptive]`, and a non-finite / square-overflowing `x` is a byte-identical no-op.
 - **`mean` / `variance` / `width`** -- the mean, variance, and item count of the CURRENT adaptive window; `width` shrinks on a detected change, then regrows while stable. Getters never throw (0 on an empty detector).
 
 ```js
@@ -261,9 +264,10 @@ HeavyKeeper.withAccuracy(k, targetError, options?)   // static: derive d, w from
 
 add(key, weight = 1) -> this   // HOT, amortized O(1), 0 B/op incl. the decay draw + the forest sift
 addFrom(buf, i) -> this        // HOT, 0 B/op: zero-box entry, key = buf[i], weight = buf[i+1] (unboxed)
-estimate(key) -> number        // COLD: max matching cell count (0 for an unseen key); never throws
+estimate(key) -> number        // COLD: max matching cell count (0 for unseen but VALID key; bad key throws)
 forEach(fn) -> void            // ALLOC-FREE iteration over the current top-k: fn(key, estimate)
-topKInto(buf) -> number        // fill a caller buffer with the top-k keys, 0-alloc; returns the count
+topKInto(buf) -> number        // pack the top-k into a Float64Array (>= 2*k) as [key, estimate] pairs,
+                               // 0-alloc; returns the entry count (a too-small buf throws)
 topK() -> Array                // COLD convenience; MAY allocate (not for the render path)
 clear() -> this                // 0-alloc reset (reuse the table + forest)
 
@@ -366,7 +370,7 @@ Gated quality numbers (`npm run verify`):
 - **Not an exact windowed aggregator.** For an EXACT sliding-window sum / min / max over a monoid, use `@zakkster/lite-o1` (`WindowFold`, `MonoDeque`, `RingLog`) -- bounded-capacity and exact. `lite-adaptive` is the approximate, unbounded-window complement.
 - **Not a cumulative sketch.** For whole-stream distinct-count / frequency / quantiles / top-k with no forgetting, use `@zakkster/lite-sketch`. The line is recency.
 - **Not a wall-clock timer.** The member never reads the clock; the caller supplies a monotone `now`.
-- **Not exact top-k.** HeavyKeeper (0.4.0) estimates the current heavy hitters in sublinear space -- exact top-k over an evolving stream is impossible in fixed memory. The four-member roster (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper) is now COMPLETE; 1.0.0 is the API-freeze milestone, not a new member.
+- **Not exact top-k.** HeavyKeeper estimates the current heavy hitters in sublinear space -- exact top-k over an evolving stream is impossible in fixed memory. The four-member core (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper) is FROZEN at 1.0.0 (the API-freeze milestone, not a new member); additive members may still land in a later minor without breaking the core.
 - **Not a cumulative top-k.** HeavyKeeper decays, so it answers "who dominates *now*"; the whole-stream heavy hitters that never forget are `@zakkster/lite-sketch`'s SpaceSaving.
 
 ## Ecosystem

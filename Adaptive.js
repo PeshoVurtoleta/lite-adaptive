@@ -45,6 +45,16 @@
  * Prior members (ExponentialHistogram, ForwardDecay) stay BYTE-IDENTICAL; only this header +
  * VERSION change above the append point (plus the additive ADWIN.addFrom inside the ADWIN class).
  *
+ * v1.0.0 is the API-FREEZE milestone: the four-member core (ExponentialHistogram, ADWIN,
+ * ForwardDecay, HeavyKeeper) is declared STABLE -- signatures, options, and valid-input behavior
+ * are frozen (additive post-1.0 members remain possible; the core does not break). No new member,
+ * no hot-path byte change. This release only TIGHTENS three previously-invalid-input paths to
+ * fail closed (all cold, 0 B/op): ForwardDecay count/sum/mean/rate now validate the query-time
+ * argument on an EMPTY summary (they no longer swallow a bad `now` and return 0); HeavyKeeper
+ * .estimate(key) throws on a non-safe-integer key (parity with add, no longer a silent 0); and
+ * HeavyKeeper.topKInto(buf) rejects a too-small buffer (length must be >= 2*k) instead of
+ * truncating silently. Prior VALID calls are byte-for-byte behaviorally identical.
+ *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
  *
@@ -52,7 +62,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.4.0';
+export const VERSION = '1.0.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -606,6 +616,15 @@ const ADWIN_KNOWN_OPTS = Object.freeze(Object.create(null));
 const ADWIN_M = 5;
 /** LEVELS -- the fixed number of size classes (a level-L bucket holds 2^L items). */
 const ADWIN_LEVELS = 64;
+/**
+ * ADWIN_X_MAX -- the largest |x| whose SQUARE is still finite (sqrt(Number.MAX_VALUE) ~= 1.34e154).
+ * A finite |x| above this makes x*x overflow to Infinity, which poisons _sumSq / _wsumSq: variance
+ * then reads Inf - Inf = NaN (clamped to 0) while mean stays finite, so every epsCut is Inf/NaN and
+ * drift detection freezes to false SILENTLY. |x| > ADWIN_X_MAX is therefore rejected fail-closed via
+ * the existing _badValue thrower (one extra comparison on the COLD reject branch -- 0 hot-path bytes).
+ * Astronomically above any real telemetry value.
+ */
+const ADWIN_X_MAX = Math.sqrt(Number.MAX_VALUE);
 
 /**
  * ADWIN -- ADaptive WINdowing (Bifet-Gavalda, SDM 2007): concept-drift detection with NO
@@ -629,8 +648,10 @@ const ADWIN_LEVELS = 64;
  * manipulation on the preallocated columns (no objects, no closures, no array literals).
  *
  * Fail closed: a bad delta / option throws `[lite-adaptive]` at the ctor door BEFORE any
- * allocation; `add(x)` validates `x` (a finite number) typeof-first, BEFORE any state
- * mutation -- a rejected add is a BYTE-IDENTICAL no-op; getters never throw (null is not zero).
+ * allocation; `add(x)` validates `x` (a finite number with |x| <= sqrt(Number.MAX_VALUE), so its
+ * square never overflows and poisons the variance) typeof-first, BEFORE any state mutation -- a
+ * rejected add is a BYTE-IDENTICAL no-op; the mean / variance getters throw `[lite-adaptive]` if
+ * the whole-window accumulator ever reaches a non-finite value (fail-closed, never a silent 0).
  */
 export class ADWIN {
     /**
@@ -713,12 +734,17 @@ export class ADWIN {
     get bucketCount() { return this._count; }
     /** The fixed pool capacity in buckets. O(1). */
     get capacity() { return this._cap; }
-    /** The mean over the current window (0 on an empty window). O(1). */
-    get mean() { return this._total > 0 ? this._wsum / this._total : 0; }
-    /** The variance over the current window (0 on an empty window, FP-clamped >= 0). O(1). */
+    /** The mean over the current window (0 on an empty window). O(1). Throws if the accumulator overflowed. */
+    get mean() {
+        if (this._total <= 0) return 0;
+        this._guardFinite();
+        return this._wsum / this._total;
+    }
+    /** The variance over the current window (0 on an empty window, FP-clamped >= 0). O(1). Throws if overflowed. */
     get variance() {
         const n = this._total;
         if (n <= 0) return 0;
+        this._guardFinite();
         const mean = this._wsum / n;
         const v = this._wsumSq / n - mean * mean;
         return v > 0 ? v : 0;
@@ -730,14 +756,16 @@ export class ADWIN {
      * bounded merge cascade, then scans every boundary split with the ADWIN2 variance-aware
      * epsCut and drops the oldest bucket(s) while a cut remains.
      *
-     * Fail closed: a non-number / NaN / +-Infinity `x` throws [lite-adaptive] (typeof-first, a
-     * BYTE-IDENTICAL no-op -- nothing is opened on a rejected add).
-     * @param {number} x  any finite real value.
+     * Fail closed: a non-number / NaN / +-Infinity `x`, or a finite |x| > sqrt(Number.MAX_VALUE)
+     * (~1.34e154, whose square would overflow to Infinity and silently poison the variance / drift
+     * test), throws [lite-adaptive] (typeof-first, a BYTE-IDENTICAL no-op -- nothing is opened).
+     * @param {number} x  a finite real value with |x| <= sqrt(Number.MAX_VALUE).
      * @returns {boolean} true iff a cut fired (drift detected) this add.
      */
     add(x) {
         // typeof guard FIRST, BEFORE any state mutation, so a rejected add is a byte-identical no-op.
-        if (typeof x !== 'number' || x !== x || x === Infinity || x === -Infinity) {
+        if (typeof x !== 'number' || x !== x || x === Infinity || x === -Infinity ||
+            x > ADWIN_X_MAX || x < -ADWIN_X_MAX) {   // reject a finite x whose square would overflow
             return this._badValue(x);
         }
         // running range over ALL x seen (widens monotonically; NOT rolled back on a shrink).
@@ -818,8 +846,9 @@ export class ADWIN {
      *
      * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer /
      * negative / out-of-range `i` (needs `i < buf.length`) throws [lite-adaptive]. A NaN /
-     * +-Infinity `buf[i]` throws (a byte-identical no-op).
-     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = the value.
+     * +-Infinity `buf[i]`, or a finite |buf[i]| > sqrt(Number.MAX_VALUE) (square would overflow),
+     * throws (a byte-identical no-op).
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = the value (|x| <= sqrt(MAX)).
      * @param {number} i the index of the value to read.
      * @returns {boolean} true iff a cut fired (drift detected) this add.
      */
@@ -830,7 +859,8 @@ export class ADWIN {
         const x = buf[i];   // UNBOXED Float64Array read -- the whole point (no argument box).
         // --- validate x FIRST (mirror add(); a Float64Array read is always a number, so add()'s
         // typeof branch is unreachable here and omitted). BYTE-IDENTICAL no-op on reject. ---
-        if (x !== x || x === Infinity || x === -Infinity) return this._badValue(x);
+        if (x !== x || x === Infinity || x === -Infinity ||
+            x > ADWIN_X_MAX || x < -ADWIN_X_MAX) return this._badValue(x);   // square would overflow
         // running range over ALL x seen (widens monotonically; NOT rolled back on a shrink).
         if (x < this._min) this._min = x;
         if (x > this._max) this._max = x;
@@ -968,7 +998,23 @@ export class ADWIN {
     /** @private Cold thrower for a bad value. */
     _badValue(x) {
         throw new TypeError(
-            '[lite-adaptive] ADWIN add x must be a finite number, got ' + String(x));
+            '[lite-adaptive] ADWIN add x must be a finite number with |x| <= sqrt(Number.MAX_VALUE) ' +
+            '(~1.34e154, so x*x stays finite), got ' + String(x));
+    }
+
+    /**
+     * @private Fail-closed guard for the query getters (mean / variance): a whole-window accumulator
+     * that reached a non-finite value (only via an astronomically long stream now the per-value square
+     * is bounded) must THROW, never silently read 0 / NaN. Cold path, 0 hot cost. Mirrors ForwardDecay.
+     */
+    _guardFinite() {
+        const s = this._wsum, sq = this._wsumSq;
+        if (s !== s || s === Infinity || s === -Infinity ||
+            sq !== sq || sq === Infinity || sq === -Infinity) {
+            throw new RangeError(
+                '[lite-adaptive] ADWIN window accumulator overflowed to a non-finite value; the summary ' +
+                'is fail-closed -- call clear() to reuse');
+        }
     }
 
     /** @private Cold thrower for a pool overflow (should be unreachable if CAP is correct). */
@@ -1278,9 +1324,9 @@ export class ForwardDecay {
      * @returns {number}
      */
     count(now) {
+        const t = this._queryTime(now);   // validate `now` BEFORE the empty early-exit (fail-closed)
         if (this._C === 0) return 0;
         this._guardFinite();
-        const t = this._queryTime(now);
         return this._C * Math.exp(-this._lambda * (t - this._L));
     }
 
@@ -1292,9 +1338,9 @@ export class ForwardDecay {
      * @returns {number}
      */
     sum(now) {
+        const t = this._queryTime(now);   // validate `now` BEFORE the empty early-exit (fail-closed)
         if (this._C === 0) return 0;
         this._guardFinite();
-        const t = this._queryTime(now);
         return this._Sv * Math.exp(-this._lambda * (t - this._L));
     }
 
@@ -1307,9 +1353,9 @@ export class ForwardDecay {
      * @returns {number}
      */
     mean(now) {
+        this._queryTime(now);   // validate `now` BEFORE the empty early-exit (fail-closed)
         if (this._C === 0) return 0;
         this._guardFinite();
-        this._queryTime(now);
         return this._Sv / this._C;
     }
 
@@ -1322,9 +1368,9 @@ export class ForwardDecay {
      * @returns {number}
      */
     rate(now) {
+        const t = this._queryTime(now);   // validate `now` BEFORE the empty early-exit (fail-closed)
         if (this._C === 0) return 0;
         this._guardFinite();
-        const t = this._queryTime(now);
         return this._C * Math.exp(-this._lambda * (t - this._L)) * this._lambda;
     }
 
@@ -1792,12 +1838,14 @@ export class HeavyKeeper {
 
     /**
      * The estimated count of `key` -- the max count over the d cells whose fingerprint matches
-     * (0 if none match). COLD, O(d). NEVER throws: a bad / unseen key reads 0 (null is not zero).
+     * (0 if none match). COLD, O(d). Fail closed: a non-safe-integer key throws [lite-adaptive]
+     * (the SAME guard `add` applies -- an invalid key is never silently 0). An unseen but VALID
+     * key reads 0 (null is not zero).
      * @param {number} key a safe integer.
      * @returns {number}
      */
     estimate(key) {
-        if (typeof key !== 'number' || !Number.isSafeInteger(key)) return 0;
+        if (typeof key !== 'number' || !Number.isSafeInteger(key)) return this._badKey(key);
         hkHash(key, this._seed);
         const fp = HK_H1 >>> 0;
         const base = HK_H2;
@@ -1827,17 +1875,17 @@ export class HeavyKeeper {
     }
 
     /**
-     * Write the current top-k as packed [key, estimate] pairs into `buf`, returning the number
-     * of pairs written (heap order, NOT sorted). 0-alloc. Writes min(size, floor(buf.length/2))
-     * pairs. Throws [lite-adaptive] on a non-Float64Array `buf` (a cold throw before any write).
-     * @param {Float64Array} buf a caller-owned Float64Array (>= 2*size for the full set).
-     * @returns {number} the number of [key, estimate] pairs written.
+     * Write the current top-k as packed [key, estimate] PAIRS into `buf` (2 Float64 slots per
+     * entry: buf[2i] = key, buf[2i+1] = estimate), returning the ENTRY COUNT written (heap order,
+     * NOT sorted). 0-alloc. Fail closed: `buf` must be a Float64Array of length >= 2*k (k = the
+     * max entries the top-k forest can hold, so a full set never truncates silently) -- a smaller
+     * buffer or a non-Float64Array throws [lite-adaptive] (a cold throw before any write).
+     * @param {Float64Array} buf a caller-owned Float64Array of length >= 2*k.
+     * @returns {number} the number of [key, estimate] entries written (<= k).
      */
     topKInto(buf) {
-        if (!(buf instanceof Float64Array)) return this._badBuf(buf, 0);
-        const cap = buf.length >> 1;
-        let n = this._hkN;
-        if (n > cap) n = cap;
+        if (!(buf instanceof Float64Array) || buf.length < 2 * this._k) return this._badTopKBuf(buf);
+        const n = this._hkN;
         const hk = this._hkKey, he = this._hkEst;
         for (let i = 0; i < n; i++) { buf[i * 2] = hk[i]; buf[i * 2 + 1] = he[i]; }
         return n;
@@ -2011,11 +2059,18 @@ export class HeavyKeeper {
             '[lite-adaptive] HeavyKeeper weight must be a positive integer, got ' + String(w));
     }
 
-    /** @private Cold thrower for a bad addFrom / topKInto buffer/index. */
+    /** @private Cold thrower for a bad addFrom buffer/index. */
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] HeavyKeeper.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
             'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+
+    /** @private Cold thrower for a too-small / non-Float64Array topKInto buffer. */
+    _badTopKBuf(buf) {
+        throw new TypeError(
+            '[lite-adaptive] HeavyKeeper.topKInto(buf) needs a Float64Array of length >= 2*k (k=' +
+            this._k + ', so it holds a full top-k as [key, estimate] pairs), got ' + String(buf));
     }
 
     /** @private Cold thrower for a non-function forEach callback. */

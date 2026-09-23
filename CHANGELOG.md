@@ -8,6 +8,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.0.0] - 2026-09-24
+
+The **API-FREEZE** milestone. The four-member core -- `ExponentialHistogram`, `ADWIN`,
+`ForwardDecay`, `HeavyKeeper` -- is declared STABLE: signatures, options, and valid-input
+behavior are frozen under 1.x. API frozen: four-member core stable (additive post-1.0
+members remain possible; the core does not break). No new member and no hot-path byte change;
+this release only tightens three previously-invalid-input paths to fail closed (all cold,
+0 B/op) and corrects a doc contract. Prior VALID calls are byte-for-byte behaviorally identical.
+
+### Changed
+
+- **API declared stable at 1.0.0.** The four-member core is frozen; the package follows
+  semantic versioning from here.
+
+### Fixed
+
+- **`ForwardDecay` fail-closed empty query.** `count(now)` / `sum(now)` / `mean(now)` /
+  `rate(now)` now validate the query-time argument (finite number `>= the last add time`)
+  BEFORE the empty-summary early exit, so an invalid `now` (negative, `NaN`, `Infinity`,
+  non-number) on an EMPTY summary throws `[lite-adaptive]` instead of silently returning `0`.
+  Valid use is unchanged: `count()` (no arg) and `count(<valid finite now>)` on an empty
+  summary still return `0`. Cold path, 0 B/op.
+- **`HeavyKeeper.estimate(key)` fail-closed key.** A non-safe-integer key now throws
+  `[lite-adaptive]` (the same guard `add` applies) instead of silently returning `0`. An
+  unseen but VALID key still reads `0`. Cold path.
+- **`HeavyKeeper.topKInto(buf)` buffer guard.** `buf` must be a `Float64Array` of length
+  `>= 2*k`; a too-small or non-`Float64Array` buffer now throws `[lite-adaptive]` instead of
+  silently truncating the top-k. Cold throw before any write, 0 B/op on the success path.
+
+### Documentation
+
+- **`topKInto` contract corrected.** `topKInto(buf)` packs the current top-k as
+  `[key, estimate]` PAIRS (2 `Float64` slots per entry) and returns the ENTRY COUNT; `buf`
+  must be a `Float64Array` of length `>= 2*k` (a `Float64Array` is required -- estimates and
+  large u32 keys need it). Fixed in `llms.txt`, `Adaptive.d.ts`, and `README.md` (the earlier
+  "top-k keys / Uint32Array" wording was wrong).
+
 ## [0.4.0] - 2026-09-23
 
 The fourth and FINAL member -- **HeavyKeeper** (Gong et al., USENIX ATC 2018): decayed /

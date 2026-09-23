@@ -33,7 +33,7 @@ function zipfKey(u, n, s, base) {
 }
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '0.4.0');
+    assert.equal(VERSION, '1.0.0');
 });
 
 test('constructor validates d / w / k fail-closed BEFORE allocation', () => {
@@ -126,13 +126,14 @@ test('add accepts safe-integer keys across the full range incl. large u32 and ne
     }
 });
 
-test('estimate never throws; returns 0 for unseen or bad keys', () => {
+test('estimate returns 0 for an unseen valid key; throws fail-closed on a bad key (T3)', () => {
     const hk = new HeavyKeeper(4, 256, 8);
     hk.add(7, 5);
     assert.equal(hk.estimate(7), 5);
+    assert.equal(hk.estimate(999999), 0, 'unseen but valid key -> 0');
+    // parity with add(): a key that is not a safe integer is rejected, not silently 0
     for (const bad of [1.5, NaN, Infinity, '7', null, undefined, {}, 7n]) {
-        assert.doesNotThrow(() => hk.estimate(bad));
-        assert.equal(hk.estimate(bad), 0, 'bad key -> 0');
+        assert.throws(() => hk.estimate(bad), /\[lite-adaptive\]/, 'bad key=' + String(bad));
     }
 });
 
@@ -263,10 +264,35 @@ test('topKInto writes packed [key, estimate] pairs and returns the count', () =>
     for (let i = 0; i < n; i++) seen.set(buf[i * 2], buf[i * 2 + 1]);
     const fromTopK = new Map(hk.topK().map((e) => [e.key, e.count]));
     for (const [key, est] of fromTopK) assert.equal(seen.get(key), est);
-    // a short buffer writes only what fits
+    // fail closed: a buffer smaller than 2*k throws -- no silent truncation
     const small = new Float64Array(4);
-    assert.equal(hk.topKInto(small), 2);
+    assert.throws(() => hk.topKInto(small), /\[lite-adaptive\]/);
     assert.throws(() => hk.topKInto([1, 2]), /\[lite-adaptive\]/);
+});
+
+test('topKInto boundary: exactly 2k-1 throws, exactly 2k and 2k+1 both work (T4)', () => {
+    const hk = new HeavyKeeper(4, 512, 6, { seed: 41 });
+    const r = mulberry32(17);
+    for (let i = 0; i < 30000; i++) hk.add(zipfKey(r(), 2000, 1.1, 0));
+    const K = hk.k;
+    // N-1: one Float64 short of 2*k -- must throw, never silently truncate.
+    assert.throws(() => hk.topKInto(new Float64Array(2 * K - 1)), /\[lite-adaptive\]/,
+        'length 2k-1 must throw');
+    // N: exactly 2*k -- must work and return the full entry count with [key,estimate] pairs.
+    const bufN = new Float64Array(2 * K);
+    const nAtN = hk.topKInto(bufN);
+    assert.equal(nAtN, hk.size, 'length 2k returns the entry count');
+    const fromTopK = new Map(hk.topK().map((e) => [e.key, e.count]));
+    for (let i = 0; i < nAtN; i++) assert.equal(bufN[i * 2 + 1], fromTopK.get(bufN[i * 2]));
+    // N+1: one Float64 more than 2*k -- must also work identically (the extra slot is untouched).
+    const bufN1 = new Float64Array(2 * K + 1);
+    const nAtN1 = hk.topKInto(bufN1);
+    assert.equal(nAtN1, nAtN, 'length 2k+1 returns the same entry count');
+    for (let i = 0; i < nAtN1 * 2; i++) assert.equal(bufN1[i], bufN[i], 'identical pairs written');
+    assert.equal(bufN1[2 * K], 0, 'the trailing extra slot is left untouched (fresh buffer default 0)');
+    // a non-Float64Array of otherwise-sufficient length is still rejected (type, not just size).
+    assert.throws(() => hk.topKInto(new Array(2 * K).fill(0)), /\[lite-adaptive\]/,
+        'a plain Array of sufficient length must still throw (not a Float64Array)');
 });
 
 test('clear resets to empty; arrays reused; PRNG replays identically', () => {
@@ -348,4 +374,30 @@ test('ADWIN.addFrom rejects a bad buffer / index / value fail-closed (byte-ident
     assert.equal(ad.width, w, 'width unchanged');
     assert.equal(ad.bucketCount, bc, 'bucketCount unchanged');
     assert.equal(ad.mean, m, 'mean unchanged');
+});
+
+test('ADWIN.addFrom rejects a FINITE square-overflowing buf[i] -- no silent drift freeze (T7)', () => {
+    // Mirrors add()'s T7 guard, but through the zero-box addFrom entry: buf[i] itself is finite
+    // (a real Float64 that survives being STORED in a Float64Array), yet buf[i]*buf[i] would
+    // overflow to Infinity and poison _wsumSq if accepted. Only NaN/Infinity were exercised for
+    // addFrom before this test; the finite-but-overflowing lane was defined in Adaptive.js
+    // (ADWIN_X_MAX check at the addFrom guard) but never actually measured by a node:test.
+    const XMAX = Math.sqrt(Number.MAX_VALUE);   // ~1.34e154
+    const ad = new ADWIN(0.1);
+    ad.add(1); ad.add(2);
+    const w = ad.width, bc = ad.bucketCount, m = ad.mean;
+    const buf = new Float64Array(1);
+    for (const bad of [1e160, -1e160, XMAX * 1.0000001, -(XMAX * 1.0000001), Number.MAX_VALUE, -Number.MAX_VALUE]) {
+        buf[0] = bad;
+        assert.throws(() => ad.addFrom(buf, 0), /\[lite-adaptive\]/, 'buf[0]=' + String(bad));
+    }
+    // a rejected addFrom is a byte-identical no-op: nothing squared, nothing accumulated.
+    assert.equal(ad.width, w, 'width unchanged after a rejected addFrom');
+    assert.equal(ad.bucketCount, bc, 'bucketCount unchanged after a rejected addFrom');
+    assert.equal(ad.mean, m, 'mean unchanged after a rejected addFrom');
+    // the domain edge holds through addFrom too: |x| == sqrt(MAX_VALUE) is accepted, not rejected.
+    buf[0] = XMAX;
+    assert.doesNotThrow(() => ad.addFrom(buf, 0), 'boundary |x| == sqrt(MAX_VALUE) is in-domain via addFrom');
+    buf[0] = -XMAX;
+    assert.doesNotThrow(() => ad.addFrom(buf, 0), 'boundary -sqrt(MAX_VALUE) is in-domain via addFrom');
 });

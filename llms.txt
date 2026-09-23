@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 0.4.0
+Version: 1.0.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -47,7 +47,7 @@ VERSION change).
 - `ADWIN` -- class. A zero-GC concept-drift detector with NO fixed window size (Bifet-
   Gavalda, SDM 2007). It keeps the most-recent values in an EH-style bucket list over its
   OWN variance-carrying `(sum, sumSq, count)` columns (design-parity with EH, a SEPARATE
-  fixed pool). `add(x) -> boolean` appends a finite real, compresses buckets (at most 5 per
+  fixed pool). `add(x) -> boolean` appends a finite real (|x| <= sqrt(MAX_VALUE)), compresses buckets (at most 5 per
   level), scans every bucket-boundary split of the window into an older `W0` and a newer
   `W1` with the ADWIN2 variance-aware (Bernstein) cut, and on a detected mean shift DROPS
   the older sub-window -- returning `true` on the detecting item. Amortized O(1), 0 B/op
@@ -79,15 +79,17 @@ VERSION change).
   matching fingerprint adds the weight, a colliding one is DECAYED with probability `b^(-count)`
   (a seeded xorshift32 draw) and evicted at count 0 -- so cold keys erode and the top-k tracks
   the CURRENT concept. Amortized O(1), 0 B/op incl. the decay draw + the forest sift.
-  `estimate(key)` is the max matching cell (0, never throws, for an unseen key); `forEach(fn)`
-  iterates the current top-k allocation-free; `topKInto(buf)` fills a caller buffer 0-alloc;
+  `estimate(key)` is the max matching cell (0 for an unseen but VALID key; a non-safe-integer key
+  throws, parity with add); `forEach(fn)` iterates the current top-k allocation-free; `topKInto(buf)`
+  packs the current top-k into a caller Float64Array as [key, estimate] pairs (2 floats per entry)
+  and returns the entry count, 0-alloc (buf length must be >= 2*k, else it throws);
   `topK()` is a COLD convenience that may allocate. `addFrom(buf, i)` is the zero-box entry
   (`key = buf[i]`, `weight = buf[i+1]` -- a large u32 key would box as a plain argument). Weight
   is a positive integer (rank by count, total time, bytes, ...). Keys are safe integers; a bad
   key/weight/buffer throws [lite-adaptive] typeof-first (byte-identical no-op). Far lower error
   than Space-Saving on skewed / evolving streams. No `merge` (it decays natively). Getters:
   `d` / `w` / `k` / `b` / `seed` / `bytes` / `size`.
-- `VERSION` -- string, '0.4.0'.
+- `VERSION` -- string, '1.0.0'.
 
 ## ExponentialHistogram
 
@@ -155,7 +157,8 @@ forgets EXACTLY at the edge); the error is relative and hard (not statistical).
   64) and never grows.
 
 Item-indexed (NO clock): the adaptive window is measured in ITEMS, not time. `add(x)` takes
-one finite real value per item and returns true iff a cut fired (drift detected) this add.
+one finite real value per item (|x| <= sqrt(Number.MAX_VALUE) ~= 1.34e154, so x*x never overflows
+the variance -- a larger finite x throws) and returns true iff a cut fired (drift detected) this add.
 
 The ADWIN2 variance-aware cut: after the insert + merge cascade, every boundary split of
 the window into W0 (older, n0 items) | W1 (newer, n1 items) is tested; a cut fires when
@@ -171,10 +174,11 @@ the scan repeats until no cut remains -- amortized O(1), 0 B/op incl. the cut-sc
 
 Hot surface:
 
-- add(x) -> boolean           Append a finite real, run the merge cascade + the cut-scan,
-                              drop the older sub-window on a cut. Returns true on the
-                              detecting item. Fail closed: a non-finite / non-number x
-                              throws [lite-adaptive] (typeof-first, BYTE-IDENTICAL no-op).
+- add(x) -> boolean           Append a finite real (|x| <= sqrt(Number.MAX_VALUE)), run the merge
+                              cascade + the cut-scan, drop the older sub-window on a cut. Returns
+                              true on the detecting item. Fail closed: a non-finite / non-number x,
+                              or a finite |x| whose square would overflow, throws [lite-adaptive]
+                              (typeof-first, BYTE-IDENTICAL no-op).
 - clear() -> this             Reset to the empty window; reuse the pool.
 - delta (getter)              The confidence knob.
 - width (getter)             The current adaptive window size in items.
@@ -276,11 +280,13 @@ Negative controls: fdNoRescale (rebase without the C,Sv rescale -> diverges) and
                                  UNBOXED from a packed [key, weight] Float64Array (a large u32 key
                                  >= 2^31 would box as a plain argument). Same validation + inline
                                  accumulate as add().
-- estimate(key) -> number        COLD; the max matching cell count (0 for an unseen key). Never throws.
+- estimate(key) -> number        COLD; the max matching cell count (0 for an unseen but VALID key;
+                                 a non-safe-integer key throws, parity with add).
 - forEach(fn) -> void            ALLOC-FREE iteration over the current top-k: fn(key, estimate).
                                  The render path (topK() may allocate; forEach never does).
-- topKInto(buf) -> number        Fill a caller Uint32Array/Float64Array with the top-k keys, 0-alloc;
-                                 returns the count written.
+- topKInto(buf) -> number        Pack the current top-k into a caller Float64Array as [key, estimate]
+                                 pairs (2 floats per entry), 0-alloc; returns the entry count (<= k).
+                                 buf must be a Float64Array of length >= 2*k, else it throws.
 - topK() -> Array                COLD convenience; MAY allocate. Not for the hot/render path.
 - clear() -> this                0-alloc reset (reuse the table + forest arrays).
 - d / w / k / b / seed / bytes / size    Getters: the shape, the decay base, the PRNG seed, the

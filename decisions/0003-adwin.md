@@ -58,10 +58,19 @@ only the file header roster comment + `VERSION` + the appended `ADWIN` class cha
    (drift detected) this add. Getters: `mean` / `variance` / `width` / `bucketCount` /
    `capacity` / `delta`; `clear()` reuses the pool.
 
-4. **The value domain is any FINITE real.** `add(x)` accepts any finite number (zero,
-   negative, fractional); a non-number / `NaN` / `+-Infinity` throws `[lite-adaptive]`.
-   The running range `R = max - min` tracks all `x` seen, so the Bernstein bound scales
-   to the actual data range (no `[0,1]` pre-normalization required of the caller).
+4. **The value domain is any finite real WHOSE SQUARE IS FINITE, i.e. `|x| <= sqrt(MAX_VALUE)`
+   (`ADWIN_X_MAX ~= 1.34e154`).** `add(x)` accepts any such number (zero, negative, fractional);
+   a non-number / `NaN` / `+-Infinity`, OR a finite `x` with `|x| > ADWIN_X_MAX`, throws
+   `[lite-adaptive]`. The upper bound is a FAIL-CLOSED guard, not a limitation of the algorithm:
+   ADWIN squares every value into `sumSq` / `wsumSq` for its Bernstein variance term, so a finite
+   `x` whose square overflows to `Infinity` would poison the accumulators -- `variance` would then
+   read `0` (via `Inf - Inf = NaN` clamped) and every `epsCut` would be `Inf/NaN`, permanently
+   freezing drift detection to `false` with NO throw (a silent fail-open of the member's core
+   function). Rejecting `|x| > ADWIN_X_MAX` at the door closes that hole. DEFENSE-IN-DEPTH: because
+   summing many in-domain squares can still overflow `wsumSq`, the `mean` / `variance` getters
+   `_guardFinite()` (mirroring ForwardDecay) and THROW on a non-finite accumulator rather than
+   returning `0`. The running range `R = max - min` tracks all `x` seen, so the Bernstein bound
+   scales to the actual data range (no `[0,1]` pre-normalization required of the caller).
 
 5. **Fail closed, typeof-first, BEFORE any state mutation (the M1 reviewer lesson).** A
    bad `delta` / unknown option throws `[lite-adaptive]` at the ctor door BEFORE any

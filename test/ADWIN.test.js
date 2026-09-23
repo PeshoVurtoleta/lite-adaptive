@@ -16,7 +16,7 @@ function mulberry32(seed) {
 }
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '0.4.0');
+    assert.equal(VERSION, '1.0.0');
 });
 
 test('constructor validates delta fail-closed BEFORE allocation', () => {
@@ -64,10 +64,45 @@ test('add rejects a non-finite x fail-closed (byte-identical no-op)', () => {
     assert.equal(ad.mean, s, 'mean unchanged after a rejected add');
 });
 
-test('add accepts any finite real: zero, negatives, fractions', () => {
+test('add accepts any finite real whose square is finite: zero, negatives, fractions, boundary', () => {
     const ad = new ADWIN(0.1);
     assert.doesNotThrow(() => { ad.add(0); ad.add(-5); ad.add(3.14159); ad.add(-2.5e9); });
     assert.equal(ad.width, 4);
+    // the domain edge: |x| == sqrt(MAX_VALUE) squares to exactly MAX_VALUE (finite) and is accepted.
+    const XMAX = Math.sqrt(Number.MAX_VALUE);
+    assert.doesNotThrow(() => { ad.add(XMAX); ad.add(-XMAX); }, 'boundary |x| == sqrt(MAX_VALUE) is in-domain');
+});
+
+test('add rejects a FINITE x whose square would overflow -- no silent drift freeze (T7)', () => {
+    // A finite x > sqrt(MAX_VALUE) makes x*x === Infinity, which poisons _sumSq/_wsumSq: variance
+    // would silently read 0 and every cut-scan's epsCut would be Inf/NaN, permanently freezing drift
+    // detection to false with no throw. The guard rejects such x fail-closed instead.
+    const XMAX = Math.sqrt(Number.MAX_VALUE);   // ~1.34e154
+    const ad = new ADWIN(0.1);
+    ad.add(1); ad.add(2);
+    const w = ad.width, bc = ad.bucketCount, s = ad.mean;
+    for (const bad of [1e160, -1e160, XMAX * 1.0000001, -(XMAX * 1.0000001), Number.MAX_VALUE, -Number.MAX_VALUE]) {
+        assert.throws(() => ad.add(bad), /\[lite-adaptive\]/, 'x=' + String(bad));
+    }
+    // a rejected add is a byte-identical no-op: nothing squared, nothing accumulated.
+    assert.equal(ad.width, w);
+    assert.equal(ad.bucketCount, bc);
+    assert.equal(ad.mean, s);
+    // and the guard does NOT suppress legitimate drift: an abrupt real shift still cuts.
+    const drift = new ADWIN(0.1);
+    let cuts = 0;
+    for (let i = 0; i < 40000; i++) if (drift.add(i < 20000 ? 0 : 1000)) cuts++;
+    assert.ok(cuts >= 1, 'the value guard must not suppress a real drift, got cuts=' + cuts);
+});
+
+test('mean / variance throw fail-closed if the window accumulator overflows to non-finite', () => {
+    // Defense-in-depth (mirrors ForwardDecay._guardFinite): even with the per-value guard, summing
+    // enough in-domain squares can overflow _wsumSq. The getters must THROW, never return 0.
+    const XMAX = Math.sqrt(Number.MAX_VALUE);
+    const ad = new ADWIN(0.1);
+    for (let i = 0; i < 10; i++) ad.add(XMAX);   // each square == MAX_VALUE; the running sum overflows
+    assert.throws(() => ad.variance, /\[lite-adaptive\]/, 'variance on a poisoned accumulator throws');
+    assert.throws(() => ad.mean, /\[lite-adaptive\]/, 'mean on a poisoned accumulator throws');
 });
 
 test('a stationary run grows the window and returns false (no drift)', () => {

@@ -306,13 +306,21 @@ export class HeavyKeeper {
      */
     addFrom(buf: Float64Array, i: number): this;
 
-    /** The estimated total for `key` (the max matching cell; 0 for an unseen key). COLD. Never throws. */
+    /**
+     * The estimated total for `key` (the max matching cell; 0 for an unseen but VALID key). COLD.
+     * Fail closed: a non-safe-integer key throws [lite-adaptive] (parity with `add`).
+     */
     estimate(key: number): number;
 
     /** Iterate the current top-k allocation-free: `fn(key, estimate)` per leader. The render path. */
     forEach(fn: (key: number, estimate: number) => void): void;
 
-    /** Fill `buf` with the current top-k keys (0-alloc); returns the count written. */
+    /**
+     * Write the current top-k into `buf` as packed [key, estimate] PAIRS (2 Float64 slots per
+     * entry: buf[2i] = key, buf[2i+1] = estimate) and return the ENTRY COUNT written (<= k),
+     * NOT sorted. 0-alloc. `buf` must be a Float64Array of length >= 2*k (a Float64Array is
+     * required: estimates and large u32 keys need it) -- a smaller buffer throws [lite-adaptive].
+     */
     topKInto(buf: Float64Array): number;
 
     /** The current top-k as an array of { key, count }. COLD -- MAY allocate (not the render path). */

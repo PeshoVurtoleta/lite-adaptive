@@ -7,7 +7,7 @@ import { ForwardDecay, VERSION } from '../Adaptive.js';
 const LN2 = Math.LN2;
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '0.4.0');
+    assert.equal(VERSION, '1.0.0');
 });
 
 test('constructor validates halfLife fail-closed BEFORE any field init', () => {
@@ -366,4 +366,29 @@ test('a rejected add does NOT advance the count-mode tick or touch C/Sv', () => 
     // a mode switch attempt is also a no-op
     assert.throws(() => fd.add(5), /\[lite-adaptive\]/);
     assert.equal(fd.count(), c, 'count unchanged after a rejected mode switch');
+});
+
+test('empty-summary query validates `now` fail-closed BEFORE the empty early-exit (T2)', () => {
+    // A freshly-constructed summary is empty (C === 0) with the default query time _now = 0.
+    // An invalid query-time argument must THROW, not be swallowed by the empty-state 0 return.
+    const empty = new ForwardDecay(1000);
+    for (const q of ['count', 'sum', 'mean', 'rate']) {
+        for (const bad of [-1, NaN, Infinity, -Infinity, 'x', null, {}]) {
+            assert.throws(() => empty[q](bad), /\[lite-adaptive\]/, q + '(' + String(bad) + ') on empty');
+        }
+        // valid use on empty still returns 0 (no arg, or a valid finite now >= _now === 0)
+        assert.equal(empty[q](), 0, q + '() on empty is 0');
+        assert.equal(empty[q](0), 0, q + '(0) on empty is 0');
+        assert.equal(empty[q](5), 0, q + '(5) on empty is 0');
+        // -0 is a valid finite number and -0 < 0 is false, so it is NOT rejected (-0 >= _now === 0).
+        assert.equal(empty[q](-0), 0, q + '(-0) on empty is 0 (not thrown)');
+        // undefined explicitly (as opposed to omitted) must resolve identically to omitted.
+        assert.equal(empty[q](undefined), 0, q + '(undefined) on empty is 0');
+    }
+    // The same holds after clear() re-empties the summary.
+    const cleared = new ForwardDecay(1000);
+    cleared.add(); cleared.add();
+    cleared.clear();
+    assert.throws(() => cleared.count(-1), /\[lite-adaptive\]/, 'count(-1) after clear throws');
+    assert.equal(cleared.count(), 0, 'count() after clear is 0');
 });
