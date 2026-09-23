@@ -2,7 +2,16 @@
 
 > Zero-GC streaming summaries over the TIME / RECENCY axis that **witness their recency against the paper's bound** -- ExponentialHistogram for sliding-window count / sum, in fixed memory, over a caller-supplied clock.
 
-![zero deps](https://img.shields.io/badge/deps-0-brightgreen) ![zero GC](https://img.shields.io/badge/hot--path-0%20B%2Fop-brightgreen) ![ESM](https://img.shields.io/badge/module-ESM-blue) ![types](https://img.shields.io/badge/types-included-blue) ![license](https://img.shields.io/badge/license-MIT-blue)
+[![npm version](https://img.shields.io/npm/v/@zakkster/lite-adaptive.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-adaptive)
+[![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
+![Zero-GC](https://img.shields.io/badge/Zero--GC-Engine-00C853?style=for-the-badge&logo=leaf&logoColor=white)
+[![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-adaptive?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-adaptive)
+[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-adaptive?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-adaptive)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-adaptive?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-adaptive)
+![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
+![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
 
 ## The recency family the ecosystem was missing
 

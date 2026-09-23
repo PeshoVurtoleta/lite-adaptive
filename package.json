@@ -67,5 +67,18 @@
   "engines": {
     "node": ">=18"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-adaptive.git"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-adaptive#readme",
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-adaptive/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
   "sideEffects": false
 }
