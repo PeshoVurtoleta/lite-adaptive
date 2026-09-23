@@ -1,0 +1,71 @@
+{
+  "name": "@zakkster/lite-adaptive",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "version": "0.1.0",
+  "description": "Zero-dependency, zero-GC family of APPROXIMATE, sublinear-space streaming summaries over the TIME / RECENCY axis that witnesses its RECENCY against the paper's theoretical bound: ExponentialHistogram (sliding-window count / sum) over a caller-supplied monotone time source and a preallocated fixed bucket pool. Tree-shakeable named exports.",
+  "type": "module",
+  "main": "./Adaptive.js",
+  "module": "./Adaptive.js",
+  "types": "./Adaptive.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Adaptive.d.ts",
+      "node": "./Adaptive.js",
+      "import": "./Adaptive.js",
+      "default": "./Adaptive.js"
+    }
+  },
+  "files": [
+    "Adaptive.js",
+    "Adaptive.d.ts",
+    "llms.txt",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:types": "tsc -p test/types/tsconfig.json",
+    "torture": "node --expose-gc test/torture.mjs",
+    "witness": "node test/witness.mjs",
+    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
+    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run test:perf"
+  },
+  "keywords": [
+    "streaming",
+    "sliding-window",
+    "windowed",
+    "recency",
+    "time-window",
+    "approximate",
+    "exponential-histogram",
+    "dgim",
+    "windowed-count",
+    "windowed-sum",
+    "drift",
+    "decay",
+    "adaptive",
+    "estimation",
+    "zero-gc",
+    "gc",
+    "garbage-collection",
+    "typed-array",
+    "tree-shakeable",
+    "zero-dependency",
+    "witness"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-perf-gate": "^1.4.2",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
+}

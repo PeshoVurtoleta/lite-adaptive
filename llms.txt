@@ -1,0 +1,110 @@
+# @zakkster/lite-adaptive
+
+Version: 0.1.0
+License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
+Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
+Node: >= 18.
+
+## What it is
+
+A zero-dependency, zero-GC family of APPROXIMATE, sublinear-space streaming
+summaries over the TIME / RECENCY axis -- one small structure per question you can
+only answer about the RECENT or CHANGING stream (sliding-window count / sum, drift,
+decay), never the whole of it. It WITNESSES its RECENCY: every member proves its
+MEASURED windowed error against the paper's THEORETICAL bound, next to the memory it
+saves. It is the fourth corner of the suite -- @zakkster/lite-o1 is EXACT O(1),
+@zakkster/lite-filter is approximate MEMBERSHIP, @zakkster/lite-sketch is CUMULATIVE
+approximate aggregates, and lite-adaptive is the WINDOWED / DECAYED / drift complement
+(cumulative -> lite-sketch; recency -> lite-adaptive).
+
+v0.1.0 ships the reference member -- ExponentialHistogram (sliding-window count / sum)
+-- plus the shared time-source + fixed bucket-pool substrate. Roster to 1.0.0:
+ExponentialHistogram (0.1.0) -> ADWIN (0.2.0, drift) -> ForwardDecay (0.3.0, decay)
+-> HeavyKeeper (0.4.0, decayed top-k) -> 1.0.0 (API stable at four members). Future
+members are pure-appended below this class + the shared substrate; prior members stay
+byte-identical, only the header + VERSION change (tree-shakeable named exports).
+
+## Exports (from the single main file Adaptive.js)
+
+- `ExponentialHistogram` -- class. A zero-GC sliding-window COUNT / SUM summary over a
+  preallocated pool of `(timestamp, size)` buckets grouped by level (Datar-Gionis-Indyk-
+  Motwani, SODA 2002). `add(now)` / `add(now, value)` is amortized O(1), 0 B/op -- it
+  opens a level-0 bucket, merges the two oldest at any level that exceeds
+  `k = ceil(1/(2*epsilon)) + 1` (a bounded cascade), and expires buckets older than
+  `now - W`. Driven by a caller-supplied MONOTONE time source; the member never reads
+  the wall clock. `count()` / `sum()` / `query()` are COLD windowed estimates within a
+  HARD relative error `<= epsilon`. DGIM (the 0/1 count stream) is the `value = 1`
+  special case. Fail closed on a bad W / epsilon (throws before allocation), a mode
+  switch, a non-finite / decreasing `now`, or a non-positive value; queries never throw.
+- `VERSION` -- string, '0.1.0'.
+
+## ExponentialHistogram
+
+    new ExponentialHistogram(W, epsilon, options?)
+
+- W: window size; a finite number > 0 (items in count mode, or the `now`-unit span in
+  explicit mode).
+- epsilon: relative-error knob in (0, 1). Smaller -> more buckets -> tighter windowed
+  error. `k = ceil(1/(2*epsilon)) + 1` buckets per level;
+  `CAP = (k+1) * (ceil(log2(W/(k+1))) + 2) + 2` buckets (a fixed pool, never grows).
+- options: reserved object; an unknown key throws [lite-adaptive].
+- Constructor throws [lite-adaptive] typeof-first on a bad W / epsilon / option BEFORE
+  the pool is allocated (nothing half-built escapes).
+
+Time modes (LOCKED at the first add, a switch throws [lite-adaptive]):
+
+- EXPLICIT: add(now) / add(now, value). `now` is a finite number, strictly NON-
+  DECREASING across calls (a decrease throws). The member never reads the wall clock.
+- COUNT: add() / add(undefined, value). The member auto-increments an internal tick
+  per add (the "last N items" convenience).
+
+Hot surface (add is amortized O(1), zero allocation incl. the merge / expire reshaping):
+
+- add(now?, value?) -> this   Open a bucket at `now` (or the auto-tick) with `value`
+                              (default 1), run the bounded merge cascade, expire the
+                              window edge. Fail closed: a mode switch, a non-finite /
+                              decreasing `now`, or a non-positive value throws
+                              [lite-adaptive] (typeof-first, BYTE-IDENTICAL no-op).
+- count() -> number           The windowed COUNT (population) over the last W. COLD,
+                              O(levels). Relative error <= epsilon. Never throws (0 on empty).
+- sum() -> number             The windowed SUM (of values) over the last W. COLD,
+                              O(buckets). Relative error <= epsilon. Never throws.
+- query() -> number           The primary windowed estimate -- an alias of count(). COLD.
+- clear() -> this             Reset to the empty window; reuse the pool (unlocks the mode).
+- windowSize / epsilon        Getters: the window; the error knob.
+- bucketCount / capacity      Getters: the live bucket count; the fixed pool capacity.
+- k / levels                  Getters: the per-level bound; the number of size classes.
+- mode (getter)               'unset' | 'explicit' | 'count' -- the locked time mode.
+
+Recency contract (the honesty anchor): the witness drives an evolving stream against an
+exact ring-of-the-last-W oracle, measures the windowed relative error, and GATES it
+`<= epsilon` on EVERY query across the W x epsilon sweep, plus a shifting-rate stream;
+a broken EH (no straddle half-correction) is REJECTED by the same gate. Space
+co-headline: the fixed bucket pool vs the exact ring's O(W). The window is HARD (EH
+forgets EXACTLY at the edge); the error is relative and hard (not statistical).
+
+## The time source + the bucket pool (ADR 0001)
+
+A caller-supplied MONOTONE `now` (logical tick or ms; count-mode convenience when
+omitted); the member never reads the wall clock (deterministic, testable). A fixed,
+preallocated bucket pool over a Struct-of-Arrays (Float64 timestamp / earliest-time /
+size, Int32 per-level linkage + free-list) with no per-op allocation -- the lite-o1
+fixed-capacity zero-GC discipline on the recency axis. ADR 0002 records the EH merge /
+expire / query + the error bound + the DGIM note + the mode-lock.
+
+## Scripts
+
+- npm test          -- node:test behavioral + fail-closed suite
+- npm run witness   -- the recency witness (windowed error vs the epsilon bound + negative control)
+- npm run torture   -- the 0 B/op leak + GC-profiler gate on add incl. reshaping (node --expose-gc)
+- npm run test:perf -- flat-throughput perf gate + a must-allocate control
+- npm run test:types-- the ambient type-surface compile check
+- npm run verify    -- test + test:types + torture + witness + test:perf (the release gate)
+
+## Roadmap
+
+ExponentialHistogram (0.1.0, sliding-window count / sum) -> ADWIN (0.2.0, drift +
+adaptive window) -> ForwardDecay (0.3.0, time-decayed aggregates) -> HeavyKeeper
+(0.4.0, decayed / windowed heavy hitters) -> 1.0.0 (API declared stable at four
+members). Post-1.0: SlidingHyperLogLog, a scalar DriftDetector, a decayed Reservoir,
+windowed Count-Min / quantiles -- one per release.
