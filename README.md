@@ -49,6 +49,7 @@ last1000.count();                          // ~1000  (an exact ring would hold 1
 - [ADWIN](#adwin)
 - [ForwardDecay](#forwarddecay)
 - [HeavyKeeper](#heavykeeper)
+- [SlidingHyperLogLog](#slidinghyperloglog)
 - [API reference](#api-reference)
 - [Composability](#composability)
 - [Zero-GC design notes](#zero-gc-design-notes)
@@ -67,7 +68,8 @@ A recency summary is a promise: "I use `X` bytes and my answer about the last `W
 - **ExponentialHistogram** -- sliding-window count / sum ("how many / how much in the last `W`?") in a fixed pool of `(timestamp, size)` buckets, with a *hard* windowed relative-error bound `<= epsilon`. The reference member; DGIM (the 0/1 count stream) is its `value = 1` special case.
 - **ADWIN** -- concept-drift detection with NO fixed window size (Bifet-Gavalda, SDM 2007): `add(x) -> boolean` tells you the moment the stream's mean *changed*, and the adaptive window GROWS while stable and SHRINKS to the new concept on a detected change. `mean` / `variance` / `width` report the current stable window. The marquee member.
 - **ForwardDecay** -- time-decayed count / sum / mean / rate (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009) in **O(1) space** (two scalar accumulators, no pool): every element's weight halves every `halfLife`, so recent data dominates and old data *fades* smoothly instead of dropping at an edge. `add(now?, value?)` accepts any finite real (signed); `count` / `sum` / `mean` / `rate` are O(1) queries, EXACT modulo floating point.
-- **HeavyKeeper** -- decayed / windowed heavy hitters (Gong et al., USENIX ATC 2018): the top-k keys dominating the stream *right now*. A `d x w` fingerprint table with probabilistic exponential decay on collision (cold keys erode) + an intrusive top-k min-forest. `add(key, weight = 1)` ranks by count or any additive weight; `forEach` / `topKInto` read the leaders 0-alloc. Far lower error than Space-Saving on skewed, evolving streams. The final member.
+- **HeavyKeeper** -- decayed / windowed heavy hitters (Gong et al., USENIX ATC 2018): the top-k keys dominating the stream *right now*. A `d x w` fingerprint table with probabilistic exponential decay on collision (cold keys erode) + an intrusive top-k min-forest. `add(key, weight = 1)` ranks by count or any additive weight; `forEach` / `topKInto` read the leaders 0-alloc. Far lower error than Space-Saving on skewed, evolving streams. The final member of the frozen 1.0.0 core.
+- **SlidingHyperLogLog** -- windowed distinct-count (Chabchoub-Hebrail, "Sliding HyperLogLog", 2010): "how many *distinct* keys in the last `W`?" in fixed preallocated space at HLL accuracy (the recency sibling of `@zakkster/lite-sketch`'s cumulative HyperLogLog). An `m = 2^p` register bank where each register keeps a small fixed LFPM ring of `(timestamp, rho)` maxima; `add(now, key)` / `addFrom` are 0-alloc incl. the windowed eviction, `count(w?)` runs Ertl's estimator over the live window with a `1.04 / sqrt(m)` standard error. The first additive post-1.0 member (1.1.0).
 - **A caller-owned time source** -- `add(now)` with a monotone `now` (a logical tick or ms), or `add()` in count mode for the "last N items" window. The member never reads the clock, so witnesses are exactly reproducible.
 - **The recency witness** -- measured windowed error vs the theoretical bound, printed side by side, with the exact-ring foil whose memory climbs O(W) while the histogram stays a fixed sliver.
 - **Zero runtime dependencies**, ESM, tree-shakeable named exports, TypeScript types, and a **0 bytes/op hot path** -- *including* the amortized bucket merge / expire reshaping -- proven by a leak + GC-profiler torture gate.
@@ -182,6 +184,32 @@ The weighted-miss rule decays **once** (not once per weight unit): a per-unit de
 The PRNG is a seeded `Uint32` xorshift (`seed` option + getter, never `Math.random`), so the decay -- and therefore the top-k and the witness -- is fully reproducible. Keys are safe integers; a bad key / weight / buffer throws `[lite-adaptive]` typeof-first (a byte-identical no-op). There is no `merge`: HeavyKeeper decays natively, so it needs no A/B rotation. The witness gates 100% recall of the true top-k above `N/k` vs an exact `Map` oracle (weighted and unit streams) and a bounded overestimate; a frozen-forest and a decay-disabled variant are rejected by the same gate -- see [Testing](#testing).
 </details>
 
+## SlidingHyperLogLog
+
+Count the *distinct* keys in the last `W` -- "how many distinct phases / sources / signatures in the recent window?" -- in fixed preallocated space at HyperLogLog accuracy. `SlidingHyperLogLog` is the recency sibling of `@zakkster/lite-sketch`'s cumulative HyperLogLog: an `m = 2^p` register bank where each register, instead of a single `rho` byte, keeps a small fixed **LFPM ring** (List of Future Possible Maxima) of `(timestamp, rho)` entries -- a per-register monotonic deque with strictly decreasing `rho`. A register's windowed max `rho` equals the HLL register of the in-window distinct key set, so accuracy is the standard `1.04 / sqrt(m)` standard error, no extra bias.
+
+```js
+import { SlidingHyperLogLog } from '@zakkster/lite-adaptive';
+
+const shll = new SlidingHyperLogLog(60000, { p: 10 });   // distinct keys in the last 60s (m = 1024)
+shll.add(now, userId);                                    // monotone now (ms), safe-integer key
+// ... a stream of (now, key) ...
+shll.count();                 // windowed distinct estimate over the last W
+shll.count(5000);             // distinct over the last 5s (a sub-window w in (0, W])
+shll.standardError;           // 1.04 / sqrt(m), guaranteed while !degraded
+shll.degraded;                // false while every register ring held every windowed maximum
+```
+
+On `add(now, key)`, an inline two-lane murmur hash (design-parity with lite-sketch's HyperLogLog, never a dep) maps the key to a register and a `rho`; the entry is appended to that register's ring after dropping every dominated tail entry (a newer arrival with `>= rho` outlives an older one, so the older can never be a future window-max). `count(w?)` lazily expires entries with `stamp <= now - W`, takes each register's live max `rho`, and runs Ertl's improved estimator (`sigma` / `tau`) -- all 0-alloc on the hot path, incl. the windowed eviction.
+
+<details>
+<summary>The honest-degradation signal</summary>
+
+The per-register ring is a fixed `ringCap` (default 8). If a register receives more than `ringCap` still-in-window maxima at once, the ring drops its oldest entry and bumps `overflows`, after which that register's windowed max can be understated -- so the `1.04 / sqrt(m)` bound is no longer guaranteed. `degraded` (true once `overflows > 0`) reports this honestly rather than silently returning a wrong count; raise `ringCap` (or lower `p`) to make overflow impossible for your rho-churn. The windowed-distinct witness gates the relative error vs an exact windowed `Set` oracle at `3 * 1.04/sqrt(m)` on 100% of >= 2000 queries across a `W`-sweep + a distinct-set shift + a post-burst edge, AND asserts `degraded === false`; a no-expiry variant (stale keys counted forever) and a no-dominated-drop variant (a plain FIFO ring) are rejected by the same gate -- see [Testing](#testing).
+</details>
+
+Driven by a caller-supplied monotone `now` (or count mode when `now` is omitted); the mode locks at the first add. Keys are safe integers; a bad `W` / `p` / `ringCap` / `seed` / key / `now` throws `[lite-adaptive]` typeof-first, before any allocation. `addFrom(buf, i)` is the zero-box entry (`now = buf[i]`, `key = buf[i+1]` read unboxed from a `Float64Array`) for fractional / epoch-ms timestamps and large safe-integer keys.
+
 ## API reference
 
 ```js
@@ -273,6 +301,17 @@ clear() -> this                // 0-alloc reset (reuse the table + forest)
 
 // getters
 d   w   k   b   seed   bytes   size
+
+// SlidingHyperLogLog -- windowed distinct-count (fixed-space HLL over the last W)
+new SlidingHyperLogLog(W, options?)         // options: { p, ringCap, seed }
+add(now, key) -> this          // HOT, 0 B/op incl. windowed eviction; monotone now, safe-int key
+addFrom(buf, i) -> this        // HOT, 0 B/op ZERO-BOX: now = buf[i], key = buf[i+1] (explicit-time)
+count(w?) -> number            // COLD, O(m); windowed distinct via Ertl's estimator; w in (0, W]
+query() -> number              // COLD; alias of count() over the full window W
+clear() -> this                // 0-alloc reset (reuse the rings; unlocks the mode)
+
+// getters
+W   p   m   ringCap   seed   standardError   lastNow   mode   overflows   degraded   bytes
 ```
 
 - **`d` / `w` / `k`** -- hash rows (`~4-8`), cells per row, and the top-k size. `HeavyKeeper.withAccuracy(k, targetError)` derives `d` / `w` from a target relative error. A bad `d` / `w` / `k` / `seed` / `b` / option throws `[lite-adaptive]` typeof-first, before any allocation.
@@ -289,6 +328,20 @@ Constants that shape the table:
 | `w` | cells / row | more cells -> fewer collisions -> lower overestimate (`~ N/w`) |
 | `b` | `~1.08` | decay base; a fingerprint miss decays with probability `b^(-count)` |
 | space | `O(d * w + k)` | two `Uint32Array` table columns + the min-forest; fixed at construction |
+
+- **`SlidingHyperLogLog(W, { p, ringCap, seed })`** -- `W` the window (items in count mode, or the `now`-unit span in explicit mode); `p` the precision (int `[4, 16]`, default 10, `m = 1 << p`); `ringCap` the per-register LFPM ring capacity (a power of two `[2, 64]`, default 8). A bad `W` / `p` / `ringCap` / `seed` / option throws `[lite-adaptive]` typeof-first, before any allocation.
+- **`options.seed`** -- the `Uint32` hash seed (default `0x9e3779b1`); `seed = 0` is a valid distinct seed (guarded as `undefined`, not falsy). There is NO PRNG -- the estimate is fully deterministic given the seed.
+- **`add(now, key)`** -- `now` a finite, non-decreasing number (a decrease throws); `key` a SAFE INTEGER. Count mode (`add(undefined, key)`) auto-ticks. The mode locks at the first add (a switch throws); a bad `now` / key is a byte-identical no-op.
+- **`count(w?)`** -- the windowed distinct estimate; `w` an optional sub-window in `(0, W]` (outside that range throws). `standardError` is `1.04 / sqrt(m)`, guaranteed while `degraded === false`.
+- **`degraded` / `overflows`** -- the honest-accuracy signal: `overflows > 0` (a ring dropped a still-in-window maximum) sets `degraded`, after which the bound is no longer guaranteed. Raise `ringCap` to make overflow impossible for your rho-churn.
+
+Constants that shape the register bank:
+
+| Symbol | Value | Meaning |
+|--------|-------|---------|
+| `p` | precision (`[4, 16]`, default 10) | `m = 2^p` registers; standard error `1.04 / sqrt(m)` |
+| `ringCap` | ring size (`[2, 64]`, default 8) | per-register LFPM maxima kept in-window; overflow -> `degraded` |
+| space | `~ m * ringCap * 9 B` | `Float64` stamp + `Uint8` rho per ring slot + O(m) head/len; fixed (p=10 -> ~72 KB) |
 
 ## Composability
 
@@ -372,6 +425,7 @@ Gated quality numbers (`npm run verify`):
 - **Not a wall-clock timer.** The member never reads the clock; the caller supplies a monotone `now`.
 - **Not exact top-k.** HeavyKeeper estimates the current heavy hitters in sublinear space -- exact top-k over an evolving stream is impossible in fixed memory. The four-member core (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper) is FROZEN at 1.0.0 (the API-freeze milestone, not a new member); additive members may still land in a later minor without breaking the core.
 - **Not a cumulative top-k.** HeavyKeeper decays, so it answers "who dominates *now*"; the whole-stream heavy hitters that never forget are `@zakkster/lite-sketch`'s SpaceSaving.
+- **Not a cumulative distinct-count.** SlidingHyperLogLog counts distinct keys in the last `W` and forgets older ones; for a whole-stream distinct-count that never forgets, use `@zakkster/lite-sketch`'s HyperLogLog. `SlidingHyperLogLog` is the first additive post-1.0 member (1.1.0), landing without breaking the frozen core.
 
 ## Ecosystem
 

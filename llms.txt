@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.0.0
+Version: 1.1.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -26,9 +26,13 @@ a periodic landmark rebase. v0.4.0 adds HeavyKeeper (decayed / windowed heavy hi
 the top-k keys dominating the stream RIGHT NOW; Gong et al., USENIX ATC 2018) and a zero-box
 `ADWIN.addFrom(buf, i)`. The four-member roster is now COMPLETE: ExponentialHistogram (0.1.0)
 -> ADWIN (0.2.0, drift) -> ForwardDecay (0.3.0, decay) -> HeavyKeeper (0.4.0, decayed top-k)
--> 1.0.0 (API freeze, no new member). The time-based members (ExponentialHistogram,
-ForwardDecay) and the item-based members (ADWIN, HeavyKeeper) each expose a zero-box
-`addFrom(buf, i)` for callers whose inputs are read from a Float64Array. Members are
+-> 1.0.0 (API freeze, no new member). v1.1.0 adds the FIRST additive post-1.0 member --
+SlidingHyperLogLog (windowed DISTINCT-count; how many distinct keys in the last W, in fixed space
+at HLL accuracy; Chabchoub-Hebrail, 2010) -- via an LFPM ring (a per-register monotonic deque)
+over the register bank. It is a PURE APPEND: the four frozen core classes stay BYTE-IDENTICAL
+(only the file header + VERSION change). The time-based members (ExponentialHistogram,
+ForwardDecay, SlidingHyperLogLog) and the item-based members (ADWIN, HeavyKeeper) each expose a
+zero-box `addFrom(buf, i)` for callers whose inputs are read from a Float64Array. Members are
 tree-shakeable named exports; prior members stay byte-identical on append (only the header +
 VERSION change).
 
@@ -89,7 +93,22 @@ VERSION change).
   key/weight/buffer throws [lite-adaptive] typeof-first (byte-identical no-op). Far lower error
   than Space-Saving on skewed / evolving streams. No `merge` (it decays natively). Getters:
   `d` / `w` / `k` / `b` / `seed` / `bytes` / `size`.
-- `VERSION` -- string, '1.0.0'.
+- `SlidingHyperLogLog` -- class. A zero-GC WINDOWED distinct-count (how many DISTINCT keys in the
+  LAST W; Chabchoub-Hebrail, 2010) -- the RECENCY sibling of lite-sketch's cumulative HyperLogLog.
+  An `m = 2^p` register bank where each register keeps a small FIXED LFPM ring of `(timestamp, rho)`
+  entries (a monotonic deque, strictly decreasing rho). `add(now, key) -> this` (count mode via
+  `add(undefined, key)`) derives register + rho from an inline two-lane hash, pops dominated tail
+  entries, and appends -- 0 B/op incl. the windowed eviction; a full ring drops its oldest entry and
+  bumps `overflows` (`degraded` flips true -- the honest degradation signal). `addFrom(buf, i)` is
+  the zero-box entry (`now = buf[i]`, `key = buf[i+1]` -- a fractional / epoch-ms `now` and a large
+  key would box as plain arguments). `count(w?) -> number` lazily expires `stamp <= now - W`, takes
+  each register's live-max rho, and runs Ertl's improved estimator (design-parity with lite-sketch,
+  inline) -- standard error `1.04 / sqrt(m)` (guaranteed while `degraded === false`); `w` is an
+  optional sub-window in `(0, W]`. `query()` aliases `count()`. Keys are safe integers; a bad key /
+  now / w / option throws [lite-adaptive] typeof-first (byte-identical no-op). Fully deterministic
+  (no PRNG). Getters: `W` / `p` / `m` / `ringCap` / `seed` / `standardError` / `lastNow` / `mode` /
+  `overflows` / `degraded` / `bytes`.
+- `VERSION` -- string, '1.1.0'.
 
 ## ExponentialHistogram
 
@@ -302,6 +321,57 @@ rejected by the same gate: a frozen-forest variant (recall 0%) and a decay-disab
 ADR 0005 records the weighted-miss decay rule (decay ONCE with prob b^(-count) then count -= weight;
 per-weight-unit rejected as non-O(1)) and the seeded-PRNG choice.
 
+## SlidingHyperLogLog (ADR 0006)
+
+Windowed DISTINCT-count -- how many DISTINCT keys arrived in the LAST W, in FIXED preallocated
+space at HLL accuracy (Chabchoub-Hebrail, "Sliding HyperLogLog", 2010). The RECENCY sibling of
+lite-sketch's cumulative HyperLogLog: an `m = 2^p` register bank where each register, instead of a
+single rho byte, keeps a small FIXED LFPM ring of `(timestamp, rho)` entries -- the List of Future
+Possible Maxima, a per-register MONOTONIC DEQUE stored oldest -> newest with STRICTLY DECREASING
+rho. An entry can be the window-max at some future time only if no NEWER entry has a >= rho (a
+newer, larger-or-equal arrival dominates it forever, since it expires later); dominated entries are
+dropped. Because a register's windowed max rho equals the HLL register of the in-window DISTINCT
+key set (a duplicate never lowers a max), accuracy is the standard `1.04 / sqrt(m)` standard error
+(gated at ~3 sigma), no extra bias -- guaranteed while `degraded === false`.
+
+Constructor: `new SlidingHyperLogLog(W, options?)` where options = { p (int in [4, 16], default 10;
+m = 1 << p), ringCap (a power of two in [2, 64], default 8; set >= q+1 to make overflow
+impossible), seed (uint32, default 0x9e3779b1; seed=0 is a valid distinct seed -- guarded as
+`undefined`, not falsy) }. A bad W / p / ringCap / seed / option throws [lite-adaptive] at the ctor
+door BEFORE any allocation.
+
+- add(now, key) -> this          HOT, 0 B/op incl. the windowed eviction. EXPLICIT mode: a finite,
+                                 non-decreasing `now`. COUNT mode: add(undefined, key) auto-ticks
+                                 (W in items). The mode LOCKS at the first add (a switch throws).
+                                 Inline two-lane murmur -> register + rho; pop dominated tail
+                                 entries; append. A full ring drops its oldest entry and bumps
+                                 overflows (degraded). Key is a safe integer; a bad key / now
+                                 throws typeof-first (byte-identical no-op).
+- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX: now = buf[i] (a fractional / epoch-ms
+                                 double), key = buf[i+1] (a safe integer that may exceed 2^31),
+                                 read UNBOXED. EXPLICIT-time only. Same validation + inline body
+                                 as add().
+- count(w?) -> number            COLD, O(m). Lazily expire stamp <= now - W, take each register's
+                                 live-max rho, run Ertl's improved estimator (sigma / tau,
+                                 alpha_inf; inline). Returns 0 on an empty window. `w` is an
+                                 optional sub-window in (0, W] (outside that range throws).
+- query() -> number              COLD; an alias of count() over the full window W.
+- clear() -> this                0-alloc reset (reuse the arrays; unlocks the mode).
+- W / p / m / ringCap / seed / standardError / lastNow / mode / overflows / degraded / bytes
+                                 Getters: the shape, the seed, the theoretical standard error, the
+                                 last applied time, the locked mode, the overflow count, the
+                                 honest-degradation flag, and the fixed memory figure (bytes).
+
+Windowed-distinct contract (the honesty anchor): the witness gates the relative error vs an EXACT
+windowed-Set oracle at `3 * 1.04/sqrt(m)` on 100% of >= 2000 queries across a W-sweep + a
+distinct-set shift + a post-burst edge, AND `degraded === false`. Negative controls rejected by
+the same gate: a NO-EXPIRY variant (never drops stamp <= now - W -> stale keys counted forever)
+and a NO-DOMINATED-DROP variant (a plain FIFO ring -> older high-rho maxima pushed out, wrong
+register max). Memory `~ m * ringCap * 9 B` (Float64 stamp + Uint8 rho) + O(m) head/len; p=10,
+ringCap=8 -> ~72 KB, never grows. ADR 0006 records the LFPM-ring-over-register-bank choice (vs the
+rejected pane-rotation / full-HLL-pane alternatives), the Ertl estimator, the expiry rule
+`stamp <= now - W`, and the ring-overflow-as-honest-degradation rationale.
+
 ## The time source + the bucket pool (ADR 0001)
 
 A caller-supplied MONOTONE `now` (logical tick or ms; count-mode convenience when
@@ -328,5 +398,6 @@ rate()=count*lambda definition. ForwardDecay keeps NO pool (two scalar accumulat
 ExponentialHistogram (0.1.0, sliding-window count / sum) -> ADWIN (0.2.0, drift +
 adaptive window) -> ForwardDecay (0.3.0, time-decayed aggregates) -> HeavyKeeper
 (0.4.0, decayed / windowed heavy hitters) -> 1.0.0 (API freeze -- the four-member roster
-is COMPLETE, no new member; a docs / stability milestone). Post-1.0: SlidingHyperLogLog,
-a scalar DriftDetector, a decayed Reservoir, windowed Count-Min / quantiles -- one per release.
+is COMPLETE, no new member; a docs / stability milestone) -> 1.1.0 (SlidingHyperLogLog --
+windowed distinct-count; the FIRST additive post-1.0 member, a PURE APPEND). Post-1.1: a scalar
+DriftDetector, a decayed Reservoir, windowed Count-Min / quantiles -- one per release.

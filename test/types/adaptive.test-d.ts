@@ -5,10 +5,13 @@
  * `npm run test:types`. Not executed; only type-checked.
  */
 
-import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, VERSION } from '../../Adaptive.js';
+import {
+    ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog, VERSION,
+} from '../../Adaptive.js';
 import type {
     ExponentialHistogramMode, ExponentialHistogramOptions, ADWINOptions,
     ForwardDecayMode, ForwardDecayOptions, HeavyKeeperOptions, HeavyKeeperEntry,
+    SlidingHyperLogLogMode, SlidingHyperLogLogOptions,
 } from '../../Adaptive.js';
 
 // VERSION is a string.
@@ -228,3 +231,73 @@ hk.topKInto([]);
 
 // @ts-expect-error -- withAccuracy targetError must be a number.
 HeavyKeeper.withAccuracy(16, 'tight');
+
+// --- SlidingHyperLogLog -----------------------------------------------------
+const sl = new SlidingHyperLogLog(1000);
+const sl2 = new SlidingHyperLogLog(65536, { p: 12, ringCap: 16, seed: 0 });   // seed=0 is valid
+
+// getters
+const slW: number = sl.W;
+const slP: number = sl.p;
+const slM: number = sl.m;
+const slRing: number = sl.ringCap;
+const slSeed: number = sl.seed;
+const slSE: number = sl.standardError;
+const slLast: number = sl.lastNow;
+const slMode: SlidingHyperLogLogMode = sl.mode;
+const slOver: number = sl.overflows;
+const slDeg: boolean = sl.degraded;
+const slBytes: number = sl.bytes;
+void slW; void slP; void slM; void slRing; void slSeed; void slSE; void slLast; void slMode;
+void slOver; void slDeg; void slBytes;
+
+// add: chainable, explicit + count mode (count = add(undefined, key)), large key ok
+const slChained: SlidingHyperLogLog = sl.add(1, 42).add(2, 4000000000);
+const slCounted: SlidingHyperLogLog = sl2.add(undefined, 7);
+void slChained; void slCounted;
+
+// addFrom: zero-box packed [now, key] entry, chainable
+const slBuf = new Float64Array([1, 42]);
+const slFrom: SlidingHyperLogLog = sl2.addFrom(slBuf, 0).addFrom(slBuf, 0);
+void slFrom;
+
+// queries return numbers, with an optional sub-window
+const slC: number = sl.count();
+const slC2: number = sl.count(500);
+const slQ: number = sl.query();
+void slC; void slC2; void slQ;
+
+// clear is chainable
+const slCleared: SlidingHyperLogLog = sl.clear();
+void slCleared;
+
+// options type is assignable
+const slOpts: SlidingHyperLogLogOptions = { p: 10, ringCap: 8, seed: 3 };
+void slOpts;
+
+// @ts-expect-error -- W must be a number.
+new SlidingHyperLogLog('1000');
+
+// @ts-expect-error -- p option must be a number.
+new SlidingHyperLogLog(1000, { p: '10' });
+
+// @ts-expect-error -- ringCap option must be a number.
+new SlidingHyperLogLog(1000, { ringCap: '8' });
+
+// @ts-expect-error -- unknown option key.
+new SlidingHyperLogLog(1000, { precision: 10 });
+
+// @ts-expect-error -- add key must be a number.
+sl.add(1, 'x');
+
+// @ts-expect-error -- addFrom buf must be a Float64Array.
+sl.addFrom([1, 42], 0);
+
+// @ts-expect-error -- addFrom index must be a number.
+sl.addFrom(slBuf, 'x');
+
+// @ts-expect-error -- count sub-window must be a number.
+sl.count('500');
+
+// @ts-expect-error -- query takes no arguments.
+sl.query(1);

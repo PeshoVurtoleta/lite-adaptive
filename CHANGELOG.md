@@ -8,6 +8,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.1.0] - 2026-09-24
+
+The first additive post-1.0 member. **PURE APPEND**: the four frozen core classes
+(`ExponentialHistogram`, `ADWIN`, `ForwardDecay`, `HeavyKeeper`) are BYTE-IDENTICAL; only the
+file header and the `VERSION` const change above the append point. MINOR bump (new API, no break).
+
+### Added
+
+- **`SlidingHyperLogLog` -- windowed DISTINCT-count** (Chabchoub-Hebrail, 2010; ADR 0006). How
+  many DISTINCT keys arrived in the LAST W, in FIXED preallocated space at HyperLogLog accuracy --
+  the RECENCY sibling of lite-sketch's cumulative HyperLogLog. An `m = 2^p` register bank where
+  each register keeps a small FIXED LFPM ring (List of Future Possible Maxima) of
+  `(timestamp, rho)` entries -- a per-register monotonic deque. `add(now, key)` / the zero-box
+  `addFrom(buf, i)` derive register + rho from an inline two-lane hash, drop dominated tail
+  entries, and append (0 B/op incl. the windowed eviction); a full ring drops its oldest entry and
+  bumps `overflows` (`degraded` -- the honest degradation signal). `count(w?)` lazily expires
+  `stamp <= now - W`, takes each register's live-max rho, and runs Ertl's improved estimator
+  (design-parity with lite-sketch, inline); standard error `1.04 / sqrt(m)`, guaranteed while not
+  degraded; `w` is an optional sub-window in `(0, W]`. Constructor `new SlidingHyperLogLog(W,
+  { p?, ringCap?, seed? })`; a caller-supplied monotone `now` or count mode; getters `W`, `p`, `m`,
+  `ringCap`, `seed`, `standardError`, `lastNow`, `mode`, `overflows`, `degraded`, `bytes`. Fail
+  closed typeof-first on every bad ctor arg / key / now / sub-window (a byte-identical no-op).
+  Fully deterministic (no PRNG). Proven by the torture gate (add + addFrom + clear at 0 B/op) and
+  the windowed-distinct witness (3-sigma vs an exact Set oracle, `degraded === false`, plus
+  no-expiry and no-dominated-drop negative controls rejected).
+
 ## [1.0.0] - 2026-09-24
 
 The **API-FREEZE** milestone. The four-member core -- `ExponentialHistogram`, `ADWIN`,

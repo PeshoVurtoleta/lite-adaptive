@@ -329,3 +329,107 @@ export class HeavyKeeper {
     /** Reset to empty; reuse the table + forest arrays (0-alloc). */
     clear(): this;
 }
+
+/** The locked time mode of a SlidingHyperLogLog. */
+export type SlidingHyperLogLogMode = 'unset' | 'explicit' | 'count';
+
+/**
+ * Constructor options for SlidingHyperLogLog. `seed=0` is a valid distinct seed (guarded as
+ * `undefined`, not falsy); an unknown key throws [lite-adaptive].
+ */
+export interface SlidingHyperLogLogOptions {
+    /** Precision p; an integer in [4, 16] (default 10). m = 1 << p registers. */
+    p?: number;
+    /** Per-register LFPM ring capacity; a power of two in [2, 64] (default 8). Set >= q+1 to make overflow impossible. */
+    ringCap?: number;
+    /** The uint32 hash seed (default 0x9e3779b1). seed=0 is valid. */
+    seed?: number;
+}
+
+/**
+ * SlidingHyperLogLog -- a zero-GC WINDOWED distinct-count (Chabchoub-Hebrail, 2010): how many
+ * DISTINCT keys arrived in the LAST W, in FIXED preallocated space at HLL accuracy (the RECENCY
+ * sibling of lite-sketch's cumulative HyperLogLog). An `m = 2^p` register bank where each register
+ * keeps a small FIXED LFPM ring of `(timestamp, rho)` entries (a monotonic deque, strictly
+ * decreasing rho). `add(now, key)` / the zero-box `addFrom(buf, i)` drop dominated tail entries and
+ * append (0 B/op incl. the windowed eviction); a full ring bumps `overflows` (the honest-
+ * degradation signal `degraded`). `count(w?)` lazily expires the window edge and runs Ertl's
+ * improved estimator; the standard error is 1.04 / sqrt(m), guaranteed while `degraded === false`.
+ * Driven by a caller-supplied MONOTONE `now` (or count mode when omitted); the mode locks at the
+ * first add. Fully deterministic given the seed (no PRNG).
+ */
+export class SlidingHyperLogLog {
+    /**
+     * @param W       window size; a finite number > 0 (items in count mode, or the `now`-unit span
+     *                in explicit mode).
+     * @param options { p?, ringCap?, seed? }; an unknown key throws [lite-adaptive].
+     * Throws [lite-adaptive] on a bad W / p / ringCap / seed / option BEFORE any allocation.
+     */
+    constructor(W: number, options?: SlidingHyperLogLogOptions);
+
+    /** The window size W. O(1). */
+    readonly W: number;
+
+    /** The precision p. O(1). */
+    readonly p: number;
+
+    /** The register count m = 2^p. O(1). */
+    readonly m: number;
+
+    /** The per-register LFPM ring capacity. O(1). */
+    readonly ringCap: number;
+
+    /** The uint32 hash seed. O(1). */
+    readonly seed: number;
+
+    /** The theoretical standard error 1.04 / sqrt(m) (guaranteed only while not degraded). O(1). */
+    readonly standardError: number;
+
+    /** The last applied time t (0 before the first add). O(1). */
+    readonly lastNow: number;
+
+    /** The locked time mode: 'unset' before the first add, then 'explicit' or 'count'. O(1). */
+    readonly mode: SlidingHyperLogLogMode;
+
+    /** The number of ring overflows so far (any > 0 -> the accuracy bound is no longer guaranteed). O(1). */
+    readonly overflows: number;
+
+    /** True once a ring overflowed (the 1.04/sqrt(m) bound is no longer guaranteed). O(1). */
+    readonly degraded: boolean;
+
+    /** A fixed memory figure in bytes (stamps + rho + head + len + hist). O(1). */
+    readonly bytes: number;
+
+    /**
+     * Add one element `key` observed at `now`. HOT, 0 B/op incl. the windowed eviction. The mode
+     * LOCKS at the first call: pass `now` (a finite, non-decreasing number) for EXPLICIT mode, or
+     * omit it (`add(undefined, key)`) for COUNT mode (the member auto-ticks; W is then in items).
+     * `key` must be a SAFE INTEGER. Throws [lite-adaptive] on a non-safe-integer key, a mode
+     * switch, or a non-finite / decreasing `now` (a byte-identical no-op).
+     */
+    add(now: number | undefined, key: number): this;
+
+    /**
+     * Add one element from a caller-owned PACKED `[now, key]` Float64Array pair (`buf[i]` = now,
+     * `buf[i+1]` = key). HOT, 0 B/op -- the ZERO-BOX entry for a caller whose `now` is a fractional
+     * / epoch-ms double and whose `key` may exceed 2^31 (reads them UNBOXED, avoiding the ~16 B
+     * HeapNumber per boxed argument at a non-inlined call boundary). EXPLICIT-time only: a
+     * count-locked instance throws, the first addFrom locks EXPLICIT mode. Same validation /
+     * byte-identical-no-op-on-reject as `add`. Throws [lite-adaptive] on a non-Float64Array `buf`
+     * or a non-integer / out-of-range `i`.
+     */
+    addFrom(buf: Float64Array, i: number): this;
+
+    /**
+     * The windowed DISTINCT-COUNT estimate over the last W (or a sub-window `w <= W`). COLD, O(m).
+     * Standard error 1.04 / sqrt(m) (guaranteed while not degraded). Returns 0 on an empty window.
+     * Throws [lite-adaptive] on a sub-window `w` outside `(0, W]`.
+     */
+    count(w?: number): number;
+
+    /** The primary windowed estimate -- an alias of count() over the full window W. COLD. Never throws. */
+    query(): number;
+
+    /** Reset to the empty window; reuse the arrays (also unlocks the mode). */
+    clear(): this;
+}

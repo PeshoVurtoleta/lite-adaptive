@@ -8,7 +8,7 @@
 // buckets vs the ring's O(W)). A NEGATIVE CONTROL (a broken EH -- no straddle half-
 // correction) is fed the SAME gate and MUST be REJECTED (the gate has teeth). ASCII-only.
 
-import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, VERSION } from '../Adaptive.js';
+import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog, VERSION } from '../Adaptive.js';
 
 const WS = [64, 1000, 65536];
 const EPS = [0.5, 0.1, 0.01];
@@ -799,7 +799,260 @@ console.log('');
 console.log('WITNESS HeavyKeeper negative controls (frozen forest + disabled decay rejected) ' +
     (hkControlsOk ? 'ok' : 'FAIL'));
 
-const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk;
+// ===========================================================================
+// SlidingHyperLogLog (ADR 0006) -- WINDOWED DISTINCT accuracy vs an exact Set oracle
+// ===========================================================================
+//
+// Drive SlidingHyperLogLog on evolving streams (a W-sweep + a distinct-set SHIFT + a
+// post-burst edge), compare its windowed distinct estimate to an EXACT windowed-Set oracle,
+// and GATE the relative error against 3 * (1.04 / sqrt(m)) on EVERY query -- printing MEASURED
+// vs THEORETICAL side by side, plus the space-vs-oracle bar (a fixed m*ringCap ring vs the
+// oracle's O(distinct-in-window) Set). Assert `degraded === false` (no ring overflowed). Two
+// NEGATIVE CONTROLS -- a NO-EXPIRY variant (never drops stamp <= now - W) and a
+// NO-DOMINATED-DROP variant (a plain FIFO ring, wrong max-rho) -- are fed the SAME gate and
+// MUST be REJECTED (the gate has teeth). ASCII-only.
+
+/** A witness-local copy of the two-lane murmur (faithful to Adaptive.js SlidingHyperLogLog). */
+const _slC1 = 0xcc9e2d51 | 0, _slC2 = 0x1b873593 | 0, _slFC1 = 0x85ebca6b | 0,
+    _slFC2 = 0xc2b2ae35 | 0, _slSALT = 0x85ebca6b | 0;
+function _slRound(h, k) {
+    k = Math.imul(k, _slC1); k = (k << 15) | (k >>> 17); k = Math.imul(k, _slC2);
+    h = h ^ k; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0; return h;
+}
+function _slFinal(h) {
+    h = h ^ (h >>> 16); h = Math.imul(h, _slFC1); h = h ^ (h >>> 13);
+    h = Math.imul(h, _slFC2); h = h ^ (h >>> 16); return h;
+}
+function _slSigma(x) {
+    if (x === 1) return Infinity;
+    let y = 1, z = x, prev;
+    do { x = x * x; prev = z; z += x * y; y += y; } while (z !== prev);
+    return z;
+}
+function _slTau(x) {
+    if (x === 0 || x === 1) return 0;
+    let y = 1, z = 1 - x, prev;
+    do { x = Math.sqrt(x); prev = z; y *= 0.5; const d = 1 - x; z -= d * d * y; } while (z !== prev);
+    return z / 3;
+}
+const _slAlpha = 0.5 / Math.LN2;
+
+/**
+ * A witness-local, faithful re-implementation of the SlidingHyperLogLog algorithm with two
+ * FLAGS so the negative controls can each disable exactly one load-bearing part:
+ *   - expire      = false -> NEVER drop stamp <= now - W  (the no-expiry control)
+ *   - dropDom     = false -> a plain FIFO ring, no LFPM domination drop (the no-dominated-drop
+ *                            control: the register max is the max over the last ringCap arrivals,
+ *                            which MISSES older-but-higher rho once newer low-rho arrivals push
+ *                            them out).
+ * With BOTH flags true it MIRRORS the shipped class (self-verified below), so a broken variant is
+ * a FAIR falsification of exactly the disabled part.
+ */
+class RefSlidingHLL {
+    constructor(W, p, ringCap, seed, expire, dropDom) {
+        this._W = W; this._p = p; this._m = 1 << p; this._cap = ringCap; this._mask = ringCap - 1;
+        this._seed = seed | 0; this._q = 64 - p; this._expire = expire; this._dropDom = dropDom;
+        const cells = this._m * ringCap;
+        this._stamps = new Float64Array(cells); this._rho = new Uint8Array(cells);
+        this._head = new Int32Array(this._m); this._len = new Int32Array(this._m);
+        this._hist = new Int32Array(this._q + 2); this._now = 0; this._overflows = 0;
+    }
+    get standardError() { return 1.04 / Math.sqrt(this._m); }
+    get degraded() { return this._overflows > 0; }
+    add(now, key) {
+        this._now = now;
+        let a = key, neg = 0; if (a < 0) { a = -a; neg = 1; }
+        const lo = a >>> 0; const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const seed = this._seed, p = this._p;
+        let hh = seed | 0; hh = _slRound(hh, lo); hh = _slRound(hh, hiw ^ neg); hh = _slFinal(hh ^ 8);
+        let gg = (seed ^ _slSALT) | 0; gg = _slRound(gg, lo); gg = _slRound(gg, hiw ^ neg); gg = _slFinal(gg ^ 8);
+        const j = hh >>> (32 - p); const hiSuf = hh << p;
+        const rho = hiSuf !== 0 ? Math.clz32(hiSuf) + 1 : (32 - p) + Math.clz32(gg) + 1;
+        const cap = this._cap, mask = this._mask, base = j * cap;
+        const stamps = this._stamps, rhos = this._rho, heads = this._head, lens = this._len;
+        let head = heads[j], len = lens[j];
+        if (this._dropDom) {   // LFPM domination drop (the fix under test)
+            while (len > 0) { const tc = base + ((head + len - 1) & mask); if (rhos[tc] <= rho) len--; else break; }
+        }
+        if (len === cap) { head = (head + 1) & mask; len--; this._overflows++; }
+        const at = base + ((head + len) & mask);
+        stamps[at] = now; rhos[at] = rho; heads[j] = head; lens[j] = len + 1;
+        return this;
+    }
+    count() {
+        const now = this._now, fullCut = this._expire ? now - this._W : -Infinity;
+        const m = this._m, cap = this._cap, mask = this._mask;
+        const stamps = this._stamps, rhos = this._rho, heads = this._head, lens = this._len;
+        const q = this._q, C = this._hist; C.fill(0);
+        for (let jj = 0; jj < m; jj++) {
+            const base = jj * cap; let head = heads[jj], len = lens[jj];
+            while (len > 0 && stamps[base + (head & mask)] <= fullCut) { head = (head + 1) & mask; len--; }
+            heads[jj] = head; lens[jj] = len;
+            // the register max = the highest rho among live entries (the shipped class relies on the
+            // LFPM invariant that this is the head; a FIFO ring must scan all live entries for its max).
+            let maxRho = 0, idx = head, rem = len;
+            while (rem > 0) { const c = rhos[base + (idx & mask)]; if (c > maxRho) maxRho = c; idx = (idx + 1) & mask; rem--; }
+            C[maxRho]++;
+        }
+        let z = m * _slTau((m - C[q + 1]) / m);
+        for (let k = q; k >= 1; k--) z = 0.5 * (z + C[k]);
+        z += m * _slSigma(C[0] / m);
+        return Math.round(_slAlpha * m * m / z);
+    }
+}
+
 console.log('');
-console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper) ' + (all ? 'ok' : 'FAIL'));
+console.log('WINDOWED-DISTINCT Witness -- SlidingHyperLogLog v' + VERSION + ' (Chabchoub-Hebrail, 2010): ' +
+    'windowed distinct-count vs an EXACT Set oracle (theoretical: |rel| <= 3 * 1.04/sqrt(m) per query)');
+console.log('');
+
+let slOk = true;
+let slQueries = 0;
+
+// --- fairness self-check: the faithful RefSlidingHLL must mirror the shipped class ---
+{
+    const P = 12, RC = 16, SEED = 7, W = 4000;
+    const real = new SlidingHyperLogLog(W, { p: P, ringCap: RC, seed: SEED });
+    const ref = new RefSlidingHLL(W, P, RC, SEED, true, true);
+    for (let t = 0; t < 12000; t++) { const key = (t * 2654435761) % 6000; real.add(t, key); ref.add(t, key); }
+    const re = real.count(), rf = ref.count();
+    const faithful = re === rf;
+    if (!faithful) slOk = false;
+    console.log('  fairness self-check: shipped count=' + re + ' vs faithful reference count=' + rf +
+        ' -> ' + (faithful ? 'MIRRORS (controls are fair)' : 'DIVERGES (FAIL)'));
+}
+
+// --- the gated lane: W-sweep + distinct-set SHIFT + post-burst edge, exact Set oracle ---
+console.log('');
+console.log('  W        m      shape              queries  maxRel err   theo (3sig)  degraded  status');
+console.log('  -------  -----  -----------------  -------  -----------  -----------  --------  ------');
+
+/**
+ * Drive one workload against the shipped class + an exact windowed-Set oracle; GATE every query's
+ * relative error <= 3 * standardError. `gen(t)` returns the key added at time t; the oracle keeps a
+ * FIFO of (t, key) and rebuilds the in-window Set at each query (exact). Returns the max rel err,
+ * the query count, and whether the sketch degraded.
+ */
+function slDrive(shape, W, p, ringCap, seed, N, warm, gen) {
+    const sl = new SlidingHyperLogLog(W, { p, ringCap, seed });
+    const se = sl.standardError, gate = 3 * se;
+    const tsBuf = new Float64Array(N), keyBuf = new Float64Array(N);
+    let head = 0;
+    let maxRel = 0, queries = 0;
+    for (let t = 0; t < N; t++) {
+        const key = gen(t);
+        sl.add(t, key);
+        tsBuf[t] = t; keyBuf[t] = key;
+        if (t >= warm && (t % 5) === 0) {   // sample every 5th step after warm-up
+            while (head <= t && tsBuf[head] <= t - W) head++;
+            const set = new Set();
+            for (let i = head; i <= t; i++) if (tsBuf[i] > t - W) set.add(keyBuf[i]);
+            const exact = set.size;
+            if (exact > 0) {
+                const est = sl.count();
+                const rel = Math.abs(est - exact) / exact;
+                if (rel > maxRel) maxRel = rel;
+                if (rel > gate) slOk = false;
+                queries++;
+            }
+        }
+    }
+    slQueries += queries;
+    const status = maxRel <= gate ? 'ok' : 'FAIL';
+    console.log('  ' + nStr(W).padEnd(7) + '  ' + String(sl.m).padEnd(5) + '  ' + shape.padEnd(17) + '  ' +
+        String(queries).padEnd(7) + '  ' + pct(maxRel).padStart(11) + '  ' + pct(gate).padStart(11) + '  ' +
+        String(sl.degraded).padEnd(8) + '  ' + status + (sl.degraded ? ' DEGRADED' : ''));
+    return { maxRel, gate, degraded: sl.degraded };
+}
+
+// W-sweep with a rolling distinct set (keys cycle over 2W ids -> the window holds ~W distinct).
+for (const W of [1000, 4000, 16000]) {
+    const r = slDrive('rolling-set', W, 12, 16, 101, 4 * W, W, (t) => (t * 2654435761 >>> 0) % (2 * W));
+    if (r.degraded) slOk = false;
+}
+// distinct-set SHIFT: the id space jumps partway (regime A -> regime B); the windowed distinct
+// count must track the NEW set as the old one expires.
+{
+    const W = 4000, N = 5 * W;
+    const r = slDrive('distinct-set-shift', W, 12, 16, 202, N, W, (t) =>
+        (t < N / 2 ? 0 : 5000000) + ((t * 2654435761 >>> 0) % (2 * W)));
+    if (r.degraded) slOk = false;
+}
+// post-BURST edge: a dense burst of many distinct keys, then a quiet tail of a few repeats -- the
+// windowed count must fall as the burst leaves the window.
+{
+    const W = 4000, N = 4 * W;
+    const r = slDrive('post-burst-edge', W, 12, 16, 303, N, W, (t) =>
+        (t % (3 * W) < W) ? (t * 2654435761 >>> 0) : 42);   // burst third, then key 42 repeated
+    if (r.degraded) slOk = false;
+}
+
+const slEnough = slQueries >= 2000;
+console.log('');
+console.log('  total queries=' + slQueries + ' (>= 2000 required: ' + (slEnough ? 'ok' : 'FAIL') +
+    '); all within 3 sigma + degraded false: ' + (slOk ? 'ok' : 'FAIL'));
+if (!slEnough) slOk = false;
+console.log('');
+console.log('WITNESS SlidingHyperLogLog (windowed distinct-count within 3 sigma, not degraded) ' +
+    (slOk ? 'ok' : 'FAIL'));
+
+// --- SlidingHyperLogLog NEGATIVE CONTROLS: expiry + the LFPM domination drop must be load-bearing ---
+console.log('');
+console.log('NEGATIVE CONTROLS -- a broken SlidingHyperLogLog MUST be rejected by the same gate:');
+let slControlsOk = true;
+
+/** Run a RefSlidingHLL variant over a distinct-set shift; return the max rel err vs the exact oracle. */
+function slControlDrive(expire, dropDom, W, p, ringCap, seed) {
+    const N = 5 * W;
+    const ref = new RefSlidingHLL(W, p, ringCap, seed, expire, dropDom);
+    const tsBuf = new Float64Array(N), keyBuf = new Float64Array(N);
+    let head = 0, maxRel = 0;
+    const gate = 3 * ref.standardError;
+    for (let t = 0; t < N; t++) {
+        // a distinct-set shift + steady churn -> both a missing-expiry AND a missing-domination-drop
+        // variant diverge (stale keys never leave; older high-rho maxima get pushed out of a FIFO).
+        const key = (t < N / 2 ? 0 : 5000000) + ((t * 2654435761 >>> 0) % (2 * W));
+        ref.add(t, key);
+        tsBuf[t] = t; keyBuf[t] = key;
+        if (t >= W && (t % 5) === 0) {
+            while (head <= t && tsBuf[head] <= t - W) head++;
+            const set = new Set();
+            for (let i = head; i <= t; i++) if (tsBuf[i] > t - W) set.add(keyBuf[i]);
+            const exact = set.size;
+            if (exact > 0) {
+                const rel = Math.abs(ref.count() - exact) / exact;
+                if (rel > maxRel) maxRel = rel;
+            }
+        }
+    }
+    return { maxRel, gate };
+}
+// (1) NO-EXPIRY -> stale keys from the whole stream are counted forever -> massive over-estimate.
+{
+    const r = slControlDrive(false, true, 4000, 12, 16, 404);
+    const rejected = r.maxRel > r.gate;
+    if (!rejected) slControlsOk = false;
+    console.log('  no-expiry SlidingHyperLogLog maxRel=' + pct(r.maxRel) + ' (> 3sig ' + pct(r.gate) + ') -> ' +
+        (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+// (2) NO-DOMINATED-DROP -> a plain FIFO ring; an older high-rho maximum is pushed out by newer
+//     low-rho arrivals, so the register max is too LOW -> the distinct count is under-estimated
+//     beyond 3 sigma. A DENSE workload (m=256, W=8000 -> ~31 in-window arrivals per register, far
+//     more than a ringCap-2 FIFO can hold) makes the lost-maxima loss bite hard.
+{
+    const r = slControlDrive(true, false, 8000, 8, 2, 505);
+    const rejected = r.maxRel > r.gate;
+    if (!rejected) slControlsOk = false;
+    console.log('  no-dominated-drop SlidingHyperLogLog (m=256, ringCap 2, dense) maxRel=' + pct(r.maxRel) +
+        ' (> 3sig ' + pct(r.gate) + ') -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+console.log('');
+console.log('WITNESS SlidingHyperLogLog negative controls (no-expiry + no-dominated-drop rejected) ' +
+    (slControlsOk ? 'ok' : 'FAIL'));
+
+const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
+    slOk && slControlsOk;
+console.log('');
+console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper + ' +
+    'SlidingHyperLogLog) ' + (all ? 'ok' : 'FAIL'));
 if (!all) process.exitCode = 1;

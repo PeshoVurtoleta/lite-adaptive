@@ -10,7 +10,7 @@
 // proving teeth.
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper } from '../../Adaptive.js';
+import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog } from '../../Adaptive.js';
 
 const W = 1000;
 const EPS = 0.01;
@@ -233,6 +233,117 @@ const hkAddFromStream = {
     statsOf(s) { return { grows: growsHk(s) }; },
 };
 
+/** Zero-alloc counter for SlidingHyperLogLog: the stamps ring column's byte length -- fixed at construction. */
+function growsSl(s) { return s.sl._stamps.buffer.byteLength; }
+
+/**
+ * SlidingHyperLogLog add on an explicit-time SMI stream: the inline two-lane murmur + the LFPM
+ * ring push (pop dominated tail entries, append) over a full, churning window. SMI now + key ->
+ * no argument box, so this isolates the hot-body cost.
+ */
+const slAddStream = {
+    name: 'SlidingHyperLogLog add explicit-time (two-lane hash + LFPM domination drop + append)',
+    setup() {
+        const sl = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 2 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) sl.add(t++, (k * 2654435761) % 3000);   // prime a churning window
+        return { sl, t, sink: 0 };
+    },
+    hot(s, n) {
+        const sl = s.sl;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            sl.add(t, (t * 2654435761) % 3000);
+            t = (t + 1) | 0;
+            sink = (sink + sl.overflows) | 0;   // observe state (defeat DCE)
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsSl(s) }; },
+};
+
+/**
+ * SlidingHyperLogLog add in COUNT mode (add(undefined, key), auto-tick): the "last N items"
+ * windowed-distinct convenience. Same hash + LFPM ring push; must stay flat + 0 old-gen.
+ */
+const slAddCountStream = {
+    name: 'SlidingHyperLogLog add count-mode (auto-tick + hash + LFPM ring push, full window)',
+    setup() {
+        const sl = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 6 });
+        for (let k = 0; k < 4000; k++) sl.add(undefined, (k * 2654435761) % 3000);
+        return { sl, i: 4000, sink: 0 };
+    },
+    hot(s, n) {
+        const sl = s.sl;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            sl.add(undefined, (i * 2654435761) % 3000);
+            i = (i + 1) | 0;
+            sink = (sink + sl.overflows) | 0;   // observe state (defeat DCE)
+        }
+        s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsSl(s) }; },
+};
+
+/**
+ * SlidingHyperLogLog addFrom on a packed [now, key] Float64Array with an epoch-ms `now` (a
+ * non-Smi double) + LARGE keys (near 2^53-1) read UNBOXED -- the zero-box entry (a plain-arg add()
+ * would box both). Same hash + LFPM ring push; must stay flat + 0 old-gen.
+ */
+const slAddFromStream = {
+    name: 'SlidingHyperLogLog addFrom epoch-ms + large key (zero-box hash + LFPM ring push)',
+    setup() {
+        const sl = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 3 });
+        const buf = new Float64Array(2);
+        let now = 1.75e12;
+        for (let k = 0; k < 4000; k++) { now += 1; buf[0] = now; buf[1] = 9007199254740000 - ((k * 2654435761) % 3000); sl.addFrom(buf, 0); }
+        return { sl, buf, now, i: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const sl = s.sl, buf = s.buf;
+        let now = s.now, i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            now += 1;
+            buf[0] = now;
+            buf[1] = (i & 1) ? (9007199254740000 - ((i * 2654435761) % 3000)) : (-(2 ** 31) + ((i * 40503) % 3000));
+            sl.addFrom(buf, 0);
+            i = (i + 1) | 0;
+            sink = (sink + sl.overflows) | 0;   // observe state (defeat DCE)
+        }
+        s.now = now; s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsSl(s) }; },
+};
+
+/**
+ * The teeth for the SlidingHyperLogLog lane: add + a fresh escaping array per op -- it MUST trip
+ * the gate, proving the SlidingHyperLogLog scenarios' flat result is a real 0-alloc measurement.
+ */
+const slMustFailAlloc = {
+    name: 'SlidingHyperLogLog add + a fresh escaping array per op (MUST allocate)',
+    setup() {
+        const sl = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 2 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) sl.add(t++, (k * 2654435761) % 3000);
+        return { sl, t, leak: null, sink: 0 };
+    },
+    hot(s, n) {
+        const sl = s.sl;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            sl.add(t, (t * 2654435761) % 3000);
+            t = (t + 1) | 0;
+            const arr = new Array(64);
+            arr[0] = t;
+            s.leak = arr;
+            sink = (sink + arr[0]) | 0;
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 /**
  * The teeth for the HeavyKeeper lane: add + a fresh escaping array per op -- it MUST trip the
  * gate, proving the HeavyKeeper scenarios' flat result is a real 0-alloc measurement.
@@ -332,7 +443,7 @@ zgcSuite({
     maxRetainedKB: 512,
     scenarios: [
         addCountStream, addTimeStream, adwinDriftStream, fdAddStream, addFromStream, fdAddFromStream,
-        hkAddStream, hkAddFromStream,
+        hkAddStream, hkAddFromStream, slAddStream, slAddCountStream, slAddFromStream,
     ],
-    mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc],
+    mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc, slMustFailAlloc],
 });

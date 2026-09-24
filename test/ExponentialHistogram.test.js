@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { ExponentialHistogram, VERSION } from '../Adaptive.js';
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '1.0.0');
+    assert.equal(VERSION, '1.1.0');
 });
 
 test('constructor validates W fail-closed BEFORE allocation', () => {

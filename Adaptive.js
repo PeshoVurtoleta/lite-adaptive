@@ -55,6 +55,19 @@
  * HeavyKeeper.topKInto(buf) rejects a too-small buffer (length must be >= 2*k) instead of
  * truncating silently. Prior VALID calls are byte-for-byte behaviorally identical.
  *
+ * v1.1.0 adds SlidingHyperLogLog (ADR 0006; Chabchoub-Hebrail, 2010): windowed DISTINCT-COUNT
+ * over the RECENCY axis -- how many distinct keys in the LAST W, in FIXED preallocated space at
+ * HLL accuracy (the adaptive sibling of lite-sketch's cumulative HyperLogLog). An `m = 2^p`
+ * register bank where each register keeps a small FIXED "List of Future Possible Maxima" ring of
+ * `(timestamp, rho)` entries (a per-register monotonic deque); `add(now, key)` / the zero-box
+ * `addFrom(buf, i)` drop dominated tail entries and append (0 B/op incl. any windowed eviction),
+ * a full ring bumps `overflows` (the honest-degradation signal, `degraded`); `count(w?)` lazily
+ * expires `stamp <= now - W`, takes each register's live-max rho, and runs Ertl's improved
+ * estimator (design-parity with lite-sketch, inline -- never an import). The FIRST additive
+ * post-1.0 member: it is a PURE APPEND -- the four frozen core classes (ExponentialHistogram,
+ * ADWIN, ForwardDecay, HeavyKeeper) stay BYTE-IDENTICAL; only this header + VERSION change above
+ * the append point plus the appended SlidingHyperLogLog class.
+ *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
  *
@@ -62,7 +75,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -2077,5 +2090,553 @@ export class HeavyKeeper {
     _badFn(fn) {
         throw new TypeError(
             '[lite-adaptive] HeavyKeeper.forEach(fn) needs a function, got ' + String(fn));
+    }
+}
+
+// ===========================================================================
+// SlidingHyperLogLog (ADR 0006) -- windowed distinct-count (Chabchoub-Hebrail, 2010)
+// ===========================================================================
+//
+// The RECENCY complement of lite-sketch's cumulative HyperLogLog: how many DISTINCT keys
+// arrived in the LAST W, in FIXED preallocated space at HLL accuracy. An `m = 2^p` register
+// bank where each register, instead of a single rho byte, keeps a small FIXED ring of
+// (timestamp, rho) entries -- the LFPM (List of Future Possible Maxima), a per-register
+// MONOTONIC DEQUE stored oldest -> newest with STRICTLY DECREASING rho. An entry can be the
+// window-max at some future time only if no NEWER entry has a >= rho (a newer, larger-or-equal
+// arrival dominates it forever, since it expires later); such dominated entries are dropped.
+//
+// HOT add(now, key) / addFrom(buf, i): the two-lane murmur (mirrored INLINE from lite-sketch
+// Sketch.js, ADR 0001 there -- pure int32 locals, never an import) derives register j + rho;
+// pop every tail entry with rho <= the new rho (now dominated), then append (now, rho). A full
+// ring drops its OLDEST (head) entry -- it expires soonest -- and bumps `_overflows` (the honest
+// degradation signal; `degraded` flips true). 0 B/op incl. that windowed eviction.
+//
+// COLD count(w?): lazily drop head entries with stamp <= now - W (expired), then take each
+// register's windowed max = the rho of the OLDEST non-expired entry (or the first with stamp >
+// now - w for a sub-window w <= W), fold the register multiplicity vector through Ertl's improved
+// estimator (sigma / tau, alpha_inf; design-parity with lite-sketch, inline). The register value
+// equals the HLL register of the in-window DISTINCT key set (a duplicate never lowers a max), so
+// accuracy is the standard 1.04 / sqrt(m) standard error (no extra bias) when not degraded.
+//
+// TIME MODEL: a caller-supplied MONOTONE now (a logical tick or ms), or COUNT mode (auto-tick)
+// when now is omitted; the mode LOCKS at the first add and a switch throws -- EXACTLY like
+// ExponentialHistogram. addFrom is EXPLICIT-time only. No Math.random, no PRNG: fully
+// deterministic given the seed.
+
+/** Lowest legal precision (m = 16 registers). */
+const SL_P_MIN = 4;
+/** Highest legal precision (m = 65536 registers) -- bounds the ring memory m * ringCap * 9 B. */
+const SL_P_MAX = 16;
+/** Default precision p = 10 (m = 1024 registers). */
+const SL_DEFAULT_P = 10;
+/** Default per-register LFPM ring capacity (a power of two; the deque is bounded by ~q+1). */
+const SL_DEFAULT_RINGCAP = 8;
+/** Max per-register ring capacity (a power of two; ringCap >= q+1 makes overflow impossible). */
+const SL_RINGCAP_MAX = 64;
+/** Default per-instance seed (a uint32; SAME default as lite-sketch so a key hashes identically). */
+const SL_DEFAULT_SEED = 0x9e3779b1;
+/** alpha_inf = 1 / (2 * ln 2) -- the asymptotic bias constant of Ertl's improved estimator. */
+const SL_ALPHA_INF = 0.5 / Math.LN2;
+/** MurmurHash3 lane-decorrelation salt (SMI) -- mirrored INLINE from lite-sketch Sketch.js. */
+const SL_LANE_SALT = 0x85ebca6b | 0;
+/** Frozen marker of the known ctor option keys -- an unknown key is a throw with a did-you-mean. */
+const SL_KNOWN_OPTS = Object.freeze({ p: true, ringCap: true, seed: true });
+
+/** One MurmurHash3 body round (pure int32, zero-alloc) -- design-parity with lite-sketch. */
+function slRound(h, k) {
+    k = Math.imul(k, HK_C1);
+    k = (k << 15) | (k >>> 17);
+    k = Math.imul(k, HK_C2);
+    h = h ^ k;
+    h = (h << 13) | (h >>> 19);
+    h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+    return h;
+}
+
+/** MurmurHash3 fmix32 finalizer -- the avalanche step (pure int32, zero-alloc). */
+function slFinal(h) {
+    h = h ^ (h >>> 16);
+    h = Math.imul(h, HK_FC1);
+    h = h ^ (h >>> 13);
+    h = Math.imul(h, HK_FC2);
+    h = h ^ (h >>> 16);
+    return h;
+}
+
+/**
+ * sigma -- the small-range correction series of Ertl's improved HyperLogLog estimator
+ * (Ertl 2017). x is the fraction of EMPTY registers. Self-terminating (converges to a fixed
+ * point), so it is table-free -- no HLL++ empirical bias tables. Cold (once per count()).
+ * Reimplemented INLINE (design-parity with lite-sketch, never an import).
+ */
+function slSigma(x) {
+    if (x === 1) return Infinity;
+    let y = 1;
+    let z = x;
+    let prev;
+    do {
+        x = x * x;
+        prev = z;
+        z += x * y;
+        y += y;
+    } while (z !== prev);
+    return z;
+}
+
+/**
+ * tau -- the large-range correction series of Ertl's improved estimator (companion to slSigma).
+ * x is 1 minus the fraction of SATURATED registers. Self-terminating fixed point; table-free.
+ * Cold (once per count()). Reimplemented INLINE (design-parity with lite-sketch).
+ */
+function slTau(x) {
+    if (x === 0 || x === 1) return 0;
+    let y = 1;
+    let z = 1 - x;
+    let prev;
+    do {
+        x = Math.sqrt(x);
+        prev = z;
+        y *= 0.5;
+        const d = 1 - x;
+        z -= d * d * y;
+    } while (z !== prev);
+    return z / 3;
+}
+
+/**
+ * SlidingHyperLogLog -- windowed DISTINCT-COUNT over the LAST W (a hard sliding window) in
+ * FIXED space (Chabchoub-Hebrail, "Sliding HyperLogLog", 2010). The RECENCY sibling of
+ * lite-sketch's cumulative HyperLogLog: an `m = 2^p` register bank where every register keeps a
+ * small FIXED LFPM ring of `(timestamp, rho)` entries (a monotonic deque, strictly decreasing rho
+ * head -> tail), so the head always holds the highest in-window rho.
+ *
+ * Headline (the family TRIPLE):
+ *   - SPACE: a FIXED `m * ringCap` ring (Float64 stamp + Uint8 rho) -- `~ m * ringCap * 9 B`;
+ *     never grows (p=10, ringCap=8 -> ~72 KB).
+ *   - ERROR: STATISTICAL -- the standard `1.04 / sqrt(m)` HLL standard error (gated at ~3 sigma),
+ *     since a register's windowed max rho equals the HLL register of the in-window distinct key
+ *     set. GUARANTEED only while `degraded === false` (no ring overflowed).
+ *   - RECENCY: a HARD last-W window (forgets EXACTLY at the window edge) with element-precise
+ *     timestamps -- and a sub-window query `count(w)` for any `w <= W`.
+ *
+ * Hot path (`add` / `addFrom`, 0 B/op incl. the windowed eviction): the inline two-lane murmur,
+ * the LFPM domination drop (pop dominated tail entries), and the append -- pure index
+ * manipulation on preallocated columns. A full ring drops its oldest (head) entry and bumps
+ * `overflows` (`degraded`) -- honest degradation, never an allocation or a silent wrong answer.
+ *
+ * Cold path: `count(w?)` is O(m) (a disclosed co-headline, NOT per-add) -- lazily expire, then
+ * Ertl's improved estimator (2017), a single table-free formula accurate across the whole range;
+ * `clear()` reuses the arrays.
+ *
+ * Fail closed: a bad W / p / ringCap / seed / option throws `[lite-adaptive]` at the ctor door
+ * BEFORE any allocation; `add` / `addFrom` lock the mode at the first call and reject a mode
+ * switch, a non-finite / decreasing `now`, or a non-safe-integer `key` -- typeof-first, a
+ * BYTE-IDENTICAL no-op; `count` rejects a sub-window `w` outside `(0, W]`; getters never throw.
+ * null is not zero (seed=0 is valid, guarded as `=== undefined`).
+ */
+export class SlidingHyperLogLog {
+    /**
+     * @param {number} W        window size; a finite number > 0 (items in count mode, or the
+     *                          `now`-unit span in explicit mode).
+     * @param {object} [options] { p?: precision integer in [4, 16] (default 10; m = 1 << p),
+     *                ringCap?: per-register ring capacity, a power of two in [2, 64] (default 8;
+     *                set >= q+1 to make overflow impossible), seed?: uint32 (default 0x9e3779b1;
+     *                seed=0 is a valid distinct seed -- guarded as `undefined`, not falsy) }.
+     *                An unknown key throws [lite-adaptive].
+     */
+    constructor(W, options) {
+        // typeof guard FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
+        if (typeof W !== 'number' || W !== W || W === Infinity || W === -Infinity || W <= 0) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingHyperLogLog W must be a finite number > 0, got ' + String(W));
+        }
+        let p = SL_DEFAULT_P;
+        let ringCap = SL_DEFAULT_RINGCAP;
+        let seed = SL_DEFAULT_SEED;
+        if (options !== undefined) {
+            if (typeof options !== 'object' || options === null) {
+                throw new TypeError('[lite-adaptive] SlidingHyperLogLog options must be an object');
+            }
+            for (const key in options) {
+                if (!(key in SL_KNOWN_OPTS)) {
+                    throw new RangeError('[lite-adaptive] SlidingHyperLogLog unknown option "' + key + '"');
+                }
+            }
+            if (options.p !== undefined) {
+                const pp = options.p;
+                if (typeof pp !== 'number' || (pp | 0) !== pp || pp < SL_P_MIN || pp > SL_P_MAX) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingHyperLogLog p must be an integer in [' + SL_P_MIN + ', ' +
+                        SL_P_MAX + '], got ' + String(pp));
+                }
+                p = pp;
+            }
+            if (options.ringCap !== undefined) {
+                const rc = options.ringCap;
+                // a power of two in [2, 64] so the ring index is a & (ringCap - 1) mask (hot-path law).
+                if (typeof rc !== 'number' || (rc | 0) !== rc || rc < 2 || rc > SL_RINGCAP_MAX ||
+                    (rc & (rc - 1)) !== 0) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingHyperLogLog ringCap must be a power of two in [2, ' +
+                        SL_RINGCAP_MAX + '], got ' + String(rc));
+                }
+                ringCap = rc;
+            }
+            // seed=0 is a VALID distinct seed -- guard `undefined`, not falsy (null is not zero).
+            if (options.seed !== undefined) {
+                const s = options.seed;
+                if (typeof s !== 'number' || !Number.isInteger(s) || s < 0 || s > 4294967295) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingHyperLogLog seed must be a uint32 (integer in [0, 2^32-1]), got ' +
+                        String(s));
+                }
+                seed = s;
+            }
+        }
+
+        this._W = W;
+        this._p = p;
+        this._m = 1 << p;
+        this._ringCap = ringCap;
+        this._mask = ringCap - 1;
+        this._seed = seed | 0;   // SMI-safe signed int32; the murmur uses it as `s | 0` either way
+        // q = 64 - p: the number of hash suffix bits -> rho in [0, q+1]; _hist is the reused
+        // Ertl multiplicity vector (scratch for count(), so count() itself allocates nothing).
+        this._q = 64 - p;
+
+        const cells = this._m * ringCap;
+        // per-register LFPM ring columns (register j occupies cells [j*ringCap, j*ringCap+ringCap)):
+        this._stamps = new Float64Array(cells);   // entry timestamp (most-recent element time)
+        this._rho = new Uint8Array(cells);        // entry rho (leftmost-1 position of the hash suffix)
+        this._head = new Int32Array(this._m);     // per-register ring head offset (oldest entry)
+        this._len = new Int32Array(this._m);      // per-register live entry count
+        this._hist = new Int32Array(this._q + 2); // Ertl multiplicity vector (reused count() scratch)
+
+        // a fixed memory figure (bytes): stamps + rho + head + len + hist.
+        this._bytes = cells * 8 + cells + this._m * 8 + (this._q + 2) * 4;
+
+        this._initState();
+    }
+
+    /** @private Reset the ring heads/lengths + time mode + overflow counter. Reused by clear(). 0 alloc. */
+    _initState() {
+        this._head.fill(0);
+        this._len.fill(0);
+        this._overflows = 0;         // count of ring overflows (any > 0 -> degraded)
+        this._mode = MODE_UNSET;     // time mode, locked at the first add
+        this._tick = 0;              // count-mode logical clock
+        // monotone guard: 0, NOT -Infinity -- the first explicit add takes the UNSET branch and sets
+        // _lastNow to a real timestamp BEFORE the EXPLICIT branch ever compares it, so the init value
+        // is never read. Keeping it a plain SMI (not the double -Infinity) means a hot clear() loop
+        // with integer timestamps never oscillates the field SMI<->double (no HeapNumber box).
+        this._lastNow = 0;           // explicit-mode monotone guard (init value never compared)
+        this._now = 0;               // the last applied t (query cutoff = now - W)
+    }
+
+    /** Window size W. O(1). */
+    get W() { return this._W; }
+    /** Precision p. O(1). */
+    get p() { return this._p; }
+    /** Register count m = 2^p. O(1). */
+    get m() { return this._m; }
+    /** Per-register LFPM ring capacity. O(1). */
+    get ringCap() { return this._ringCap; }
+    /** The uint32 hash seed. O(1). */
+    get seed() { return this._seed >>> 0; }
+    /** The theoretical standard error 1.04 / sqrt(m) (guaranteed only while not degraded). O(1). */
+    get standardError() { return 1.04 / Math.sqrt(this._m); }
+    /** The last applied time t (0 before the first add). O(1). */
+    get lastNow() { return this._now; }
+    /** The locked time mode: 'unset' | 'explicit' | 'count'. O(1). */
+    get mode() {
+        return this._mode === MODE_EXPLICIT ? 'explicit' : this._mode === MODE_COUNT ? 'count' : 'unset';
+    }
+    /** The number of ring overflows so far (any > 0 -> the accuracy bound is no longer guaranteed). O(1). */
+    get overflows() { return this._overflows; }
+    /** True once a ring overflowed (the 1.04/sqrt(m) bound is no longer guaranteed). O(1). */
+    get degraded() { return this._overflows > 0; }
+    /** A fixed memory figure in bytes (stamps + rho + head + len + hist). O(1). */
+    get bytes() { return this._bytes; }
+
+    /**
+     * Add one element `key` observed at `now`. HOT, 0 B/op INCLUDING the windowed eviction.
+     *
+     * Time modes (LOCKED at the first add, a switch throws):
+     *   - EXPLICIT: add(now, key). `now` is a finite number, strictly NON-DECREASING across calls.
+     *   - COUNT: add(undefined, key). The member auto-increments an internal tick per add (the
+     *     "last N items" convenience; W is then measured in items).
+     *
+     * Fail closed: a non-safe-integer key, a mode switch, a non-finite `now`, or a `now` going
+     * backwards throws [lite-adaptive] (typeof-first, a BYTE-IDENTICAL no-op -- nothing is
+     * touched on a rejected add).
+     * @param {number} [now] the monotone time (omit for count mode).
+     * @param {number} key   a safe integer.
+     * @returns {SlidingHyperLogLog} this
+     */
+    add(now, key) {
+        // validate the key FIRST, before ANY state mutation (typeof-first, no alloc).
+        if (typeof key !== 'number' || !Number.isSafeInteger(key)) return this._badKey(key);
+        // resolve the timestamp + lock/verify the mode (typeof-first, no alloc).
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            if (now !== undefined) return this._badMode('count', 'explicit');
+            t = ++this._tick;
+        } else if (mode === MODE_EXPLICIT) {
+            if (now === undefined) return this._badMode('explicit', 'count');
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badNow(now);
+            }
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now === undefined) {
+                this._mode = MODE_COUNT;
+                t = ++this._tick;
+            } else {
+                if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                    return this._badNow(now);
+                }
+                this._mode = MODE_EXPLICIT;
+                t = now;
+                this._lastNow = now;
+            }
+        }
+        this._now = t;
+
+        // --- the inline two-lane murmur (pure int32 locals; lanes never touch a module slot, so a
+        //     uint32 >= 2^31 lane never boxes a HeapNumber -- design-parity with lite-sketch HLL). ---
+        let a = key, neg = 0;
+        if (a < 0) { a = -a; neg = 1; }
+        const lo = a >>> 0;
+        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const seed = this._seed;
+        let hh = seed | 0;
+        hh = slRound(hh, lo);
+        hh = slRound(hh, hiw ^ neg);
+        hh = slFinal(hh ^ 8);
+        let gg = (seed ^ SL_LANE_SALT) | 0;
+        gg = slRound(gg, lo);
+        gg = slRound(gg, hiw ^ neg);
+        gg = slFinal(gg ^ 8);
+        const p = this._p;
+        const j = hh >>> (32 - p);
+        // hiSuf kept SIGNED (no `>>> 0`): Math.clz32 does its own ToUint32 and `!== 0` is
+        // equivalent, so a uint32 >= 2^31 never materializes as a tagged HeapNumber inside this
+        // hot body (the box a `>>> 0` would force once the function is large -- proven via torture).
+        const hiSuf = hh << p;
+        const rho = hiSuf !== 0 ? Math.clz32(hiSuf) + 1 : (32 - p) + Math.clz32(gg) + 1;
+
+        // --- the LFPM ring push: pop every dominated tail entry (rho <= new rho), append (t, rho);
+        //     a full ring drops its oldest (head) entry and bumps overflows (honest degradation). ---
+        const cap = this._ringCap, mask = this._mask;
+        const base = j * cap;
+        const stamps = this._stamps, rhos = this._rho;
+        const heads = this._head, lens = this._len;
+        let head = heads[j];
+        let len = lens[j];
+        while (len > 0) {
+            const tailCell = base + ((head + len - 1) & mask);
+            if (rhos[tailCell] <= rho) len--; else break;
+        }
+        if (len === cap) { head = (head + 1) & mask; len--; this._overflows++; }
+        const at = base + ((head + len) & mask);
+        stamps[at] = t;
+        rhos[at] = rho;
+        heads[j] = head;
+        lens[j] = len + 1;
+        return this;
+    }
+
+    /**
+     * Add one element from a caller-owned PACKED `[now, key]` Float64Array pair. HOT, 0 B/op --
+     * the ZERO-BOX entry: `now = buf[i]` (a fractional / epoch-ms double) and `key = buf[i + 1]`
+     * (a safe integer that may exceed 2^31) are read UNBOXED straight from the array, avoiding the
+     * ~16 B HeapNumber each would box as a plain argument at a non-inlined call boundary. The
+     * caller writes a `Float64Array(2)` scratch and calls `addFrom(scratch, 0)` (a batch steps `i`
+     * by 2). Identical validation, throws, byte-identical-no-op-on-reject, and ring reshaping as
+     * `add(now, key)`; the body is DUPLICATED (not delegated) to keep `add`'s hot body byte-
+     * identical and avoid re-boxing at an internal call boundary.
+     *
+     * EXPLICIT-time ONLY: addFrom always carries a `now`, so a COUNT-locked instance rejects it and
+     * the first addFrom locks EXPLICIT mode. Fail closed BEFORE any read (typeof-first): a
+     * non-Float64Array `buf`, or a non-integer / negative / out-of-range `i` (needs
+     * `i + 1 < buf.length`) throws [lite-adaptive].
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now, `buf[i+1]` = key.
+     * @param {number} i the base index of the [now, key] pair (0, 2, 4, ...).
+     * @returns {SlidingHyperLogLog} this
+     */
+    addFrom(buf, i) {
+        // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        const now = buf[i];       // UNBOXED Float64Array reads -- the whole point (no argument box).
+        const key = buf[i + 1];   // packed [now, key]
+        if (!Number.isSafeInteger(key)) return this._badKey(key);
+        // addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify EXPLICIT.
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+        }
+        this._now = t;
+
+        // --- the inline two-lane murmur -- DUPLICATED from add() to keep add()'s hot body byte-identical. ---
+        let a = key, neg = 0;
+        if (a < 0) { a = -a; neg = 1; }
+        const lo = a >>> 0;
+        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const seed = this._seed;
+        let hh = seed | 0;
+        hh = slRound(hh, lo);
+        hh = slRound(hh, hiw ^ neg);
+        hh = slFinal(hh ^ 8);
+        let gg = (seed ^ SL_LANE_SALT) | 0;
+        gg = slRound(gg, lo);
+        gg = slRound(gg, hiw ^ neg);
+        gg = slFinal(gg ^ 8);
+        const p = this._p;
+        const j = hh >>> (32 - p);
+        // hiSuf kept SIGNED (no `>>> 0`) -- see add() for why (avoids a tagged-HeapNumber box).
+        const hiSuf = hh << p;
+        const rho = hiSuf !== 0 ? Math.clz32(hiSuf) + 1 : (32 - p) + Math.clz32(gg) + 1;
+
+        // --- the LFPM ring push (see add() for the full commentary) ---
+        const cap = this._ringCap, mask = this._mask;
+        const base = j * cap;
+        const stamps = this._stamps, rhos = this._rho;
+        const heads = this._head, lens = this._len;
+        let head = heads[j];
+        let len = lens[j];
+        while (len > 0) {
+            const tailCell = base + ((head + len - 1) & mask);
+            if (rhos[tailCell] <= rho) len--; else break;
+        }
+        if (len === cap) { head = (head + 1) & mask; len--; this._overflows++; }
+        const at = base + ((head + len) & mask);
+        stamps[at] = t;
+        rhos[at] = rho;
+        heads[j] = head;
+        lens[j] = len + 1;
+        return this;
+    }
+
+    /**
+     * The windowed DISTINCT-COUNT estimate over the last W (or a sub-window `w <= W`). Lazily
+     * expires ring entries with `stamp <= now - W`, takes each register's windowed max rho, and
+     * runs Ertl's improved estimator (2017). COLD, O(m + total entries) (a disclosed co-headline,
+     * NOT per-add): 0 alloc (the multiplicity vector is the reused `_hist`). Standard error
+     * 1.04 / sqrt(m), guaranteed only while `degraded === false`. Returns 0 on an empty window.
+     *
+     * Fail closed: a sub-window `w` outside `(0, W]` (non-finite, <= 0, or > W) throws
+     * [lite-adaptive]; `w` omitted queries the full window W.
+     * @param {number} [w] an optional sub-window in `(0, W]` (omit for the full window W).
+     * @returns {number}
+     */
+    count(w) {
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
+                return this._badWindow(w);
+            }
+            effW = w;
+        }
+        if (this._mode === MODE_UNSET) return 0;
+        const now = this._now;
+        const fullCut = now - this._W;   // permanent expiry cutoff (entries this old can never return)
+        const subCut = now - effW;       // sub-window cutoff (>= fullCut)
+        const m = this._m, cap = this._ringCap, mask = this._mask;
+        const stamps = this._stamps, rhos = this._rho;
+        const heads = this._head, lens = this._len;
+        const q = this._q;
+        const C = this._hist;
+        C.fill(0);
+        for (let jj = 0; jj < m; jj++) {
+            const base = jj * cap;
+            let head = heads[jj];
+            let len = lens[jj];
+            // destructive full-W expiry from the head (oldest first).
+            while (len > 0 && stamps[base + (head & mask)] <= fullCut) { head = (head + 1) & mask; len--; }
+            heads[jj] = head; lens[jj] = len;
+            // non-destructive sub-window scan: the first entry with stamp > subCut is the OLDEST
+            // in-window entry, which carries the HIGHEST rho (rho decreases head -> tail).
+            let maxRho = 0;
+            let idx = head, rem = len;
+            while (rem > 0) {
+                const cell = base + (idx & mask);
+                if (stamps[cell] > subCut) { maxRho = rhos[cell]; break; }
+                idx = (idx + 1) & mask; rem--;
+            }
+            C[maxRho]++;
+        }
+        // Ertl improved estimator: z accumulates the corrected inverse-sum.
+        let z = m * slTau((m - C[q + 1]) / m);   // large-range (saturated) correction
+        for (let k = q; k >= 1; k--) z = 0.5 * (z + C[k]);
+        z += m * slSigma(C[0] / m);              // small-range (empty) correction
+        return Math.round(SL_ALPHA_INF * m * m / z);
+    }
+
+    /**
+     * The primary windowed estimate -- an alias of count() over the full window W. COLD. Fails
+     * closed only on an out-of-range sub-window (never here, no arg). NEVER throws.
+     * @returns {number}
+     */
+    query() { return this.count(); }
+
+    /** Reset to the empty window; reuse every array (0-alloc), unlock the mode. O(m). @returns {SlidingHyperLogLog} this */
+    clear() {
+        this._initState();
+        return this;
+    }
+
+    /** @private Cold thrower for a bad key. */
+    _badKey(key) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingHyperLogLog key must be a safe integer, got ' + String(key));
+    }
+
+    /** @private Cold thrower for a mode switch after the mode locked. */
+    _badMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingHyperLogLog mode is locked to ' + locked +
+            ' at the first add; got a ' + attempted + '-mode add');
+    }
+
+    /** @private Cold thrower for a non-finite `now`. */
+    _badNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingHyperLogLog add now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone `now`. */
+    _badMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingHyperLogLog add now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad sub-window `w`. */
+    _badWindow(w) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingHyperLogLog count sub-window w must be a finite number in (0, W] (W=' +
+            this._W + '), got ' + String(w));
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingHyperLogLog.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
     }
 }

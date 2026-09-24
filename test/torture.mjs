@@ -21,7 +21,7 @@ async function main() {
     }
     const { GcProfiler, checkNoGc, measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper } = await import('../Adaptive.js');
+    const { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog } = await import('../Adaptive.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -58,6 +58,14 @@ async function main() {
             hk.estimate(4000000001); hk.forEach(noop); hk.topK();   // cold reads (topK may alloc, cold)
             hk.clear();
             tracker.track(hk, noop, 'heavykeeper', { audit: true });
+
+            const sl = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 2 });
+            // a rolling distinct set over a full, churning window -> expire + LFPM domination drop.
+            let st = 0;
+            for (let k = 0; k < 4096; k++) sl.add(st++, (k * 2654435761) % 3000);
+            sl.count(); sl.count(500);                   // exercise the cold estimator + sub-window (0 alloc)
+            sl.clear();
+            tracker.track(sl, noop, 'slidinghyperloglog', { audit: true });
         }
         return tracker.size();
     }
@@ -314,6 +322,69 @@ async function main() {
     const hkClearBytes = Math.max(0, Math.round(hkClearBpc));
     const hkClearOk = hkClearBytes === 0;
 
+    // ---- phase 2a-quinquies: SlidingHyperLogLog -- add (SMI now + key: two-lane hash + LFPM
+    // domination drop + append) + the ZERO-BOX addFrom on epoch-ms `now` + LARGE keys + clear. ----
+    // SlidingHLL add: an explicit-time SMI `now` + SMI key (both Smi so the plain-arg add never
+    // boxes), so every measured add runs the inline murmur + the LFPM ring push. Primed to a full,
+    // churning window first (so the domination drop is exercised each add).
+    const slAdd = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 2 });
+    let slT = 0;
+    for (let k = 0; k < 4000; k++) slAdd.add(slT++, (k * 2654435761) % 3000);
+    let slSink = 0;
+    const slStep = () => {
+        slAdd.add(slT, (slT * 2654435761) % 3000);
+        slT = (slT + 1) | 0;
+        slSink = (slSink + slAdd.overflows) | 0;   // observe state (defeat DCE)
+    };
+    const slRes = measureAllocs(slStep, { iterations: 100000, batches: 8 });
+    const slBpc = slRes.bytesPerCall === null ? 0 : slRes.bytesPerCall;
+    const slBytes = Math.max(0, Math.round(slBpc));
+    const slOk = slBytes === 0;
+
+    // SlidingHLL addFrom: epoch-ms `now` (a non-Smi double) + LARGE keys (2^53-1 band and -2^31)
+    // read UNBOXED from a packed [now, key] Float64Array -- the case where a plain-arg add() would
+    // box both the fractional `now` and the large key. This is the gated zero-box floor.
+    const slFrom = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 3 });
+    const SLBUF = new Float64Array(2);
+    let slfNow = 1.75e12;   // epoch-ms base (well above 2^31 -> a non-Smi double)
+    for (let k = 0; k < 4000; k++) {
+        slfNow += 1;
+        SLBUF[0] = slfNow;
+        SLBUF[1] = 9007199254740000 - ((k * 2654435761) % 3000);   // near 2^53-1
+        slFrom.addFrom(SLBUF, 0);
+    }
+    let slFromSink = 0, slfI = 0;
+    const slFromStep = () => {
+        slfNow += 1;
+        SLBUF[0] = slfNow;
+        // alternate a near-2^53 band and a -2^31 band so both large-magnitude regimes run.
+        SLBUF[1] = (slfI & 1) ? (9007199254740000 - ((slfI * 2654435761) % 3000))
+                             : (-(2 ** 31) + ((slfI * 40503) % 3000));
+        slFrom.addFrom(SLBUF, 0);
+        slfI = (slfI + 1) | 0;
+        slFromSink = (slFromSink + slFrom.overflows) | 0;   // observe state (defeat DCE)
+    };
+    const slFromRes = measureAllocs(slFromStep, { iterations: 100000, batches: 8 });
+    const slFromBpc = slFromRes.bytesPerCall === null ? 0 : slFromRes.bytesPerCall;
+    const slFromBytes = Math.max(0, Math.round(slFromBpc));
+    const slFromOk = slFromBytes === 0;
+
+    // SlidingHLL clear(): re-fill between clears so every measured clear() resets non-trivial live
+    // state (head/len fills + mode/overflow reset), not a no-op on an already-empty instance.
+    const slClear = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 4 });
+    for (let k = 0; k < 4000; k++) slClear.add(k, (k * 2654435761) % 3000);
+    let slClearSink = 0, slClearI = 0;
+    const slClearStep = () => {
+        slClear.clear();
+        slClear.add(slClearI, (slClearI * 2654435761) % 3000);   // re-seed live state
+        slClearI = (slClearI + 1) | 0;
+        slClearSink = (slClearSink + (slClear.mode === 'explicit' ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const slClearRes = measureAllocs(slClearStep, { iterations: 100000, batches: 8 });
+    const slClearBpc = slClearRes.bytesPerCall === null ? 0 : slClearRes.bytesPerCall;
+    const slClearBytes = Math.max(0, Math.round(slClearBpc));
+    const slClearOk = slClearBytes === 0;
+
     // ---- phase 2b: GC budget over a long hot run (millions of add + reshaping ops) ----
     const gc = new GcProfiler().start();
     const HOT = 4000000;
@@ -321,9 +392,10 @@ async function main() {
     for (let i = 0; i < HOT; i++) {
         addStep(); addTStep(); adStep(); fdStep(); fdRebStep(); ehFromStep(); fdFromStep();
         hkStep(); hkFromStep(); adFromStep(); hkClearStep();
+        slStep(); slFromStep(); slClearStep();
     }
     SINK += addSink + addTSink + adSink + fpSink + frSink + ehFromSink + fdFromSink + ehBoxedSink + fdBoxedSink +
-        hkSink + hkFromSink + hkBoxedSink + adFromSink + hkClearSink;
+        hkSink + hkFromSink + hkBoxedSink + adFromSink + hkClearSink + slSink + slFromSink + slClearSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -333,6 +405,8 @@ async function main() {
     const reuse = new ExponentialHistogram(2048, 0.01);
     const reuseAd = new ADWIN(0.1);
     const reuseHk = new HeavyKeeper(4, 512, 16, { seed: 9 });
+    const reuseSl = new SlidingHyperLogLog(2048, { p: 10, ringCap: 8, seed: 10 });
+    let reuseSlT = 0;
     for (let c = 0; c < 500; c++) {
         for (let k = 0; k < 8192; k++) reuse.add();     // full window -> expire + cascade
         reuse.count();
@@ -344,6 +418,9 @@ async function main() {
         for (let k = 0; k < 8192; k++) reuseHk.add((k * 2654435761) % 3000, (k & 7) + 1);  // skew + decay
         reuseHk.forEach(noop);
         reuseHk.clear();                                // reuse the arrays, no new store
+        for (let k = 0; k < 8192; k++) reuseSl.add(reuseSlT++, (k * 2654435761) % 3000);  // window churn + LFPM
+        reuseSl.count();
+        reuseSl.clear();                                // reuse the arrays, no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -353,7 +430,7 @@ async function main() {
     // ---- verdict + GATE line ----
     const ok = trackedOk && live === 0 && findings.length === 0 &&
         addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk &&
-        hkOk && hkFromOk && adFromOk && hkClearOk && report.ok && abOk;
+        hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk && report.ok && abOk;
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=0' +
@@ -368,7 +445,10 @@ async function main() {
         hkBytes + ' B/op (HeavyKeeper add + decay + forest) ' +
         hkFromBytes + ' B/op (HeavyKeeper addFrom large-u32) ' +
         adFromBytes + ' B/op (ADWIN addFrom fractional) ' +
-        hkClearBytes + ' B/op (HeavyKeeper clear)' +
+        hkClearBytes + ' B/op (HeavyKeeper clear) ' +
+        slBytes + ' B/op (SlidingHyperLogLog add + LFPM drop) ' +
+        slFromBytes + ' B/op (SlidingHyperLogLog addFrom epoch-ms + large key) ' +
+        slClearBytes + ' B/op (SlidingHyperLogLog clear)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta +
         ' diag: add-boxed-fractional EH=' + ehBoxedBytes + ' B/op FD=' + fdBoxedBytes +
@@ -389,6 +469,9 @@ async function main() {
         if (!hkFromOk) console.error('  alloc ' + hkFromBytes + ' B/op HeavyKeeper addFrom (raw ' + hkFromBpc + ')');
         if (!adFromOk) console.error('  alloc ' + adFromBytes + ' B/op ADWIN addFrom (raw ' + adFromBpc + ')');
         if (!hkClearOk) console.error('  alloc ' + hkClearBytes + ' B/op HeavyKeeper clear (raw ' + hkClearBpc + ')');
+        if (!slOk) console.error('  alloc ' + slBytes + ' B/op SlidingHyperLogLog add (raw ' + slBpc + ')');
+        if (!slFromOk) console.error('  alloc ' + slFromBytes + ' B/op SlidingHyperLogLog addFrom (raw ' + slFromBpc + ')');
+        if (!slClearOk) console.error('  alloc ' + slClearBytes + ' B/op SlidingHyperLogLog clear (raw ' + slClearBpc + ')');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
