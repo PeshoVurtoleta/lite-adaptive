@@ -6,12 +6,14 @@
  */
 
 import {
-    ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog, VERSION,
+    ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, VERSION,
 } from '../../Adaptive.js';
 import type {
     ExponentialHistogramMode, ExponentialHistogramOptions, ADWINOptions,
     ForwardDecayMode, ForwardDecayOptions, HeavyKeeperOptions, HeavyKeeperEntry,
     SlidingHyperLogLogMode, SlidingHyperLogLogOptions,
+    DriftDetectorMode, DriftDetectorOptions,
 } from '../../Adaptive.js';
 
 // VERSION is a string.
@@ -301,3 +303,74 @@ sl.count('500');
 
 // @ts-expect-error -- query takes no arguments.
 sl.query(1);
+
+// --- DriftDetector -----------------------------------------------------------
+const dd = new DriftDetector(DRIFT_PH);
+const dd2 = new DriftDetector(DRIFT_CUSUM, { delta: 0, threshold: 5, target: 0 });   // delta=0 / target=0 valid
+
+// the mode consts are the documented literal types
+const phMode: 0 = DRIFT_PH;
+const cusumMode: 1 = DRIFT_CUSUM;
+void phMode; void cusumMode;
+
+// getters
+const ddMode: DriftDetectorMode = dd.mode;
+const ddDelta: number = dd.delta;
+const ddThreshold: number = dd.threshold;
+const ddTarget: number | undefined = dd.target;   // the fixed CUSUM mu0, or undefined for PH
+const ddCount: number = dd.count;
+const ddMean: number = dd.mean;
+const ddStat: number = dd.statistic;
+void ddMode; void ddDelta; void ddThreshold; void ddTarget; void ddCount; void ddMean; void ddStat;
+
+// add returns a boolean (drift detected?)
+const ddDrift: boolean = dd.add(3.14);
+const ddDrift2: boolean = dd2.add(-5);
+void ddDrift; void ddDrift2;
+
+// addFrom: zero-box entry, returns the boolean drift flag
+const ddBuf = new Float64Array([3.14]);
+const ddDriftFrom: boolean = dd.addFrom(ddBuf, 0);
+void ddDriftFrom;
+
+// clear is chainable
+const ddCleared: DriftDetector = dd.clear();
+void ddCleared;
+
+// options type is assignable (target is part of the options surface)
+const ddOpts: DriftDetectorOptions = { delta: 0.01, threshold: 20, target: 3.5 };
+void ddOpts;
+
+// @ts-expect-error -- target option must be a number.
+new DriftDetector(DRIFT_CUSUM, { target: '0' });
+
+// @ts-expect-error -- mode must be DRIFT_PH | DRIFT_CUSUM (a numeric literal), not an arbitrary number.
+new DriftDetector(2);
+
+// @ts-expect-error -- mode must be a DriftDetectorMode, not a string.
+new DriftDetector('ph');
+
+// @ts-expect-error -- delta option must be a number.
+new DriftDetector(DRIFT_PH, { delta: '0.005' });
+
+// @ts-expect-error -- threshold option must be a number.
+new DriftDetector(DRIFT_PH, { threshold: '50' });
+
+// @ts-expect-error -- unknown option key.
+new DriftDetector(DRIFT_PH, { lambda: 50 });
+
+// @ts-expect-error -- add value must be a number.
+dd.add('x');
+
+// @ts-expect-error -- add takes exactly one argument.
+dd.add(1, 2);
+
+// @ts-expect-error -- addFrom buf must be a Float64Array.
+dd.addFrom([3.14], 0);
+
+// @ts-expect-error -- addFrom index must be a number.
+dd.addFrom(ddBuf, 'x');
+
+// @ts-expect-error -- add returns a boolean, not assignable to DriftDetector (no chaining).
+const ddChain: DriftDetector = dd.add(1);
+void ddChain;

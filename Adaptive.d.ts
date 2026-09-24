@@ -433,3 +433,95 @@ export class SlidingHyperLogLog {
     /** Reset to the empty window; reuse the arrays (also unlocks the mode). */
     clear(): this;
 }
+
+/** Page-Hinkley DriftDetector mode (cumulative deviation of x from its running mean, two-sided). */
+export const DRIFT_PH: 0;
+/** Two-sided CUSUM DriftDetector mode (two accumulators gP / gN, each floored at 0). */
+export const DRIFT_CUSUM: 1;
+
+/** The DriftDetector mode union (DRIFT_PH | DRIFT_CUSUM). */
+export type DriftDetectorMode = typeof DRIFT_PH | typeof DRIFT_CUSUM;
+
+/**
+ * Constructor options for DriftDetector. `delta = 0` is a valid, meaningful setting (guarded as
+ * `undefined`, not falsy); an unknown key throws [lite-adaptive].
+ */
+export interface DriftDetectorOptions {
+    /** The magnitude allowance (Page-Hinkley) / slack (CUSUM); a finite number in [0, 1e150] (default 0.005). */
+    delta?: number;
+    /** The decision level (Page-Hinkley lambda / CUSUM decision interval); a finite number > 0 (default 50). */
+    threshold?: number;
+    /**
+     * The FIXED in-control mean mu0 the CUSUM test deviates from; a finite number, any sign,
+     * |target| <= 1e150 (target = 0 is valid). REQUIRED for DRIFT_CUSUM; FORBIDDEN for DRIFT_PH
+     * (which uses the online running mean). A mismatch throws [lite-adaptive].
+     */
+    target?: number;
+}
+
+/**
+ * DriftDetector -- a zero-GC, O(1)-STATE scalar streaming DRIFT DETECTOR over a real-valued signal
+ * (Page, Biometrika 1954; Mouss et al. 2004), selected by a mode const -- `DRIFT_PH` (Page-Hinkley:
+ * cumulative deviation of x from the ONLINE running mean, two-sided) or `DRIFT_CUSUM` (two-sided
+ * CUSUM: two accumulators gP / gN, each floored at 0, deviating from a FIXED `target` mu0).
+ * `add(x)` / the zero-box `addFrom(buf, i)` update a running mean, run the ONE mode branch, and
+ * return true EXACTLY on the detecting item, resetting the accumulators + running mean so the NEXT
+ * shift is caught (0 B/op). The mode is load-bearing via its reference: PH self-references the
+ * online mean (adaptive), CUSUM references a fixed mu0 (classic SPC) -- they genuinely diverge.
+ * The item-based, scalar, fixed-scalar-state complement to ADWIN's adaptive window: no pool (pure
+ * scalars), no window. (DDM / EDDM -- Bernoulli error-bit + tri-state output -- are out of scope.)
+ */
+export class DriftDetector {
+    /**
+     * @param mode    DRIFT_PH or DRIFT_CUSUM.
+     * @param options { delta?, threshold?, target? }; `target` is REQUIRED for DRIFT_CUSUM and
+     *                FORBIDDEN for DRIFT_PH; an unknown key throws [lite-adaptive].
+     * Throws [lite-adaptive] on a bad mode / delta / threshold / target / option BEFORE any field init.
+     */
+    constructor(mode: DriftDetectorMode, options?: DriftDetectorOptions);
+
+    /** The detector mode (DRIFT_PH or DRIFT_CUSUM). O(1). */
+    readonly mode: DriftDetectorMode;
+
+    /** The magnitude allowance (PH) / slack (CUSUM). O(1). */
+    readonly delta: number;
+
+    /** The decision level (PH lambda / CUSUM decision interval). O(1). */
+    readonly threshold: number;
+
+    /** The fixed CUSUM target mu0 (the reference the test deviates from); undefined for PH. O(1). */
+    readonly target: number | undefined;
+
+    /** The number of items seen since the last reset (a fire resets it). O(1). */
+    readonly count: number;
+
+    /** The running mean of the signal (0 on empty). O(1). Throws [lite-adaptive] if an accumulator overflowed. */
+    readonly mean: number;
+
+    /**
+     * The current test statistic (>= 0): how close the detector is to firing (it crosses
+     * `threshold` exactly when `add` returns true). 0 on empty. O(1). Throws [lite-adaptive] if an
+     * accumulator overflowed (fail-closed, never a silent NaN).
+     */
+    readonly statistic: number;
+
+    /**
+     * Add one value to the signal. HOT, 0 B/op. Updates the running mean, runs the mode branch, and
+     * returns true EXACTLY on the item that trips the threshold (drift detected), resetting the
+     * accumulators so the next shift is caught. Throws [lite-adaptive] on a non-number / NaN /
+     * +-Infinity x or a finite |x| > 1e150 (a byte-identical no-op).
+     */
+    add(x: number): boolean;
+
+    /**
+     * Add one value read UNBOXED from a caller-owned Float64Array (`x = buf[i]`). HOT, 0 B/op -- the
+     * ZERO-BOX sibling of `add(x)` for a caller whose fractional `x` would box as a plain argument at
+     * a non-inlined call boundary. Runs the identical detection and returns the same boolean flag.
+     * Throws [lite-adaptive] on a non-Float64Array `buf` or a non-integer / out-of-range `i`; a
+     * non-finite / out-of-domain `buf[i]` is a byte-identical no-op.
+     */
+    addFrom(buf: Float64Array, i: number): boolean;
+
+    /** Reset all scalar state; keep the mode / delta / threshold. */
+    clear(): this;
+}

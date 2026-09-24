@@ -21,7 +21,8 @@ async function main() {
     }
     const { GcProfiler, checkNoGc, measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog } = await import('../Adaptive.js');
+    const { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
+        DriftDetector, DRIFT_PH, DRIFT_CUSUM } = await import('../Adaptive.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -66,6 +67,13 @@ async function main() {
             sl.count(); sl.count(500);                   // exercise the cold estimator + sub-window (0 alloc)
             sl.clear();
             tracker.track(sl, noop, 'slidinghyperloglog', { audit: true });
+
+            const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5 });
+            // a drifting stream -> exercise the running mean + the PH branch + the reset on a fire.
+            for (let k = 0; k < 4096; k++) dd.add(((k >> 9) & 1) ? 1000 : 0);
+            dd.mean; dd.statistic; dd.count;             // exercise the cold getters (0 alloc)
+            dd.clear();
+            tracker.track(dd, noop, 'driftdetector', { audit: true });
         }
         return tracker.size();
     }
@@ -385,6 +393,75 @@ async function main() {
     const slClearBytes = Math.max(0, Math.round(slClearBpc));
     const slClearOk = slClearBytes === 0;
 
+    // ---- phase 2a-sexies: DriftDetector -- add (PH + CUSUM, both mode branches, incl. the reset
+    // on a fire) + the ZERO-BOX addFrom on a FRACTIONAL value + clear. Pure scalars, no pool. ----
+    // DriftDetector add PH: a drifting stream (mean alternates every 512 items) so every measured add
+    // updates the running mean, runs the PH branch, and periodically FIRES (the reset path). Integer
+    // means keep the plain-arg add off the boxing boundary. Primed first.
+    const ddPh = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5 });
+    let ddPhI = 0;
+    for (let k = 0; k < 40000; k++) { ddPh.add(((ddPhI >> 9) & 1) ? 1000 : 0); ddPhI++; }
+    let ddPhSink = 0;
+    const ddPhStep = () => {
+        const cut = ddPh.add(((ddPhI >> 9) & 1) ? 1000 : 0);
+        ddPhI = (ddPhI + 1) | 0;
+        ddPhSink = (ddPhSink + (cut ? 1 : 0) + (ddPh.count & 255)) | 0;   // observe state (defeat DCE)
+    };
+    const ddPhRes = measureAllocs(ddPhStep, { iterations: 100000, batches: 8 });
+    const ddPhBpc = ddPhRes.bytesPerCall === null ? 0 : ddPhRes.bytesPerCall;
+    const ddPhBytes = Math.max(0, Math.round(ddPhBpc));
+    const ddPhOk = ddPhBytes === 0;
+
+    // DriftDetector add CUSUM: the other mode branch (two floored accumulators vs a FIXED target),
+    // same drifting stream. target=500 sits between the two regimes so both directions depart + fire.
+    const ddCu = new DriftDetector(DRIFT_CUSUM, { delta: 0.005, threshold: 5, target: 500 });
+    let ddCuI = 0;
+    for (let k = 0; k < 40000; k++) { ddCu.add(((ddCuI >> 9) & 1) ? 1000 : 0); ddCuI++; }
+    let ddCuSink = 0;
+    const ddCuStep = () => {
+        const cut = ddCu.add(((ddCuI >> 9) & 1) ? 1000 : 0);
+        ddCuI = (ddCuI + 1) | 0;
+        ddCuSink = (ddCuSink + (cut ? 1 : 0) + (ddCu.count & 255)) | 0;   // observe state (defeat DCE)
+    };
+    const ddCuRes = measureAllocs(ddCuStep, { iterations: 100000, batches: 8 });
+    const ddCuBpc = ddCuRes.bytesPerCall === null ? 0 : ddCuRes.bytesPerCall;
+    const ddCuBytes = Math.max(0, Math.round(ddCuBpc));
+    const ddCuOk = ddCuBytes === 0;
+
+    // DriftDetector addFrom: a drifting FRACTIONAL stream read UNBOXED from a Float64Array(1) scratch
+    // -- the zero-box sibling of add(x). Primed first.
+    const ddFrom = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5 });
+    const DDBUF = new Float64Array(1);
+    let ddfI = 0;
+    for (let k = 0; k < 40000; k++) { DDBUF[0] = ((ddfI >> 9) & 1) ? 1000.5 : 0.25; ddFrom.addFrom(DDBUF, 0); ddfI++; }
+    let ddFromSink = 0;
+    const ddFromStep = () => {
+        DDBUF[0] = ((ddfI >> 9) & 1) ? 1000.5 : 0.25;   // fractional drifting value
+        const cut = ddFrom.addFrom(DDBUF, 0);
+        ddfI = (ddfI + 1) | 0;
+        ddFromSink = (ddFromSink + (cut ? 1 : 0) + (ddFrom.count & 255)) | 0;   // observe (defeat DCE)
+    };
+    const ddFromRes = measureAllocs(ddFromStep, { iterations: 100000, batches: 8 });
+    const ddFromBpc = ddFromRes.bytesPerCall === null ? 0 : ddFromRes.bytesPerCall;
+    const ddFromBytes = Math.max(0, Math.round(ddFromBpc));
+    const ddFromOk = ddFromBytes === 0;
+
+    // DriftDetector clear(): re-add between clears so every measured clear() resets non-trivial live
+    // state (the six scalars), not a no-op on an already-empty instance.
+    const ddClear = new DriftDetector(DRIFT_CUSUM, { delta: 0.005, threshold: 5, target: 500 });
+    for (let k = 0; k < 2000; k++) ddClear.add((k & 511) ? 1 : 1000);
+    let ddClearSink = 0, ddClearI = 0;
+    const ddClearStep = () => {
+        ddClear.clear();
+        ddClear.add((ddClearI & 511) ? 1 : 1000);   // re-seed live state
+        ddClearI = (ddClearI + 1) | 0;
+        ddClearSink = (ddClearSink + ddClear.count) | 0;   // observe state (defeat DCE)
+    };
+    const ddClearRes = measureAllocs(ddClearStep, { iterations: 100000, batches: 8 });
+    const ddClearBpc = ddClearRes.bytesPerCall === null ? 0 : ddClearRes.bytesPerCall;
+    const ddClearBytes = Math.max(0, Math.round(ddClearBpc));
+    const ddClearOk = ddClearBytes === 0;
+
     // ---- phase 2b: GC budget over a long hot run (millions of add + reshaping ops) ----
     const gc = new GcProfiler().start();
     const HOT = 4000000;
@@ -393,9 +470,11 @@ async function main() {
         addStep(); addTStep(); adStep(); fdStep(); fdRebStep(); ehFromStep(); fdFromStep();
         hkStep(); hkFromStep(); adFromStep(); hkClearStep();
         slStep(); slFromStep(); slClearStep();
+        ddPhStep(); ddCuStep(); ddFromStep(); ddClearStep();
     }
     SINK += addSink + addTSink + adSink + fpSink + frSink + ehFromSink + fdFromSink + ehBoxedSink + fdBoxedSink +
-        hkSink + hkFromSink + hkBoxedSink + adFromSink + hkClearSink + slSink + slFromSink + slClearSink;
+        hkSink + hkFromSink + hkBoxedSink + adFromSink + hkClearSink + slSink + slFromSink + slClearSink +
+        ddPhSink + ddCuSink + ddFromSink + ddClearSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -430,7 +509,8 @@ async function main() {
     // ---- verdict + GATE line ----
     const ok = trackedOk && live === 0 && findings.length === 0 &&
         addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk &&
-        hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk && report.ok && abOk;
+        hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk &&
+        ddPhOk && ddCuOk && ddFromOk && ddClearOk && report.ok && abOk;
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=0' +
@@ -448,7 +528,11 @@ async function main() {
         hkClearBytes + ' B/op (HeavyKeeper clear) ' +
         slBytes + ' B/op (SlidingHyperLogLog add + LFPM drop) ' +
         slFromBytes + ' B/op (SlidingHyperLogLog addFrom epoch-ms + large key) ' +
-        slClearBytes + ' B/op (SlidingHyperLogLog clear)' +
+        slClearBytes + ' B/op (SlidingHyperLogLog clear) ' +
+        ddPhBytes + ' B/op (DriftDetector add PH) ' +
+        ddCuBytes + ' B/op (DriftDetector add CUSUM) ' +
+        ddFromBytes + ' B/op (DriftDetector addFrom fractional) ' +
+        ddClearBytes + ' B/op (DriftDetector clear)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta +
         ' diag: add-boxed-fractional EH=' + ehBoxedBytes + ' B/op FD=' + fdBoxedBytes +
@@ -472,6 +556,10 @@ async function main() {
         if (!slOk) console.error('  alloc ' + slBytes + ' B/op SlidingHyperLogLog add (raw ' + slBpc + ')');
         if (!slFromOk) console.error('  alloc ' + slFromBytes + ' B/op SlidingHyperLogLog addFrom (raw ' + slFromBpc + ')');
         if (!slClearOk) console.error('  alloc ' + slClearBytes + ' B/op SlidingHyperLogLog clear (raw ' + slClearBpc + ')');
+        if (!ddPhOk) console.error('  alloc ' + ddPhBytes + ' B/op DriftDetector add PH (raw ' + ddPhBpc + ')');
+        if (!ddCuOk) console.error('  alloc ' + ddCuBytes + ' B/op DriftDetector add CUSUM (raw ' + ddCuBpc + ')');
+        if (!ddFromOk) console.error('  alloc ' + ddFromBytes + ' B/op DriftDetector addFrom (raw ' + ddFromBpc + ')');
+        if (!ddClearOk) console.error('  alloc ' + ddClearBytes + ' B/op DriftDetector clear (raw ' + ddClearBpc + ')');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

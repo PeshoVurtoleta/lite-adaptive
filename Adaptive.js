@@ -68,6 +68,21 @@
  * ADWIN, ForwardDecay, HeavyKeeper) stay BYTE-IDENTICAL; only this header + VERSION change above
  * the append point plus the appended SlidingHyperLogLog class.
  *
+ * v1.2.0 adds DriftDetector (ADR 0007; Page, "Continuous Inspection Schemes", Biometrika 1954;
+ * Mouss-Mouss-Linkens-Sellami, 2004): a SCALAR, O(1)-STATE streaming drift detector over a
+ * real-valued signal, selected by a mode const -- DRIFT_PH (Page-Hinkley: cumulative deviation
+ * of x from its running mean, two-sided) or DRIFT_CUSUM (two-sided CUSUM: two accumulators gP /
+ * gN each floored at 0). `add(x) -> boolean` (and the zero-box `addFrom(buf, i)`) updates a
+ * running mean, runs the ONE mode branch, and returns true EXACTLY on the detecting item,
+ * resetting the accumulators so the NEXT shift is caught -- 0 B/op. It is the item-based, scalar,
+ * fixed-scalar-state complement to ADWIN's adaptive window: no pool (pure scalars, like
+ * ForwardDecay), no window, just a bounded test statistic. DDM / EDDM (which need a Bernoulli
+ * error-bit stream + tri-state output) are deliberately OUT of this class -- a future member.
+ * The SECOND additive post-1.0 member: a PURE APPEND -- the five prior classes
+ * (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog) stay
+ * BYTE-IDENTICAL; only this header + VERSION change above the append point plus the appended
+ * DriftDetector class (and its DRIFT_PH / DRIFT_CUSUM mode consts).
+ *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
  *
@@ -75,7 +90,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -2638,5 +2653,372 @@ export class SlidingHyperLogLog {
         throw new TypeError(
             '[lite-adaptive] SlidingHyperLogLog.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
             'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+}
+
+// ===========================================================================
+// DriftDetector (ADR 0007) -- scalar, O(1)-state streaming drift detection
+// (Page, Biometrika 1954; Mouss et al. 2004)
+// ===========================================================================
+//
+// DriftDetector is the SCALAR, item-based, fixed-scalar-state complement to ADWIN: it
+// detects a shift in the MEAN of a real-valued signal in O(1) STATE (a handful of scalars,
+// no pool, no window -- like ForwardDecay) and returns true EXACTLY on the detecting item.
+// A single class selects one of two classical tests via a mode const:
+//
+//   DRIFT_PH    -- Page-Hinkley (Page 1954; Mouss-Mouss-Linkens-Sellami 2004). It accumulates
+//                  the deviation of each x from the RUNNING MEAN and watches the gap between the
+//                  cumulative sum and its running extreme; a persistent one-directional drift
+//                  makes the gap exceed the threshold lambda. Two-sided: an upward accumulator
+//                  gP (with a -delta magnitude allowance) tracked against its running MIN, and a
+//                  downward accumulator gN (+delta) tracked against its running MAX.
+//   DRIFT_CUSUM -- two-sided CUSUM (Page 1954). Two accumulators gP (upward) / gN (downward),
+//                  each FLOORED at 0 (reset to 0 whenever it would go negative), grow only while
+//                  the signal drifts past the slack delta; either exceeding the decision interval
+//                  (threshold) fires.
+//
+// On a POSITIVE detection the accumulators + running mean are RESET (the standard PH / CUSUM
+// discipline) so the detector recalibrates to the new concept and catches the NEXT shift.
+//
+// DDM / EDDM are deliberately OUT of this class: they consume a Bernoulli ERROR-BIT stream
+// (a classifier's 0/1 correctness) and emit a TRI-STATE (stable / warning / drift) output, a
+// different contract from a real-valued add(x) -> boolean. They belong in a future member.
+
+/** The two DriftDetector modes. Numeric consts (parity with the internal mode sentinels). */
+export const DRIFT_PH = 0;
+export const DRIFT_CUSUM = 1;
+
+/** Frozen marker of the known ctor option keys -- an unknown key is a throw with a did-you-mean. */
+const DD_KNOWN_OPTS = Object.freeze({ delta: true, threshold: true, target: true });
+
+/** Default magnitude allowance (PH) / slack (CUSUM): 0 is a valid, meaningful setting (null is not zero). */
+const DD_DEFAULT_DELTA = 0.005;
+/** Default threshold (PH lambda / CUSUM decision interval); tune to the signal's scale. */
+const DD_DEFAULT_THRESHOLD = 50;
+/**
+ * DD_X_MAX -- the largest |x| the hot path accepts (1e150). A finite const, far below Double.MAX,
+ * so the running accumulators cannot silently overflow to a non-finite value (the ADWIN
+ * finite-square-overflow lesson): each add moves gP / gN by at most ~2*DD_X_MAX, and both
+ * accumulators are BOUNDED between resets -- CUSUM floors at 0 and fires (then resets) at the
+ * finite threshold; PH resets at the finite threshold too. Reaching Double.MAX from a 1e150 step
+ * would need ~1e158 un-fired adds -- physically unreachable -- and a single add can never
+ * overflow. |x| > DD_X_MAX is rejected fail-closed via the cold _badValue thrower (one extra
+ * comparison on the COLD reject branch -- 0 hot-path bytes). Astronomically above any real signal.
+ */
+const DD_X_MAX = 1e150;
+
+/**
+ * DriftDetector -- a SCALAR, O(1)-STATE streaming drift detector over a real-valued signal,
+ * selected by a mode const (DRIFT_PH or DRIFT_CUSUM). It maintains a running mean plus one or
+ * two bounded test accumulators (no pool, no window -- pure scalars, like ForwardDecay) and
+ * returns true EXACTLY on the item that trips the threshold, then RESETS so it can catch the
+ * next shift.
+ *
+ * The mode is LOAD-BEARING via the reference the test deviates from (see ADR 0007): under a
+ * SHARED reference the two rules collapse to the identical reflected-random-walk statistic
+ * (CUSUM's max(0, cumsum) is exactly cumsum minus its running min -- what Page-Hinkley computes),
+ * so they must NOT share one. DRIFT_PH deviates from the ONLINE running mean (self-referencing,
+ * adaptive -- it tracks a slow ramp and stays quiet); DRIFT_CUSUM deviates from a FIXED `target`
+ * mu0 (the classic SPC in-control mean -- it accumulates whenever the signal departs mu0). They
+ * genuinely diverge on the same stream.
+ *
+ * Headline (the recency TRIPLE):
+ *   - SPACE: O(1) -- six scalars, no allocation ever (the lightest member).
+ *   - ERROR: the threshold trades detection latency against false alarms (larger threshold ->
+ *     fewer false alarms, longer latency); delta is the magnitude/slack the test ignores.
+ *   - RECENCY: a SCALAR change signal (vs EH's hard window, ADWIN's adaptive window, or
+ *     ForwardDecay's smooth decay) -- "did the mean of this signal just shift?"
+ *
+ * Hot path (`add(x)`, 0 B/op): reject a non-finite / out-of-domain x on the cold branch, update
+ * the running mean (Welford, O(1)), run the ONE mode branch (a couple of adds + compares), and
+ * on a fire call the O(1) reset. No objects, no closures, no array literals.
+ *
+ * Fail closed: a bad mode / delta / threshold / option throws `[lite-adaptive]` at the ctor door
+ * BEFORE any field init; `add(x)` validates x (a finite number with |x| <= DD_X_MAX) typeof-first,
+ * BEFORE any state mutation -- a rejected add is a BYTE-IDENTICAL no-op; the statistic / mean
+ * getters throw `[lite-adaptive]` if an accumulator ever reaches a non-finite value (fail-closed,
+ * never a silent 0 / NaN); getters never throw on empty (return 0). null is not zero.
+ */
+export class DriftDetector {
+    /**
+     * @param {number} mode  DRIFT_PH or DRIFT_CUSUM.
+     * @param {object} [options] per-mode knobs:
+     *   - delta: the magnitude allowance (PH) / slack (CUSUM); a finite number in [0, 1e150]
+     *     (default 0.005). delta = 0 is a VALID, meaningful setting.
+     *   - threshold: the decision level (PH lambda / CUSUM decision interval); a finite number
+     *     > 0 (default 50). Tune to the signal's scale.
+     *   - target: the FIXED in-control mean mu0 the CUSUM test deviates from; a finite number,
+     *     ANY sign, |target| <= 1e150 (target = 0 is VALID). REQUIRED for DRIFT_CUSUM; FORBIDDEN
+     *     for DRIFT_PH (which uses the online running mean -- fail-closed, never a silent ignore).
+     *   An unknown key throws [lite-adaptive].
+     */
+    constructor(mode, options) {
+        // typeof / value guard FIRST, BEFORE any field init (a bad param leaves no half-built instance).
+        if (mode !== DRIFT_PH && mode !== DRIFT_CUSUM) {
+            throw new RangeError(
+                '[lite-adaptive] DriftDetector mode must be DRIFT_PH or DRIFT_CUSUM, got ' + String(mode));
+        }
+        let delta = DD_DEFAULT_DELTA;
+        let threshold = DD_DEFAULT_THRESHOLD;
+        let target;   // undefined = no fixed reference (PH); a finite mu0 is REQUIRED for CUSUM.
+        if (options !== undefined) {
+            if (typeof options !== 'object' || options === null) {
+                throw new TypeError('[lite-adaptive] DriftDetector options must be an object');
+            }
+            for (const key in options) {
+                if (!(key in DD_KNOWN_OPTS)) {
+                    throw new RangeError('[lite-adaptive] DriftDetector unknown option "' + key + '"');
+                }
+            }
+            // delta = 0 is VALID -- guard `undefined`, not falsy (null is not zero). delta is capped at
+            // DD_X_MAX (like x) so the accumulators cannot be driven non-finite by a pathological delta
+            // (each add moves gP/gN by ~delta; an uncapped delta near Double.MAX would overflow them in a
+            // few adds and add() would silently stop firing -- a fail-open boolean). Fail closed instead.
+            if (options.delta !== undefined) {
+                const d = options.delta;
+                if (typeof d !== 'number' || d !== d || d === Infinity || d === -Infinity ||
+                    d < 0 || d > DD_X_MAX) {
+                    throw new RangeError(
+                        '[lite-adaptive] DriftDetector delta must be a finite number in [0, 1e150], got ' + String(d));
+                }
+                delta = d;
+            }
+            if (options.threshold !== undefined) {
+                const th = options.threshold;
+                if (typeof th !== 'number' || th !== th || th === Infinity || th === -Infinity || th <= 0) {
+                    throw new RangeError(
+                        '[lite-adaptive] DriftDetector threshold must be a finite number > 0, got ' + String(th));
+                }
+                threshold = th;
+            }
+            // target = 0 is VALID -- guard `undefined`, not falsy (null is not zero). Capped at DD_X_MAX
+            // (symmetry with x) so `x - target` stays finite. Mode coherence is enforced below.
+            if (options.target !== undefined) {
+                const tg = options.target;
+                if (typeof tg !== 'number' || tg !== tg || tg === Infinity || tg === -Infinity ||
+                    tg > DD_X_MAX || tg < -DD_X_MAX) {
+                    throw new RangeError(
+                        '[lite-adaptive] DriftDetector target must be a finite number with |target| <= 1e150, got ' +
+                        String(tg));
+                }
+                target = tg;
+            }
+        }
+        // Mode / target coherence -- fail-closed, no silent ignore (the mode is load-bearing):
+        //   DRIFT_CUSUM tests against a FIXED target mu0 -> it is REQUIRED.
+        //   DRIFT_PH tests against the ONLINE running mean -> a target is FORBIDDEN (meaningless).
+        if (mode === DRIFT_CUSUM) {
+            if (target === undefined) {
+                throw new RangeError(
+                    '[lite-adaptive] DriftDetector DRIFT_CUSUM requires a finite `target` (the in-control mean mu0)');
+            }
+        } else if (target !== undefined) {
+            throw new RangeError(
+                '[lite-adaptive] DriftDetector `target` is only valid for DRIFT_CUSUM ' +
+                '(DRIFT_PH uses the online running mean)');
+        }
+        this._mode = mode;
+        this._delta = delta;
+        this._threshold = threshold;
+        this._target = target;   // a finite mu0 for CUSUM; undefined for PH (config, never reset)
+        this._initState();
+    }
+
+    /** @private Reset all scalar state to empty. Reused by clear(). 0 alloc. */
+    _initState() {
+        this._n = 0;          // items seen since the last reset
+        this._mean = 0;       // running mean of the signal
+        this._gP = 0;         // upward accumulator (PH cumulative +dev; CUSUM floored +dev)
+        this._gN = 0;         // downward accumulator (PH cumulative +dev; CUSUM floored -dev)
+        this._mMin = 0;       // PH running MIN of gP
+        this._mMax = 0;       // PH running MAX of gN
+    }
+
+    /** The detector mode (DRIFT_PH or DRIFT_CUSUM). O(1). */
+    get mode() { return this._mode; }
+    /** The magnitude allowance (PH) / slack (CUSUM). O(1). */
+    get delta() { return this._delta; }
+    /** The decision level (PH lambda / CUSUM decision interval). O(1). */
+    get threshold() { return this._threshold; }
+    /** The fixed CUSUM target mu0 (the reference the test deviates from); undefined for PH. O(1). */
+    get target() { return this._target; }
+    /** The number of items seen since the last reset (a fire resets it). O(1). */
+    get count() { return this._n; }
+    /** The running mean of the signal (0 on empty). O(1). Throws if an accumulator overflowed. */
+    get mean() {
+        if (this._n <= 0) return 0;
+        this._guardFinite();
+        return this._mean;
+    }
+    /**
+     * The current test statistic (>= 0): how close the detector is to firing. For PH it is the
+     * larger of the up-gap (gP - runningMin) and the down-gap (runningMax - gN); for CUSUM it is
+     * max(gP, gN). It crosses `threshold` exactly when `add` returns true. 0 on empty. O(1).
+     * Throws [lite-adaptive] if an accumulator overflowed (fail-closed, never a silent NaN).
+     */
+    get statistic() {
+        if (this._n <= 0) return 0;
+        this._guardFinite();
+        if (this._mode === DRIFT_PH) {
+            const up = this._gP - this._mMin;
+            const dn = this._mMax - this._gN;
+            return up > dn ? up : dn;
+        }
+        return this._gP > this._gN ? this._gP : this._gN;
+    }
+
+    /**
+     * Add one value to the signal. HOT, 0 B/op. Updates the running mean, runs the ONE mode branch,
+     * and returns true EXACTLY on the item that trips the threshold (drift detected), resetting the
+     * accumulators + running mean so the NEXT shift is caught.
+     *
+     * Fail closed: a non-number / NaN / +-Infinity x, or a finite |x| > DD_X_MAX (1e150, so the
+     * running accumulators cannot overflow), throws [lite-adaptive] (typeof-first, a BYTE-IDENTICAL
+     * no-op -- nothing is accumulated).
+     * @param {number} x  a finite real value with |x| <= DD_X_MAX.
+     * @returns {boolean} true iff drift was detected on this item.
+     */
+    add(x) {
+        // typeof guard FIRST, BEFORE any state mutation, so a rejected add is a byte-identical no-op.
+        if (typeof x !== 'number' || x !== x || x === Infinity || x === -Infinity ||
+            x > DD_X_MAX || x < -DD_X_MAX) {
+            return this._badValue(x);
+        }
+        const n = this._n + 1;
+        this._n = n;
+        // Welford running mean (O(1), no accumulated sum to overflow -- bounded by the x range). It
+        // is the PH reference AND the CUSUM `mean` observability getter (CUSUM's TEST uses target).
+        const mean = this._mean + (x - this._mean) / n;
+        this._mean = mean;
+        const delta = this._delta;
+        const th = this._threshold;
+        if (this._mode === DRIFT_PH) {
+            // Page-Hinkley two-sided: cumulative deviation from the ONLINE running mean, watched
+            // against its running extreme (a self-referencing / adaptive reference).
+            const dev = x - mean;
+            const gP = this._gP + (dev - delta);   // upward cumulative
+            const gN = this._gN + (dev + delta);   // downward cumulative
+            this._gP = gP;
+            this._gN = gN;
+            if (gP < this._mMin) this._mMin = gP;   // running MIN (upward reference)
+            if (gN > this._mMax) this._mMax = gN;   // running MAX (downward reference)
+            if (gP - this._mMin > th || this._mMax - gN > th) { this._reset(); return true; }
+            return false;
+        }
+        // Two-sided CUSUM: deviation from the FIXED target mu0 (the classic SPC in-control mean),
+        // two accumulators each floored at 0, fire at the decision interval. The fixed reference is
+        // what makes CUSUM genuinely differ from PH (see ADR 0007).
+        const dev = x - this._target;
+        let gP = this._gP + dev - delta;
+        if (gP < 0) gP = 0;
+        let gN = this._gN - dev - delta;
+        if (gN < 0) gN = 0;
+        this._gP = gP;
+        this._gN = gN;
+        if (gP > th || gN > th) { this._reset(); return true; }
+        return false;
+    }
+
+    /**
+     * Add one value read UNBOXED from a caller-owned Float64Array (`x = buf[i]`). HOT, 0 B/op --
+     * the ZERO-BOX sibling of `add(x)` for a caller whose `x` is a FRACTIONAL double: `add(x)` boxes
+     * a fractional argument into a ~16 B HeapNumber at a non-inlined call boundary; this reads it
+     * UNBOXED straight from the array. Identical validation, throws, byte-identical-no-op-on-reject,
+     * and detection as `add(x)`; the body is DUPLICATED from `add` (not delegated) to keep `add`'s
+     * hot body byte-identical and avoid re-boxing at an internal call boundary.
+     *
+     * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer /
+     * negative / out-of-range `i` (needs `i < buf.length`) throws [lite-adaptive]. A NaN /
+     * +-Infinity `buf[i]`, or a finite |buf[i]| > DD_X_MAX, throws (a byte-identical no-op).
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = the value (|x| <= DD_X_MAX).
+     * @param {number} i the index of the value to read.
+     * @returns {boolean} true iff drift was detected on this item.
+     */
+    addFrom(buf, i) {
+        // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badBuf(buf, i);
+        const x = buf[i];   // UNBOXED Float64Array read -- the whole point (no argument box).
+        // validate x (a Float64Array read is always a number, so add()'s typeof branch is omitted).
+        if (x !== x || x === Infinity || x === -Infinity ||
+            x > DD_X_MAX || x < -DD_X_MAX) return this._badValue(x);
+        const n = this._n + 1;
+        this._n = n;
+        const mean = this._mean + (x - this._mean) / n;   // DUPLICATED from add()
+        this._mean = mean;
+        const delta = this._delta;
+        const th = this._threshold;
+        if (this._mode === DRIFT_PH) {
+            const dev = x - mean;   // PH: deviation from the ONLINE running mean
+            const gP = this._gP + (dev - delta);
+            const gN = this._gN + (dev + delta);
+            this._gP = gP;
+            this._gN = gN;
+            if (gP < this._mMin) this._mMin = gP;
+            if (gN > this._mMax) this._mMax = gN;
+            if (gP - this._mMin > th || this._mMax - gN > th) { this._reset(); return true; }
+            return false;
+        }
+        const dev = x - this._target;   // CUSUM: deviation from the FIXED target mu0
+        let gP = this._gP + dev - delta;
+        if (gP < 0) gP = 0;
+        let gN = this._gN - dev - delta;
+        if (gN < 0) gN = 0;
+        this._gP = gP;
+        this._gN = gN;
+        if (gP > th || gN > th) { this._reset(); return true; }
+        return false;
+    }
+
+    /**
+     * @private Reset the accumulators + running mean on a positive detection (the standard PH /
+     * CUSUM discipline) so the detector recalibrates to the new concept. 0 alloc. A dedicated
+     * method (not _initState) so a witness control can disable ONLY the reset without breaking
+     * construction / clear().
+     */
+    _reset() {
+        this._n = 0;
+        this._mean = 0;
+        this._gP = 0;
+        this._gN = 0;
+        this._mMin = 0;
+        this._mMax = 0;
+    }
+
+    /** Reset all scalar state; keep the mode / delta / threshold. O(1). @returns {DriftDetector} this */
+    clear() {
+        this._initState();
+        return this;
+    }
+
+    /** @private Cold thrower for a bad value. */
+    _badValue(x) {
+        throw new TypeError(
+            '[lite-adaptive] DriftDetector add x must be a finite number with |x| <= 1e150, got ' + String(x));
+    }
+
+    /**
+     * @private Fail-closed guard for the statistic / mean getters: an accumulator that reached a
+     * non-finite value must THROW, never silently read 0 / NaN. Cold path, 0 hot cost. Mirrors
+     * ADWIN / ForwardDecay. (Unreachable via the public API given DD_X_MAX; defense-in-depth.)
+     */
+    _guardFinite() {
+        const m = this._mean, gp = this._gP, gn = this._gN, mn = this._mMin, mx = this._mMax;
+        if (m !== m || m === Infinity || m === -Infinity ||
+            gp !== gp || gp === Infinity || gp === -Infinity ||
+            gn !== gn || gn === Infinity || gn === -Infinity ||
+            mn !== mn || mn === Infinity || mn === -Infinity ||
+            mx !== mx || mx === Infinity || mx === -Infinity) {
+            throw new RangeError(
+                '[lite-adaptive] DriftDetector accumulator overflowed to a non-finite value; the ' +
+                'detector is fail-closed -- call clear() to reuse');
+        }
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] DriftDetector.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index (0 <= i < buf.length), got ' + String(buf) + ', ' + String(i));
     }
 }

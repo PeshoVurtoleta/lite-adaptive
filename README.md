@@ -50,6 +50,7 @@ last1000.count();                          // ~1000  (an exact ring would hold 1
 - [ForwardDecay](#forwarddecay)
 - [HeavyKeeper](#heavykeeper)
 - [SlidingHyperLogLog](#slidinghyperloglog)
+- [DriftDetector](#driftdetector)
 - [API reference](#api-reference)
 - [Composability](#composability)
 - [Zero-GC design notes](#zero-gc-design-notes)
@@ -70,6 +71,7 @@ A recency summary is a promise: "I use `X` bytes and my answer about the last `W
 - **ForwardDecay** -- time-decayed count / sum / mean / rate (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009) in **O(1) space** (two scalar accumulators, no pool): every element's weight halves every `halfLife`, so recent data dominates and old data *fades* smoothly instead of dropping at an edge. `add(now?, value?)` accepts any finite real (signed); `count` / `sum` / `mean` / `rate` are O(1) queries, EXACT modulo floating point.
 - **HeavyKeeper** -- decayed / windowed heavy hitters (Gong et al., USENIX ATC 2018): the top-k keys dominating the stream *right now*. A `d x w` fingerprint table with probabilistic exponential decay on collision (cold keys erode) + an intrusive top-k min-forest. `add(key, weight = 1)` ranks by count or any additive weight; `forEach` / `topKInto` read the leaders 0-alloc. Far lower error than Space-Saving on skewed, evolving streams. The final member of the frozen 1.0.0 core.
 - **SlidingHyperLogLog** -- windowed distinct-count (Chabchoub-Hebrail, "Sliding HyperLogLog", 2010): "how many *distinct* keys in the last `W`?" in fixed preallocated space at HLL accuracy (the recency sibling of `@zakkster/lite-sketch`'s cumulative HyperLogLog). An `m = 2^p` register bank where each register keeps a small fixed LFPM ring of `(timestamp, rho)` maxima; `add(now, key)` / `addFrom` are 0-alloc incl. the windowed eviction, `count(w?)` runs Ertl's estimator over the live window with a `1.04 / sqrt(m)` standard error. The first additive post-1.0 member (1.1.0).
+- **DriftDetector** -- scalar change detection (Page, *Biometrika* 1954): "did the mean of *this* signal just shift?" in `O(1)` state -- six scalars, no pool, no window (the lightest member). One class selects **Page-Hinkley** or two-sided **CUSUM** via a mode const; `add(x) -> boolean` returns `true` exactly on the detecting item, then resets to catch the next shift. The cheap per-channel companion to ADWIN -- run one per stream when you have many. The second additive post-1.0 member (1.2.0).
 - **A caller-owned time source** -- `add(now)` with a monotone `now` (a logical tick or ms), or `add()` in count mode for the "last N items" window. The member never reads the clock, so witnesses are exactly reproducible.
 - **The recency witness** -- measured windowed error vs the theoretical bound, printed side by side, with the exact-ring foil whose memory climbs O(W) while the histogram stays a fixed sliver.
 - **Zero runtime dependencies**, ESM, tree-shakeable named exports, TypeScript types, and a **0 bytes/op hot path** -- *including* the amortized bucket merge / expire reshaping -- proven by a leak + GC-profiler torture gate.
@@ -210,6 +212,39 @@ The per-register ring is a fixed `ringCap` (default 8). If a register receives m
 
 Driven by a caller-supplied monotone `now` (or count mode when `now` is omitted); the mode locks at the first add. Keys are safe integers; a bad `W` / `p` / `ringCap` / `seed` / key / `now` throws `[lite-adaptive]` typeof-first, before any allocation. `addFrom(buf, i)` is the zero-box entry (`now = buf[i]`, `key = buf[i+1]` read unboxed from a `Float64Array`) for fractional / epoch-ms timestamps and large safe-integer keys.
 
+## DriftDetector
+
+Answer one question -- "did the mean of *this* signal just shift?" -- in `O(1)` state: six scalars, no pool, no window (the lightest member). `DriftDetector` is the scalar, item-based companion to ADWIN: where ADWIN keeps a variance-carrying bucket window and auto-adapts its size, `DriftDetector` keeps only a running mean and one or two bounded test accumulators and returns `true` the moment the mean shifts. Run one per channel when you have many streams and only need a change flag, not the adapted window. A single class selects one of two classical tests via a **mode const** -- and the two differ in their *reference*, which is what makes the flag load-bearing:
+
+```js
+import { DriftDetector, DRIFT_PH, DRIFT_CUSUM } from '@zakkster/lite-adaptive';
+
+// Page-Hinkley: no known baseline -- it learns the reference online (the running mean).
+const ph = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 50 });
+for (const x of latencies) if (ph.add(x)) markRegimeChange();   // true EXACTLY on the shift
+
+// CUSUM: you KNOW the in-control mean -- alarm on departure from a fixed target mu0.
+const cs = new DriftDetector(DRIFT_CUSUM, { target: 200, delta: 0.5, threshold: 8 });
+cs.add(x);          // two accumulators floored at 0; either crossing `threshold` fires
+cs.statistic;       // how close to firing (>= 0); crosses `threshold` when add() returns true
+cs.mean;            // the running mean of the signal (observability; CUSUM tests vs `target`)
+```
+
+- **`DRIFT_PH`** (Page-Hinkley; Page 1954, Mouss et al. 2004) -- references the **online running mean**: it accumulates the deviation of each `x` from the mean it has learned so far and watches the gap between the cumulative sum and its running extreme; a persistent one-directional drift makes the gap exceed the threshold `lambda`. Two-sided (an upward accumulator against its running min, a downward one against its running max). Use it when you have **no known baseline** -- it tracks a slow ramp and stays quiet.
+- **`DRIFT_CUSUM`** (two-sided CUSUM; Page 1954) -- references a **fixed target `mu0`** (the classic SPC in-control mean, a required option): two accumulators, each floored at 0, grow only while the signal departs `mu0` past the slack `delta`; either exceeding the decision interval `threshold` fires. Use it when you **know the target** -- a *sustained* departure from `mu0` keeps alarming, and it goes quiet only when the signal returns to `mu0`.
+
+> Why the reference matters: under a *shared* running-mean reference the two rules compute a mathematically identical statistic (CUSUM's floor-at-0 recursion is exactly Page-Hinkley's cumulative-sum-minus-running-min). PH's adaptive reference and CUSUM's fixed `mu0` are what make the modes genuinely diverge -- on a slow mean ramp PH fires a handful of times while CUSUM (vs a fixed `mu0`) fires on nearly every item. See ADR 0007.
+
+On a positive detection the accumulators + running mean are **reset** (the standard PH / CUSUM discipline; the fixed `target` is preserved) so the detector recalibrates and catches the *next* transient shift. Both `add(x)` and the zero-box `addFrom(buf, i)` (reads `x = buf[i]` unboxed from a `Float64Array` for fractional signals) are 0 B/op -- no pool to reshape, just a Welford mean update and one mode branch.
+
+<details>
+<summary>Fail-closed domain (the ADWIN finite-overflow lesson)</summary>
+
+`add(x)` rejects a non-finite `x` and any finite `|x| > DD_X_MAX` (`1e150`) as a byte-identical no-op, so the running accumulators can never be driven to a non-finite value (each add moves them by `~2 * DD_X_MAX`, and both are bounded between resets -- reaching `Double.MAX` would need `~1e158` un-fired adds). `delta` is capped at the same bound at the ctor door, because each add also moves the accumulators by `~delta` -- an uncapped pathological `delta` would overflow them in a few adds and `add()` would silently stop firing (a fail-open boolean). As defense-in-depth, the `mean` / `statistic` getters throw `[lite-adaptive]` if any accumulator is ever non-finite, never a silent `0` / `NaN`. `delta = 0` is a valid, meaningful setting (no dead-band), guarded as `!== undefined` -- null is not zero.
+</details>
+
+Item-indexed (no clock). `delta` is the magnitude the test ignores (widens the dead-band -> fewer detections, higher latency); `threshold` trades detection latency against false alarms. A bad `mode` / `delta` / `threshold` / option throws `[lite-adaptive]` at the ctor door, before any field init. `DDM` / `EDDM` are deliberately out of this class -- they consume a Bernoulli *error-bit* stream and emit a tri-state (stable / warning / drift) output, a different contract from `add(x) -> boolean`, and belong in a future member.
+
 ## API reference
 
 ```js
@@ -312,6 +347,16 @@ clear() -> this                // 0-alloc reset (reuse the rings; unlocks the mo
 
 // getters
 W   p   m   ringCap   seed   standardError   lastNow   mode   overflows   degraded   bytes
+
+// DriftDetector -- scalar change detection (Page-Hinkley / two-sided CUSUM) in O(1) state
+new DriftDetector(mode, options?)           // mode: DRIFT_PH | DRIFT_CUSUM; options: { delta, threshold, target }
+                                            //   target: REQUIRED for CUSUM (fixed mu0), FORBIDDEN for PH
+add(x) -> boolean              // HOT, 0 B/op; true EXACTLY on the detecting item, then resets
+addFrom(buf, i) -> boolean     // HOT, 0 B/op ZERO-BOX: x = buf[i] read unboxed (fractional signals)
+clear() -> this                // 0-alloc reset of all scalar state (keeps mode / delta / threshold / target)
+
+// getters
+mode   delta   threshold   target   count   mean   statistic
 ```
 
 - **`d` / `w` / `k`** -- hash rows (`~4-8`), cells per row, and the top-k size. `HeavyKeeper.withAccuracy(k, targetError)` derives `d` / `w` from a target relative error. A bad `d` / `w` / `k` / `seed` / `b` / option throws `[lite-adaptive]` typeof-first, before any allocation.
@@ -342,6 +387,22 @@ Constants that shape the register bank:
 | `p` | precision (`[4, 16]`, default 10) | `m = 2^p` registers; standard error `1.04 / sqrt(m)` |
 | `ringCap` | ring size (`[2, 64]`, default 8) | per-register LFPM maxima kept in-window; overflow -> `degraded` |
 | space | `~ m * ringCap * 9 B` | `Float64` stamp + `Uint8` rho per ring slot + O(m) head/len; fixed (p=10 -> ~72 KB) |
+
+- **`DriftDetector(mode, { delta, threshold, target })`** -- `mode` is `DRIFT_PH` or `DRIFT_CUSUM` (the two named-export mode consts); any other value throws `[lite-adaptive]` at the ctor door. `delta` (default `0.005`) a finite number in `[0, 1e150]`, `threshold` (default `50`) a finite number `> 0`; a bad `delta` / `threshold` / unknown option throws typeof-first, before any field init.
+- **`target`** -- the fixed reference `mu0` for CUSUM: a finite number of any sign with `|target| <= 1e150`. **REQUIRED for `DRIFT_CUSUM`** (a CUSUM with no in-control mean is meaningless) and **FORBIDDEN for `DRIFT_PH`** (which self-references the running mean) -- a mismatch throws `[lite-adaptive]`, never a silent default or ignore. `target = 0` is valid (guarded `!== undefined`, not falsy).
+- **`delta` / `threshold`** -- `delta` is the magnitude allowance (PH) / slack (CUSUM) the test ignores: `delta = 0` is a valid, meaningful setting (no dead-band), guarded as `!== undefined`, never falsy. `threshold` is the decision level (PH `lambda` / CUSUM decision interval) -- larger -> fewer false alarms, longer latency; tune it to the signal's scale.
+- **`add(x)` / `addFrom(buf, i)`** -- `x` a finite number with `|x| <= 1e150`; both return `true` EXACTLY on the detecting item and reset the detector (the `target` is preserved). A non-finite / out-of-domain `x` (or, for `addFrom`, a non-`Float64Array` `buf` / out-of-range `i`) throws `[lite-adaptive]` as a byte-identical no-op.
+- **`statistic` / `mean` / `target` / `count`** -- `statistic` (`>= 0`) is how close the detector is to firing (it crosses `threshold` when `add` returns true); `mean` is the running mean of the signal (the PH reference; an observability value for CUSUM, which tests vs `target`); `target` is the fixed CUSUM `mu0` (`undefined` for PH); `count` the items seen since the last reset. `statistic` / `mean` throw `[lite-adaptive]` if an accumulator ever went non-finite (fail-closed); both return `0` on empty.
+
+Constants that shape the detector:
+
+| Symbol | Value | Meaning |
+|--------|-------|---------|
+| `mode` | `DRIFT_PH` \| `DRIFT_CUSUM` | Page-Hinkley (adaptive running-mean reference) or two-sided CUSUM (fixed-target reference) |
+| `target` | CUSUM: required, any finite real; PH: forbidden | the fixed in-control mean `mu0` CUSUM tests departure from |
+| `delta` | default `0.005`, `[0, 1e150]` | magnitude allowance / slack the test ignores (widens the dead-band) |
+| `threshold` | default `50`, `> 0` | decision level; latency vs false-alarm trade-off |
+| space | `O(1)` (six scalars) | no pool, no window; 0 B/op on `add` / `addFrom` / `clear` |
 
 ## Composability
 
@@ -408,11 +469,12 @@ Gated quality numbers (`npm run verify`):
 - **ForwardDecay accepts signed values; ExponentialHistogram does not.** Because the decayed count `C` and the decayed sum `Sv` are separate accumulators, a negative value gives a proper decayed weighted mean without corrupting the count. EH's positive-only sum is a deliberate contrast.
 - **`rate()` is a definition, not a theorem.** `rate = decayedCount * lambda` is the decayed events per unit time under the exponential kernel, exact only in the steady-state limit -- documented, never oversold.
 - **Fail closed, typeof-first, before allocation.** A bad `W` / `epsilon` / `halfLife` / option throws at the constructor door before any allocation; `null` is not zero; a query before the last add time throws (can't un-decay); other queries never throw.
+- **The DriftDetector mode is the *reference*, and it is load-bearing.** Page-Hinkley and CUSUM share the contract -- a real-valued `add(x) -> boolean` -- so they live behind one mode flag with a single hot body (a Welford mean + one branch). But under a *shared* reference the two rules are the identical statistic (CUSUM's floor-at-0 recursion is exactly PH's cumulative-sum-minus-running-min), so the modes differ by what they reference: PH the **online running mean** (no baseline needed), CUSUM a **fixed target `mu0`** (the SPC in-control mean). That is what makes the flag meaningful, and the witness gates the divergence so a regression back to one statistic is rejected (see ADR 0007). DDM / EDDM take a Bernoulli error bit and emit a tri-state signal -- an incompatible contract -- so they were deliberately deferred to a future member. The `delta` (and `target`) caps mirror the `x` cap so a pathological config can never turn `add` into a fail-open boolean.
 
 ## Testing
 
-- `npm test` -- the `node:test` behavioral + fail-closed suite across all three members (ExponentialHistogram, ADWIN, ForwardDecay): ctor validation before allocation, mode-lock both ways, monotone-`now`, signed values, the landmark rebase, query-now contract, and the M1 no-op regressions (a rejected add is byte-identical).
-- `npm run witness` -- the recency witness: the windowed error vs the `epsilon` bound (EH) + the change-response gates (ADWIN) + the exact-aggregate gate `|fd - oracle| / |oracle| <= 1e-9` (ForwardDecay) across 3 `halfLife` x 3 stream-shapes, each with rejected negative controls.
+- `npm test` -- the `node:test` behavioral + fail-closed suite across every member (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog, DriftDetector): ctor validation before allocation, mode-lock both ways, monotone-`now`, signed values, the landmark rebase, query-now contract, drift detection + reset, and the no-op regressions (a rejected add is byte-identical).
+- `npm run witness` -- the recency witness: the windowed error vs the `epsilon` bound (EH) + the change-response gates (ADWIN) + the exact-aggregate gate `|fd - oracle| / |oracle| <= 1e-9` (ForwardDecay) + the top-k recall / marquee (HeavyKeeper) + the windowed-distinct error vs a `Set` oracle (SlidingHyperLogLog) + the detection-latency / false-alarm gates (DriftDetector), each with rejected negative controls.
 - `npm run torture` -- the 0 B/op leak + GC-profiler gate on `add` including the merge / expire reshaping (`node --expose-gc`).
 - `npm run test:perf` -- the flat-throughput perf gate + a must-allocate control.
 - `npm run test:types` -- the ambient type-surface compile check.
@@ -426,6 +488,7 @@ Gated quality numbers (`npm run verify`):
 - **Not exact top-k.** HeavyKeeper estimates the current heavy hitters in sublinear space -- exact top-k over an evolving stream is impossible in fixed memory. The four-member core (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper) is FROZEN at 1.0.0 (the API-freeze milestone, not a new member); additive members may still land in a later minor without breaking the core.
 - **Not a cumulative top-k.** HeavyKeeper decays, so it answers "who dominates *now*"; the whole-stream heavy hitters that never forget are `@zakkster/lite-sketch`'s SpaceSaving.
 - **Not a cumulative distinct-count.** SlidingHyperLogLog counts distinct keys in the last `W` and forgets older ones; for a whole-stream distinct-count that never forgets, use `@zakkster/lite-sketch`'s HyperLogLog. `SlidingHyperLogLog` is the first additive post-1.0 member (1.1.0), landing without breaking the frozen core.
+- **Not an error-rate / classifier-drift detector.** `DriftDetector` (Page-Hinkley / CUSUM) watches the mean of a *real-valued* signal and returns a boolean; the DDM / EDDM family that consumes a Bernoulli *error-bit* stream and emits a tri-state (stable / warning / drift) output is a different contract and belongs in a future member. `DriftDetector` is also not an *adaptive-window* detector -- for the auto-grown / auto-shrunk window (and the current mean / variance / width of it), use ADWIN; `DriftDetector` is the cheaper `O(1)`-state per-channel change flag (the second additive post-1.0 member, 1.2.0).
 
 ## Ecosystem
 

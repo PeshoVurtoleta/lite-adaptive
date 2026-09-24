@@ -8,7 +8,8 @@
 // buckets vs the ring's O(W)). A NEGATIVE CONTROL (a broken EH -- no straddle half-
 // correction) is fed the SAME gate and MUST be REJECTED (the gate has teeth). ASCII-only.
 
-import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog, VERSION } from '../Adaptive.js';
+import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, VERSION } from '../Adaptive.js';
 
 const WS = [64, 1000, 65536];
 const EPS = [0.5, 0.1, 0.01];
@@ -1050,9 +1051,190 @@ console.log('');
 console.log('WITNESS SlidingHyperLogLog negative controls (no-expiry + no-dominated-drop rejected) ' +
     (slControlsOk ? 'ok' : 'FAIL'));
 
+// ===========================================================================
+// CHANGE-RESPONSE Witness -- DriftDetector (ADR 0007; Page 1954, Mouss et al. 2004). The scalar
+// drift anchor: inject a KNOWN changepoint into a real-valued signal and MEASURE, against ground
+// truth, for BOTH modes (DRIFT_PH online-mean-referenced, DRIFT_CUSUM fixed-target-referenced):
+//   - detection LATENCY per shift magnitude (a larger shift detects no slower)
+//   - false-alarm rate on a STATIONARY run (GATE bounded)
+//   - reset discipline: fires ROUGHLY ONCE per changepoint (not on every subsequent item)
+//   - DIVERGENCE: on a designed slow-ramp stream PH (adaptive) and CUSUM (fixed mu0) fire
+//     MEASURABLY DIFFERENTLY -- the mode is load-bearing (a regression back to the qa-found
+//     identical-statistic bug is REJECTED here).
+// plus the NEGATIVE CONTROLS (the gate must have teeth):
+//   - a huge-threshold detector (threshold 1e12) NEVER detects a real shift -> the latency gate
+//     must REJECT it.
+//   - a NO-RESET detector (never resets the accumulators on a fire) keeps firing on nearly every
+//     item after the first crossing -> the fires-per-changepoint gate must REJECT it.
+// The CUSUM sub-lanes pass a fixed target = the in-control mean (0 for these noise-around-0 streams).
+// ===========================================================================
+
+/** A DriftDetector that never resets on a fire -> after one crossing it keeps firing. */
+class NoResetDD extends DriftDetector {
+    _reset() { /* BUG: never resets the accumulators / running mean -> false-alarms forever */ }
+}
+
+/** Per-mode options: CUSUM REQUIRES a fixed target; inject the in-control mean (0) unless given. */
+function ddOpts(mode, extra) {
+    const o = Object.assign({}, extra);
+    if (mode === DRIFT_CUSUM && o.target === undefined) o.target = 0;
+    return o;
+}
+
+/** Detection latency for a stationary(0) -> shift stream; {lat, fires}, lat = Infinity if missed. */
+function ddDetect(Ctor, mode, extra, shift, CP, post, seed) {
+    const dd = new Ctor(mode, ddOpts(mode, extra));
+    const r = mulberry32(seed);
+    let lat = Infinity, fires = 0;
+    for (let i = 0; i < CP; i++) { if (dd.add((r() - 0.5) * 0.4)) fires++; }
+    for (let j = 0; j < post; j++) {
+        if (dd.add(shift + (r() - 0.5) * 0.4)) { if (!Number.isFinite(lat)) lat = j; fires++; }
+    }
+    return { lat, fires };
+}
+
+/** Flags raised on a stationary uniform-noise stream / N -- the false-alarm rate. */
+function ddFalseAlarm(mode, extra, N, seed) {
+    const dd = new DriftDetector(mode, ddOpts(mode, extra));
+    const r = mulberry32(seed);
+    let flags = 0;
+    for (let i = 0; i < N; i++) if (dd.add((r() - 0.5) * 0.4)) flags++;
+    return flags / N;
+}
+
+/** Fires over a slow linear mean-ramp (0 -> span) -- the mode-divergence probe. */
+function ddRampFires(mode, seed) {
+    const dd = new DriftDetector(mode, ddOpts(mode, { delta: 0.005, threshold: 5 }));
+    const r = mulberry32(seed);
+    let fires = 0;
+    for (let i = 0; i < 20000; i++) if (dd.add(i * 0.002 + (r() - 0.5) * 0.1)) fires++;   // ramp 0 -> 40
+    return fires;
+}
+
+/**
+ * The reset-discipline probe: a TRANSIENT shift (stationary mu0 -> +shift for `dur` -> back to mu0)
+ * and the fires counted ONLY in the final stationary TAIL. A working reset settles both modes quiet
+ * in the tail (PH's adaptive mean recovers; CUSUM's accumulator decays back to 0 at mu0); a no-reset
+ * variant keeps firing through the tail. Returns { detected, tailFires }.
+ */
+function ddTransientTail(Ctor, mode, shift, warm, dur, tail, seed) {
+    const dd = new Ctor(mode, ddOpts(mode, { delta: 0.005, threshold: 5 }));
+    const r = mulberry32(seed);
+    let detected = false, tailFires = 0;
+    for (let i = 0; i < warm; i++) dd.add((r() - 0.5) * 0.4);
+    for (let i = 0; i < dur; i++) if (dd.add(shift + (r() - 0.5) * 0.4)) detected = true;
+    for (let i = 0; i < tail; i++) if (dd.add((r() - 0.5) * 0.4)) tailFires++;   // back at mu0
+    return { detected, tailFires };
+}
+
+let ddOk = true;
+const DD_OPTS = { delta: 0.005, threshold: 5 };
+const DD_CP = 40000, DD_POST = 40000;
+
+console.log('');
+console.log('CHANGE-RESPONSE Witness -- DriftDetector v' + VERSION + ' (Page 1954; Mouss et al. 2004): scalar ' +
+    'drift detection (theoretical: a persistent mean shift > delta trips the threshold; latency ~ threshold/(shift-delta))');
+console.log('');
+console.log('  detection latency per shift magnitude (stationary 0 -> shift at item 40k; delta=0.005, threshold=5):');
+console.log('  mode    shift  latency (items)  fires post-CP  status');
+console.log('  ------  -----  ---------------  -------------  ------');
+for (const [name, mode] of [['PH', DRIFT_PH], ['CUSUM', DRIFT_CUSUM]]) {
+    for (const shift of [0.5, 1, 5]) {
+        const d = ddDetect(DriftDetector, mode, DD_OPTS, shift, DD_CP, DD_POST, 4242);
+        const missed = !Number.isFinite(d.lat);
+        // GATE: every shift here is persistent + well above delta, so it MUST be detected; a large
+        // shift (>= 1) within a short latency. (Fires-count is NOT gated here: PH's adaptive mean
+        // catches up and it quiets, but CUSUM's FIXED mu0 sees a SUSTAINED departure and legitimately
+        // keeps alarming while out of control -- the reset discipline is gated below on a TRANSIENT.)
+        const cellOk = !missed && (shift < 1 || d.lat < 2000);
+        if (!cellOk) ddOk = false;
+        console.log('  ' + name.padEnd(6) + '  ' + String(shift).padEnd(5) + '  ' +
+            (missed ? 'MISSED' : String(d.lat)).padStart(15) + '  ' +
+            String(d.fires).padStart(13) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+    }
+}
+
+// --- reset discipline on a TRANSIENT shift: detect during the spike, then go QUIET once the signal
+//     returns to mu0 (a working reset settles both modes; a no-reset variant keeps firing -- gated as
+//     a negative control below). GATE: detected during the spike AND the stationary tail is quiet. ---
+console.log('');
+console.log('  reset discipline (transient: 20k mu0 -> 5k at +5 -> 20k back at mu0; tail must be QUIET):');
+console.log('  mode    detected  tail fires  status');
+console.log('  ------  --------  ----------  ------');
+for (const [name, mode] of [['PH', DRIFT_PH], ['CUSUM', DRIFT_CUSUM]]) {
+    const d = ddTransientTail(DriftDetector, mode, 5, 20000, 5000, 20000, 4242);
+    const cellOk = d.detected && d.tailFires < 50;   // a working reset settles quiet after the spike
+    if (!cellOk) ddOk = false;
+    console.log('  ' + name.padEnd(6) + '  ' + String(d.detected).padEnd(8) + '  ' +
+        String(d.tailFires).padStart(10) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+}
+
+console.log('');
+console.log('  stationary false-alarm rate (uniform noise, N=100k; theoretical: bounded, ~0 at threshold=5):');
+console.log('  mode    false-alarm   bound (1%)   status');
+console.log('  ------  ------------  -----------  ------');
+for (const [name, mode] of [['PH', DRIFT_PH], ['CUSUM', DRIFT_CUSUM]]) {
+    let worst = 0;
+    for (const seed of [1, 2, 3]) {
+        const fa = ddFalseAlarm(mode, DD_OPTS, 100000, seed);
+        if (fa > worst) worst = fa;
+    }
+    const cellOk = worst <= 0.01;   // a well-set threshold false-alarms rarely on stationary noise
+    if (!cellOk) ddOk = false;
+    console.log('  ' + name.padEnd(6) + '  ' + pct(worst).padStart(12) + '  ' +
+        pct(0.01).padStart(11) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+}
+
+// --- MODE DIVERGENCE: the mode must be LOAD-BEARING (guards against the qa-found identical-statistic
+//     bug). On a slow mean ramp, PH's ONLINE reference tracks it and stays quiet, while CUSUM's FIXED
+//     mu0=0 sees an ever-growing departure and fires far more. GATE: the two fire counts DIFFER (and
+//     CUSUM >> PH). If a future change collapses the modes to one statistic, this lane FAILS. ---
+console.log('');
+console.log('  mode divergence (slow mean ramp 0 -> 40 over 20k; PH adaptive vs CUSUM fixed mu0=0):');
+{
+    const phFires = ddRampFires(DRIFT_PH, 1);
+    const cuFires = ddRampFires(DRIFT_CUSUM, 1);   // identical stream (same seed)
+    const diverge = phFires !== cuFires && cuFires > phFires * 5;
+    if (!diverge) ddOk = false;
+    console.log('    PH fires=' + phFires + '  CUSUM fires=' + cuFires + '  (CUSUM must be >> PH) -> ' +
+        (diverge ? 'DIVERGE (mode is load-bearing, ok)' : 'IDENTICAL (mode is cosmetic, FAIL)'));
+}
+
+console.log('');
+console.log('WITNESS DriftDetector (change response: latency + bounded false-alarm + reset discipline + mode divergence) ' +
+    (ddOk ? 'ok' : 'FAIL'));
+
+// --- DriftDetector NEGATIVE CONTROLS: the threshold + the reset must be load-bearing ---
+console.log('');
+console.log('NEGATIVE CONTROLS -- a broken DriftDetector MUST be rejected by the same gates:');
+let ddControlsOk = true;
+// 1) huge threshold -> a real shift never crosses -> MUST fail the latency (detection) gate.
+for (const [name, mode] of [['PH', DRIFT_PH], ['CUSUM', DRIFT_CUSUM]]) {
+    const d = ddDetect(DriftDetector, mode, { delta: 0.005, threshold: 1e12 }, 5, DD_CP, DD_POST, 909);
+    const rejected = !Number.isFinite(d.lat);   // the latency gate must REJECT it (never detects)
+    if (!rejected) ddControlsOk = false;
+    console.log('  ' + name + ' huge-threshold (1e12) detector: shift 0 -> 5 detected=' +
+        (Number.isFinite(d.lat) ? ('+' + d.lat) : 'NEVER') +
+        ' -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+// 2) no-reset -> on a TRANSIENT shift that RETURNS to baseline, a working detector goes quiet in the
+//    tail but the no-reset variant's statistic stays latched and it keeps firing -> MUST fail the
+//    tail-quiet gate. (A sustained departure fires for BOTH, so the reset is only separable on a
+//    transient -- baseline is the learned mean for PH, the fixed target for CUSUM.)
+for (const [name, mode] of [['PH', DRIFT_PH], ['CUSUM', DRIFT_CUSUM]]) {
+    const d = ddTransientTail(NoResetDD, mode, 5, 20000, 5000, 20000, 555);
+    const rejected = d.tailFires >= 50;   // a working reset keeps the tail < 50; no-reset stays latched
+    if (!rejected) ddControlsOk = false;
+    console.log('  ' + name + ' no-reset detector (transient): tail fires=' + d.tailFires +
+        ' (>= 50 == latched / never quiets) -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+console.log('');
+console.log('WITNESS DriftDetector negative controls (huge-threshold + no-reset rejected) ' +
+    (ddControlsOk ? 'ok' : 'FAIL'));
+
 const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
-    slOk && slControlsOk;
+    slOk && slControlsOk && ddOk && ddControlsOk;
 console.log('');
 console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper + ' +
-    'SlidingHyperLogLog) ' + (all ? 'ok' : 'FAIL'));
+    'SlidingHyperLogLog + DriftDetector) ' + (all ? 'ok' : 'FAIL'));
 if (!all) process.exitCode = 1;

@@ -8,6 +8,64 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.2.0] - 2026-09-24
+
+The second additive post-1.0 member. **PURE APPEND**: the five prior classes
+(`ExponentialHistogram`, `ADWIN`, `ForwardDecay`, `HeavyKeeper`, `SlidingHyperLogLog`) are
+BYTE-IDENTICAL; only the file header and the `VERSION` const change above the append point.
+MINOR bump (new API, no break).
+
+### Added
+
+- **`DriftDetector` -- scalar, O(1)-state streaming drift detection** (Page, "Continuous
+  Inspection Schemes", Biometrika 1954; Mouss-Mouss-Linkens-Sellami, 2004; ADR 0007). A single
+  class over a real-valued signal, selected by a mode const whose REFERENCE is load-bearing --
+  `DRIFT_PH` (Page-Hinkley: cumulative deviation of x from the ONLINE running mean, two-sided;
+  adaptive) or `DRIFT_CUSUM` (two-sided CUSUM: two accumulators `gP` / `gN`, each floored at 0,
+  deviating from a FIXED `target` mu0; classic SPC). The distinct references are deliberate: under
+  a shared running-mean reference the two rules collapse to the identical reflected-random-walk
+  statistic (CUSUM's `max(0, cumsum)` IS `cumsum` minus its running min, which is what PH computes),
+  so PH self-references the online mean while CUSUM references a fixed mu0 -- they genuinely diverge
+  (e.g. on a slow ramp PH stays quiet while CUSUM fires continuously). `add(x) -> boolean` updates a
+  running mean (Welford), runs the one mode branch, and returns `true` EXACTLY on the detecting item,
+  RESETTING the accumulators + running mean so the NEXT shift is caught -- **0 B/op**. It is the
+  item-based, scalar, fixed-scalar-state complement to `ADWIN`'s adaptive window: no pool (pure
+  scalars, like `ForwardDecay`), no window. Constructor
+  `new DriftDetector(mode, { delta?, threshold?, target? })` -- `delta` the magnitude allowance (PH)
+  / slack (CUSUM), a finite number in `[0, 1e150]` (default `0.005`; `delta = 0` is a valid setting,
+  guarded as `undefined`, not falsy); `threshold` the decision level (PH lambda / CUSUM decision
+  interval), a finite number `> 0` (default `50`, tune to the signal scale); `target` the FIXED
+  in-control mean mu0 the CUSUM test deviates from, a finite number of any sign, `|target| <= 1e150`
+  (`target = 0` valid) -- **REQUIRED for `DRIFT_CUSUM`, FORBIDDEN for `DRIFT_PH`** (a mismatch throws,
+  never a silent ignore). `add(x)` accepts a finite real with `|x| <= 1e150` (`DD_X_MAX`, so the
+  accumulators cannot silently overflow to a non-finite value -- the `ADWIN` finite-overflow
+  lesson). Getters `mode`, `delta`, `threshold`, `target` (the fixed CUSUM mu0; `undefined` for PH),
+  `count` (items seen since the last reset), `mean`, `statistic` (the current test statistic; crosses
+  `threshold` exactly when `add` fires); `mean` / `statistic` throw `[lite-adaptive]` fail-closed on
+  a non-finite accumulator; getters return `0` on empty. Fail closed typeof-first on a bad `mode` /
+  `delta` / `threshold` / `target` / option / `x` (a byte-identical no-op). Proven by the torture
+  gate (add PH + add CUSUM + addFrom + clear at 0 B/op) and the change-response witness (latency per
+  shift magnitude both modes + bounded stationary false-alarm + transient reset discipline + a
+  PH-vs-CUSUM mode-divergence gate, plus huge-threshold and no-reset negative controls rejected).
+- **`DriftDetector.addFrom(buf, i)`** -- the zero-box hot entry: `x = buf[i]` read UNBOXED from a
+  caller-owned `Float64Array` (a fractional `x` boxes as a plain argument at a non-inlined call
+  boundary; `addFrom` avoids it -- torture-gated 0 B/op on a fractional drifting stream).
+- **`DRIFT_PH` / `DRIFT_CUSUM`** -- the two mode consts (numeric named exports, `0` / `1`).
+- **`DriftDetector.target`** -- the getter for the fixed CUSUM in-control mean mu0 (`undefined`
+  for PH).
+
+### Note
+
+- **DDM / EDDM are deliberately deferred.** They consume a Bernoulli ERROR-BIT stream (a
+  classifier's 0/1 correctness) and emit a TRI-STATE (stable / warning / drift) output -- a
+  different contract from a real-valued `add(x) -> boolean`. They belong in a separate future
+  member, not in `DriftDetector` (ADR 0007 records the reasoning).
+
+### Changed
+
+- `VERSION` -> `1.2.0` (package.json / `Adaptive.js` / llms.txt trinity); the file header documents
+  the six-member roster.
+
 ## [1.1.0] - 2026-09-24
 
 The first additive post-1.0 member. **PURE APPEND**: the four frozen core classes

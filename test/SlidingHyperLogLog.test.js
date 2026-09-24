@@ -18,8 +18,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // version pin
 // ---------------------------------------------------------------------------
-test('VERSION is 1.1.0 (SlidingHyperLogLog milestone)', () => {
-    assert.equal(VERSION, '1.1.0');
+test('VERSION is 1.2.0 (DriftDetector milestone)', () => {
+    assert.equal(VERSION, '1.2.0');
 });
 
 // ---------------------------------------------------------------------------

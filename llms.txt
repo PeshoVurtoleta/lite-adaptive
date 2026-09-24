@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.1.0
+Version: 1.2.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -108,7 +108,36 @@ VERSION change).
   now / w / option throws [lite-adaptive] typeof-first (byte-identical no-op). Fully deterministic
   (no PRNG). Getters: `W` / `p` / `m` / `ringCap` / `seed` / `standardError` / `lastNow` / `mode` /
   `overflows` / `degraded` / `bytes`.
-- `VERSION` -- string, '1.1.0'.
+- `DriftDetector` -- class. A zero-GC, O(1)-STATE scalar streaming DRIFT DETECTOR over a
+  real-valued signal (Page, Biometrika 1954; Mouss et al. 2004), selected by a mode const --
+  `DRIFT_PH` (Page-Hinkley: cumulative deviation of x from the ONLINE running mean, two-sided) or
+  `DRIFT_CUSUM` (two-sided CUSUM: two accumulators gP / gN each floored at 0, deviating from a FIXED
+  `target` mu0). The mode is LOAD-BEARING via its REFERENCE: under a shared reference the two rules
+  collapse to the identical reflected-random-walk statistic (CUSUM's max(0, cumsum) IS cumsum minus
+  its running min -- what PH computes), so PH self-references the online mean (adaptive; it tracks a
+  slow ramp and stays quiet) while CUSUM references a fixed mu0 (classic SPC; it fires whenever the
+  signal departs mu0). `add(x) -> boolean` updates a running mean (Welford), runs the ONE mode
+  branch, and returns true EXACTLY on the detecting item, RESETTING the accumulators + running mean
+  so the NEXT shift is caught -- 0 B/op. The item-based, scalar, fixed-scalar-state complement to
+  ADWIN's adaptive window: NO pool (pure scalars, like ForwardDecay), no window. Constructor
+  `new DriftDetector(mode, { delta, threshold, target })` -- `delta` the magnitude allowance (PH) /
+  slack (CUSUM), a finite number in [0, 1e150] (default 0.005; delta=0 is a VALID setting, guarded
+  as `undefined`, never falsy); `threshold` the decision level (PH lambda / CUSUM decision interval),
+  a finite number > 0 (default 50, tune to the signal scale); `target` the FIXED in-control mean mu0
+  the CUSUM test deviates from, a finite number of ANY sign, |target| <= 1e150 (target=0 is valid) --
+  REQUIRED for DRIFT_CUSUM, FORBIDDEN for DRIFT_PH (a mismatch throws [lite-adaptive], never a silent
+  ignore). `add(x)` accepts a finite real with |x| <= DD_X_MAX (1e150, so the accumulators cannot
+  overflow -- the ADWIN finite-overflow lesson); `addFrom(buf, i) -> boolean` is the zero-box sibling
+  (reads `x = buf[i]` unboxed for a fractional x). `clear()` reuses the instance (keeps the config,
+  incl. target). Getters: `mode` / `delta` / `threshold` / `target` (the fixed CUSUM mu0, `undefined`
+  for PH) / `count` (items seen since the last reset) / `mean` (running mean) / `statistic` (the
+  current test statistic, >= 0, crosses `threshold` exactly when `add` fires). `mean` / `statistic`
+  throw [lite-adaptive] fail-closed on a non-finite accumulator; getters return 0 on empty. A bad
+  mode / delta / threshold / target / option / x throws [lite-adaptive] typeof-first (byte-identical
+  no-op). DDM / EDDM (Bernoulli error-bit + tri-state output) are deliberately OUT of this class -- a
+  future member.
+- `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
+- `VERSION` -- string, '1.2.0'.
 
 ## ExponentialHistogram
 
@@ -372,6 +401,79 @@ ringCap=8 -> ~72 KB, never grows. ADR 0006 records the LFPM-ring-over-register-b
 rejected pane-rotation / full-HLL-pane alternatives), the Ertl estimator, the expiry rule
 `stamp <= now - W`, and the ring-overflow-as-honest-degradation rationale.
 
+## DriftDetector (ADR 0007)
+
+Scalar, item-based, O(1)-STATE change detection over a real-valued signal (Page, "Continuous
+Inspection Schemes", Biometrika 1954) -- "did the mean of THIS signal just shift?" in a handful of
+scalars, no pool and no window (the lightest member; like ForwardDecay it keeps only scalars). The
+cheap per-channel companion to ADWIN: where ADWIN keeps a variance-carrying bucket window and
+auto-adapts its size, DriftDetector keeps a running mean plus one or two BOUNDED test accumulators
+and returns true EXACTLY on the item that trips the threshold, then RESETS to catch the next shift.
+A SINGLE class selects one of two classical tests via a mode const (exported alongside the class):
+
+- DRIFT_PH -- Page-Hinkley (Page 1954; Mouss et al. 2004). Accumulates each x's deviation from the
+  ONLINE running mean and watches the gap between the cumulative sum and its running extreme; a
+  persistent one-directional drift makes the gap exceed the threshold lambda. Two-sided (an upward
+  accumulator vs its running MIN, a downward one vs its running MAX). The online reference is
+  ADAPTIVE -- it tracks a slow ramp and stays quiet.
+- DRIFT_CUSUM -- two-sided CUSUM (Page 1954). Two accumulators, each FLOORED at 0, grow only while
+  the signal departs a FIXED target mu0 by more than the slack delta; either exceeding the decision
+  interval (threshold) fires. The fixed reference is the classic SPC in-control mean -- a SUSTAINED
+  departure from mu0 keeps alarming (out-of-control); returning to mu0 quiets it.
+
+The mode is LOAD-BEARING via its REFERENCE, not cosmetic: under a SHARED running-mean reference the
+two rules collapse to the IDENTICAL reflected-random-walk statistic -- CUSUM's `max(0, cumsum)` is
+exactly `cumsum` minus its running MIN, which is what Page-Hinkley computes explicitly. So they must
+not share a reference: PH self-references the online mean (adaptive), CUSUM references a fixed mu0
+(SPC). On a slow mean ramp they diverge sharply (PH quiet, CUSUM fires continuously) -- the witness
+gates that divergence so a regression back to one statistic is rejected. (ADR 0007 records the
+identity + the resolution.)
+
+Constructor: `new DriftDetector(mode, options?)` where mode is DRIFT_PH or DRIFT_CUSUM (any other
+value throws) and options = { delta (magnitude allowance / slack; a finite number in [0, 1e150],
+default 0.005; delta=0 is a VALID setting, guarded as `!== undefined` not falsy), threshold (the
+PH lambda / CUSUM decision interval; a finite number > 0, default 50), target (the FIXED in-control
+mean mu0 the CUSUM test deviates from; a finite number of ANY sign, |target| <= 1e150, target=0
+valid -- REQUIRED for DRIFT_CUSUM, FORBIDDEN for DRIFT_PH) }. A bad mode / delta / threshold /
+target / option -- including a CUSUM without a target or a PH with one -- throws [lite-adaptive]
+typeof-first BEFORE any field init (fail-closed, never a silent ignore).
+
+- add(x) -> boolean         HOT, 0 B/op. Reject a non-finite x / a finite |x| > DD_X_MAX (1e150) on
+                            the cold branch (byte-identical no-op), update the running mean (Welford),
+                            run the ONE mode branch, and on a fire call the O(1) reset. Returns true
+                            iff drift was detected on this item.
+- addFrom(buf, i) -> boolean  HOT, 0 B/op ZERO-BOX sibling: reads x = buf[i] UNBOXED from a
+                            Float64Array (for a FRACTIONAL x that add(x) would box). Same validation
+                            + body as add.
+- clear() -> this           Reset all scalar state; keep the config (mode / delta / threshold /
+                            target). O(1).
+- mode / delta / threshold / target / count   Getters: the mode; the knobs; the fixed CUSUM mu0
+                            (`undefined` for PH); items seen since the last reset.
+- mean / statistic          Getters: the running mean; the current test statistic (>= 0, how close to
+                            firing -- crosses threshold when add returns true). 0 on empty; THROW
+                            [lite-adaptive] fail-closed if an accumulator ever went non-finite.
+
+Fail-closed domain (the ADWIN finite-overflow lesson): DD_X_MAX = 1e150 caps |x| so the accumulators
+can never be driven non-finite (each add moves them by ~2*DD_X_MAX; both bounded between resets;
+reaching Double.MAX needs ~1e158 un-fired adds). delta is capped at the SAME bound -- each add also
+moves the accumulators by ~delta, so an uncapped pathological delta would overflow them in a few adds
+and add() would silently stop firing (a FAIL-OPEN boolean the getter guard cannot see). The
+mean / statistic getters _guardFinite() as defense-in-depth. DDM / EDDM are OUT of this class (they
+consume a Bernoulli error-bit stream + emit a tri-state stable/warning/drift output -- an
+incompatible contract; a future member).
+
+Change-response contract (the honesty anchor): the witness injects a known changepoint and GATES the
+detection latency (a persistent shift above delta is detected) for BOTH modes + the stationary
+false-alarm rate + reset discipline on a TRANSIENT shift (fire during the spike, go QUIET once the
+signal returns to baseline) + the MODE-DIVERGENCE gate (on a slow ramp PH stays quiet while CUSUM vs
+the fixed mu0 fires far more -- proving the mode is load-bearing). Negative controls REJECTED by the
+same gates: a huge-threshold detector (never detects a real shift) and a no-reset variant (its
+statistic stays latched and it keeps firing through the post-return tail of a transient). ADR 0007
+records the PH+CUSUM-only roster choice (why DDM/EDDM were deferred), the running-mean-vs-fixed-target
+reference distinction (and the cumsum-minus-running-min identity that forces it), the per-mode update
+equations, the DD_X_MAX / delta / target overflow fail-closed argument, and the reset-on-detection
+rationale.
+
 ## The time source + the bucket pool (ADR 0001)
 
 A caller-supplied MONOTONE `now` (logical tick or ms; count-mode convenience when
@@ -399,5 +501,7 @@ ExponentialHistogram (0.1.0, sliding-window count / sum) -> ADWIN (0.2.0, drift 
 adaptive window) -> ForwardDecay (0.3.0, time-decayed aggregates) -> HeavyKeeper
 (0.4.0, decayed / windowed heavy hitters) -> 1.0.0 (API freeze -- the four-member roster
 is COMPLETE, no new member; a docs / stability milestone) -> 1.1.0 (SlidingHyperLogLog --
-windowed distinct-count; the FIRST additive post-1.0 member, a PURE APPEND). Post-1.1: a scalar
-DriftDetector, a decayed Reservoir, windowed Count-Min / quantiles -- one per release.
+windowed distinct-count; the FIRST additive post-1.0 member, a PURE APPEND) -> 1.2.0 (DriftDetector
+-- scalar Page-Hinkley / CUSUM change detection; the SECOND additive post-1.0 member, a PURE APPEND).
+Post-1.2: windowed quantiles, windowed Count-Min, a decayed Reservoir, an error-rate DDM / EDDM
+detector -- one per release, each a pure append that keeps the frozen core byte-identical.

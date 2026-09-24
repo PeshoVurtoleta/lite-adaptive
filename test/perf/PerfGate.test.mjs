@@ -10,7 +10,8 @@
 // proving teeth.
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog } from '../../Adaptive.js';
+import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM } from '../../Adaptive.js';
 
 const W = 1000;
 const EPS = 0.01;
@@ -317,6 +318,84 @@ const slAddFromStream = {
 };
 
 /**
+ * DriftDetector add on a DRIFTING stream, PH mode: update the running mean + the Page-Hinkley
+ * branch (cumulative deviation vs the running extreme) + the reset on a fire, all on scalars (no
+ * pool). The mean alternates every 512 items (integer -> no arg boxing), forcing repeated fires ->
+ * the reset path runs and must stay flat + 0 old-gen. `grows` is a constant 0 (no TypedArray store).
+ */
+const ddPhStream = {
+    name: 'DriftDetector add PH drifting stream (running mean + Page-Hinkley branch + reset on fire)',
+    setup() {
+        const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5 });
+        for (let k = 0; k < 40000; k++) dd.add(((k >> 9) & 1) ? 1000 : 0);   // prime a drifting stream
+        return { dd, i: 40000, sink: 0 };
+    },
+    hot(s, n) {
+        const dd = s.dd;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            const cut = dd.add(((i >> 9) & 1) ? 1000 : 0);
+            i = (i + 1) | 0;
+            sink = (sink + (cut ? 1 : 0) + (dd.count & 255)) | 0;   // observe state (defeat DCE)
+        }
+        s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+/**
+ * DriftDetector add on a DRIFTING stream, CUSUM mode: the other mode branch (two floored
+ * accumulators vs a FIXED target) + the reset on a fire. target=500 sits between the two regimes so
+ * both directions depart + fire. Same drifting stream; must stay flat + 0 old-gen.
+ */
+const ddCusumStream = {
+    name: 'DriftDetector add CUSUM drifting stream (running mean + two floored accumulators + reset on fire)',
+    setup() {
+        const dd = new DriftDetector(DRIFT_CUSUM, { delta: 0.005, threshold: 5, target: 500 });
+        for (let k = 0; k < 40000; k++) dd.add(((k >> 9) & 1) ? 1000 : 0);
+        return { dd, i: 40000, sink: 0 };
+    },
+    hot(s, n) {
+        const dd = s.dd;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            const cut = dd.add(((i >> 9) & 1) ? 1000 : 0);
+            i = (i + 1) | 0;
+            sink = (sink + (cut ? 1 : 0) + (dd.count & 255)) | 0;   // observe state (defeat DCE)
+        }
+        s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+/**
+ * The teeth for the DriftDetector lane: add + a fresh escaping array per op -- it MUST trip the
+ * gate, proving the DriftDetector scenarios' flat result is a real 0-alloc measurement.
+ */
+const ddMustFailAlloc = {
+    name: 'DriftDetector add + a fresh escaping array per op (MUST allocate)',
+    setup() {
+        const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5 });
+        for (let k = 0; k < 40000; k++) dd.add(((k >> 9) & 1) ? 1000 : 0);
+        return { dd, i: 40000, leak: null, sink: 0 };
+    },
+    hot(s, n) {
+        const dd = s.dd;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            dd.add(((i >> 9) & 1) ? 1000 : 0);
+            i = (i + 1) | 0;
+            const arr = new Array(64);
+            arr[0] = i;
+            s.leak = arr;
+            sink = (sink + arr[0]) | 0;
+        }
+        s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+/**
  * The teeth for the SlidingHyperLogLog lane: add + a fresh escaping array per op -- it MUST trip
  * the gate, proving the SlidingHyperLogLog scenarios' flat result is a real 0-alloc measurement.
  */
@@ -444,6 +523,7 @@ zgcSuite({
     scenarios: [
         addCountStream, addTimeStream, adwinDriftStream, fdAddStream, addFromStream, fdAddFromStream,
         hkAddStream, hkAddFromStream, slAddStream, slAddCountStream, slAddFromStream,
+        ddPhStream, ddCusumStream,
     ],
-    mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc, slMustFailAlloc],
+    mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc, slMustFailAlloc, ddMustFailAlloc],
 });
