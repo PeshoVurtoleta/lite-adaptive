@@ -18,8 +18,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // version pin
 // ---------------------------------------------------------------------------
-test('VERSION is 1.4.0 (advance() idle-slide milestone)', () => {
-    assert.equal(VERSION, '1.4.0');
+test('VERSION is 1.5.0 (SlidingCountMin milestone)', () => {
+    assert.equal(VERSION, '1.5.0');
 });
 
 // ---------------------------------------------------------------------------

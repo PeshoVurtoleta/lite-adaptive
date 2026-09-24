@@ -113,6 +113,23 @@
  * existing method + hot body of the three touched classes stays BYTE-IDENTICAL; only this header +
  * VERSION change plus the two new methods (and their cold throwers) per touched class.
  *
+ * v1.5.0 adds SlidingCountMin (ADR 0010; Cormode-Muthukrishnan, "Count-Min Sketch", 2005, on a
+ * windowed pane ring): WINDOWED per-label FREQUENCY over the LAST W in FIXED preallocated space --
+ * the recency sibling of lite-sketch's cumulative CountMinSketch and the frequency complement of
+ * SlidingHyperLogLog / SlidingDDSketch. A ring of B+1 panes, each a full d x w CountMin matrix
+ * covering W/B of the window; add(now, key, count?) / the zero-box stride-3 addFrom(buf, i) write the
+ * current pane's d cells (conservative-update per pane by default) over the SAME two-lane murmur3 as
+ * lite-sketch CMS (base = hi ^ lo, row column = mix(base ^ i*ODD_CONST) & (w-1)); crossing a pane
+ * boundary rotates to the next pane and clears it (0 B/op, a bounded while-loop capped at B+1).
+ * estimate(key, w?) SUMS each row's cell across the live panes then MINs over rows (sum-then-min) --
+ * COLD, 0 alloc, returns a DOUBLE, never throws. The query covers the live panes so the span is
+ * [W, W+W/B]: the straddling oldest pane is KEPT (never dropped), giving a ONE-SIDED upper bound
+ * true(W) <= est <= true(W+W/B) + epsilon*N. Counters saturate at 2^32-1 (the `saturated` honesty
+ * flag). advance() / advanceFrom() slide an idle window. The FOURTH additive post-1.0 member: a PURE
+ * APPEND -- the seven prior classes (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper,
+ * SlidingHyperLogLog, DriftDetector, SlidingDDSketch) stay BYTE-IDENTICAL; only this header + VERSION
+ * change above the append point plus the appended SlidingCountMin class (and its SCM_* consts).
+ *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
  *
@@ -120,7 +137,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.4.0';
+export const VERSION = '1.5.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -3451,12 +3468,22 @@ export class SlidingDDSketch {
         if (maxKey > SLD_KEY_MAX) maxKey = SLD_KEY_MAX;
         if (minKey < -SLD_KEY_MAX) minKey = -SLD_KEY_MAX;
 
+        // Fail closed BEFORE alloc: a SUBNORMAL W underflows W/panes to 0 (or a non-finite value), which
+        // would make the pane-boundary arithmetic non-finite -> no pane ever live -> add() never throws yet
+        // quantile()/count() silently read empty for a just-added value. Guard the derived pane width.
+        const paneW = W / panes;          // per-pane time width (the disclosed edge error)
+        if (!(paneW > 0) || !Number.isFinite(paneW)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingDDSketch W is too small for panes=' + panes +
+                ' (W / panes underflowed to ' + paneW + '); use a larger W or fewer panes');
+        }
+
         this._W = W;
         this._alpha = alpha;
         this._strict = strict;
         this._panes = panes;
         this._maxBins = SLD_MAX_BINS;
-        this._paneW = W / panes;          // per-pane time width (the disclosed edge error)
+        this._paneW = paneW;              // per-pane time width (the disclosed edge error); guarded > 0 above
         this._gamma = gamma;
         this._multiplier = multiplier;
         this._maxKey = maxKey;
@@ -4130,6 +4157,760 @@ export class SlidingDDSketch {
     _badAdvanceBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] SlidingDDSketch.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+}
+
+// ===========================================================================
+// SlidingCountMin (ADR 0010) -- windowed per-label frequency over the LAST W
+// (Cormode-Muthukrishnan, "Count-Min Sketch", 2005, on a fixed-(B+1) pane ring)
+// ===========================================================================
+//
+// SlidingCountMin answers "how many times did KEY occur in the LAST W" in FIXED preallocated space
+// with the SAME one-sided over-estimate guarantee as lite-sketch's cumulative CountMinSketch
+// (est >= true, est - true <= epsilon*N w.p. >= 1 - delta), on the RECENCY axis. It is the frequency
+// sibling of SlidingHyperLogLog (windowed distinct-count) and SlidingDDSketch (windowed quantiles) --
+// all keep a hard last-W window over a caller-supplied MONOTONE `now`, never the wall clock.
+//
+// WINDOW MODEL (ADR 0010): B+1 panes, each a full d x w CountMin counter matrix covering W/B of the
+// window. add() writes the CURRENT pane; when `now` crosses a pane boundary the ring rotates to the
+// next pane and CLEARS it (fill(0), 0-alloc). The query covers the LIVE panes (paneEnd > now - W),
+// so the covered span is [W, W+W/B] -- ALWAYS covers the full W with at most one extra (straddling)
+// pane. The partially-expired oldest pane is KEPT, NEVER dropped, so the estimate is a ONE-SIDED
+// UPPER bound: true(W) <= est <= true(W+W/B) + epsilon*N(W+W/B). Dropping the oldest pane would
+// under-count and silently break the lower side of that contract.
+//
+// COUNTMIN MAPPING (inlined, NOT a dependency -- a consumer pre-checks / swaps in lite-sketch CMS
+// identically; any divergence would be a breaking surprise): the two-lane 64-bit murmur3 (hi, lo)
+// over the key's low + high words + sign, base = (hi ^ lo) | 0, and each of the d rows derives its
+// column from ONE base lane via `mix(base ^ i*ODD_CONST) & (w-1)` (w a power of two) -- byte-identical
+// to lite-sketch CountMinSketch (ADR 0003 there); seed default shared, seed=0 valid (guarded via
+// `=== undefined`, null is not zero). QUERY estimate(key, w?): for each row SUM the key's cell across
+// the live panes, THEN MIN over rows (sum-then-min, NOT min-then-sum -- a windowed CMS must sum a row
+// across time before taking the row-min, else the min is over unrelated per-pane cells). Counters are
+// per-pane `Uint32Array`, SATURATING at 2^32-1 (never wrap); conservative update (default) runs PER
+// PANE (min over the current pane's d cells), NOT over window sums. estimate returns a DOUBLE (a window
+// sum can exceed 2^32) and NEVER throws (0 for an unseen / out-of-domain key or an empty window) --
+// parity with lite-sketch CMS.
+
+/** Frozen marker of the known SlidingCountMin option keys -- an unknown key throws with a hint. */
+const SCM_KNOWN_OPTS = Object.freeze({
+    epsilon: true, delta: true, w: true, d: true, panes: true, seed: true, conservative: true });
+/** Default pane count B (edge error W/32); the ring holds B+1 panes. */
+const SCM_DEFAULT_PANES = 32;
+/** Fewest panes: at least 2 so the window is meaningfully sub-divided. */
+const SCM_PANES_MIN = 2;
+/** Most panes: bounds the preallocated store ((panes+1) * d * w Uint32 cells). */
+const SCM_PANES_MAX = 1024;
+/** Highest legal depth d (hash rows) -- matches lite-sketch CountMinSketch's CMS_D_MAX. */
+const SCM_D_MAX = 32;
+/**
+ * SCM_W_MAX -- highest legal WIDTH w (cells/row) BEFORE the power-of-two round-up. A TIGHTER cap than
+ * lite-sketch CountMinSketch's 1<<25: the windowed store is (panes+1) FULL matrices, so per-instance
+ * memory is (B+1)x a single CMS -- 1<<16 keeps the max store bounded. The WINDOW span W is NOT capped
+ * (parity with SlidingDDSketch / SlidingHyperLogLog -- a finite number > 0); the cell array
+ * (panes+1)*d*w is INDEPENDENT of W, so W needs no small cap (ADR 0010).
+ */
+const SCM_W_MAX = 1 << 16;
+/** Counter saturation: a Uint32Array cell tops out here (saturating add, never wraps). */
+const SCM_SAT = 4294967295;
+/** Hard ceiling on the flat cell count so every index (panes+1)*d*w stays a SMI (else it boxes / deopts). */
+const SCM_CELLS_CAP = 2 ** 31;
+/** Default per-instance seed (shared with HeavyKeeper / SlidingHyperLogLog so all hash identically). */
+const SCM_DEFAULT_SEED = 0x9e3779b1;
+/** Default relative error target (derives the default width w = ceil(e/epsilon) rounded to a power of two). */
+const SCM_DEFAULT_EPSILON = 0.01;
+/** Default failure probability (derives the default depth d = ceil(ln(1/delta))). */
+const SCM_DEFAULT_DELTA = 0.01;
+
+/**
+ * SlidingCountMin -- WINDOWED per-label FREQUENCY estimation over the LAST W (a hard sliding window)
+ * in FIXED space (Cormode-Muthukrishnan, "Count-Min Sketch", 2005, over a fixed-(B+1) pane ring). The
+ * recency sibling of lite-sketch's cumulative CountMinSketch and the frequency complement of
+ * SlidingHyperLogLog / SlidingDDSketch.
+ *
+ * Headline (the family TRIPLE):
+ *   - SPACE: a FIXED ring of B+1 panes, each a dense `Uint32Array(d * w)` CountMin matrix; never grows
+ *     (defaults ~epsilon=delta=0.01 -> d=5, w=512, panes=32 -> ~338 KB).
+ *   - ERROR: a ONE-SIDED over-estimate `true(W) <= est <= true(W+W/B) + epsilon*N` on the merged live
+ *     window (epsilon = e/w, delta = e^-d), PLUS a window-edge error of up to one pane width W/B (the
+ *     straddling oldest pane, kept -- never dropped).
+ *   - RECENCY: a HARD last-W window (forgets at the window edge, + up to one pane width) with a
+ *     sub-window query `estimate(key, w)` for any `w <= W`.
+ *
+ * Hot path (`add` / `addFrom`, 0 B/op INCLUDING pane rotation): validate key + count, lock/verify the
+ * time mode, rotate + clear panes if `now` crossed a boundary (a bounded, alloc-free while-loop capped
+ * at B+1 -- one rotation is an O(d*w) fill(0) spike, disclosed as amortized), inline the two-lane
+ * murmur into int32 LOCALS (never the module hash slots -- a uint32 >= 2^31 lane never boxes), and write
+ * the d cells of the CURRENT pane (conservative-update per pane by default, plain add otherwise),
+ * saturating at 2^32-1.
+ *
+ * Cold path: `estimate(key, w?)` sums each row's cell across the live panes then MINs over rows
+ * (O(d x (B+1)), 0 alloc) -- a disclosed co-headline, NOT a per-add cost. `clear()` reuses every array.
+ *
+ * Fail closed: a bad W / epsilon / delta / w / d / panes / seed / conservative / option throws
+ * `[lite-adaptive]` at the ctor door BEFORE any allocation; `add` / `addFrom` reject a non-number / NaN
+ * / +-Infinity / non-safe-integer key, a non-positive-integer count, a mode switch, a non-finite /
+ * decreasing `now` -- typeof-first, every rejection a BYTE-IDENTICAL no-op (validated before any state
+ * write). `estimate` NEVER throws (0 for an unseen / out-of-domain key or an empty window -- parity with
+ * lite-sketch CMS so a consumer can swap it in). Key domain: every SAFE INTEGER |key| <= 2^53 - 1 (so a
+ * composite key channelIdx*2^32 + tag works for a single shared instance). The `saturated` getter is the
+ * honesty flag (count of adds that hit the 2^32-1 ceiling). null is not zero. No `merge` in 1.5.0.
+ */
+export class SlidingCountMin {
+    /**
+     * @param {number} W        window size; a finite number > 0 (items in count mode, or the
+     *                          `now`-unit span in explicit mode). NOT capped.
+     * @param {{epsilon?: number, delta?: number, w?: number, d?: number, panes?: number, seed?: number, conservative?: boolean}} [options]
+     *   epsilon: relative error in (0, 1) (default 0.01) -> w = ceil(e/epsilon) rounded up to a power of two.
+     *   delta:   failure probability in (0, 1) (default 0.01) -> d = ceil(ln(1/delta)).
+     *   w:       explicit width (cells/row) in [1, 2^16], rounded UP to a power of two (overrides epsilon).
+     *   d:       explicit depth (hash rows) in [1, 32] (overrides delta).
+     *   panes:   pane count B; an integer in [2, 1024] (default 32). Edge error is W / panes; ring is B+1.
+     *   seed:    uint32 hash seed (any integer, coerced with `| 0`); default shared with the hashing members.
+     *   conservative: conservative-update (per pane) instead of plain add; default true (lite-sketch CMS parity).
+     */
+    constructor(W, options) {
+        // typeof guard FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
+        if (typeof W !== 'number' || W !== W || W === Infinity || W === -Infinity || W <= 0) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingCountMin W must be a finite number > 0, got ' + String(W));
+        }
+        let epsilon, delta, wOpt, dOpt;
+        let panes = SCM_DEFAULT_PANES;
+        let seed = SCM_DEFAULT_SEED;
+        let conservative = true;
+        if (options !== undefined) {
+            if (typeof options !== 'object' || options === null) {
+                throw new TypeError('[lite-adaptive] SlidingCountMin options must be an object');
+            }
+            for (const key in options) {
+                if (!(key in SCM_KNOWN_OPTS)) {
+                    throw new RangeError('[lite-adaptive] SlidingCountMin unknown option "' + key + '"');
+                }
+            }
+            if (options.epsilon !== undefined) {
+                epsilon = options.epsilon;
+                if (typeof epsilon !== 'number' || !(epsilon > 0 && epsilon < 1)) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingCountMin epsilon must be a number in (0, 1), got ' + String(epsilon));
+                }
+            }
+            if (options.delta !== undefined) {
+                delta = options.delta;
+                if (typeof delta !== 'number' || !(delta > 0 && delta < 1)) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingCountMin delta must be a number in (0, 1), got ' + String(delta));
+                }
+            }
+            if (options.w !== undefined) {
+                wOpt = options.w;
+                if (typeof wOpt !== 'number' || (wOpt | 0) !== wOpt || wOpt < 1 || wOpt > SCM_W_MAX) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingCountMin w must be an integer in [1, ' + SCM_W_MAX + '], got ' + String(wOpt));
+                }
+            }
+            if (options.d !== undefined) {
+                dOpt = options.d;
+                if (typeof dOpt !== 'number' || (dOpt | 0) !== dOpt || dOpt < 1 || dOpt > SCM_D_MAX) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingCountMin d must be an integer in [1, ' + SCM_D_MAX + '], got ' + String(dOpt));
+                }
+            }
+            if (options.panes !== undefined) {
+                const p = options.panes;
+                if (typeof p !== 'number' || (p | 0) !== p || p < SCM_PANES_MIN || p > SCM_PANES_MAX) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingCountMin panes must be an integer in [' + SCM_PANES_MIN +
+                        ', ' + SCM_PANES_MAX + '], got ' + String(p));
+                }
+                panes = p;
+            }
+            if (options.seed !== undefined) {
+                seed = options.seed;
+                if (typeof seed !== 'number' || !Number.isInteger(seed)) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingCountMin seed must be an integer, got ' + String(seed));
+                }
+            }
+            // conservative = true is the default; guard `undefined`, and require a real boolean (null is not true).
+            if (options.conservative !== undefined) {
+                conservative = options.conservative;
+                if (typeof conservative !== 'boolean') {
+                    throw new TypeError(
+                        '[lite-adaptive] SlidingCountMin conservative must be a boolean, got ' + String(conservative));
+                }
+            }
+        }
+        // Derive width w: explicit `w` overrides `epsilon`; else w = ceil(e/epsilon) (lite-sketch CMS
+        // derivation), clamped to SCM_W_MAX BEFORE the power-of-two round-up so `<<= 1` never overflows.
+        let w;
+        if (wOpt !== undefined) {
+            w = wOpt;
+        } else {
+            const eps = epsilon !== undefined ? epsilon : SCM_DEFAULT_EPSILON;
+            w = Math.ceil(Math.E / eps);
+            if (w > SCM_W_MAX) w = SCM_W_MAX;
+        }
+        let cw = 1;
+        while (cw < w) cw <<= 1;
+        if (cw > SCM_W_MAX) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingCountMin w rounded up to ' + cw + ' exceeds max ' + SCM_W_MAX);
+        }
+        w = cw;
+        // Derive depth d: explicit `d` overrides `delta`; else d = ceil(ln(1/delta)) clamped to [1, 32].
+        let d;
+        if (dOpt !== undefined) {
+            d = dOpt;
+        } else {
+            const del = delta !== undefined ? delta : SCM_DEFAULT_DELTA;
+            d = Math.ceil(Math.log(1 / del));
+            if (d < 1) d = 1;
+            if (d > SCM_D_MAX) d = SCM_D_MAX;
+        }
+        const ring = panes + 1;
+        // SMI cap: keep every flat cell index a SMI (else _cells[id] boxes / deopts on a pathological size).
+        if (ring * d * w > SCM_CELLS_CAP) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingCountMin store (panes+1)*d*w=' + (ring * d * w) +
+                ' exceeds cap ' + SCM_CELLS_CAP);
+        }
+        // Fail closed BEFORE alloc: a SUBNORMAL W underflows W/panes to 0 (or a non-finite value), which
+        // would make floor(now / paneW) == NaN -> no pane ever live -> add() never throws yet estimate()
+        // silently returns 0 for a just-added key (a violation of the one-sided lower bound true(W) <= est).
+        const paneW = W / panes;     // per-pane time width (the disclosed edge error)
+        if (!(paneW > 0) || !Number.isFinite(paneW)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingCountMin W is too small for panes=' + panes +
+                ' (W / panes underflowed to ' + paneW + '); use a larger W or fewer panes');
+        }
+
+        this._W = W;
+        this._panes = panes;         // B (getter returns this); the ring holds B+1 panes
+        this._ring = ring;           // B + 1
+        this._d = d;
+        this._w = w;
+        this._mask = w - 1;          // w is a power of two -> column = hash & mask
+        this._dw = d * w;            // cells per pane
+        this._seed = seed | 0;       // SMI-safe (signed int32); the murmur uses it as `s | 0` either way
+        this._conservative = conservative;
+        this._paneW = paneW;         // per-pane time width (the disclosed edge error); guarded > 0 above
+        this._epsilon = Math.E / w;  // theoretical relative error e/w
+        this._delta = Math.exp(-d);  // theoretical failure probability e^-d
+        this._cells = new Uint32Array(ring * d * w);   // (B+1) dense d x w matrices (saturate at 2^32-1)
+        this._paneEnd = new Float64Array(ring);        // per-pane EXCLUSIVE upper time bound
+        this._idx = new Int32Array(d);                 // per-row flat-index scratch (0-alloc conservative update)
+        this._bytes = this._cells.byteLength + this._paneEnd.byteLength + this._idx.byteLength;
+
+        this._initState();
+    }
+
+    /**
+     * Build a windowed sketch sized to a target accuracy -- the lite-sketch CountMinSketch.withAccuracy
+     * convenience, one axis over: `w = ceil(e/epsilon)` (rounded up to a power of two), `d = ceil(ln(1/delta))`.
+     * A COLD one-time path; it merges `epsilon` / `delta` into the options bag and delegates ALL sizing +
+     * validation (incl. the power-of-two round-up, the caps, and the SMI check) to the ctor. Any `panes` /
+     * `seed` / `conservative` in `options` pass through; an explicit `w` / `d` there overrides the derived value.
+     * @param {number} W       window size; a finite number > 0.
+     * @param {number} epsilon relative error, in (0, 1).
+     * @param {number} delta   failure probability, in (0, 1).
+     * @param {{panes?: number, seed?: number, conservative?: boolean, w?: number, d?: number}} [options]
+     * @returns {SlidingCountMin}
+     */
+    static withAccuracy(W, epsilon, delta, options) {
+        if (typeof epsilon !== 'number' || !(epsilon > 0 && epsilon < 1)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingCountMin.withAccuracy epsilon must be a number in (0, 1), got ' + String(epsilon));
+        }
+        if (typeof delta !== 'number' || !(delta > 0 && delta < 1)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingCountMin.withAccuracy delta must be a number in (0, 1), got ' + String(delta));
+        }
+        if (options !== undefined && (typeof options !== 'object' || options === null)) {
+            throw new TypeError('[lite-adaptive] SlidingCountMin.withAccuracy options must be an object');
+        }
+        const opts = {};
+        if (options !== undefined) for (const key in options) opts[key] = options[key];
+        opts.epsilon = epsilon;
+        opts.delta = delta;
+        return new SlidingCountMin(W, opts);
+    }
+
+    /** @private Reset all pane state + time mode. Reused by clear(). 0 alloc. */
+    _initState() {
+        this._cells.fill(0);
+        this._paneEnd.fill(0);
+        this._cur = 0;               // current (newest) pane index in the ring
+        this._mode = MODE_UNSET;     // time mode, locked at the first add
+        this._tick = 0;              // count-mode logical clock
+        this._lastNow = 0;           // explicit-mode monotone guard (init value never compared)
+        this._now = 0;               // the last applied t (query cutoff = now - W)
+        this._saturated = 0;         // count of adds that hit the 2^32-1 ceiling (the honesty flag)
+    }
+
+    /** Depth d (hash rows). O(1). */
+    get d() { return this._d; }
+    /** Width w (columns/row, a power of two). O(1). */
+    get w() { return this._w; }
+    /** The pane count B (edge error is W / panes; the ring holds B+1 panes). O(1). */
+    get panes() { return this._panes; }
+    /** Window size W. O(1). */
+    get W() { return this._W; }
+    /** The uint32 hash seed. O(1). */
+    get seed() { return this._seed >>> 0; }
+    /** Whether conservative update (per pane) is on. O(1). */
+    get conservative() { return this._conservative; }
+    /** How many adds hit the 2^32-1 saturation ceiling (the honesty flag; 0 in normal use). O(1). */
+    get saturated() { return this._saturated; }
+    /** The theoretical relative error e / w. O(1). */
+    get epsilon() { return this._epsilon; }
+    /** The theoretical failure probability e^-d. O(1). */
+    get delta() { return this._delta; }
+    /** The last applied time t (0 before the first add). O(1). */
+    get lastNow() { return this._now; }
+    /** The locked time mode: 'unset' | 'explicit' | 'count'. O(1). */
+    get mode() {
+        return this._mode === MODE_EXPLICIT ? 'explicit' : this._mode === MODE_COUNT ? 'count' : 'unset';
+    }
+    /** A fixed memory figure in bytes (all pane matrices + paneEnd + scratch). O(1). */
+    get bytes() { return this._bytes; }
+
+    /**
+     * Add `count` (default 1) occurrences of `key` observed at `now`. HOT, 0 B/op INCLUDING pane
+     * rotation + clear (one rotation is an amortized O(d*w) fill(0) spike, disclosed).
+     *
+     * Time modes (LOCKED at the first add, a switch throws):
+     *   - EXPLICIT: add(now, key, count?). `now` is a finite number, strictly NON-DECREASING across calls.
+     *   - COUNT: add(undefined, key, count?). The member auto-increments an internal tick per add (W in items).
+     *
+     * Key domain: every SAFE INTEGER |key| <= 2^53 - 1 (the hot body folds the low word + high word + sign);
+     * `count` a positive integer in [1, 2^32-1].
+     *
+     * Fail closed: a non-number / NaN / +-Infinity / non-safe-integer key, a non-positive-integer count, a
+     * mode switch, or a non-finite / decreasing `now` throws [lite-adaptive] (typeof-first, a BYTE-IDENTICAL
+     * no-op -- ALL validation precedes any state write).
+     * @param {number} [now]  the monotone time (omit for count mode).
+     * @param {number} key    a safe integer, |key| <= 2^53 - 1.
+     * @param {number} [count=1] a positive integer in [1, 2^32-1].
+     * @returns {SlidingCountMin} this
+     */
+    add(now, key, count = 1) {
+        // 1. validate key + count FIRST (typeof-first), before ANY state mutation.
+        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
+            key > 9007199254740991 || key < -9007199254740991) return this._badKey(key);
+        if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > SCM_SAT) {
+            return this._badCount(count);
+        }
+        // 2. resolve + lock the time mode (no mutation until every key + count + time check has passed).
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            if (now !== undefined) return this._badMode('count', 'explicit');
+            t = ++this._tick;
+        } else if (mode === MODE_EXPLICIT) {
+            if (now === undefined) return this._badMode('explicit', 'count');
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badNow(now);
+            }
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now === undefined) {
+                this._mode = MODE_COUNT;
+                t = ++this._tick;
+                this._anchor(t);
+            } else {
+                if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                    return this._badNow(now);
+                }
+                this._mode = MODE_EXPLICIT;
+                t = now;
+                this._lastNow = now;
+                this._anchor(t);
+            }
+        }
+        this._now = t;
+        // 3. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
+        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        // 4. two-lane murmur INLINED into int32 LOCALS (byte-parity with lite-sketch CMS; never the module slots).
+        let a = key, neg = 0;
+        if (a < 0) { a = -a; neg = 1; }
+        const lo = a >>> 0;
+        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const s = this._seed;
+        let h = s;
+        h = hkRound(h, lo);
+        h = hkRound(h, hiw ^ neg);
+        h = hkFinal(h ^ 8);                            // HI lane
+        let g = s ^ HK_LANE_SALT;
+        g = hkRound(g, lo);
+        g = hkRound(g, hiw ^ neg);
+        g = hkFinal(g ^ 8);                            // LO lane
+        const base = (h ^ g) | 0;
+        // 5. write the d cells of the CURRENT pane (conservative per pane, or plain add).
+        const cur = this._cur, d = this._d, w = this._w, mask = this._mask, cells = this._cells, idx = this._idx;
+        const paneBase = cur * this._dw;
+        if (this._conservative) {
+            let mn = 0xffffffff;
+            for (let i = 0; i < d; i++) {
+                const col = hkFinal((base ^ Math.imul(i, HK_ODD)) | 0) & mask;
+                const id = paneBase + i * w + col;
+                idx[i] = id;
+                const v = cells[id];
+                if (v < mn) mn = v;
+            }
+            let target = mn + count;
+            if (target > SCM_SAT) { target = SCM_SAT; this._saturated++; }   // saturate, never wrap
+            for (let i = 0; i < d; i++) {
+                const id = idx[i];
+                if (cells[id] < target) cells[id] = target;
+            }
+        } else {
+            let sat = 0;
+            for (let i = 0; i < d; i++) {
+                const col = hkFinal((base ^ Math.imul(i, HK_ODD)) | 0) & mask;
+                const id = paneBase + i * w + col;
+                let v = cells[id] + count;
+                if (v > SCM_SAT) { v = SCM_SAT; sat = 1; }                   // saturate, never wrap
+                cells[id] = v;
+            }
+            if (sat) this._saturated++;
+        }
+        return this;
+    }
+
+    /**
+     * Add from a caller-owned PACKED stride-3 `[now, key, count]` Float64Array entry. HOT, 0 B/op -- the
+     * ZERO-BOX entry: `now = buf[i]`, `key = buf[i+1]`, `count = buf[i+2]` are read UNBOXED, avoiding the
+     * ~16 B HeapNumber each would box as a plain argument at a non-inlined call boundary. EXPLICIT-time
+     * ONLY (addFrom always carries a `now`): a COUNT-locked instance rejects it and the first addFrom
+     * locks EXPLICIT mode. Identical validation, throws, byte-identical-no-op-on-reject, and cell writes
+     * as `add(now, key, count)`; the body is DUPLICATED (not delegated) to keep `add`'s hot body
+     * byte-identical and avoid re-boxing at an internal boundary.
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now, `buf[i+1]` = key, `buf[i+2]` = count.
+     * @param {number} i the base index of the [now, key, count] triple (0, 3, 6, ...).
+     * @returns {SlidingCountMin} this
+     */
+    addFrom(buf, i) {
+        // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i + 2 >= buf.length) return this._badBuf(buf, i);
+        const now = buf[i];         // UNBOXED Float64Array reads -- the whole point (no argument box).
+        const key = buf[i + 1];     // packed [now, key, count]
+        const count = buf[i + 2];
+        // 1. validate key + count FIRST (a Float64Array read is always a number, so no typeof branch).
+        if (key !== key || !Number.isInteger(key) ||
+            key > 9007199254740991 || key < -9007199254740991) return this._badKey(key);
+        if (!Number.isInteger(count) || count < 1 || count > SCM_SAT) return this._badCount(count);
+        // 2. addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify EXPLICIT.
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._anchor(t);
+        }
+        this._now = t;
+        // 3. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
+        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        // 4. two-lane murmur INLINED (DUPLICATED from add() -- byte-identical body).
+        let a = key, neg = 0;
+        if (a < 0) { a = -a; neg = 1; }
+        const lo = a >>> 0;
+        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const s = this._seed;
+        let h = s;
+        h = hkRound(h, lo);
+        h = hkRound(h, hiw ^ neg);
+        h = hkFinal(h ^ 8);
+        let g = s ^ HK_LANE_SALT;
+        g = hkRound(g, lo);
+        g = hkRound(g, hiw ^ neg);
+        g = hkFinal(g ^ 8);
+        const base = (h ^ g) | 0;
+        // 5. write the d cells of the CURRENT pane (DUPLICATED from add()).
+        const cur = this._cur, d = this._d, w = this._w, mask = this._mask, cells = this._cells, idx = this._idx;
+        const paneBase = cur * this._dw;
+        if (this._conservative) {
+            let mn = 0xffffffff;
+            for (let ii = 0; ii < d; ii++) {
+                const col = hkFinal((base ^ Math.imul(ii, HK_ODD)) | 0) & mask;
+                const id = paneBase + ii * w + col;
+                idx[ii] = id;
+                const v = cells[id];
+                if (v < mn) mn = v;
+            }
+            let target = mn + count;
+            if (target > SCM_SAT) { target = SCM_SAT; this._saturated++; }
+            for (let ii = 0; ii < d; ii++) {
+                const id = idx[ii];
+                if (cells[id] < target) cells[id] = target;
+            }
+        } else {
+            let sat = 0;
+            for (let ii = 0; ii < d; ii++) {
+                const col = hkFinal((base ^ Math.imul(ii, HK_ODD)) | 0) & mask;
+                const id = paneBase + ii * w + col;
+                let v = cells[id] + count;
+                if (v > SCM_SAT) { v = SCM_SAT; sat = 1; }
+                cells[id] = v;
+            }
+            if (sat) this._saturated++;
+        }
+        return this;
+    }
+
+    /**
+     * @private Anchor the pane ring around the first `now` (grid-aligned to W/panes -- ABSOLUTE alignment
+     * so two same-(W, panes) instances would align, forward-compat for a future merge). The current pane
+     * (index 0) covers the grid cell containing `now`; predecessors go backward by one pane width each.
+     * Cold (once per lifecycle / clear). 0 alloc.
+     */
+    _anchor(now) {
+        const B = this._ring, pw = this._paneW;
+        const E = (Math.floor(now / pw) + 1) * pw;   // EXCLUSIVE upper bound of the current pane
+        this._cur = 0;
+        this._paneEnd[0] = E;
+        let e = E, idx = 0;
+        for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; }
+    }
+
+    /**
+     * @private Rotate the ring forward so the current pane covers time `t`, clearing each pane it rotates
+     * onto. Capped at B+1 rotations (a now-jump of k panes clears min(k, B+1) panes, NEVER loops k --
+     * skipping >= B+1 panes clears them ALL, then re-anchors the ring around `t`). 0 alloc. Called only
+     * when `t` crossed the current pane boundary.
+     */
+    _advance(t) {
+        const pw = this._paneW, B = this._ring;
+        let cur = this._cur;
+        let E = this._paneEnd[cur];
+        let rot = 0;
+        while (t >= E && rot < B) {
+            cur++; if (cur === B) cur = 0;
+            this._clearPane(cur);
+            E += pw;
+            this._paneEnd[cur] = E;
+            rot++;
+        }
+        if (t >= E) {
+            // jumped >= B+1 pane widths: every pane cleared above -> grid-re-anchor around t.
+            const newE = (Math.floor(t / pw) + 1) * pw;
+            this._paneEnd[cur] = newE;
+            let e = newE, idx = cur;
+            for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; }
+        }
+        this._cur = cur;
+    }
+
+    /** @private Clear one pane's d x w counter matrix (0 alloc). */
+    _clearPane(p) {
+        const base = p * this._dw;
+        this._cells.fill(0, base, base + this._dw);
+    }
+
+    /**
+     * Estimate `key`'s frequency over the last W (or a sub-window `w <= W`): for each row SUM the key's
+     * cell across the LIVE panes (paneEnd > now - W, INCLUDING the straddling oldest pane -- the one-sided
+     * upper bound), then take the MINIMUM over rows (sum-then-min). COLD, O(d x (B+1)), 0 alloc. Returns a
+     * DOUBLE (a window sum can exceed 2^32). NEVER throws -- an unseen / out-of-domain key or an empty
+     * window returns 0 (lite-sketch CMS parity). A bad sub-window `w` also returns 0 (fail-closed, no throw).
+     * @param {number} key
+     * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
+     * @returns {number} the estimated windowed frequency (>= the true windowed count).
+     */
+    estimate(key, w) {
+        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
+            key > 9007199254740991 || key < -9007199254740991) return 0;
+        if (this._mode === MODE_UNSET) return 0;
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
+                return 0;
+            }
+            effW = w;
+        }
+        let a = key, neg = 0;
+        if (a < 0) { a = -a; neg = 1; }
+        const lo = a >>> 0;
+        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const s = this._seed;
+        let h = s;
+        h = hkRound(h, lo);
+        h = hkRound(h, hiw ^ neg);
+        h = hkFinal(h ^ 8);
+        let g = s ^ HK_LANE_SALT;
+        g = hkRound(g, lo);
+        g = hkRound(g, hiw ^ neg);
+        g = hkFinal(g ^ 8);
+        const base = (h ^ g) | 0;
+        const d = this._d, wid = this._w, mask = this._mask, cells = this._cells, dw = this._dw, B = this._ring;
+        const cut = this._now - effW;
+        const paneEnd = this._paneEnd;
+        let mn = Infinity;
+        for (let i = 0; i < d; i++) {
+            const cellOff = i * wid + (hkFinal((base ^ Math.imul(i, HK_ODD)) | 0) & mask);
+            let sum = 0;
+            for (let p = 0; p < B; p++) {
+                if (paneEnd[p] > cut) sum += cells[p * dw + cellOff];   // sum this row across LIVE panes
+            }
+            if (sum < mn) mn = sum;                                     // then MIN over rows (sum-then-min)
+        }
+        return mn === Infinity ? 0 : mn;
+    }
+
+    /**
+     * Advance the window's reference time to `now` WITHOUT adding a value (the R11 idle slide). It moves
+     * `_now` forward and runs the SAME bounded pane rotate-and-clear an add would (the private `_advance`
+     * -- distinct from this PUBLIC `advance`), so an idle stream still rotates stale panes out and
+     * `estimate()` keeps sliding to empty (0) with no traffic. Bounded (<= B+1 clears), 0 B/op.
+     *
+     * EXPLICIT-time ONLY (parity with addFrom): a COUNT-locked instance throws; an UNSET instance locks
+     * EXPLICIT (and anchors the pane ring around `now`). Monotone: `now` finite and >= lastNow (a decrease
+     * throws). A rejected advance is a BYTE-IDENTICAL no-op.
+     * @param {number} now the monotone time (finite, >= the last now).
+     * @returns {SlidingCountMin} this
+     */
+    advance(now) {
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._anchor(t);
+        }
+        this._now = t;
+        if (t >= this._paneEnd[this._cur]) this._advance(t);   // rotate + clear stale panes (bounded).
+        return this;
+    }
+
+    /**
+     * Advance the window's reference time from a caller-owned Float64Array (`now = buf[i]`, read UNBOXED).
+     * The ZERO-BOX sibling of advance(now) -- identical mode / monotone / rotate body, EXPLICIT-time only.
+     * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer / negative /
+     * out-of-range `i` (needs `i < buf.length`) throws [lite-adaptive].
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now.
+     * @param {number} i the index of the `now` scalar.
+     * @returns {SlidingCountMin} this
+     */
+    advanceFrom(buf, i) {
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badAdvanceBuf(buf, i);
+        const now = buf[i];   // UNBOXED Float64Array read (always a number -> no typeof branch).
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._anchor(t);
+        }
+        this._now = t;
+        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        return this;
+    }
+
+    /** Reset to the empty window; reuse every array (also unlocks the mode). O((panes+1)*d*w). @returns {SlidingCountMin} this */
+    clear() {
+        this._initState();
+        return this;
+    }
+
+    /** @private Cold thrower for a bad key (non-safe-integer). */
+    _badKey(key) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingCountMin key must be a safe integer (|key| <= 2^53 - 1), got ' + String(key));
+    }
+
+    /** @private Cold thrower for a bad count. */
+    _badCount(count) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingCountMin count must be an integer in [1, ' + SCM_SAT + '], got ' + String(count));
+    }
+
+    /** @private Cold thrower for a mode switch after the mode locked. */
+    _badMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingCountMin mode is locked to ' + locked +
+            ' at the first add; got a ' + attempted + '-mode add');
+    }
+
+    /** @private Cold thrower for a non-finite `now`. */
+    _badNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingCountMin add now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone `now`. */
+    _badMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingCountMin add now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingCountMin.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i + 2 < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+
+    /** @private Cold thrower for an advance mode switch (advance is EXPLICIT-only). */
+    _badAdvanceMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingCountMin mode is locked to ' + locked +
+            '; advance() is an ' + attempted + '-time op');
+    }
+
+    /** @private Cold thrower for a non-finite advance `now`. */
+    _badAdvanceNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingCountMin advance now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone advance `now`. */
+    _badAdvanceMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingCountMin advance now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad advanceFrom buffer/index. */
+    _badAdvanceBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingCountMin.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
             'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
     }
 }

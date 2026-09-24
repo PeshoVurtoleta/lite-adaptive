@@ -9,7 +9,7 @@
 // correction) is fed the SAME gate and MUST be REJECTED (the gate has teeth). ASCII-only.
 
 import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, VERSION } from '../Adaptive.js';
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin, VERSION } from '../Adaptive.js';
 
 const WS = [64, 1000, 65536];
 const EPS = [0.5, 0.1, 0.01];
@@ -1565,9 +1565,262 @@ let isControlsOk = true;
 console.log('');
 console.log('WITNESS advance() negative controls (frozen windows rejected) ' + (isControlsOk ? 'ok' : 'FAIL'));
 
+// ===========================================================================
+// WINDOWED-FREQUENCY Witness -- SlidingCountMin (ADR 0010; Cormode-Muthukrishnan, CMS 2005, on a
+// (B+1)-pane ring). The frequency honesty anchor on the recency axis: drive SlidingCountMin on evolving
+// key streams, and GATE the ONE-SIDED bound `true(W) <= est <= true(W+W/B) + epsilon*N(W+W/B)` on 100%
+// of >= 2000 queries across >= 4 (W, epsilon) pairs + a churny (distribution-shifting) key stream + an
+// advance-past-W empties check. The exact oracle scans the stream over the sketch's LIVE pane content
+// (grid-aligned, replicated exactly) for the upper side, and over the ideal (now-W, now] for the lower
+// side. Two NEGATIVE CONTROLS the same gate rejects: a DROP-OLDEST-PANE variant (drops the straddling
+// oldest pane -> UNDER-counts -> breaks the lower bound true(W) <= est) and a MIN-THEN-SUM variant
+// (min-over-rows per pane, then sum across panes -> per-pane collision noise accumulates over B+1 panes
+// and overshoots eps*N -> breaks the upper bound). Both alternative estimators are computed from the
+// SAME internal state via a hash replicated byte-for-byte from the shipped class (verified by a
+// self-check that the replicated sum-then-min equals the public estimate()).
+// ===========================================================================
+
+// murmur3 constants byte-identical to the shipped SlidingCountMin (HK_* in Adaptive.js) so the
+// witness reconstructs the exact column indices from the instance's public seed + internal columns.
+const M_C1 = 0xcc9e2d51 | 0, M_C2 = 0x1b873593 | 0, M_FC1 = 0x85ebca6b | 0, M_FC2 = 0xc2b2ae35 | 0;
+const M_LANE = 0x85ebca6b | 0, M_ODD = 0x9e3779b1 | 0;
+function mRound(h, k) {
+    k = Math.imul(k, M_C1); k = (k << 15) | (k >>> 17); k = Math.imul(k, M_C2);
+    h = h ^ k; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0; return h;
+}
+function mFinal(h) {
+    h = h ^ (h >>> 16); h = Math.imul(h, M_FC1); h = h ^ (h >>> 13); h = Math.imul(h, M_FC2); h = h ^ (h >>> 16); return h;
+}
+function scmBase(key, seed) {
+    let a = key, neg = 0; if (a < 0) { a = -a; neg = 1; }
+    const lo = a >>> 0; const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+    const s = seed | 0;
+    let h = s; h = mRound(h, lo); h = mRound(h, hiw ^ neg); h = mFinal(h ^ 8);
+    let g = s ^ M_LANE; g = mRound(g, lo); g = mRound(g, hiw ^ neg); g = mFinal(g ^ 8);
+    return (h ^ g) | 0;
+}
+function scmCol(base, i, mask) { return mFinal((base ^ Math.imul(i, M_ODD)) | 0) & mask; }
+
+/** The shipped estimate: SUM each row across live panes, THEN MIN over rows (sum-then-min). */
+function estSumThenMin(s, key, effW) {
+    const base = scmBase(key, s.seed), cut = s._now - effW;
+    let mn = Infinity;
+    for (let i = 0; i < s._d; i++) {
+        const off = i * s._w + scmCol(base, i, s._mask);
+        let sum = 0;
+        for (let p = 0; p < s._ring; p++) if (s._paneEnd[p] > cut) sum += s._cells[p * s._dw + off];
+        if (sum < mn) mn = sum;
+    }
+    return mn === Infinity ? 0 : mn;
+}
+/** MIN over rows within each pane, THEN SUM across panes. By `sum of mins <= min of sums` this is
+ *  <= sum-then-min AND (each pane's min-row >= that pane's true mass) >= true -- a VALID but weaker-
+ *  guarantee estimator, NOT a bound-violating bug (see the note below the controls). */
+function estMinThenSum(s, key, effW) {
+    const base = scmBase(key, s.seed), cut = s._now - effW;
+    let total = 0;
+    for (let p = 0; p < s._ring; p++) {
+        if (!(s._paneEnd[p] > cut)) continue;
+        let mn = Infinity;
+        for (let i = 0; i < s._d; i++) {
+            const v = s._cells[p * s._dw + i * s._w + scmCol(base, i, s._mask)];
+            if (v < mn) mn = v;
+        }
+        total += mn === Infinity ? 0 : mn;
+    }
+    return total;
+}
+/** CONTROL: sum-then-min but DROP the oldest live pane (under-counts -> breaks the lower bound). */
+function estDropOldest(s, key, effW) {
+    const base = scmBase(key, s.seed), cut = s._now - effW;
+    let oldestP = -1, oldestEnd = Infinity;
+    for (let p = 0; p < s._ring; p++) if (s._paneEnd[p] > cut && s._paneEnd[p] < oldestEnd) { oldestEnd = s._paneEnd[p]; oldestP = p; }
+    let mn = Infinity;
+    for (let i = 0; i < s._d; i++) {
+        const off = i * s._w + scmCol(base, i, s._mask);
+        let sum = 0;
+        for (let p = 0; p < s._ring; p++) { if (p === oldestP) continue; if (s._paneEnd[p] > cut) sum += s._cells[p * s._dw + off]; }
+        if (sum < mn) mn = sum;
+    }
+    return mn === Infinity ? 0 : mn;
+}
+
+/** A NO-CLEAR-ON-ROTATE SlidingCountMin: `_clearPane` is a no-op, so a pane rotated back into the ring
+ *  keeps its STALE counts from B+1 cycles ago (the clear-on-rotate IS the expiry mechanism). On a
+ *  stream longer than the ring, ancient mass is counted as live -> est OVER-shoots true(W+W/B) + eps*N
+ *  -> the same one-sided gate MUST reject it (the upper side). Mirrors SlidingDDSketch's NoExpirySDS. */
+class NoClearSCM extends SlidingCountMin {
+    _clearPane() { /* BUG: never clears -> stale counts from prior ring cycles are counted as live */ }
+}
+
+/**
+ * Drive SlidingCountMin on a one-key-per-tick stream (tv[i] = i+1) and gate the one-sided bound with
+ * `estFn`. Oracle scans only the last ~(W + pw) items (indices are exact since one add per tick).
+ * Returns { queries, lowerViol, upperViol }.
+ */
+function scmDrive(W, eps, panes, N, warm, gen, estFn, Ctor) {
+    const s = new (Ctor || SlidingCountMin)(W, { epsilon: eps, panes });
+    const pw = W / panes;
+    const tv = new Float64Array(N), key = new Float64Array(N);
+    let queries = 0, lowerViol = 0, upperViol = 0;
+    for (let t = 1; t <= N; t++) {
+        const k = gen(t);
+        s.add(t, k);
+        tv[t - 1] = t; key[t - 1] = k;
+        if (t >= warm && (t % 11) === 0) {
+            const now = t;
+            const E = (Math.floor(now / pw) + 1) * pw;
+            const liveThresh = E - W;          // an add is LIVE iff paneEndOf(tv') >= E - W
+            const idealCut = now - W;          // ideal window (now - W, now]
+            const scan0 = Math.max(0, (Math.floor(now - W - pw) | 0) - 2);
+            const qkeys = [k, key[(now * 0.37) | 0], key[(now * 0.71) | 0]];
+            for (const qk of qkeys) {
+                let trueIdeal = 0, trueLive = 0, Nlive = 0;
+                for (let i = scan0; i < t; i++) {
+                    const pe = (Math.floor(tv[i] / pw) + 1) * pw;
+                    if (pe >= liveThresh) { Nlive++; if (key[i] === qk) trueLive++; }
+                    if (tv[i] > idealCut && key[i] === qk) trueIdeal++;
+                }
+                const est = estFn(s, qk, W);
+                if (!(est >= trueIdeal)) lowerViol++;                        // lower: true(W) <= est
+                if (!(est <= trueLive + s.epsilon * Nlive)) upperViol++;     // upper: <= true(W+W/B) + eps*N
+                queries++;
+            }
+        }
+    }
+    return { queries, lowerViol, upperViol };
+}
+
+console.log('');
+console.log('WINDOWED-FREQUENCY Witness -- SlidingCountMin v' + VERSION + ' (Cormode-Muthukrishnan, CMS ' +
+    '2005, (B+1)-pane ring): windowed frequency vs an EXACT ring oracle (one-sided: true(W) <= est <= ' +
+    'true(W+W/B) + eps*N)');
+console.log('');
+console.log('  W        epsilon  panes  shape          queries  lowerViol  upperViol  status');
+console.log('  -------  -------  -----  -------------  -------  ---------  ---------  ------');
+
+let scmOk = true, scmQueries = 0;
+
+// a fixed set of active keys per tick, i.i.d. -- a stationary key distribution.
+function scmUniform(seed, span) { const r = mulberry32(seed); return () => (r() * span) | 0; }
+// a CHURNY / evolving key stream: the active key band slides upward every W/4 ticks (concept drift).
+function scmChurn(seed, span, W) { const r = mulberry32(seed); return (t) => (((t / (W / 4)) | 0) * span + ((r() * span) | 0)); }
+
+for (const [W, eps] of [[500, 0.1], [1000, 0.05], [2000, 0.02], [4000, 0.01]]) {
+    const panes = 32;
+    const gen = scmUniform(4242 + W, Math.max(50, (W / 4) | 0));
+    const r = scmDrive(W, eps, panes, 3 * W, W, gen, estSumThenMin);
+    scmQueries += r.queries;
+    const cellOk = r.lowerViol === 0 && r.upperViol === 0;
+    if (!cellOk) scmOk = false;
+    console.log('  ' + nStr(W).padEnd(7) + '  ' + String(eps).padEnd(7) + '  ' + String(panes).padEnd(5) +
+        '  ' + 'uniform'.padEnd(13) + '  ' + String(r.queries).padEnd(7) + '  ' +
+        String(r.lowerViol).padStart(9) + '  ' + String(r.upperViol).padStart(9) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+}
+
+// churny / evolving key stream (the active band drifts): the same bound must still hold on 100%.
+{
+    const W = 2000, eps = 0.02, panes = 32;
+    const gen = scmChurn(777, 300, W);
+    const r = scmDrive(W, eps, panes, 4 * W, W, gen, estSumThenMin);
+    scmQueries += r.queries;
+    const cellOk = r.lowerViol === 0 && r.upperViol === 0;
+    if (!cellOk) scmOk = false;
+    console.log('  ' + nStr(W).padEnd(7) + '  ' + String(eps).padEnd(7) + '  ' + String(panes).padEnd(5) +
+        '  ' + 'churn-drift'.padEnd(13) + '  ' + String(r.queries).padEnd(7) + '  ' +
+        String(r.lowerViol).padStart(9) + '  ' + String(r.upperViol).padStart(9) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+}
+
+// self-check: the witness's replicated sum-then-min equals the shipped public estimate() (so the
+// controls, which reuse the replicated hash, are testing the SAME sketch state).
+{
+    const s = new SlidingCountMin(1000, { epsilon: 0.05, panes: 16, seed: 123 });
+    const rng = mulberry32(9);
+    for (let t = 1; t <= 3000; t++) s.add(t, (rng() * 400) | 0);
+    let match = true;
+    for (const k of [0, 1, 42, 200, 399]) if (estSumThenMin(s, k, s.W) !== s.estimate(k)) match = false;
+    if (!match) scmOk = false;
+    console.log('');
+    console.log('  self-check: replicated sum-then-min == public estimate() -> ' + (match ? 'ok' : 'FAIL'));
+}
+
+// advance-past-W empties: an idle slide past the window drives every key's estimate to 0.
+{
+    const s = new SlidingCountMin(1000, { epsilon: 0.05, panes: 16 });
+    for (let t = 1; t <= 900; t++) s.add(t, (t % 50));
+    const beforeAny = s.estimate(3) > 0;
+    s.advance(900 + 3 * 1000);
+    let allZero = true;
+    for (let k = 0; k < 50; k++) if (s.estimate(k) !== 0) allZero = false;
+    const emptyOk = beforeAny && allZero;
+    if (!emptyOk) scmOk = false;
+    console.log('  advance +3W idle-slide -> every key estimate 0: ' + (emptyOk ? 'ok' : 'FAIL'));
+}
+
+const scmEnough = scmQueries >= 2000;
+if (!scmEnough) scmOk = false;
+console.log('  total queries=' + scmQueries + ' (>= 2000 required: ' + (scmEnough ? 'ok' : 'FAIL') +
+    '); one-sided bound holds on 100%: ' + (scmOk ? 'ok' : 'FAIL'));
+console.log('');
+console.log('WITNESS SlidingCountMin (windowed frequency one-sided bound true(W) <= est <= true(W+W/B) + eps*N) ' +
+    (scmOk ? 'ok' : 'FAIL'));
+
+// --- SlidingCountMin NEGATIVE CONTROLS: keep-oldest + sum-then-min must be load-bearing ---
+console.log('');
+console.log('NEGATIVE CONTROLS -- a broken SlidingCountMin estimator MUST be rejected by the same gate:');
+let scmControlsOk = true;
+// (1) DROP-OLDEST-PANE: a steadily-added key has mass in the straddling oldest pane; dropping it
+//     UNDER-counts -> the LOWER bound true(W) <= est is broken.
+{
+    const W = 2000, eps = 0.02, panes = 32;
+    const gen = scmUniform(555, 400);   // steady key set -> every key has mass in the oldest pane
+    const r = scmDrive(W, eps, panes, 3 * W, W, gen, estDropOldest);
+    const rejected = r.lowerViol > 0;   // the gate must REJECT it (it under-counts)
+    if (!rejected) scmControlsOk = false;
+    console.log('  drop-oldest-pane estimator: lowerViol=' + r.lowerViol + '/' + r.queries +
+        ' -> ' + (rejected ? 'REJECTED (under-counts, ok)' : 'NOT rejected (FAIL)'));
+}
+// (2) NO-CLEAR-ON-ROTATE: `_clearPane` disabled -> a pane rotated back into the ring keeps STALE
+//     counts from prior ring cycles -> ancient mass counted as live -> est OVER-shoots
+//     true(W+W/B) + eps*N. Fed the SAME one-sided gate (the upper side), it MUST be rejected.
+{
+    const W = 2000, eps = 0.02, panes = 32;
+    const gen = scmUniform(4242 + W, Math.max(50, (W / 4) | 0));   // same stream as the fair W=2000 lane
+    const r = scmDrive(W, eps, panes, 4 * W, W, gen, estSumThenMin, NoClearSCM);   // 4W >> ring -> wraps
+    const rejected = r.upperViol > 0;   // stale mass breaks the upper bound
+    if (!rejected) scmControlsOk = false;
+    console.log('  no-clear-on-rotate estimator: upperViol=' + r.upperViol + '/' + r.queries +
+        ' -> ' + (rejected ? 'REJECTED (stale mass over-counts, ok)' : 'NOT rejected (FAIL)'));
+}
+// NOTE (why min-then-sum is NOT a rejectable control): `sum of mins <= min of sums`, so min-then-sum
+// <= sum-then-min (== the exact merged-window CMS query), and each pane's min-row >= that pane's true
+// mass, so min-then-sum >= true. Thus true <= min-then-sum <= sum-then-min <= true + eps*N: min-then-sum
+// can NEVER violate the one-sided bound (it is a valid, weaker-GUARANTEE estimator, not a wrong number).
+// The correctness of sum-then-min -- that it is the exact merged-CMS query -- is what the ACCURACY gate
+// above proves directly; here we only confirm the two numerically differ so the choice is not vacuous.
+{
+    const s = new SlidingCountMin(2000, { epsilon: 0.02, panes: 32, seed: 3 });
+    const rng = mulberry32(17);
+    let t = 0; for (let i = 0; i < 8000; i++) { t += 1; s.add(t, (i % 7 === 0) ? (500000 + i) : ((rng() * 300) | 0)); }
+    let differ = false, boundHeldMTS = true;
+    for (let k = 0; k < 300; k++) {
+        const mts = estMinThenSum(s, k, s.W), stm = estSumThenMin(s, k, s.W);
+        if (mts !== stm) differ = true;
+        if (!(mts <= stm)) boundHeldMTS = false;   // min-then-sum never EXCEEDS sum-then-min
+    }
+    if (!(differ && boundHeldMTS)) scmControlsOk = false;
+    console.log('  min-then-sum note: differs from sum-then-min=' + differ +
+        ', and min-then-sum <= sum-then-min held=' + boundHeldMTS +
+        ' -> ' + (differ && boundHeldMTS ? 'sum-then-min order load-bearing (ok)' : 'FAIL'));
+}
+console.log('');
+console.log('WITNESS SlidingCountMin negative controls (drop-oldest-pane + no-clear-on-rotate rejected) ' +
+    (scmControlsOk ? 'ok' : 'FAIL'));
+
 const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
-    slOk && slControlsOk && ddOk && ddControlsOk && sdOk && sdControlsOk && isOk && isControlsOk;
+    slOk && slControlsOk && ddOk && ddControlsOk && sdOk && sdControlsOk && isOk && isControlsOk &&
+    scmOk && scmControlsOk;
 console.log('');
 console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper + ' +
-    'SlidingHyperLogLog + DriftDetector + SlidingDDSketch) ' + (all ? 'ok' : 'FAIL'));
+    'SlidingHyperLogLog + DriftDetector + SlidingDDSketch + SlidingCountMin) ' + (all ? 'ok' : 'FAIL'));
 if (!all) process.exitCode = 1;

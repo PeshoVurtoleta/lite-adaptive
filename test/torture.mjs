@@ -22,7 +22,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
     const { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-        DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch } = await import('../Adaptive.js');
+        DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin } = await import('../Adaptive.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -82,6 +82,14 @@ async function main() {
             sd.quantile(0.5); sd.quantile(0.99); sd.count();   // cold queries (0 alloc via scratch)
             sd.clear();
             tracker.track(sd, noop, 'slidingddsketch', { audit: true });
+
+            const scm = new SlidingCountMin(1000, { panes: 16, w: 128, d: 4, seed: 1 });
+            // a rolling explicit-time key stream over a full, churning window -> pane rotate + clear + conservative.
+            let scmt = 0;
+            for (let k = 0; k < 4096; k++) scm.add(scmt++, ((k * 2654435761) >>> 0) % 5000);
+            scm.estimate(1234); scm.estimate(1234, 500);   // cold sum-then-min queries (0 alloc)
+            scm.clear();
+            tracker.track(scm, noop, 'slidingcountmin', { audit: true });
         }
         return tracker.size();
     }
@@ -778,6 +786,168 @@ async function main() {
         if (sdH.count() !== 0 || !Number.isNaN(sdH.quantile(0.5)) || dt2 >= 50) hugeOk = false;
     }
 
+    // ---- phase 2a-undecies: SlidingCountMin -- add (two-lane hash + pane rotate/clear + per-pane
+    // conservative update) + a ROTATION-EVERY-ADD lane + the ZERO-BOX stride-3 addFrom + estimate +
+    // advance / advanceFrom + a BIG-JUMP (1e12) advance + clear + retention. All 0 B/op. ----
+    // SlidingCountMin add: explicit-time SMI now + SMI key over a full, churning window so every measured
+    // add periodically crosses a pane boundary (rotate + clear + conservative write must be 0-alloc). Primed.
+    const scmAdd = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 3 });
+    let scmT = 0;
+    for (let k = 0; k < 4000; k++) scmAdd.add(scmT++, ((k * 2654435761) >>> 0) % 5000);
+    let scmSink = 0;
+    const scmStep = () => {
+        scmAdd.add(scmT, ((scmT * 2654435761) >>> 0) % 5000);
+        scmT = (scmT + 1) | 0;
+        scmSink = (scmSink + scmAdd.saturated) | 0;   // observe state (defeat DCE)
+    };
+    const scmRes = measureAllocs(scmStep, { iterations: 100000, batches: 8 });
+    const scmBpc = scmRes.bytesPerCall === null ? 0 : scmRes.bytesPerCall;
+    const scmBytes = Math.max(0, Math.round(scmBpc));
+    const scmOk = scmBytes === 0;
+
+    // SlidingCountMin PLAIN (conservative: false) add: every other SCM add lane above uses the
+    // DEFAULT conservative=true update; this is the ONLY lane measuring the plain-add branch (the
+    // `else` half of add()'s per-pane write) -- same churning-window / rotate-every-so-often shape.
+    const scmPlain = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 15, conservative: false });
+    let scmPlainT = 0;
+    for (let k = 0; k < 4000; k++) scmPlain.add(scmPlainT++, ((k * 2654435761) >>> 0) % 5000);
+    let scmPlainSink = 0;
+    const scmPlainStep = () => {
+        scmPlain.add(scmPlainT, ((scmPlainT * 2654435761) >>> 0) % 5000);
+        scmPlainT = (scmPlainT + 1) | 0;
+        scmPlainSink = (scmPlainSink + scmPlain.saturated) | 0;   // observe state (defeat DCE)
+    };
+    const scmPlainRes = measureAllocs(scmPlainStep, { iterations: 100000, batches: 8 });
+    const scmPlainBpc = scmPlainRes.bytesPerCall === null ? 0 : scmPlainRes.bytesPerCall;
+    const scmPlainBytes = Math.max(0, Math.round(scmPlainBpc));
+    const scmPlainOk = scmPlainBytes === 0;
+
+    // SlidingCountMin ROTATION-EVERY-ADD: paneW = 64/64 = 1 and now += 1 per add, so EVERY measured add
+    // crosses a boundary -> _advance rotates + clears a pane (the amortized fill(0) spike) on every call.
+    const scmRot = new SlidingCountMin(64, { panes: 64, w: 64, d: 3, seed: 5 });
+    let scmRotT = 0;
+    for (let k = 0; k < 400; k++) scmRot.add(scmRotT++, ((k * 2654435761) >>> 0) % 2000);
+    let scmRotSink = 0;
+    const scmRotStep = () => {
+        scmRot.add(scmRotT, ((scmRotT * 2654435761) >>> 0) % 2000);   // now += 1 -> rotate every add
+        scmRotT = (scmRotT + 1) | 0;
+        scmRotSink = (scmRotSink + scmRot.saturated) | 0;
+    };
+    const scmRotRes = measureAllocs(scmRotStep, { iterations: 100000, batches: 8 });
+    const scmRotBpc = scmRotRes.bytesPerCall === null ? 0 : scmRotRes.bytesPerCall;
+    const scmRotBytes = Math.max(0, Math.round(scmRotBpc));
+    const scmRotOk = scmRotBytes === 0;
+
+    // SlidingCountMin addFrom: epoch-ms now (non-Smi double) + key + count read UNBOXED from a packed
+    // stride-3 [now, key, count] Float64Array -- the gated zero-box floor (a plain-arg add would box all).
+    const scmFrom = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 7 });
+    const SCMBUF = new Float64Array(3);
+    let scmfNow = 1.75e12;
+    for (let k = 0; k < 4000; k++) {
+        scmfNow += 1.5; SCMBUF[0] = scmfNow; SCMBUF[1] = ((k * 2654435761) >>> 0) % 5000; SCMBUF[2] = (k & 7) + 1;
+        scmFrom.addFrom(SCMBUF, 0);
+    }
+    let scmFromSink = 0, scmfI = 0;
+    const scmFromStep = () => {
+        scmfNow += 1.5;
+        SCMBUF[0] = scmfNow; SCMBUF[1] = ((scmfI * 2654435761) >>> 0) % 5000; SCMBUF[2] = (scmfI & 7) + 1;
+        scmFrom.addFrom(SCMBUF, 0);
+        scmfI = (scmfI + 1) | 0;
+        scmFromSink = (scmFromSink + scmFrom.saturated) | 0;
+    };
+    const scmFromRes = measureAllocs(scmFromStep, { iterations: 100000, batches: 8 });
+    const scmFromBpc = scmFromRes.bytesPerCall === null ? 0 : scmFromRes.bytesPerCall;
+    const scmFromBytes = Math.max(0, Math.round(scmFromBpc));
+    const scmFromOk = scmFromBytes === 0;
+
+    // SlidingCountMin estimate: sum-then-min over the live panes must be 0-alloc (never a per-query alloc).
+    let scmEstSink = 0;
+    const scmEstStep = () => {
+        scmEstSink = (scmEstSink + (scmAdd.estimate(1234) > 0 ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const scmEstRes = measureAllocs(scmEstStep, { iterations: 50000, batches: 8 });
+    const scmEstBpc = scmEstRes.bytesPerCall === null ? 0 : scmEstRes.bytesPerCall;
+    const scmEstBytes = Math.max(0, Math.round(scmEstBpc));
+    const scmEstOk = scmEstBytes === 0;
+
+    // SlidingCountMin advance: slide the pane ring forward (rotate + clear stale panes), re-primed each call.
+    const scmAdv = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 9 });
+    let scmAdvT = 0;
+    for (let k = 0; k < 4000; k++) scmAdv.add(scmAdvT++, ((k * 2654435761) >>> 0) % 5000);
+    let scmAdvSink = 0;
+    const scmAdvStep = () => {
+        scmAdv.add(scmAdvT, ((scmAdvT * 2654435761) >>> 0) % 5000);   // re-prime
+        scmAdvT += 3;
+        scmAdv.advance(scmAdvT);                                      // pane-ring slide
+        scmAdvSink = (scmAdvSink + scmAdv.saturated) | 0;
+    };
+    const scmAdvRes = measureAllocs(scmAdvStep, { iterations: 100000, batches: 8 });
+    const scmAdvBpc = scmAdvRes.bytesPerCall === null ? 0 : scmAdvRes.bytesPerCall;
+    const scmAdvBytes = Math.max(0, Math.round(scmAdvBpc));
+    const scmAdvOk = scmAdvBytes === 0;
+
+    // SlidingCountMin advanceFrom: ZERO-BOX epoch-ms clock + stride-3 re-prime, pane slide.
+    const scmAvf = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 10 });
+    const SCMAVBUF = new Float64Array(3);
+    let scmAvfNow = 1.75e12;
+    for (let k = 0; k < 4000; k++) { SCMAVBUF[0] = scmAvfNow; SCMAVBUF[1] = ((k * 2654435761) >>> 0) % 5000; SCMAVBUF[2] = 1; scmAvf.addFrom(SCMAVBUF, 0); scmAvfNow += 1.5; }
+    let scmAvfSink = 0, scmAvfI = 0;
+    const scmAvfStep = () => {
+        SCMAVBUF[0] = scmAvfNow; SCMAVBUF[1] = ((scmAvfI * 2654435761) >>> 0) % 5000; SCMAVBUF[2] = 1; scmAvf.addFrom(SCMAVBUF, 0);
+        scmAvfNow += 4.5; SCMAVBUF[0] = scmAvfNow; scmAvfI = (scmAvfI + 1) | 0;
+        scmAvf.advanceFrom(SCMAVBUF, 0);
+        scmAvfSink = (scmAvfSink + scmAvf.saturated) | 0;
+    };
+    const scmAvfRes = measureAllocs(scmAvfStep, { iterations: 100000, batches: 8 });
+    const scmAvfBpc = scmAvfRes.bytesPerCall === null ? 0 : scmAvfRes.bytesPerCall;
+    const scmAvfBytes = Math.max(0, Math.round(scmAvfBpc));
+    const scmAvfOk = scmAvfBytes === 0;
+
+    // SlidingCountMin clear(): re-fill between clears so every measured clear() resets non-trivial live state.
+    const scmClear = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 11 });
+    for (let k = 0; k < 4000; k++) scmClear.add(k, ((k * 2654435761) >>> 0) % 5000);
+    let scmClearSink = 0, scmClearI = 0;
+    const scmClearStep = () => {
+        scmClear.clear();
+        scmClear.add(scmClearI, ((scmClearI * 2654435761) >>> 0) % 5000);   // re-seed live state
+        scmClearI = (scmClearI + 1) | 0;
+        scmClearSink = (scmClearSink + (scmClear.mode === 'explicit' ? 1 : 0)) | 0;
+    };
+    const scmClearRes = measureAllocs(scmClearStep, { iterations: 20000, batches: 8 });
+    const scmClearBpc = scmClearRes.bytesPerCall === null ? 0 : scmClearRes.bytesPerCall;
+    const scmClearBytes = Math.max(0, Math.round(scmClearBpc));
+    const scmClearOk = scmClearBytes === 0;
+
+    // SlidingCountMin BIG-JUMP advance: refill near capacity, then jump 1e12 in ONE advance -> the
+    // grid-re-anchor branch (clears all B+1 panes via the bounded loop, then re-anchors) each call.
+    const scmBig = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 12 });
+    let scmBigT = 0;
+    for (let k = 0; k < 300; k++) { scmBig.add(scmBigT, ((k * 40503) >>> 0) % 5000); scmBigT += 1000 / 300; }
+    let scmBigSink = 0;
+    const scmBigStep = () => {
+        for (let k = 0; k < 300; k++) { scmBig.add(scmBigT, ((k * 40503) >>> 0) % 5000); scmBigT += 1000 / 300; }
+        scmBigT += 1e12;                       // ASTRONOMICAL jump: forces the grid-re-anchor branch
+        scmBig.advance(scmBigT);
+        scmBigSink = (scmBigSink + scmBig.saturated) | 0;
+    };
+    const scmBigRes = measureAllocs(scmBigStep, { iterations: 5000, batches: 4 });
+    const scmBigBpc = scmBigRes.bytesPerCall === null ? 0 : scmBigRes.bytesPerCall;
+    const scmBigBytes = Math.max(0, Math.round(scmBigBpc));
+    const scmBigOk = scmBigBytes === 0 && scmBig.estimate(((0 * 40503) >>> 0) % 5000) === 0;   // the jump must ALSO empty it
+
+    // SlidingCountMin retention: bytes constant + estimate returns to baseline over 10 clear/refill cycles.
+    const scmRet = new SlidingCountMin(1000, { panes: 16, w: 128, d: 4, seed: 13 });
+    const scmRetBytes0 = scmRet.bytes;
+    let scmRetBase = -1, scmRetOk = true;
+    for (let cyc = 0; cyc < 10; cyc++) {
+        scmRet.clear();
+        for (let k = 0; k < 2000; k++) scmRet.add(k, ((k * 2654435761) >>> 0) % 5000);
+        const e = scmRet.estimate(1234);
+        if (scmRetBase < 0) scmRetBase = e;
+        else if (e !== scmRetBase) scmRetOk = false;
+        if (scmRet.bytes !== scmRetBytes0) scmRetOk = false;
+    }
+
     // ---- phase 2b: GC budget over a long hot run (millions of add + reshaping ops) ----
     const gc = new GcProfiler().start();
     const HOT = 4000000;
@@ -789,6 +959,7 @@ async function main() {
         ddPhStep(); ddCuStep(); ddFromStep(); ddClearStep();
         sdStep(); sdFromStep();
         ehAdvStep(); ehAvfStep(); slAdvStep(); slAvfStep(); sdAdvStep(); sdAvfStep();
+        scmStep(); scmPlainStep(); scmRotStep(); scmFromStep(); scmEstStep(); scmAdvStep(); scmAvfStep();
     }
     // big-jump lanes are heavier per call (a window-refill inside the step) -- run them separately,
     // outside the 4M-iteration HOT loop, at their own (already-measured) iteration count above; fold
@@ -798,7 +969,9 @@ async function main() {
         ddPhSink + ddCuSink + ddFromSink + ddClearSink +
         sdSink + sdFromSink + sdQSink + sdIntoSink + sdClearSink +
         ehAdvSink + ehAvfSink + slAdvSink + slAvfSink + sdAdvSink + sdAvfSink +
-        ehBigSink + slBigSink + sdBigSink;
+        ehBigSink + slBigSink + sdBigSink +
+        scmSink + scmPlainSink + scmRotSink + scmFromSink + scmEstSink + scmAdvSink + scmAvfSink +
+        scmClearSink + scmBigSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -811,9 +984,10 @@ async function main() {
     const reuseHk = new HeavyKeeper(4, 512, 16, { seed: 9 });
     const reuseSl = new SlidingHyperLogLog(2048, { p: 10, ringCap: 8, seed: 10 });
     const reuseSd = new SlidingDDSketch(2048, { alpha: 0.01, panes: 16 });
+    const reuseScm = new SlidingCountMin(2048, { panes: 16, w: 128, d: 4, seed: 14 });
     globalThis.gc();
     const abBefore = process.memoryUsage().arrayBuffers;
-    let reuseSlT = 0, reuseSdT = 0;
+    let reuseSlT = 0, reuseSdT = 0, reuseScmT = 0;
     for (let c = 0; c < 500; c++) {
         for (let k = 0; k < 8192; k++) reuse.add();     // full window -> expire + cascade
         reuse.count();
@@ -831,6 +1005,9 @@ async function main() {
         for (let k = 0; k < 8192; k++) reuseSd.add(reuseSdT++, ((k * 2654435761) % 9973) + 1);  // pane rotate + collapse
         reuseSd.quantile(0.99);
         reuseSd.clear();                                // reuse the arrays, no new store
+        for (let k = 0; k < 8192; k++) reuseScm.add(reuseScmT++, ((k * 2654435761) >>> 0) % 5000);  // pane rotate + conservative
+        reuseScm.estimate(1234);
+        reuseScm.clear();                               // reuse the arrays, no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -844,7 +1021,9 @@ async function main() {
         ddPhOk && ddCuOk && ddFromOk && ddClearOk &&
         sdOk && sdFromOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk &&
         ehAdvOk && ehAvfOk && slAdvOk && slAvfOk && sdAdvOk && sdAvfOk && advRetOk &&
-        ehBigOk && slBigOk && sdBigOk && hugeOk && report.ok && abOk;
+        ehBigOk && slBigOk && sdBigOk && hugeOk &&
+        scmOk && scmPlainOk && scmRotOk && scmFromOk && scmEstOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
+        report.ok && abOk;
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=0' +
@@ -877,7 +1056,16 @@ async function main() {
         slAdvBytes + ' B/op (SlidingHyperLogLog advance) ' +
         slAvfBytes + ' B/op (SlidingHyperLogLog advanceFrom) ' +
         sdAdvBytes + ' B/op (SlidingDDSketch advance) ' +
-        sdAvfBytes + ' B/op (SlidingDDSketch advanceFrom)' +
+        sdAvfBytes + ' B/op (SlidingDDSketch advanceFrom) ' +
+        scmBytes + ' B/op (SlidingCountMin add + pane rotate + conservative) ' +
+        scmPlainBytes + ' B/op (SlidingCountMin add conservative:false) ' +
+        scmRotBytes + ' B/op (SlidingCountMin rotate-every-add) ' +
+        scmFromBytes + ' B/op (SlidingCountMin addFrom stride-3) ' +
+        scmEstBytes + ' B/op (SlidingCountMin estimate sum-then-min) ' +
+        scmAdvBytes + ' B/op (SlidingCountMin advance) ' +
+        scmAvfBytes + ' B/op (SlidingCountMin advanceFrom) ' +
+        scmClearBytes + ' B/op (SlidingCountMin clear) ' +
+        scmBigBytes + ' B/op (SlidingCountMin big-jump advance)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta +
         ' diag: add-boxed-fractional EH=' + ehBoxedBytes + ' B/op FD=' + fdBoxedBytes +
@@ -918,6 +1106,16 @@ async function main() {
         if (!sdAdvOk) console.error('  alloc ' + sdAdvBytes + ' B/op SlidingDDSketch advance (raw ' + sdAdvBpc + ')');
         if (!sdAvfOk) console.error('  alloc ' + sdAvfBytes + ' B/op SlidingDDSketch advanceFrom (raw ' + sdAvfBpc + ')');
         if (!advRetOk) console.error('  retention: advance idle-slide bytes/count drifted over cycles');
+        if (!scmOk) console.error('  alloc ' + scmBytes + ' B/op SlidingCountMin add (raw ' + scmBpc + ')');
+        if (!scmPlainOk) console.error('  alloc ' + scmPlainBytes + ' B/op SlidingCountMin add conservative:false (raw ' + scmPlainBpc + ')');
+        if (!scmRotOk) console.error('  alloc ' + scmRotBytes + ' B/op SlidingCountMin rotate-every-add (raw ' + scmRotBpc + ')');
+        if (!scmFromOk) console.error('  alloc ' + scmFromBytes + ' B/op SlidingCountMin addFrom (raw ' + scmFromBpc + ')');
+        if (!scmEstOk) console.error('  alloc ' + scmEstBytes + ' B/op SlidingCountMin estimate (raw ' + scmEstBpc + ')');
+        if (!scmAdvOk) console.error('  alloc ' + scmAdvBytes + ' B/op SlidingCountMin advance (raw ' + scmAdvBpc + ')');
+        if (!scmAvfOk) console.error('  alloc ' + scmAvfBytes + ' B/op SlidingCountMin advanceFrom (raw ' + scmAvfBpc + ')');
+        if (!scmClearOk) console.error('  alloc ' + scmClearBytes + ' B/op SlidingCountMin clear (raw ' + scmClearBpc + ')');
+        if (!scmBigOk) console.error('  alloc ' + scmBigBytes + ' B/op SlidingCountMin big-jump advance (raw ' + scmBigBpc + ') or not emptied');
+        if (!scmRetOk) console.error('  retention: SlidingCountMin bytes/estimate drifted over clear/refill cycles');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

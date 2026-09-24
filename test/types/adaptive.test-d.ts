@@ -7,7 +7,7 @@
 
 import {
     ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, VERSION,
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin, VERSION,
 } from '../../Adaptive.js';
 import type {
     ExponentialHistogramMode, ExponentialHistogramOptions, ADWINOptions,
@@ -15,6 +15,7 @@ import type {
     SlidingHyperLogLogMode, SlidingHyperLogLogOptions,
     DriftDetectorMode, DriftDetectorOptions,
     SlidingDDSketchMode, SlidingDDSketchOptions,
+    SlidingCountMinOptions,
 } from '../../Adaptive.js';
 
 // VERSION is a string.
@@ -485,3 +486,75 @@ sd.count('500');
 
 // @ts-expect-error -- a readonly getter is not assignable.
 sd.alpha = 0.02;
+
+// --- SlidingCountMin ---------------------------------------------------------
+const cm = new SlidingCountMin(1000);
+const cm2 = new SlidingCountMin(60000, { epsilon: 0.005, delta: 0.01, panes: 64, seed: 0, conservative: false });
+void cm2;
+
+// withAccuracy: the accuracy-sizing convenience ctor (parity with lite-sketch CMS), returns an instance
+const cmWA: SlidingCountMin = SlidingCountMin.withAccuracy(60000, 0.01, 0.01, { panes: 32 });
+void cmWA;
+
+// @ts-expect-error -- withAccuracy epsilon must be a number.
+SlidingCountMin.withAccuracy(1000, '0.01', 0.01);
+
+// add / addFrom / advance / advanceFrom are chainable, return this
+const cmChained: SlidingCountMin = cm.add(1, 42).add(2, 42, 3);
+const cmCounted: SlidingCountMin = cm2.add(undefined, 7);
+void cmChained; void cmCounted;
+
+const cmBuf = new Float64Array([1, 42, 3]);
+const cmFrom: SlidingCountMin = cm2.addFrom(cmBuf, 0).addFrom(cmBuf, 0);
+const cmAdv: SlidingCountMin = cm2.advance(500).advanceFrom(cmBuf, 0);
+void cmFrom; void cmAdv;
+
+// estimate returns a number (double), with an optional sub-window
+const cmEst: number = cm.estimate(42);
+const cmEstW: number = cm.estimate(42, 500);
+void cmEst; void cmEstW;
+
+const cmCleared: SlidingCountMin = cm.clear();
+void cmCleared;
+
+// getters
+const cmMode: 'unset' | 'explicit' | 'count' = cm.mode;
+const cmNums: number = cm.d + cm.w + cm.panes + cm.W + cm.seed + cm.saturated + cm.epsilon + cm.delta + cm.lastNow + cm.bytes;
+const cmCons: boolean = cm.conservative;
+void cmMode; void cmNums; void cmCons;
+
+const cmOpts: SlidingCountMinOptions = { epsilon: 0.01, delta: 0.01, w: 2048, d: 5, panes: 32, seed: 3, conservative: true };
+void cmOpts;
+
+// @ts-expect-error -- W must be a number.
+new SlidingCountMin('1000');
+
+// @ts-expect-error -- epsilon option must be a number.
+new SlidingCountMin(1000, { epsilon: '0.01' });
+
+// @ts-expect-error -- panes option must be a number.
+new SlidingCountMin(1000, { panes: '32' });
+
+// @ts-expect-error -- conservative option must be a boolean.
+new SlidingCountMin(1000, { conservative: 1 });
+
+// @ts-expect-error -- unknown option key.
+new SlidingCountMin(1000, { width: 2048 });
+
+// @ts-expect-error -- add key must be a number.
+cm.add(1, 'x');
+
+// @ts-expect-error -- addFrom buf must be a Float64Array.
+cm.addFrom([1, 42, 3], 0);
+
+// @ts-expect-error -- advance now must be a number.
+cm.advance('500');
+
+// @ts-expect-error -- advanceFrom buf must be a Float64Array.
+cm.advanceFrom([1], 0);
+
+// @ts-expect-error -- estimate key must be a number.
+cm.estimate('42');
+
+// @ts-expect-error -- a readonly getter is not assignable.
+cm.saturated = 0;

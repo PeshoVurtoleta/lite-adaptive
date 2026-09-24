@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.4.0
+Version: 1.5.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -42,6 +42,10 @@ BYTE-IDENTICAL (only the file header + VERSION change). v1.4.0 adds advance(now)
 to the three TIME-windowed members (ExponentialHistogram, SlidingHyperLogLog, SlidingDDSketch) -- the
 R11 idle-slide sweep (ADR 0009): move the window forward WITHOUT inserting a value, so an idle stream
 still slides to empty with no traffic. EXPLICIT-time only, 0 B/op, every existing method byte-identical.
+v1.5.0 adds SlidingCountMin (windowed per-label FREQUENCY over the last W; Cormode-Muthukrishnan, 2005,
+over a fixed-(B+1) pane ring) -- the recency sibling of lite-sketch's cumulative CountMinSketch and the
+frequency complement of SlidingHyperLogLog / SlidingDDSketch. It is a PURE APPEND: the seven prior
+classes stay BYTE-IDENTICAL (only the file header + VERSION change).
 
 ## Exports (from the single main file Adaptive.js)
 
@@ -158,8 +162,29 @@ still slides to empty with no traffic. EXPLICIT-time only, 0 B/op, every existin
   [lite-adaptive] typeof-first (byte-identical no-op). Empty window -> NaN quantile / 0 count. Getters:
   `alpha` / `strict` / `panes` / `W` / `mode` / `lastNow` / `minIndexable` / `maxIndexable` / `collapsed`
   / `bytes`.
+- `SlidingCountMin` -- class. A zero-GC WINDOWED per-label FREQUENCY summary over the LAST W
+  (Cormode-Muthukrishnan, "Count-Min Sketch", 2005, over a fixed-(B+1) pane ring; ADR 0010) -- the
+  recency sibling of lite-sketch's cumulative CountMinSketch and the frequency complement of
+  SlidingHyperLogLog / SlidingDDSketch. A ring of B+1 panes, each a full d x w CountMin matrix covering
+  W/B of the window; `add(now, key, count?) -> this` (count mode via `add(undefined, key, count?)`)
+  hashes the key with the SAME two-lane murmur3 as lite-sketch CMS (base = hi ^ lo, row column =
+  mix(base ^ i*ODD_CONST) & (w-1)) and writes the current pane's d cells (conservative-update PER PANE by
+  default, plain add otherwise; saturating at 2^32-1), rotating + clearing panes as `now` advances --
+  0 B/op incl. rotation. `addFrom(buf, i)` is the zero-box stride-3 entry (`now = buf[i]`, `key = buf[i+1]`,
+  `count = buf[i+2]` read UNBOXED). `estimate(key, w?) -> number` SUMS each row's cell across the live panes
+  then MINs over rows (sum-then-min); it returns a DOUBLE (a window sum can exceed 2^32) and NEVER throws
+  (0 for an unseen / out-of-domain key or an empty window -- lite-sketch CMS parity). The query covers the
+  live panes so the span is [W, W+W/B]: the straddling oldest pane is KEPT, giving a ONE-SIDED upper bound
+  true(W) <= est <= true(W+W/B) + epsilon*N. `advance(now)` / `advanceFrom(buf, i)` slide an idle window.
+  Key domain: every SAFE INTEGER |key| <= 2^53 - 1 (so a composite channelIdx*2^32 + tag works for one
+  shared instance); a bad key / count / now / option throws [lite-adaptive] typeof-first on add / addFrom
+  (byte-identical no-op), estimate never throws. Ctor `new SlidingCountMin(W, options?)` with
+  `{ epsilon?, delta?, w?, d?, panes?, seed?, conservative? }` (epsilon -> w = ceil(e/epsilon) power-of-two,
+  delta -> d = ceil(ln(1/delta)); explicit w / d override; defaults epsilon=delta=0.01 -> d=5, w=512,
+  panes=32). No `merge` in 1.5.0. Getters: `d` / `w` / `panes` / `W` / `seed` / `conservative` / `saturated`
+  (adds that hit the 2^32-1 ceiling -- the honesty flag) / `epsilon` / `delta` / `mode` / `lastNow` / `bytes`.
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.4.0'.
+- `VERSION` -- string, '1.5.0'.
 
 ## ExponentialHistogram
 
@@ -582,6 +607,83 @@ never grows. ADR 0008 records the pane-ring choice (vs the rejected histogram-of
 the rotate-and-clear model, the edge-error disclosure, the merge-into-instance-scratch 0-alloc argument,
 the DDSketch mapping/collapse parity (and why inlined), the SLD_KEY_MAX overflow cap, and the
 independent-pane-collapse subtlety (why the bound is witnessed, not assumed).
+
+## SlidingCountMin (ADR 0010)
+
+Windowed per-label FREQUENCY -- how many times did KEY occur in the LAST W, in FIXED preallocated space
+with the SAME one-sided over-estimate as lite-sketch's cumulative CountMinSketch (Cormode-Muthukrishnan,
+"Count-Min Sketch", 2005): est >= true(W), est - true <= epsilon*N w.p. >= 1 - delta. The recency sibling
+of cumulative CountMinSketch and the frequency complement of SlidingHyperLogLog / SlidingDDSketch.
+
+Window model (ADR 0010): B+1 panes, each a full d x w CountMin matrix covering W/B of the window, held in
+a ring. add() writes the CURRENT pane; when `now` crosses a pane boundary the ring rotates to the next pane
+and CLEARS it (fill(0), a bounded O(d*w) spike, disclosed as amortized). A `now` jump of k panes clears
+min(k, B+1) panes, NEVER loops k (skipping >= B+1 panes clears them ALL, then re-anchors around `now`).
+Panes are ABSOLUTELY grid-aligned (pane index = floor(now / paneWidth)) so two same-(W, panes) instances
+would align (forward-compat for a future merge). The query covers the LIVE panes (paneEnd > now - W), so
+the covered span is [W, W+W/B]: it ALWAYS covers the full W with at most one extra pane, and the partially-
+expired oldest pane is KEPT, NEVER dropped -- so the estimate is a ONE-SIDED UPPER bound
+true(W) <= est <= true(W+W/B) + epsilon*N(W+W/B). Dropping the oldest pane would under-count and silently
+break the lower side of that contract.
+
+CountMin mapping (INLINED, never an import -- a consumer swaps in lite-sketch CMS identically, so a shared
+dependency's divergence would be a breaking surprise): the two-lane 64-bit murmur3 (hi, lo) over the key's
+low + high words + sign, base = (hi ^ lo) | 0, and each of the d rows derives its column from ONE base lane
+via `mix(base ^ i*ODD_CONST) & (w-1)` (w a power of two) -- byte-identical to lite-sketch CountMinSketch;
+seed default shared with the hashing members, seed=0 valid (guarded via `=== undefined`, null is not zero).
+Query estimate(key, w?): for each row SUM the key's cell across the live panes, THEN MIN over rows (sum-
+then-min, NOT min-then-sum -- a windowed CMS must sum a row across time before taking the row-min). Counters
+are per-pane Uint32Array, SATURATING at 2^32-1 (never wrap; the `saturated` getter is the honesty flag, like
+SlidingHLL's `degraded`). Conservative update (default) runs PER PANE (min over the current pane's d cells),
+NOT over window sums. W is a finite number > 0 with NO small cap (parity with SlidingDDSketch /
+SlidingHyperLogLog -- the cell array (B+1)*d*w is INDEPENDENT of W); the 1<<16-style cap is on the WIDTH w
+(cells/row, tighter than lite-sketch's 1<<25 because the store is B+1 full matrices), and d (rows) is capped
+at 32 (D_MAX). Rejected alternative (ADR 0010): an EH-per-cell ECM-sketch (Papapetrou et al., VLDB 2012) --
+one exponential histogram PER counter cell gives a tighter per-cell error but ~6 MB and a variable-cost
+merge-on-add, not the 0 B/op the suite sells.
+
+Constructor: `new SlidingCountMin(W, options?)` where options = { epsilon (a number in (0, 1), default 0.01
+-> w = ceil(e/epsilon) rounded up to a power of two), delta (a number in (0, 1), default 0.01 -> d =
+ceil(ln(1/delta))), w (explicit width in [1, 2^16], overrides epsilon), d (explicit depth in [1, 32],
+overrides delta), panes (B; an integer in [2, 1024], default 32 -- the ring holds B+1), seed (uint32, any
+integer, default shared), conservative (a boolean, default true -- null is not true) }. Defaults ->
+d=5, w=512, panes=32 -> ~338 KB. A bad W / epsilon / delta / w / d / panes / seed / conservative / option
+throws [lite-adaptive] at the ctor door BEFORE any allocation. No `merge` in 1.5.0 (deferred).
+
+- add(now, key, count?) -> this  HOT, 0 B/op incl. pane rotate + clear. EXPLICIT mode: a finite,
+                                 non-decreasing `now`. COUNT mode: add(undefined, key, count?) auto-ticks
+                                 (W in items). The mode LOCKS at the first add. key a SAFE INTEGER
+                                 (|key| <= 2^53 - 1); count a positive integer in [1, 2^32-1] (default 1).
+                                 Key + count + time validated BEFORE any state write (a reject is a byte-
+                                 identical no-op). Conservative update per pane by default; saturating.
+- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX stride-3: now = buf[i], key = buf[i+1],
+                                 count = buf[i+2] read UNBOXED. EXPLICIT-time only. Same validation + body
+                                 (duplicated) as add().
+- estimate(key, w?) -> number    COLD, O(d x (B+1)), 0 alloc. SUM each row's cell across the live panes,
+                                 then MIN over rows. Returns a DOUBLE (a window sum can exceed 2^32). NEVER
+                                 throws: 0 for an unseen / out-of-domain key, an empty window, or a bad
+                                 sub-window w (fail-closed). `w` an optional sub-window in (0, W].
+- advance(now) -> this           Move the window's reference time to `now` WITHOUT adding (the R11 idle
+                                 slide, ADR 0009): rotate + clear stale panes via the private _advance so
+                                 an idle stream slides to empty (estimate 0). EXPLICIT-time ONLY (count-
+                                 locked throws, unset locks EXPLICIT + anchors), monotone; bounded
+                                 (<= B+1 clears), 0 B/op.
+- advanceFrom(buf, i) -> this    The ZERO-BOX sibling of advance(now): `now = buf[i]` read UNBOXED (needs
+                                 `i < buf.length`), same rotate body, EXPLICIT-only.
+- clear() -> this                0-alloc reset (reuse the arrays; unlocks the mode).
+- d / w / panes / W / seed / conservative / saturated / epsilon / delta / mode / lastNow / bytes
+                                 Getters: the shape, the seed / mode knobs, the saturation honesty flag,
+                                 the theoretical error e/w and failure e^-d, the locked mode, the last
+                                 applied time, the fixed memory figure.
+
+Windowed-frequency contract (the honesty anchor): the witness drives against an EXACT per-key ring oracle
+and gates the ONE-SIDED bound true(W) <= est <= true(W+W/B) + epsilon*N on 100% of >= 2000 queries across
+>= 4 (W, eps) pairs + a churny key stream + advance-empties. Negative controls rejected by the same gate: a
+DROP-OLDEST-PANE variant (under-counts -> breaks the lower bound est >= true(W)) and a MIN-THEN-SUM variant
+(min over rows per pane, then sum -> wrong). Memory ~ (B+1) * d * w * 4 B + paneEnd + scratch; defaults ->
+~338 KB, never grows. ADR 0010 records the B+1 / keep-oldest one-sided-bound rationale, the rejected ECM-
+sketch alternative, the absolute pane alignment, sum-then-min, per-pane conservative update, Uint32
+saturation + `saturated`, the W-not-capped resolution, and the lite-sketch byte-parity note.
 
 ## advance() / idle-slide (ADR 0009)
 

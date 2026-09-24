@@ -8,6 +8,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.5.0] - 2026-09-24
+
+The fourth additive post-1.0 member (`SlidingCountMin`), plus a shared fail-closed ctor guard applied
+to both windowed-pane members. Six of the prior classes (`ExponentialHistogram`, `ADWIN`,
+`ForwardDecay`, `HeavyKeeper`, `SlidingHyperLogLog`, `DriftDetector`) are BYTE-IDENTICAL; the new class
+is appended after `SlidingDDSketch`, which itself changes only by the one-line ctor guard below (no
+behavior change on any valid input). MINOR bump (new API + a fail-closed hardening, no break).
+
+### Fixed
+
+- **Subnormal-window fail-closed guard on both windowed-pane members** (`SlidingDDSketch` and the new
+  `SlidingCountMin`). At an astronomically small window `W` (subnormal range, e.g. `Number.MIN_VALUE`),
+  the derived per-pane width `W / panes` underflows to exactly `0`, which would make the pane-boundary
+  arithmetic non-finite -- no pane ever "live", so `add` never throws yet a query silently reads empty
+  for a value added on the same tick (a silent violation of the one-sided bound). The constructor now
+  guards the derived pane width (`paneW > 0 && Number.isFinite(paneW)`) and throws `[lite-adaptive]` at
+  construction, before any allocation -- consistent with the suite's fail-closed law. No valid,
+  representable `W` is affected (a tiny `W` such as `1e-6` still constructs and works).
+
+### Added
+
+- **`SlidingCountMin` -- windowed per-label frequency** (Cormode-Muthukrishnan Count-Min Sketch over a
+  B+1 pane ring; ADR 0010). Answers "how many times did key `k` occur in the LAST W?" in fixed memory
+  -- the recency sibling of lite-sketch's cumulative `CountMinSketch`, for lite-hud's per-label rate
+  panels. A ring of **B+1 panes** (default `panes` B = 32, so 33 panes), each a `d x w` `Uint32`
+  counter grid aligned to absolute time (`pane = floor(now / (W/B))`). The live panes cover a span in
+  `[W, W + W/B]` -- always the full window plus at most one extra pane -- and the partially-expired
+  oldest pane is **KEPT, never dropped**, so the estimate stays a **one-sided upper bound**:
+  `true(W) <= est <= true(W + W/B) + epsilon * N(W + W/B)`. Dropping it would under-count and silently
+  break the Count-Min contract.
+  - `new SlidingCountMin(W, { epsilon?, delta?, w?, d?, panes?, seed?, conservative? })` -- `W` a finite
+    number `> 0` (a `now`-unit span in explicit mode, or items in count mode; **not capped** -- ms /
+    epoch-time spans are fine). `epsilon` (default `0.01`) sizes the width `w`; `delta` (default `0.01`)
+    sizes the depth `d`; or pass `w` (int `[1, 65536]`) / `d` (int `[1, 32]`) explicitly. `panes` an
+    integer `[2, 1024]` (default 32). `seed` a Uint32 (default `0x9e3779b1`; `seed = 0` valid).
+    `conservative` (default `true`) enables per-pane conservative update. Throws `[lite-adaptive]`
+    typeof-first on a bad arg BEFORE any allocation.
+  - `add(now, key, count = 1) -> this` -- HOT, amortized 0 B/op incl. the pane rotate + clear. EXPLICIT
+    mode (finite, non-decreasing `now`) or COUNT mode via `add(undefined, key, count)`; the mode locks
+    at the first add (a switch throws). `key` a SAFE INTEGER (a composite `channelIdx * 2^32 + tag`
+    works, for lite-hud's ONE-shared-instance-across-channels use); `count` a positive integer,
+    **saturating at `2^32-1`** (never wraps). Fail closed: a mode switch, a non-finite / decreasing
+    `now`, or a non-safe-integer key / non-positive-integer count is a byte-identical no-op.
+  - `addFrom(buf, i) -> this` -- HOT, 0 B/op ZERO-BOX entry: reads a packed stride-3 `[now, key, count]`
+    from a `Float64Array` UNBOXED (EXPLICIT-time only). Same validation + body as `add`.
+  - `advance(now) -> this` + `advanceFrom(buf, i) -> this` -- built in from the start (R11 idle-slide):
+    move the reference time forward with NO increment, rotating out stale panes (bounded to B+1 clears),
+    so an idle key's `estimate` slides to 0 instead of freezing. HOT, amortized 0 B/op, EXPLICIT-only,
+    monotone.
+  - `estimate(key, w?) -> number` -- COLD, `O(d * (B+1))`; sums the key's cell across the live panes per
+    row THEN takes the min over rows (sum-then-min). Returns a **double** (a window sum can exceed
+    `2^32`). **Never throws** -- returns 0 for an unseen / out-of-domain key or an empty window (parity
+    with lite-sketch, so it can be swapped in). `w` an optional sub-window in `(0, W]`.
+  - `clear() -> this`; getters `d` / `w` / `panes` / `W` / `seed` / `conservative` / `saturated` /
+    `epsilon` / `delta` / `lastNow` / `mode` / `bytes`. `saturated` (the count of saturated increments)
+    is the honesty flag, like `SlidingHyperLogLog`'s `degraded`.
+  - DESIGN PARITY with lite-sketch `CountMinSketch` (inlined, never a dependency): the same two-lane
+    seeded hash + row derivation, seed handling, `epsilon` / `delta` sizing, `2^32-1` saturation, and
+    the `conservative` option. Counters are `Uint32Array` per pane; memory `(B+1) * d * w * 4 B`, fixed.
+    Absolute pane alignment means two same-`(W, panes)` instances align cell-for-cell (forward-compat
+    for a future `merge`).
+  - WITNESSED (the honesty anchor, ADR 0010): the one-sided bound `true(W) <= est <= true(W + W/B) +
+    epsilon * N` on 100% of the sweep + a churny key stream, plus an idle-slide-empties check. Negative
+    controls REJECTED by the same gate: a DROP-OLDEST-PANE variant (under-counts, breaks the lower
+    bound) and a MIN-THEN-SUM variant (mis-estimates). ADR 0010 records the B+1 / keep-oldest one-sided
+    rationale and rejects the per-cell EH ("ECM-sketch", Papapetrou et al. VLDB 2012, ~6 MB) alternative.
+- **`VERSION`** is now `'1.5.0'`.
+
 ## [1.4.0] - 2026-09-24
 
 The R11 "idle streams must still slide" sweep. **NOT a pure append**: this ADDS methods to three

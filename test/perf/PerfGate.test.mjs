@@ -11,7 +11,7 @@
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
 import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch } from '../../Adaptive.js';
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin } from '../../Adaptive.js';
 
 const W = 1000;
 const EPS = 0.01;
@@ -590,6 +590,92 @@ const fdMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** Zero-alloc counter for SlidingCountMin: the cells column's byte length -- fixed at construction. */
+function growsScm(s) { return s.scm._cells.buffer.byteLength; }
+
+/**
+ * SlidingCountMin add on an explicit-time key stream: the two-lane hash + pane rotate/clear + the
+ * per-pane conservative update, over a full, churning window so every measured add periodically crosses
+ * a pane boundary (rotate + clear must stay flat + 0 old-gen).
+ */
+const scmAddStream = {
+    name: 'SlidingCountMin add explicit-time (two-lane hash + pane rotate/clear + conservative update)',
+    setup() {
+        const scm = new SlidingCountMin(1000, { panes: 8, w: 128, d: 4, seed: 3 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) scm.add(t++, ((k * 2654435761) >>> 0) % 5000);
+        return { scm, t, sink: 0 };
+    },
+    hot(s, n) {
+        const scm = s.scm;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            scm.add(t, ((t * 2654435761) >>> 0) % 5000);
+            t = (t + 1) | 0;
+            sink = (sink + scm.saturated) | 0;   // observe state (defeat DCE)
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsScm(s) }; },
+};
+
+/**
+ * SlidingCountMin addFrom on a packed stride-3 [now, key, count] Float64Array with an epoch-ms `now` (a
+ * non-Smi double) read UNBOXED -- the zero-box entry (a plain-arg add would box all three). Same hash +
+ * pane rotate/clear + conservative update; must stay flat + 0 old-gen.
+ */
+const scmAddFromStream = {
+    name: 'SlidingCountMin addFrom epoch-ms stride-3 [now,key,count] (zero-box + pane rotate/clear)',
+    setup() {
+        const scm = new SlidingCountMin(1000, { panes: 8, w: 128, d: 4, seed: 7 });
+        const buf = new Float64Array(3);
+        let now = 1.75e12;
+        for (let k = 0; k < 4000; k++) { now += 1.5; buf[0] = now; buf[1] = ((k * 2654435761) >>> 0) % 5000; buf[2] = (k & 7) + 1; scm.addFrom(buf, 0); }
+        return { scm, buf, now, i: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const scm = s.scm, buf = s.buf;
+        let now = s.now, i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            now += 1.5;
+            buf[0] = now; buf[1] = ((i * 2654435761) >>> 0) % 5000; buf[2] = (i & 7) + 1;
+            scm.addFrom(buf, 0);
+            i = (i + 1) | 0;
+            sink = (sink + scm.saturated) | 0;
+        }
+        s.now = now; s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsScm(s) }; },
+};
+
+/**
+ * The teeth for the SlidingCountMin lane: add + a fresh escaping array per op -- it MUST trip the gate,
+ * proving the SlidingCountMin scenarios' flat result is a real 0-alloc measurement.
+ */
+const scmMustFailAlloc = {
+    name: 'SlidingCountMin add + a fresh escaping array per op (MUST allocate)',
+    setup() {
+        const scm = new SlidingCountMin(1000, { panes: 8, w: 128, d: 4, seed: 3 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) scm.add(t++, ((k * 2654435761) >>> 0) % 5000);
+        return { scm, t, leak: null, sink: 0 };
+    },
+    hot(s, n) {
+        const scm = s.scm;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            scm.add(t, ((t * 2654435761) >>> 0) % 5000);
+            t = (t + 1) | 0;
+            const arr = new Array(64);
+            arr[0] = t;
+            s.leak = arr;
+            sink = (sink + arr[0]) | 0;
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 // maxScavenges: the AUTHORITATIVE 0-B/op proof is test/torture.mjs (measureAllocs = 0 B/op on
 // add count-mode AND explicit-time, gc major 0). This perf gate proves the other invariants
 // strictly -- NO old-gen GC, NO arrayBuffer growth (grows delta 0: the fixed bucket pool never
@@ -609,8 +695,8 @@ zgcSuite({
     scenarios: [
         addCountStream, addTimeStream, adwinDriftStream, fdAddStream, addFromStream, fdAddFromStream,
         hkAddStream, hkAddFromStream, slAddStream, slAddCountStream, slAddFromStream,
-        ddPhStream, ddCusumStream, sdAddStream, sdAddFromStream,
+        ddPhStream, ddCusumStream, sdAddStream, sdAddFromStream, scmAddStream, scmAddFromStream,
     ],
     mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc, slMustFailAlloc, ddMustFailAlloc,
-        sdMustFailAlloc],
+        sdMustFailAlloc, scmMustFailAlloc],
 });

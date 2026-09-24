@@ -18,8 +18,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // version pin
 // ---------------------------------------------------------------------------
-test('VERSION is 1.4.0 (advance() idle-slide milestone)', () => {
-    assert.equal(VERSION, '1.4.0');
+test('VERSION is 1.5.0 (SlidingCountMin milestone)', () => {
+    assert.equal(VERSION, '1.5.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -55,6 +55,16 @@ test('ctor rejects panes outside [2, 1024] / non-integer', () => {
     assert.throws(() => new SlidingDDSketch(1000, { panes: 2000 }), /panes must be an integer/);
     assert.throws(() => new SlidingDDSketch(1000, { panes: 8.5 }), /panes must be an integer/);
     assert.throws(() => new SlidingDDSketch(1000, { panes: '32' }), /panes must be an integer/);
+});
+
+test('ctor FAILS CLOSED on a subnormal W (W / panes underflows to 0) -- no silent window', () => {
+    // A subnormal W would underflow the per-pane width to 0 -> non-finite pane boundaries -> a silently
+    // empty window. The ctor guards the derived pane width and throws instead (fail-closed Law).
+    assert.throws(() => new SlidingDDSketch(Number.MIN_VALUE, { panes: 2 }),
+        /\[lite-adaptive\] SlidingDDSketch W is too small/);
+    // a representable small W keeps a positive pane width and constructs normally:
+    const ok = new SlidingDDSketch(1e-6, { panes: 2 });
+    assert.ok(ok.W === 1e-6);
 });
 
 // ---------------------------------------------------------------------------

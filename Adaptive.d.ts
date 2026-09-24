@@ -682,3 +682,124 @@ export class SlidingDDSketch {
     /** Reset to the empty window; reuse the arrays (also unlocks the mode). */
     clear(): this;
 }
+
+export interface SlidingCountMinOptions {
+    /** Relative-error target epsilon; a number in (0, 1) (default 0.01). Sizes the width w when `w` is omitted. */
+    epsilon?: number;
+    /** Failure-probability target delta; a number in (0, 1) (default 0.01). Sizes the depth d when `d` is omitted. */
+    delta?: number;
+    /** The width (cells per row); an integer in [1, 65536]. Overrides the `epsilon`-derived width. */
+    w?: number;
+    /** The depth (number of hash rows); an integer in [1, 32]. Overrides the `delta`-derived depth. */
+    d?: number;
+    /** The pane-ring size B; an integer in [2, 1024] (default 32). The window is covered by B+1 panes; edge error is one pane width W / panes. */
+    panes?: number;
+    /** The Uint32 hash seed (default 0x9e3779b1); `seed = 0` is a valid distinct seed (guarded as undefined, not falsy). */
+    seed?: number;
+    /** Conservative update (min-increment per pane) for a tighter overestimate (default true). */
+    conservative?: boolean;
+}
+
+/**
+ * SlidingCountMin -- a zero-GC WINDOWED per-label FREQUENCY summary over the LAST W (Cormode-
+ * Muthukrishnan Count-Min Sketch over a B+1 pane ring; ADR 0010) -- the recency sibling of
+ * lite-sketch's cumulative CountMinSketch. A ring of B+1 panes (each a `d x w` Uint32 counter grid),
+ * every pane aligned to absolute time (pane = floor(now / (W/B))); `add(now, key, count?)` / the
+ * zero-box `addFrom(buf, i)` (stride-3 `[now, key, count]`) hash `key` to one cell per row in the
+ * CURRENT pane and add `count` (saturating at 2^32-1, never wrapping), rotating + clearing stale
+ * panes as `now` advances (amortized 0 B/op; a rotation is one O(d*w) fill). `estimate(key, w?)` sums
+ * the key's cell across the live panes per row THEN takes the MIN over rows (sum-then-min) -- a
+ * ONE-SIDED upper bound `true(W) <= est <= true(W + W/B) + epsilon * N`; the oldest partial pane is
+ * KEPT (never dropped) so the estimate never under-counts. It is time-windowed, so it ships
+ * `advance(now)` / `advanceFrom(buf, i)` (R11 idle-slide). Design-parity with lite-sketch's
+ * CountMinSketch (same hash / seed / sizing / saturation / conservative option), inlined -- not a
+ * dependency. Hashing / row derivation is deterministic given the seed (there is no PRNG).
+ */
+export class SlidingCountMin {
+    /**
+     * @param W  the window: a finite number > 0 (a `now`-unit span in explicit mode, or items in
+     *           count mode). NOT capped -- ms / epoch-time spans are fine.
+     * @param options  see SlidingCountMinOptions. A bad W / epsilon / delta / w / d / panes / seed /
+     *           option throws [lite-adaptive] typeof-first, before any allocation.
+     */
+    constructor(W: number, options?: SlidingCountMinOptions);
+
+    /**
+     * Convenience ctor sizing the width `w` and depth `d` from accuracy targets (parity with
+     * lite-sketch `CountMinSketch.withAccuracy`): `w = ceil(e / epsilon)` (rounded up to a power of
+     * two), `d = ceil(ln(1 / delta))` clamped to [1, 32]. Throws [lite-adaptive] on a bad
+     * W / epsilon / delta / option.
+     */
+    static withAccuracy(W: number, epsilon: number, delta: number, options?: SlidingCountMinOptions): SlidingCountMin;
+
+    /**
+     * Add `count` (default 1) occurrences of `key` at time `now`. HOT, amortized 0 B/op incl. the
+     * pane rotate + clear. EXPLICIT mode (a finite, non-decreasing `now`) or COUNT mode via
+     * `add(undefined, key, count)` (auto-tick); the mode locks at the first add (a switch throws).
+     * `key` a SAFE INTEGER (a composite `channelIdx * 2^32 + tag` works); `count` a positive integer,
+     * saturating at 2^32-1. Fail closed: a mode switch, a non-finite / decreasing `now`, or a
+     * non-safe-integer key / non-positive-integer count throws [lite-adaptive] (byte-identical no-op).
+     */
+    add(now: number | undefined, key: number, count?: number): this;
+
+    /**
+     * Add from a caller-owned PACKED stride-3 `[now, key, count]` Float64Array (`buf[i]` = now,
+     * `buf[i+1]` = key, `buf[i+2]` = count). HOT, 0 B/op -- the ZERO-BOX entry (reads all three
+     * UNBOXED). EXPLICIT-time only. Same validation / byte-identical-no-op-on-reject as `add`.
+     * Throws [lite-adaptive] on a non-Float64Array `buf` or an out-of-range `i`.
+     */
+    addFrom(buf: Float64Array, i: number): this;
+
+    /**
+     * Move the window's reference time forward to `now` WITHOUT adding anything (R11 idle-slide):
+     * rotate + clear panes as `now` passes their boundaries (bounded to B+1 clears) so a subsequent
+     * `estimate` reflects the window ending at `now` -- an idle key's estimate slides to 0. HOT,
+     * amortized 0 B/op. EXPLICIT-time only (a count-locked instance throws; the first advance locks
+     * EXPLICIT). Monotone: a `now` below the last applied time throws [lite-adaptive] (byte-identical no-op).
+     */
+    advance(now: number): this;
+
+    /**
+     * The ZERO-BOX sibling of `advance(now)`: reads `now = buf[i]` UNBOXED from a Float64Array.
+     * Same validation / throws / EXPLICIT-only lock as `advance`. Throws [lite-adaptive] on a
+     * non-Float64Array `buf` or out-of-range `i`.
+     */
+    advanceFrom(buf: Float64Array, i: number): this;
+
+    /**
+     * The estimated windowed frequency of `key` over the last W (or a sub-window `w <= W`). COLD,
+     * O(d * (B+1)); sums the key's cell across the live panes per row then takes the min over rows.
+     * Returns a DOUBLE (a window sum can exceed 2^32). NEVER throws -- returns 0 for an unseen or
+     * out-of-domain key or an empty window (parity with lite-sketch, so it can be swapped in). `w` an
+     * optional sub-window in (0, W].
+     */
+    estimate(key: number, w?: number): number;
+
+    /** Reset to the empty window; reuse the arrays (also unlocks the mode). */
+    clear(): this;
+
+    /** The depth (number of hash rows). */
+    readonly d: number;
+    /** The width (cells per row). */
+    readonly w: number;
+    /** The pane-ring parameter B (the window is covered by B+1 panes). */
+    readonly panes: number;
+    /** The window span W. */
+    readonly W: number;
+    /** The Uint32 hash seed. */
+    readonly seed: number;
+    /** Whether conservative update is enabled. */
+    readonly conservative: boolean;
+    /** The count of saturated increments -- the honesty flag (like SlidingHyperLogLog's `degraded`). */
+    readonly saturated: number;
+    /** The relative-error target epsilon. */
+    readonly epsilon: number;
+    /** The failure-probability target delta. */
+    readonly delta: number;
+    /** The last applied time. */
+    readonly lastNow: number;
+    /** The locked time mode. */
+    readonly mode: 'unset' | 'explicit' | 'count';
+    /** The fixed memory figure in bytes. */
+    readonly bytes: number;
+}
