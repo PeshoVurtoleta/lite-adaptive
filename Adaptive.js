@@ -98,6 +98,21 @@
  * DriftDetector) stay BYTE-IDENTICAL; only this header + VERSION change above the append point
  * plus the appended SlidingDDSketch class (and its SLD_* consts).
  *
+ * v1.4.0 adds advance(now) / advanceFrom(buf, i) to the THREE time-windowed members
+ * (ExponentialHistogram, SlidingHyperLogLog, SlidingDDSketch) -- the R11 idle-slide sweep (ADR
+ * 0009). advance() moves the window's reference time forward and applies the SAME expiry / pane
+ * rotation an add would, but inserts NO value, so an IDLE stream (no traffic) still forgets at
+ * the window edge and count() / sum() / quantile() keep sliding to empty. EXPLICIT-time only
+ * (parity with addFrom): a COUNT-locked instance throws, an UNSET instance locks EXPLICIT +
+ * anchors, monotone `now` >= lastNow; a rejected advance is a byte-identical no-op; 0 B/op.
+ * EH runs add()'s expire loop VERBATIM (opens no bucket); SlidingHyperLogLog is CLOCK-ONLY (count
+ * already lazily expires off `now` -- eager expiry would perturb overflows/degraded);
+ * SlidingDDSketch rotates+clears stale panes via the private _advance. ForwardDecay / ADWIN /
+ * HeavyKeeper / DriftDetector are EXCLUDED (FD satisfies R11 via its existing now? query args;
+ * ADWIN/HeavyKeeper/DriftDetector are item-indexed, not time-windowed). A PURE method ADD: every
+ * existing method + hot body of the three touched classes stays BYTE-IDENTICAL; only this header +
+ * VERSION change plus the two new methods (and their cold throwers) per touched class.
+ *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
  *
@@ -105,7 +120,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.3.0';
+export const VERSION = '1.4.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -629,6 +644,144 @@ export class ExponentialHistogram {
         throw new TypeError(
             '[lite-adaptive] ExponentialHistogram.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
             'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+
+    /**
+     * Advance the window's reference time to `now` WITHOUT inserting a value (the R11 idle
+     * slide). It runs the SAME expiry sweep `add(now)` would (dropping buckets whose timestamp
+     * fell out of `[now - W, now]`), but opens NO bucket -- so an idle stream still forgets at
+     * the window edge and `count()` / `sum()` keep sliding to 0 with no traffic. HOT, 0 B/op.
+     *
+     * EXPLICIT-time ONLY (parity with addFrom): a COUNT-locked instance throws; an UNSET instance
+     * locks EXPLICIT (and sets the reference time). Monotone: `now` finite and >= lastNow (a
+     * decrease throws). Queries stay pure -- advance is the only op that moves the clock without
+     * a value. A rejected advance is a BYTE-IDENTICAL no-op (nothing is expired, the mode is not
+     * locked, the monotone guard does not advance).
+     * @param {number} now the monotone time (finite, >= the last now).
+     * @returns {ExponentialHistogram} this
+     */
+    advance(now) {
+        // resolve + lock/verify the mode (typeof-first, no alloc); EXPLICIT-only.
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+        }
+        this._now = t;
+        // --- expire buckets that fell out of [t - W, t] (oldest first) -- VERBATIM from add(),
+        //     but open NO bucket (idle slide: move the window forward without inserting). ---
+        const cutoff = t - this._W;
+        const ts = this._ts;
+        while (this._count > 0) {
+            const L = this._maxLevel;
+            const b = this._head[L];
+            if (ts[b] > cutoff) break;
+            const after = this._next[b];
+            this._head[L] = after;
+            if (after === -1) this._tail[L] = -1; else this._prev[after] = -1;
+            this._lcount[L]--;
+            this._count--;
+            this._next[b] = this._freeHead;
+            this._freeHead = b;
+            if (this._head[L] === -1) {
+                let m = L;
+                while (m >= 0 && this._head[m] === -1) m--;
+                this._maxLevel = m;
+            }
+        }
+        return this;
+    }
+
+    /**
+     * Advance the window's reference time from a caller-owned Float64Array (`now = buf[i]`, read
+     * UNBOXED). The ZERO-BOX sibling of advance(now) -- identical mode / monotone / expiry body,
+     * EXPLICIT-time only. Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or
+     * a non-integer / negative / out-of-range `i` (needs `i < buf.length`) throws [lite-adaptive].
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now.
+     * @param {number} i the index of the `now` scalar.
+     * @returns {ExponentialHistogram} this
+     */
+    advanceFrom(buf, i) {
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badAdvanceBuf(buf, i);
+        const now = buf[i];   // UNBOXED Float64Array read (always a number -> no typeof branch).
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+        }
+        this._now = t;
+        const cutoff = t - this._W;
+        const ts = this._ts;
+        while (this._count > 0) {
+            const L = this._maxLevel;
+            const b = this._head[L];
+            if (ts[b] > cutoff) break;
+            const after = this._next[b];
+            this._head[L] = after;
+            if (after === -1) this._tail[L] = -1; else this._prev[after] = -1;
+            this._lcount[L]--;
+            this._count--;
+            this._next[b] = this._freeHead;
+            this._freeHead = b;
+            if (this._head[L] === -1) {
+                let m = L;
+                while (m >= 0 && this._head[m] === -1) m--;
+                this._maxLevel = m;
+            }
+        }
+        return this;
+    }
+
+    /** @private Cold thrower for an advance mode switch (advance is EXPLICIT-only). */
+    _badAdvanceMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] ExponentialHistogram mode is locked to ' + locked +
+            '; advance() is an ' + attempted + '-time op');
+    }
+
+    /** @private Cold thrower for a non-finite advance `now`. */
+    _badAdvanceNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] ExponentialHistogram advance now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone advance `now`. */
+    _badAdvanceMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] ExponentialHistogram advance now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad advanceFrom buffer/index. */
+    _badAdvanceBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] ExponentialHistogram.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
     }
 }
 
@@ -2669,6 +2822,103 @@ export class SlidingHyperLogLog {
             '[lite-adaptive] SlidingHyperLogLog.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
             'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
     }
+
+    /**
+     * Advance the reference clock to `now` WITHOUT adding a key (the R11 idle slide). CLOCK-ONLY:
+     * it moves `_now` / `_lastNow` forward and touches NOTHING else. The ring is NOT eagerly
+     * expired -- `count()` already lazily drops `stamp <= now - W` off `_now` at query time, so a
+     * pure clock bump is enough for an idle stream to slide to 0; eager expiry would perturb the
+     * `overflows` / `degraded` degradation signal (an entry evicted by an idle slide never
+     * happened as far as capacity accounting is concerned). O(1), 0 B/op.
+     *
+     * EXPLICIT-time ONLY (parity with addFrom): a COUNT-locked instance throws; an UNSET instance
+     * locks EXPLICIT (and sets the reference time). Monotone: `now` finite and >= lastNow (a
+     * decrease throws). A rejected advance is a BYTE-IDENTICAL no-op.
+     * @param {number} now the monotone time (finite, >= the last now).
+     * @returns {SlidingHyperLogLog} this
+     */
+    advance(now) {
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+        }
+        this._now = t;   // clock-only: count() lazily expires stamp <= now - W off this.
+        return this;
+    }
+
+    /**
+     * Advance the reference clock from a caller-owned Float64Array (`now = buf[i]`, read UNBOXED).
+     * The ZERO-BOX sibling of advance(now) -- identical mode / monotone / clock-only body,
+     * EXPLICIT-time only. Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or
+     * a non-integer / negative / out-of-range `i` (needs `i < buf.length`) throws [lite-adaptive].
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now.
+     * @param {number} i the index of the `now` scalar.
+     * @returns {SlidingHyperLogLog} this
+     */
+    advanceFrom(buf, i) {
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badAdvanceBuf(buf, i);
+        const now = buf[i];   // UNBOXED Float64Array read (always a number -> no typeof branch).
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+        }
+        this._now = t;
+        return this;
+    }
+
+    /** @private Cold thrower for an advance mode switch (advance is EXPLICIT-only). */
+    _badAdvanceMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingHyperLogLog mode is locked to ' + locked +
+            '; advance() is an ' + attempted + '-time op');
+    }
+
+    /** @private Cold thrower for a non-finite advance `now`. */
+    _badAdvanceNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingHyperLogLog advance now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone advance `now`. */
+    _badAdvanceMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingHyperLogLog advance now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad advanceFrom buffer/index. */
+    _badAdvanceBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingHyperLogLog.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
 }
 
 // ===========================================================================
@@ -3781,5 +4031,105 @@ export class SlidingDDSketch {
         throw new TypeError(
             '[lite-adaptive] SlidingDDSketch.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
             'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+
+    /**
+     * Advance the window's reference time to `now` WITHOUT binning a value (the R11 idle slide).
+     * It moves `_now` forward and runs the SAME pane rotate-and-clear `add(now)` would (the
+     * private `_advance` -- distinct from this PUBLIC `advance`), so an idle stream still rotates
+     * stale panes out and `count()` / `quantile()` keep sliding to empty (NaN) with no traffic.
+     * Bounded (<= panes clears), 0 B/op.
+     *
+     * EXPLICIT-time ONLY (parity with addFrom): a COUNT-locked instance throws; an UNSET instance
+     * locks EXPLICIT (and anchors the pane ring around `now`). Monotone: `now` finite and >=
+     * lastNow (a decrease throws). A rejected advance is a BYTE-IDENTICAL no-op.
+     * @param {number} now the monotone time (finite, >= the last now).
+     * @returns {SlidingDDSketch} this
+     */
+    advance(now) {
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._anchor(t);
+        }
+        this._now = t;
+        if (t >= this._paneEnd[this._cur]) this._advance(t);   // rotate + clear stale panes (bounded).
+        return this;
+    }
+
+    /**
+     * Advance the window's reference time from a caller-owned Float64Array (`now = buf[i]`, read
+     * UNBOXED). The ZERO-BOX sibling of advance(now) -- identical mode / monotone / rotate body,
+     * EXPLICIT-time only. Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or
+     * a non-integer / negative / out-of-range `i` (needs `i < buf.length`) throws [lite-adaptive].
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now.
+     * @param {number} i the index of the `now` scalar.
+     * @returns {SlidingDDSketch} this
+     */
+    advanceFrom(buf, i) {
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badAdvanceBuf(buf, i);
+        const now = buf[i];   // UNBOXED Float64Array read (always a number -> no typeof branch).
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._anchor(t);
+        }
+        this._now = t;
+        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        return this;
+    }
+
+    /** @private Cold thrower for an advance mode switch (advance is EXPLICIT-only). */
+    _badAdvanceMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingDDSketch mode is locked to ' + locked +
+            '; advance() is an ' + attempted + '-time op');
+    }
+
+    /** @private Cold thrower for a non-finite advance `now`. */
+    _badAdvanceNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingDDSketch advance now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone advance `now`. */
+    _badAdvanceMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingDDSketch advance now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad advanceFrom buffer/index. */
+    _badAdvanceBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingDDSketch.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
     }
 }

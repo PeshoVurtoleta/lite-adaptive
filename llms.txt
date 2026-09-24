@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.3.0
+Version: 1.4.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -38,7 +38,10 @@ VERSION change). v1.2.0 adds DriftDetector (scalar Page-Hinkley / CUSUM change d
 SlidingDDSketch (windowed relative-error QUANTILES over the last W; Masson-Rim-Lee, VLDB 2019, over a
 fixed-B pane ring) -- the recency sibling of lite-sketch's cumulative DDSketch and the quantile
 complement of SlidingHyperLogLog. Each post-1.0 member is a PURE APPEND: the prior classes stay
-BYTE-IDENTICAL (only the file header + VERSION change).
+BYTE-IDENTICAL (only the file header + VERSION change). v1.4.0 adds advance(now) / advanceFrom(buf, i)
+to the three TIME-windowed members (ExponentialHistogram, SlidingHyperLogLog, SlidingDDSketch) -- the
+R11 idle-slide sweep (ADR 0009): move the window forward WITHOUT inserting a value, so an idle stream
+still slides to empty with no traffic. EXPLICIT-time only, 0 B/op, every existing method byte-identical.
 
 ## Exports (from the single main file Adaptive.js)
 
@@ -156,7 +159,7 @@ BYTE-IDENTICAL (only the file header + VERSION change).
   `alpha` / `strict` / `panes` / `W` / `mode` / `lastNow` / `minIndexable` / `maxIndexable` / `collapsed`
   / `bytes`.
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.3.0'.
+- `VERSION` -- string, '1.4.0'.
 
 ## ExponentialHistogram
 
@@ -194,6 +197,13 @@ Hot surface (add is amortized O(1), zero allocation incl. the merge / expire res
                               stays 0 B/op. EXPLICIT-time ONLY (a count-locked instance throws;
                               the first addFrom locks EXPLICIT). Same validation / throws /
                               byte-identical-no-op-on-reject; a bad buf/index throws typeof-first.
+- advance(now) -> this        Move the window's reference time to `now` WITHOUT opening a bucket
+                              (the R11 idle slide, ADR 0009): run add()'s expire sweep VERBATIM so
+                              an idle stream still forgets at the edge and count()/sum() slide to 0.
+                              EXPLICIT-time ONLY (count-locked throws, unset locks EXPLICIT),
+                              monotone `now`; HOT, 0 B/op; a rejected advance is a byte-identical no-op.
+- advanceFrom(buf, i) -> this The ZERO-BOX sibling of advance(now): `now = buf[i]` read UNBOXED
+                              (needs `i < buf.length`), same mode / monotone / expiry, EXPLICIT-only.
 - count() -> number           The windowed COUNT (population) over the last W. COLD,
                               O(levels). Relative error <= epsilon. Never throws (0 on empty).
 - sum() -> number             The windowed SUM (of values) over the last W. COLD,
@@ -399,6 +409,13 @@ door BEFORE any allocation.
                                  double), key = buf[i+1] (a safe integer that may exceed 2^31),
                                  read UNBOXED. EXPLICIT-time only. Same validation + inline body
                                  as add().
+- advance(now) -> this           Move the reference clock to `now` WITHOUT adding a key (the R11
+                                 idle slide, ADR 0009). CLOCK-ONLY: set `_now`, touch NOTHING else --
+                                 count() already lazily expires stamp <= now - W off `_now`, and
+                                 eager expiry would perturb overflows/degraded. EXPLICIT-time ONLY
+                                 (count-locked throws, unset locks EXPLICIT), monotone; O(1), 0 B/op.
+- advanceFrom(buf, i) -> this    The ZERO-BOX sibling of advance(now): `now = buf[i]` read UNBOXED
+                                 (needs `i < buf.length`), same clock-only body, EXPLICIT-only.
 - count(w?) -> number            COLD, O(m). Lazily expire stamp <= now - W, take each register's
                                  live-max rho, run Ertl's improved estimator (sigma / tau,
                                  alpha_inf; inline). Returns 0 on an empty window. `w` is an
@@ -533,6 +550,13 @@ allocation.
                                  bin write (time has legitimately advanced, state intact).
 - addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX: now = buf[i], value = buf[i+1] read UNBOXED.
                                  EXPLICIT-time only. Same validation + body (duplicated) as add().
+- advance(now) -> this           Move the window's reference time to `now` WITHOUT binning a value
+                                 (the R11 idle slide, ADR 0009): rotate + clear stale panes via the
+                                 private _advance so an idle stream slides to empty (count 0, quantile
+                                 NaN). EXPLICIT-time ONLY (count-locked throws, unset locks EXPLICIT +
+                                 anchors), monotone; bounded (<= panes clears), 0 B/op.
+- advanceFrom(buf, i) -> this    The ZERO-BOX sibling of advance(now): `now = buf[i]` read UNBOXED
+                                 (needs `i < buf.length`), same rotate body, EXPLICIT-only.
 - quantile(q, w?) -> number      COLD, 0 alloc. Merge the live panes into the scratch, walk it. q in
                                  [0, 1] (outside throws). `w` an optional sub-window in (0, W] (outside
                                  throws). NaN on an empty window. rel error <= alpha (+ edge W/panes).
@@ -558,6 +582,31 @@ never grows. ADR 0008 records the pane-ring choice (vs the rejected histogram-of
 the rotate-and-clear model, the edge-error disclosure, the merge-into-instance-scratch 0-alloc argument,
 the DDSketch mapping/collapse parity (and why inlined), the SLD_KEY_MAX overflow cap, and the
 independent-pane-collapse subtlety (why the bound is witnessed, not assumed).
+
+## advance() / idle-slide (ADR 0009)
+
+R11: a sliding-window summary must be able to slide even when NO data arrives. Without it, an
+idle stream reports a STALE window -- count()/sum()/quantile() keep returning last-second values
+long after the window should have emptied, because the members only expire ON an add(). v1.4.0
+adds `advance(now)` / `advanceFrom(buf, i)` to the three TIME-windowed members so the caller can
+move the window forward with no traffic.
+
+- advance() moves the window's reference time forward and applies the SAME expiry / rotation an
+  add would, WITHOUT inserting a value. Queries stay PURE (they never mutate); advance() is the
+  only op that moves the clock without a value.
+- Per-member body: ExponentialHistogram runs add()'s expire loop VERBATIM (opens no bucket).
+  SlidingHyperLogLog is CLOCK-ONLY (set `_now`; count() already lazily expires stamp <= now - W,
+  and EAGER expiry would perturb the overflows/degraded degradation signal). SlidingDDSketch
+  rotates + clears stale panes via the private `_advance` (bounded, <= panes clears).
+- Mode rule (all 3, parity with addFrom): EXPLICIT-time ONLY. A COUNT-locked instance throws; an
+  UNSET instance locks EXPLICIT (and anchors, for SlidingDDSketch). Monotone: `now` finite and
+  >= lastNow (a decrease throws). A rejected advance is a BYTE-IDENTICAL no-op. All 0 B/op.
+- EXCLUDED: ForwardDecay (satisfies R11 already via its now? query args -- decay is computed at
+  query time relative to `now`, so an idle FD already fades correctly with no advance needed);
+  ADWIN, HeavyKeeper, DriftDetector (item-indexed, NOT time-windowed -- they have no `now` axis
+  to advance).
+- Every existing method + hot body of the three touched classes is BYTE-IDENTICAL; advance /
+  advanceFrom are pure additions.
 
 ## The time source + the bucket pool (ADR 0001)
 

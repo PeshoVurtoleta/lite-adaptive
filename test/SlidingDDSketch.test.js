@@ -18,8 +18,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // version pin
 // ---------------------------------------------------------------------------
-test('VERSION is 1.3.0 (SlidingDDSketch milestone)', () => {
-    assert.equal(VERSION, '1.3.0');
+test('VERSION is 1.4.0 (advance() idle-slide milestone)', () => {
+    assert.equal(VERSION, '1.4.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -621,4 +621,83 @@ test('ADVERSARIAL: quantile/count validate q/w BEFORE the empty-window short-cir
     // a VALID q/w on the same empty instance correctly falls through to NaN / 0, never a throw.
     assert.ok(Number.isNaN(s.quantile(0.5)));
     assert.equal(s.count(500), 0);
+});
+
+// --- advance() / advanceFrom() -- the R11 idle slide, pane rotate (ADR 0009) ----
+
+test('advance(now) slides the sketch to empty (count 0, quantile NaN) on idle', () => {
+    const W = 1000;
+    const s = new SlidingDDSketch(W, { alpha: 0.01 });
+    for (let t = 0; t < 5000; t++) s.add(t, (t % 100) + 1);
+    assert.ok(s.count() > 0 && Number.isFinite(s.quantile(0.5)), 'has content before idle');
+    s.advance(5000 + 2 * W);             // idle jump past the window -> all panes rotate out
+    assert.equal(s.count(), 0, 'idle slide empties the count');
+    assert.ok(Number.isNaN(s.quantile(0.5)), 'idle slide -> NaN quantile');
+});
+
+test('advance(now) partial slide rotates only the stale panes', () => {
+    const s = new SlidingDDSketch(1000, { alpha: 0.01 });
+    for (let t = 0; t < 2000; t++) s.add(t, (t % 100) + 1);
+    const before = s.count();
+    s.advance(2500);                     // window (1500, 2500]: ~half the panes rotate out
+    const after = s.count();
+    assert.ok(after < before && after > 0, 'partial idle slide: ' + before + ' -> ' + after);
+});
+
+test('advance() returns this + locks EXPLICIT + anchors on UNSET', () => {
+    const s = new SlidingDDSketch(1000, { alpha: 0.01 });
+    assert.equal(s.advance(50), s);
+    assert.equal(s.mode, 'explicit');
+    s.add(60, 5);
+    assert.equal(s.count(), 1);
+    assert.ok(Number.isFinite(s.quantile(0.5)));
+    assert.throws(() => s.add(undefined, 5), /\[lite-adaptive\]/);   // count add rejected
+});
+
+test('advance() on a COUNT-locked instance throws (EXPLICIT-only)', () => {
+    const s = new SlidingDDSketch(1000, { alpha: 0.01 });
+    s.add(undefined, 5);                 // locks COUNT
+    assert.throws(() => s.advance(5), /\[lite-adaptive\]/);
+});
+
+test('advance() rejects non-finite / decreasing now as a byte-identical no-op', () => {
+    const s = new SlidingDDSketch(1000, { alpha: 0.01 });
+    s.add(100, 5);
+    const snap = s.count();
+    for (const bad of [NaN, Infinity, -Infinity, '10', null, undefined, {}]) {
+        assert.throws(() => s.advance(bad), /\[lite-adaptive\]/, 'now=' + String(bad));
+    }
+    assert.throws(() => s.advance(50), /\[lite-adaptive\]/);   // decreasing
+    assert.equal(s.count(), snap, 'no-op on reject');
+    s.add(100, 5);                       // guard did not advance
+    assert.equal(s.count(), snap + 1);
+});
+
+test('advanceFrom(buf, i) matches advance(now)', () => {
+    const a = new SlidingDDSketch(1000, { alpha: 0.01 });
+    const b = new SlidingDDSketch(1000, { alpha: 0.01 });
+    for (let t = 0; t < 2000; t++) { a.add(t, (t % 100) + 1); b.add(t, (t % 100) + 1); }
+    a.advance(2500);
+    const buf = new Float64Array([0, 2500]);
+    b.advanceFrom(buf, 1);
+    assert.equal(a.count(), b.count());
+    assert.equal(a.quantile(0.5), b.quantile(0.5));
+    assert.equal(b.advanceFrom(new Float64Array([3000]), 0), b);   // chainable
+});
+
+test('advanceFrom rejects a bad buffer / index; COUNT-lock throws', () => {
+    const s = new SlidingDDSketch(1000, { alpha: 0.01 });
+    s.add(0, 5);
+    const snap = s.count();
+    for (const bad of [[0], 'x', null, undefined, {}, new Uint32Array([1])]) {
+        assert.throws(() => s.advanceFrom(bad, 0), /\[lite-adaptive\]/);
+    }
+    const buf = new Float64Array([10]);
+    for (const badI of [-1, 1, 1.5, '0', NaN]) {
+        assert.throws(() => s.advanceFrom(buf, badI), /\[lite-adaptive\]/, 'i=' + String(badI));
+    }
+    assert.equal(s.count(), snap, 'no-op on reject');
+    const c = new SlidingDDSketch(1000, { alpha: 0.01 });
+    c.add(undefined, 5);
+    assert.throws(() => c.advanceFrom(new Float64Array([5]), 0), /\[lite-adaptive\]/);
 });

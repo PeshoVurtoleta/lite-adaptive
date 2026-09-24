@@ -76,6 +76,22 @@ export class ExponentialHistogram {
      */
     addFrom(buf: Float64Array, i: number): this;
 
+    /**
+     * Move the window's reference time forward to `now` WITHOUT adding a value (R11 idle-slide):
+     * expire buckets older than `now - W` so a subsequent `count()` / `sum()` reflects the window
+     * ending at `now` instead of freezing on the last add. HOT, 0 B/op. EXPLICIT-time only (a
+     * count-locked instance throws; the first advance locks EXPLICIT). Monotone: a `now` less than
+     * the last applied time throws [lite-adaptive] (byte-identical no-op of window state).
+     */
+    advance(now: number): this;
+
+    /**
+     * The ZERO-BOX sibling of `advance(now)`: reads `now = buf[i]` UNBOXED from a Float64Array (for
+     * a fractional / epoch-ms `now` that `advance` would box). Same validation / throws / EXPLICIT-
+     * only lock as `advance`. Throws [lite-adaptive] on a non-Float64Array `buf` or out-of-range `i`.
+     */
+    advanceFrom(buf: Float64Array, i: number): this;
+
     /** The windowed COUNT (population) estimate over the last W. COLD, O(levels). Never throws. */
     count(): number;
 
@@ -421,6 +437,23 @@ export class SlidingHyperLogLog {
     addFrom(buf: Float64Array, i: number): this;
 
     /**
+     * Move the window's reference time forward to `now` WITHOUT adding a key (R11 idle-slide): a
+     * subsequent `count(w?)` then lazily expires `stamp <= now - W` relative to the advanced time,
+     * so an idle stream's readout empties instead of freezing on the last burst. HOT, O(1), 0 B/op
+     * (clock-only -- the ring is untouched, so `overflows` / `degraded` are unaffected). EXPLICIT-
+     * time only (a count-locked instance throws; the first advance locks EXPLICIT). Monotone: a
+     * `now` less than the last applied time throws [lite-adaptive] (byte-identical no-op).
+     */
+    advance(now: number): this;
+
+    /**
+     * The ZERO-BOX sibling of `advance(now)`: reads `now = buf[i]` UNBOXED from a Float64Array.
+     * Same validation / throws / EXPLICIT-only lock as `advance`. Throws [lite-adaptive] on a
+     * non-Float64Array `buf` or out-of-range `i`.
+     */
+    advanceFrom(buf: Float64Array, i: number): this;
+
+    /**
      * The windowed DISTINCT-COUNT estimate over the last W (or a sub-window `w <= W`). COLD, O(m).
      * Standard error 1.04 / sqrt(m) (guaranteed while not degraded). Returns 0 on an empty window.
      * Throws [lite-adaptive] on a sub-window `w` outside `(0, W]`.
@@ -608,6 +641,23 @@ export class SlidingDDSketch {
      * non-integer / out-of-range `i`.
      */
     addFrom(buf: Float64Array, i: number): this;
+
+    /**
+     * Move the window's reference time forward to `now` WITHOUT adding a value (R11 idle-slide):
+     * rotate + clear panes as `now` passes their boundaries (bounded to `panes` clears) so a
+     * subsequent `quantile` / `count` reflects the window ending at `now` instead of freezing on the
+     * last add -- an idle stream empties to NaN / 0. HOT, 0 B/op. EXPLICIT-time only (a count-locked
+     * instance throws; the first advance locks EXPLICIT + anchors the panes). Monotone: a `now` less
+     * than the last applied time throws [lite-adaptive] (byte-identical no-op of quantile state).
+     */
+    advance(now: number): this;
+
+    /**
+     * The ZERO-BOX sibling of `advance(now)`: reads `now = buf[i]` UNBOXED from a Float64Array.
+     * Same validation / throws / EXPLICIT-only lock as `advance`. Throws [lite-adaptive] on a
+     * non-Float64Array `buf` or out-of-range `i`.
+     */
+    advanceFrom(buf: Float64Array, i: number): this;
 
     /**
      * Estimate the value at quantile q over the last W (or a sub-window `w <= W`). COLD, 0 alloc.

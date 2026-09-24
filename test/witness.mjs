@@ -1420,8 +1420,153 @@ console.log('');
 console.log('WITNESS SlidingDDSketch negative controls (no-expiry + coarse-panes rejected) ' +
     (sdControlsOk ? 'ok' : 'FAIL'));
 
+// ===========================================================================
+// advance() / idle-slide WITNESS (R11, ADR 0009): an idle stream still slides to
+// empty; advance(t) + add(t, v) is state-equivalent to add(t, v); advance is
+// idempotent. NEGATIVE CONTROL: a clock-only "advanceNoExpire" (skips the expire /
+// rotate) leaves the window FROZEN and MUST FAIL the empties-on-idle gate.
+// ===========================================================================
+
+// Snapshot EVERY own field of a summary (SoA columns as arrays, scalars as-is) for a
+// deep structural compare -- the state-equivalence oracle over the internal columns.
+function snapshot(obj) {
+    const out = {};
+    for (const k of Object.keys(obj)) {
+        const v = obj[k];
+        out[k] = ArrayBuffer.isView(v) ? Array.from(v) : v;
+    }
+    return JSON.stringify(out);
+}
+
+// Deep-copy a summary instance (typed columns by value, scalars as-is) so a base stream is
+// warmed ONCE and each trial branches off a fresh copy -- the state-equivalence oracle.
+function clone(obj) {
+    const c = Object.create(Object.getPrototypeOf(obj));
+    for (const k of Object.keys(obj)) {
+        const v = obj[k];
+        c[k] = ArrayBuffer.isView(v) ? v.slice() : v;
+    }
+    return c;
+}
+
+// Broken advance variants that leave the window FROZEN on an idle stream (fed the same
+// empties-on-idle gate, they MUST fail it -- proving the real advance body is load-bearing):
+//  - EH.count() sums the LIVE buckets and does not self-filter by `now`, so a clock-only advance
+//    that SKIPS the expire loop leaves every bucket in place -> count frozen. The expire is the
+//    load-bearing part for EH.
+//  - SlidingHyperLogLog.count() and SlidingDDSketch.count() self-filter by `_now`, so moving the
+//    clock alone already empties them; the load-bearing part there is ADVANCING THE CLOCK. A
+//    frozen-clock advance (a no-op that never updates `_now`) leaves the window frozen.
+class EHNoExpire extends ExponentialHistogram {
+    advance(now) { this._mode = 1; this._lastNow = now; this._now = now; return this; }   // clock only, NO expire
+}
+class SHLLFrozen extends SlidingHyperLogLog {
+    advance() { return this; }   // frozen clock: never updates _now -> count() cannot lazily expire
+}
+class SDSFrozen extends SlidingDDSketch {
+    advance() { return this; }   // frozen clock: never updates _now -> count()/quantile keep the stale panes
+}
+
+console.log('');
+console.log('IDLE-SLIDE Witness -- advance() v' + VERSION + ' (R11, ADR 0009): an idle stream slides ' +
+    'to empty; advance(t)+add(t,v) == add(t,v) per SoA column; advance idempotent.');
+console.log('');
+let isOk = true;
+
+// (1) empties-on-idle: burst then advance(lastNow + 2*W) -> every windowed member reads empty.
+{
+    const W = 1000, N = 10000;
+    const eh = new ExponentialHistogram(W, 0.01);
+    const sh = new SlidingHyperLogLog(W, { p: 8 });
+    const sd = new SlidingDDSketch(W, { alpha: 0.01 });
+    let lastNow = 0;
+    for (let t = 0; t < N; t++) { eh.add(t, 1); sh.add(t, t); sd.add(t, (t % 100) + 1); lastNow = t; }
+    const j = lastNow + 2 * W;
+    eh.advance(j); sh.advance(j); sd.advance(j);
+    const ehE = eh.count() === 0;
+    const shE = sh.count() === 0;
+    const sdE = sd.count() === 0 && Number.isNaN(sd.quantile(0.5));
+    if (!(ehE && shE && sdE)) isOk = false;
+    console.log('  empties-on-idle (burst ' + nStr(N) + ', advance +2W):  EH count=' + eh.count() +
+        '  SlidingHLL count=' + sh.count() + '  SlidingDDSketch count=' + sd.count() +
+        ' q50=' + (Number.isNaN(sd.quantile(0.5)) ? 'NaN' : sd.quantile(0.5)) +
+        ' -> ' + (ehE && shE && sdE ? 'ok' : 'FAIL'));
+}
+
+// (2) state-equivalence + idempotence over >= 5000 random (t, v), replayed on fresh instances.
+{
+    const W = 500, TRIALS = 5000;
+    let rng = mulberry32(0x1d1e51);
+    let eqEH = true, eqSH = true, eqSD = true, idem = true;
+    let now = 0;
+    // build a shared prior stream, then at each step compare advance(t)+add vs add on clones.
+    const baseEH = new ExponentialHistogram(W, 0.05);
+    const baseSH = new SlidingHyperLogLog(W, { p: 7 });
+    const baseSD = new SlidingDDSketch(W, { alpha: 0.02 });
+    // warm the base with a prior stream so expiry actually bites during the trials.
+    for (let i = 0; i < 2000; i++) { const dt = 1 + (rng() * 3 | 0); now += dt; baseEH.add(now, 1 + (rng() * 9 | 0)); baseSH.add(now, (rng() * 1e6) | 0); baseSD.add(now, 1 + (rng() * 200 | 0)); }
+    for (let tr = 0; tr < TRIALS; tr++) {
+        const dt = 1 + (rng() * 5 | 0); now += dt;
+        const v = 1 + (rng() * 200 | 0);
+        const key = (rng() * 1e6) | 0;
+        // EH
+        {
+            const a = clone(baseEH); const b = clone(baseEH);
+            a.advance(now); a.add(now, v);
+            b.add(now, v);
+            if (snapshot(a) !== snapshot(b)) eqEH = false;
+            const c = clone(baseEH); const s1 = (c.advance(now), snapshot(c)); const s2 = (c.advance(now), snapshot(c));
+            if (s1 !== s2) idem = false;
+        }
+        // SlidingHLL -- compare state BEFORE count() (count is destructive-lazy).
+        {
+            const a = clone(baseSH); const b = clone(baseSH);
+            a.advance(now); a.add(now, key);
+            b.add(now, key);
+            if (snapshot(a) !== snapshot(b)) eqSH = false;
+        }
+        // SlidingDDSketch
+        {
+            const a = clone(baseSD); const b = clone(baseSD);
+            a.advance(now); a.add(now, v);
+            b.add(now, v);
+            if (snapshot(a) !== snapshot(b)) eqSD = false;
+        }
+    }
+    if (!(eqEH && eqSH && eqSD && idem)) isOk = false;
+    console.log('  state-equivalence over ' + nStr(TRIALS) + ' random (t,v)  advance(t).add == add:  EH ' +
+        (eqEH ? 'ok' : 'FAIL') + '  SlidingHLL ' + (eqSH ? 'ok' : 'FAIL') + '  SlidingDDSketch ' +
+        (eqSD ? 'ok' : 'FAIL') + '   advance idempotent ' + (idem ? 'ok' : 'FAIL'));
+}
+console.log('');
+console.log('WITNESS advance()/idle-slide (empties-on-idle + state-equivalence + idempotent) ' + (isOk ? 'ok' : 'FAIL'));
+
+// --- NEGATIVE CONTROLS: a clock-only advance (skips expire / rotate) MUST FAIL the gate ---
+console.log('');
+console.log('NEGATIVE CONTROLS -- an advance that skips the expire/rotate MUST be rejected:');
+let isControlsOk = true;
+{
+    const W = 1000, N = 10000;
+    const eh = new EHNoExpire(W, 0.01);
+    const sh = new SHLLFrozen(W, { p: 8 });
+    const sd = new SDSFrozen(W, { alpha: 0.01 });
+    let lastNow = 0;
+    for (let t = 0; t < N; t++) { eh.add(t, 1); sh.add(t, t); sd.add(t, (t % 100) + 1); lastNow = t; }
+    const j = lastNow + 2 * W;
+    eh.advance(j); sh.advance(j); sd.advance(j);
+    const ehFrozen = eh.count() !== 0;             // must NOT have emptied
+    const shFrozen = sh.count() !== 0;
+    const sdFrozen = sd.count() !== 0;
+    if (!(ehFrozen && shFrozen && sdFrozen)) isControlsOk = false;
+    console.log('  clock-only EHNoExpire (skips expire) count=' + eh.count() + ' -> ' + (ehFrozen ? 'REJECTED (frozen, ok)' : 'emptied (FAIL)'));
+    console.log('  frozen-clock SHLLFrozen count=' + sh.count() + ' -> ' + (shFrozen ? 'REJECTED (frozen, ok)' : 'emptied (FAIL)'));
+    console.log('  frozen-clock SDSFrozen count=' + sd.count() + ' -> ' + (sdFrozen ? 'REJECTED (frozen, ok)' : 'emptied (FAIL)'));
+}
+console.log('');
+console.log('WITNESS advance() negative controls (frozen windows rejected) ' + (isControlsOk ? 'ok' : 'FAIL'));
+
 const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
-    slOk && slControlsOk && ddOk && ddControlsOk && sdOk && sdControlsOk;
+    slOk && slControlsOk && ddOk && ddControlsOk && sdOk && sdControlsOk && isOk && isControlsOk;
 console.log('');
 console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper + ' +
     'SlidingHyperLogLog + DriftDetector + SlidingDDSketch) ' + (all ? 'ok' : 'FAIL'));

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { ExponentialHistogram, VERSION } from '../Adaptive.js';
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '1.3.0');
+    assert.equal(VERSION, '1.4.0');
 });
 
 test('constructor validates W fail-closed BEFORE allocation', () => {
@@ -315,4 +315,92 @@ test('bucket pool never overflows across a long shifting stream (all sweep cells
             }
         }
     }
+});
+
+// --- advance() / advanceFrom() -- the R11 idle slide (ADR 0009) -----------------
+
+test('advance(now) slides the window to empty on an idle stream', () => {
+    const W = 100;
+    const eh = new ExponentialHistogram(W, 0.01);
+    for (let t = 0; t < 1000; t++) eh.add(t, 1);
+    assert.ok(eh.count() > 0, 'has content before idle');
+    eh.advance(1000 + 2 * W);            // idle jump well past the window
+    assert.equal(eh.count(), 0, 'idle slide empties the window');
+    assert.equal(eh.sum(), 0);
+});
+
+test('advance(now) partial slide expires only the out-of-window buckets', () => {
+    const eh = new ExponentialHistogram(100, 0.01);
+    for (let t = 0; t < 200; t++) eh.add(t, 1);
+    const before = eh.count();
+    eh.advance(250);                     // window is now (150, 250]; ~half expires
+    const after = eh.count();
+    assert.ok(after < before && after > 0, 'partial idle slide: ' + before + ' -> ' + after);
+});
+
+test('advance() returns this (chainable)', () => {
+    const eh = new ExponentialHistogram(100, 0.01);
+    eh.add(0, 1);
+    assert.equal(eh.advance(10), eh);
+});
+
+test('advance() locks EXPLICIT on an UNSET instance', () => {
+    const eh = new ExponentialHistogram(100, 0.01);
+    eh.advance(50);
+    assert.equal(eh.mode, 'explicit');
+    eh.add(60, 1);
+    assert.equal(eh.count(), 1);
+    assert.throws(() => eh.add(), /\[lite-adaptive\]/);   // count add now rejected
+});
+
+test('advance() on a COUNT-locked instance throws (EXPLICIT-only)', () => {
+    const eh = new ExponentialHistogram(100, 0.01);
+    eh.add();                            // locks COUNT
+    assert.throws(() => eh.advance(5), /\[lite-adaptive\]/);
+});
+
+test('advance() rejects a non-finite / decreasing now as a BYTE-IDENTICAL no-op', () => {
+    const eh = new ExponentialHistogram(100, 0.01);
+    eh.add(100, 1);
+    const snap = eh.count();
+    for (const bad of [NaN, Infinity, -Infinity, '10', null, undefined, {}]) {
+        assert.throws(() => eh.advance(bad), /\[lite-adaptive\]/, 'now=' + String(bad));
+    }
+    assert.throws(() => eh.advance(50), /\[lite-adaptive\]/);   // decreasing
+    assert.equal(eh.count(), snap, 'no-op: count unchanged');
+    // the monotone guard did not advance on reject: a later add at the original now still works.
+    eh.add(100, 1);
+    assert.equal(eh.count(), snap + 1);
+});
+
+test('advanceFrom(buf, i) matches advance(now) and reads now UNBOXED', () => {
+    const a = new ExponentialHistogram(100, 0.01);
+    const b = new ExponentialHistogram(100, 0.01);
+    for (let t = 0; t < 500; t++) { a.add(t, 1); b.add(t, 1); }
+    a.advance(700);
+    const buf = new Float64Array([0, 700, 0]);
+    b.advanceFrom(buf, 1);
+    assert.equal(a.count(), b.count());
+    assert.equal(a.sum(), b.sum());
+    assert.equal(b.advanceFrom(new Float64Array([800]), 0), b);   // chainable, i=last valid
+});
+
+test('advanceFrom rejects a bad buffer / index typeof-first (no-op)', () => {
+    const eh = new ExponentialHistogram(100, 0.01);
+    eh.add(0, 1);
+    const snap = eh.count();
+    for (const bad of [[0], 'x', null, undefined, {}, new Uint32Array([1])]) {
+        assert.throws(() => eh.advanceFrom(bad, 0), /\[lite-adaptive\]/);
+    }
+    const buf = new Float64Array([10]);
+    for (const badI of [-1, 1, 1.5, '0', NaN]) {
+        assert.throws(() => eh.advanceFrom(buf, badI), /\[lite-adaptive\]/, 'i=' + String(badI));
+    }
+    assert.equal(eh.count(), snap, 'no-op on reject');
+});
+
+test('advanceFrom on a COUNT-locked instance throws', () => {
+    const eh = new ExponentialHistogram(100, 0.01);
+    eh.add();
+    assert.throws(() => eh.advanceFrom(new Float64Array([5]), 0), /\[lite-adaptive\]/);
 });

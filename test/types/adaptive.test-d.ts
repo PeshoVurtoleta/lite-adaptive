@@ -45,11 +45,21 @@ const ehBuf = new Float64Array([1, 3]);
 const ehFrom: ExponentialHistogram = eh2.addFrom(ehBuf, 0).addFrom(ehBuf, 0);
 void ehFrom;
 
+// advance / advanceFrom: idle-slide, chainable, returns this
+const ehAdv: ExponentialHistogram = eh2.advance(500).advanceFrom(ehBuf, 0);
+void ehAdv;
+
 // @ts-expect-error -- addFrom buf must be a Float64Array.
 eh2.addFrom([1, 3], 0);
 
 // @ts-expect-error -- addFrom index must be a number.
 eh2.addFrom(ehBuf, 'x');
+
+// @ts-expect-error -- advance now must be a number.
+eh2.advance('500');
+
+// @ts-expect-error -- advanceFrom buf must be a Float64Array.
+eh2.advanceFrom([1], 0);
 
 // queries return numbers
 const c: number = eh.count();
@@ -264,6 +274,10 @@ const slBuf = new Float64Array([1, 42]);
 const slFrom: SlidingHyperLogLog = sl2.addFrom(slBuf, 0).addFrom(slBuf, 0);
 void slFrom;
 
+// advance / advanceFrom: idle-slide, chainable, returns this
+const slAdv: SlidingHyperLogLog = sl2.advance(500).advanceFrom(slBuf, 0);
+void slAdv;
+
 // queries return numbers, with an optional sub-window
 const slC: number = sl.count();
 const slC2: number = sl.count(500);
@@ -298,6 +312,12 @@ sl.addFrom([1, 42], 0);
 
 // @ts-expect-error -- addFrom index must be a number.
 sl.addFrom(slBuf, 'x');
+
+// @ts-expect-error -- advance now must be a number.
+sl.advance('500');
+
+// @ts-expect-error -- advanceFrom buf must be a Float64Array.
+sl.advanceFrom([1], 0);
 
 // @ts-expect-error -- count sub-window must be a number.
 sl.count('500');
@@ -404,6 +424,10 @@ const sdBuf = new Float64Array([1, 42]);
 const sdFrom: SlidingDDSketch = sd2.addFrom(sdBuf, 0).addFrom(sdBuf, 0);
 void sdFrom;
 
+// advance / advanceFrom: idle-slide, chainable, returns this
+const sdAdv: SlidingDDSketch = sd2.advance(500).advanceFrom(sdBuf, 0);
+void sdAdv;
+
 // queries return numbers, with an optional sub-window; quantileInto returns a count
 const sdQ: number = sd.quantile(0.5);
 const sdQw: number = sd.quantile(0.99, 500);
@@ -443,6 +467,12 @@ sd.addFrom([1, 42], 0);
 
 // @ts-expect-error -- addFrom index must be a number.
 sd.addFrom(sdBuf, 'x');
+
+// @ts-expect-error -- advance now must be a number.
+sd.advance('500');
+
+// @ts-expect-error -- advanceFrom buf must be a Float64Array.
+sd.advanceFrom([1], 0);
 
 // @ts-expect-error -- quantile q must be a number.
 sd.quantile('0.5');

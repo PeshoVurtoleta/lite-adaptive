@@ -1,8 +1,8 @@
 {
   "name": "@zakkster/lite-adaptive",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.3.0",
-  "description": "Zero-dependency, zero-GC family of APPROXIMATE, sublinear-space streaming summaries over the TIME / RECENCY axis that witnesses its RECENCY against the paper's theoretical bound: ExponentialHistogram (sliding-window count / sum) + ADWIN (concept-drift detection + adaptive windowing) + ForwardDecay (time-decayed count / sum / mean / rate) + HeavyKeeper (decayed top-k / heavy hitters) + SlidingHyperLogLog (windowed distinct-count) + DriftDetector (scalar Page-Hinkley / CUSUM change detection) + SlidingDDSketch (windowed relative-error quantiles) over a preallocated fixed bucket pool. Tree-shakeable named exports.",
+  "version": "1.4.0",
+  "description": "Zero-dependency, zero-GC family of APPROXIMATE, sublinear-space streaming summaries over the TIME / RECENCY axis that witnesses its RECENCY against the paper's theoretical bound: ExponentialHistogram (sliding-window count / sum) + ADWIN (concept-drift detection + adaptive windowing) + ForwardDecay (time-decayed count / sum / mean / rate) + HeavyKeeper (decayed top-k / heavy hitters) + SlidingHyperLogLog (windowed distinct-count) + DriftDetector (scalar Page-Hinkley / CUSUM change detection) + SlidingDDSketch (windowed relative-error quantiles) over a preallocated fixed bucket pool; the time-windowed members expose advance() / advanceFrom() so an IDLE stream still slides its window to empty with no traffic. Tree-shakeable named exports.",
   "type": "module",
   "main": "./Adaptive.js",
   "module": "./Adaptive.js",
@@ -36,6 +36,7 @@
   "keywords": [
     "streaming",
     "sliding-window",
+    "idle-slide",
     "windowed",
     "recency",
     "time-window",

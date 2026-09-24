@@ -18,8 +18,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // version pin
 // ---------------------------------------------------------------------------
-test('VERSION is 1.3.0 (SlidingDDSketch milestone)', () => {
-    assert.equal(VERSION, '1.3.0');
+test('VERSION is 1.4.0 (advance() idle-slide milestone)', () => {
+    assert.equal(VERSION, '1.4.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -435,4 +435,90 @@ test('windowed estimate matches an exact distinct-set oracle within 3 sigma acro
         }
         assert.equal(s.degraded, false, 'W=' + W + ' should not degrade with ringCap 16');
     }
+});
+
+// --- advance() / advanceFrom() -- the R11 idle slide, CLOCK-ONLY (ADR 0009) -----
+
+test('advance(now) slides the windowed distinct-count to 0 on an idle stream', () => {
+    const W = 1000;
+    const s = new SlidingHyperLogLog(W, { p: 8 });
+    for (let t = 0; t < 5000; t++) s.add(t, t);
+    assert.ok(s.count() > 0, 'has distinct content before idle');
+    s.advance(5000 + 2 * W);             // idle jump past the window
+    assert.equal(s.count(), 0, 'idle slide (clock-only) empties the count');
+});
+
+test('advance() is CLOCK-ONLY: count reads correctly after advance with no add', () => {
+    const W = 1000;
+    const s = new SlidingHyperLogLog(W, { p: 8 });
+    for (let t = 0; t < 500; t++) s.add(t, t);
+    const before = s.count();
+    s.advance(600);                      // window (- ,600] with W=1000 still holds everything
+    assert.equal(s.count(), before, 'a within-window advance does not drop live keys');
+    s.advance(1200);                     // now (200, 1200]: the first 200 keys expire
+    assert.ok(s.count() < before && s.count() > 0, 'partial idle slide: ' + before + ' -> ' + s.count());
+});
+
+test('advance() does not perturb overflows / degraded (eager expiry avoided)', () => {
+    const s = new SlidingHyperLogLog(1000, { p: 8 });
+    for (let t = 0; t < 500; t++) s.add(t, t);
+    const ov = s.overflows;
+    s.advance(100000);
+    assert.equal(s.overflows, ov, 'idle slide leaves the degradation signal untouched');
+});
+
+test('advance() returns this + locks EXPLICIT on UNSET', () => {
+    const s = new SlidingHyperLogLog(1000, { p: 8 });
+    assert.equal(s.advance(50), s);
+    assert.equal(s.mode, 'explicit');
+    s.add(60, 7);
+    assert.equal(s.count(), 1);
+    assert.throws(() => s.add(undefined, 8), /\[lite-adaptive\]/);
+});
+
+test('advance() on a COUNT-locked instance throws (EXPLICIT-only)', () => {
+    const s = new SlidingHyperLogLog(1000, { p: 8 });
+    s.add(undefined, 1);                 // locks COUNT
+    assert.throws(() => s.advance(5), /\[lite-adaptive\]/);
+});
+
+test('advance() rejects non-finite / decreasing now as a byte-identical no-op', () => {
+    const s = new SlidingHyperLogLog(1000, { p: 8 });
+    s.add(100, 1);
+    const snap = s.count();
+    for (const bad of [NaN, Infinity, -Infinity, '10', null, undefined, {}]) {
+        assert.throws(() => s.advance(bad), /\[lite-adaptive\]/, 'now=' + String(bad));
+    }
+    assert.throws(() => s.advance(50), /\[lite-adaptive\]/);   // decreasing
+    assert.equal(s.count(), snap, 'no-op on reject');
+    s.add(100, 2);                       // guard did not advance: same-now add still works
+    assert.equal(s.count(), 2);
+});
+
+test('advanceFrom(buf, i) matches advance(now)', () => {
+    const a = new SlidingHyperLogLog(1000, { p: 8 });
+    const b = new SlidingHyperLogLog(1000, { p: 8 });
+    for (let t = 0; t < 2000; t++) { a.add(t, t); b.add(t, t); }
+    a.advance(2500);
+    const buf = new Float64Array([0, 2500]);
+    b.advanceFrom(buf, 1);
+    assert.equal(a.count(), b.count());
+    assert.equal(b.advanceFrom(new Float64Array([3000]), 0), b);   // chainable
+});
+
+test('advanceFrom rejects a bad buffer / index; COUNT-lock throws', () => {
+    const s = new SlidingHyperLogLog(1000, { p: 8 });
+    s.add(0, 1);
+    const snap = s.count();
+    for (const bad of [[0], 'x', null, undefined, {}, new Uint32Array([1])]) {
+        assert.throws(() => s.advanceFrom(bad, 0), /\[lite-adaptive\]/);
+    }
+    const buf = new Float64Array([10]);
+    for (const badI of [-1, 1, 1.5, '0', NaN]) {
+        assert.throws(() => s.advanceFrom(buf, badI), /\[lite-adaptive\]/, 'i=' + String(badI));
+    }
+    assert.equal(s.count(), snap, 'no-op on reject');
+    const c = new SlidingHyperLogLog(1000, { p: 8 });
+    c.add(undefined, 1);
+    assert.throws(() => c.advanceFrom(new Float64Array([5]), 0), /\[lite-adaptive\]/);
 });

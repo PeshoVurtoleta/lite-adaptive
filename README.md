@@ -90,7 +90,7 @@ The only source of error is the oldest bucket, which may straddle the window bou
 The same invariant fixes the memory: the number of levels is `ceil(log2(W/(k+1))) + 2`, and each level holds at most `k + 1` buckets, so the pool is a fixed
 `CAP = (k+1) * (ceil(log2(W/(k+1))) + 2) + 2` buckets -- preallocated at construction, never grown. At `W = 65536, epsilon = 0.01` that is 678 buckets (~24 KB) versus an exact ring of 65536 timestamps (512 KB).
 
-The measured windowed relative error tracks `1/(2k)` and stays under `epsilon` across the whole `W in {64, 1000, 65536} x epsilon in {0.5, 0.1, 0.01}` sweep -- see [Testing](#testing).
+The measured windowed relative error tracks `1/(2k)` and stays under `epsilon` across the whole `W in {64, 1000, 65536} x epsilon in {0.5, 0.1, 0.01}` sweep -- see [Testing](#testing). For an idle stream, `advance(now)` (and the zero-box `advanceFrom(buf, i)`) expires the window edge with no value added, so `count()` an hour later reflects the empty window instead of the last burst (R11 idle-slide, 0 B/op).
 </details>
 
 ## ADWIN
@@ -209,7 +209,7 @@ On `add(now, key)`, an inline two-lane murmur hash (design-parity with lite-sket
 <details>
 <summary>The honest-degradation signal</summary>
 
-The per-register ring is a fixed `ringCap` (default 8). If a register receives more than `ringCap` still-in-window maxima at once, the ring drops its oldest entry and bumps `overflows`, after which that register's windowed max can be understated -- so the `1.04 / sqrt(m)` bound is no longer guaranteed. `degraded` (true once `overflows > 0`) reports this honestly rather than silently returning a wrong count; raise `ringCap` (or lower `p`) to make overflow impossible for your rho-churn. The windowed-distinct witness gates the relative error vs an exact windowed `Set` oracle at `3 * 1.04/sqrt(m)` on 100% of >= 2000 queries across a `W`-sweep + a distinct-set shift + a post-burst edge, AND asserts `degraded === false`; a no-expiry variant (stale keys counted forever) and a no-dominated-drop variant (a plain FIFO ring) are rejected by the same gate -- see [Testing](#testing).
+The per-register ring is a fixed `ringCap` (default 8). If a register receives more than `ringCap` still-in-window maxima at once, the ring drops its oldest entry and bumps `overflows`, after which that register's windowed max can be understated -- so the `1.04 / sqrt(m)` bound is no longer guaranteed. `degraded` (true once `overflows > 0`) reports this honestly rather than silently returning a wrong count; raise `ringCap` (or lower `p`) to make overflow impossible for your rho-churn. The windowed-distinct witness gates the relative error vs an exact windowed `Set` oracle at `3 * 1.04/sqrt(m)` on 100% of >= 2000 queries across a `W`-sweep + a distinct-set shift + a post-burst edge, AND asserts `degraded === false`; a no-expiry variant (stale keys counted forever) and a no-dominated-drop variant (a plain FIFO ring) are rejected by the same gate -- see [Testing](#testing). `advance(now)` moves the lazy-expiry clock forward with no key added (O(1), 0 B/op, the ring untouched so `overflows` / `degraded` are unaffected), so an idle window's `count()` slides to empty (R11 idle-slide).
 </details>
 
 Driven by a caller-supplied monotone `now` (or count mode when `now` is omitted); the mode locks at the first add. Keys are safe integers; a bad `W` / `p` / `ringCap` / `seed` / key / `now` throws `[lite-adaptive]` typeof-first, before any allocation. `addFrom(buf, i)` is the zero-box entry (`now = buf[i]`, `key = buf[i+1]` read unboxed from a `Float64Array`) for fractional / epoch-ms timestamps and large safe-integer keys.
@@ -271,7 +271,7 @@ q.count();                   // the windowed population (0 on empty)
 The window is **soft to within one pane width** `W / panes`: a value can survive up to `W / panes` past the strict window edge, in the pane that has not yet rotated out. That is the disclosed price of a fixed-memory sliding window over an exact `O(W)` sort; the default 32 panes puts the edge at ~3% of `W`, and it is the caller's knob (more panes -> tighter edge, linearly more memory). Per-pane bin counts are a `Uint32Array` that **saturates at `2^32 - 1`** (never wraps); the merge scratch sums the panes in `Float64`, so a merged window count stays exact well past `2^32`. Each pane collapses its lowest bins independently (the DDSketch `maxBins = 2048` bound), so the merged min-key can differ from a single sketch's -- the accuracy bound is therefore **witnessed**, not assumed. A value whose bin key would exceed `SLD_KEY_MAX` (`1 << 30`) is rejected fail-closed, so the bin index can never overflow.
 </details>
 
-`SlidingDDSketch` locks EXPLICIT vs COUNT mode at the first add (a switch throws), and `alpha` / `strict` / `panes` / `W` are validated typeof-first before any allocation. The windowed-quantile witness gates the relative error `<= alpha` vs an exact windowed-sorted-array oracle on 100% of `>= 2000` queries across a `W` x `alpha` sweep, a distribution shift, and a post-burst edge, and asserts the edge stays within one pane width; a no-expiry variant (stale out-of-window values counted) and a coarse `panes = 2` variant (the edge bound blows past `W / 32`) are rejected by the same gate -- see [Testing](#testing).
+`SlidingDDSketch` locks EXPLICIT vs COUNT mode at the first add (a switch throws), and `alpha` / `strict` / `panes` / `W` are validated typeof-first before any allocation. The windowed-quantile witness gates the relative error `<= alpha` vs an exact windowed-sorted-array oracle on 100% of `>= 2000` queries across a `W` x `alpha` sweep, a distribution shift, and a post-burst edge, and asserts the edge stays within one pane width; a no-expiry variant (stale out-of-window values counted) and a coarse `panes = 2` variant (the edge bound blows past `W / 32`) are rejected by the same gate -- see [Testing](#testing). `advance(now)` rotates + clears stale panes with no value added (0 B/op), so an idle window's `quantile` reads `NaN` (and `count()` reads 0) instead of freezing on the last burst (R11 idle-slide).
 
 ## API reference
 
@@ -280,6 +280,8 @@ new ExponentialHistogram(W, epsilon, options?)
 
 add(now?, value?) -> this   // HOT, 0 B/op incl. merge cascade + expire
 addFrom(buf, i) -> this     // HOT, 0 B/op: zero-box packed [now, value] entry (now = buf[i], value = buf[i+1])
+advance(now) -> this        // HOT, 0 B/op; move time to `now` with NO add -- expire the window edge (idle-slide, R11)
+advanceFrom(buf, i) -> this // HOT, 0 B/op ZERO-BOX: now = buf[i] (explicit-time)
 count() -> number           // COLD, O(levels): windowed population estimate
 sum() -> number             // COLD, O(buckets): windowed value-sum estimate
 query() -> number           // COLD: alias of count()
@@ -369,6 +371,8 @@ d   w   k   b   seed   bytes   size
 new SlidingHyperLogLog(W, options?)         // options: { p, ringCap, seed }
 add(now, key) -> this          // HOT, 0 B/op incl. windowed eviction; monotone now, safe-int key
 addFrom(buf, i) -> this        // HOT, 0 B/op ZERO-BOX: now = buf[i], key = buf[i+1] (explicit-time)
+advance(now) -> this           // HOT, O(1), 0 B/op; move time to `now` with NO add (clock-only; count() slides, idle-slide R11)
+advanceFrom(buf, i) -> this    // HOT, 0 B/op ZERO-BOX: now = buf[i] (explicit-time)
 count(w?) -> number            // COLD, O(m); windowed distinct via Ertl's estimator; w in (0, W]
 query() -> number              // COLD; alias of count() over the full window W
 clear() -> this                // 0-alloc reset (reuse the rings; unlocks the mode)
@@ -390,6 +394,8 @@ mode   delta   threshold   target   count   mean   statistic
 new SlidingDDSketch(W, options?)            // options: { alpha, strict, panes }
 add(now, value) -> this        // HOT, 0 B/op incl. pane rotate + clear; monotone now, DDSketch-domain value
 addFrom(buf, i) -> this        // HOT, 0 B/op ZERO-BOX: now = buf[i], value = buf[i+1] (explicit-time)
+advance(now) -> this           // HOT, 0 B/op; move time to `now` with NO add -- rotate/clear panes (idle-slide, R11)
+advanceFrom(buf, i) -> this    // HOT, 0 B/op ZERO-BOX: now = buf[i] (explicit-time)
 quantile(q, w?) -> number      // COLD; windowed quantile for q in [0,1]; NaN on empty; w in (0, W]
 quantileInto(qs, out) -> number// COLD, 0-alloc; write each qs[j]'s quantile into out; returns the count
 count(w?) -> number            // COLD; windowed population (0 on empty); w in (0, W]
@@ -525,6 +531,7 @@ Gated quality numbers (`npm run verify`):
 - **Fail closed, typeof-first, before allocation.** A bad `W` / `epsilon` / `halfLife` / option throws at the constructor door before any allocation; `null` is not zero; a query before the last add time throws (can't un-decay); other queries never throw.
 - **The DriftDetector mode is the *reference*, and it is load-bearing.** Page-Hinkley and CUSUM share the contract -- a real-valued `add(x) -> boolean` -- so they live behind one mode flag with a single hot body (a Welford mean + one branch). But under a *shared* reference the two rules are the identical statistic (CUSUM's floor-at-0 recursion is exactly PH's cumulative-sum-minus-running-min), so the modes differ by what they reference: PH the **online running mean** (no baseline needed), CUSUM a **fixed target `mu0`** (the SPC in-control mean). That is what makes the flag meaningful, and the witness gates the divergence so a regression back to one statistic is rejected (see ADR 0007). DDM / EDDM take a Bernoulli error bit and emit a tri-state signal -- an incompatible contract -- so they were deliberately deferred to a future member. The `delta` (and `target`) caps mirror the `x` cap so a pathological config can never turn `add` into a fail-open boolean.
 - **SlidingDDSketch is a pane ring, not an EH-of-sketches, and that is a zero-GC decision.** A windowed quantile wants to expire old values without an `O(W)` sort. The exact-edge option -- a DGIM / exponential-histogram *of DDSketches* -- has to *merge* sketches on `add`, which allocates; and Arasu-Manku true windowed quantiles keep unbounded per-item state. Both fail the 0-B/op contract. A fixed ring of `panes` preallocated sketches keeps `add` allocation-free (rotate + `fill(0)`, bounded even on a huge `now` jump) and merges only at query, into an instance-owned scratch. The cost is an honest, disclosed edge -- the window is soft to within one pane width `W / panes` -- and because each pane collapses its lowest bins independently, the merged accuracy is *witnessed* against an exact oracle rather than assumed (see ADR 0008).
+- **Idle streams still slide (`advance`, R11).** A windowed query is anchored to the last applied time, so a stream that goes quiet would keep reporting its last burst forever. `advance(now)` (and the zero-box `advanceFrom(buf, i)`) move that reference time forward with NO value added -- expiring the window edge (`ExponentialHistogram`), sliding the lazy-expiry clock (`SlidingHyperLogLog`), or rotating out stale panes (`SlidingDDSketch`) -- so an idle channel's readout empties instead of lying. It keeps queries pure (they never mutate); the sliding is an explicit, 0-B/op step the consumer calls at render. `ADWIN` / `DriftDetector` are item-indexed (no clock, so no `advance`), and `ForwardDecay` already takes an optional `now` on its pure queries -- the two sanctioned ways to satisfy R11 (see ADR 0009).
 
 ## Testing
 

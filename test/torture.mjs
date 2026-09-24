@@ -563,6 +563,221 @@ async function main() {
         if (sdRet.bytes !== sdRetBytes0) sdRetOk = false;
     }
 
+    // ---- phase 2a-octies: advance() / advanceFrom() -- the R11 idle slide (ADR 0009). Each
+    // measured step RE-PRIMES with one add (monotone-safe, independently gated 0 B/op above) and
+    // then runs the advance under test, so the expire (EH) / rotate (SlidingDDSketch) / clock bump
+    // (SlidingHyperLogLog) body executes on every call. A 0-B/op combined lane proves advance
+    // itself allocates nothing (add is 0 B/op above, so the delta is advance). ----
+    // EH advance: keep content to expire, then slide the window forward.
+    const ehAdv = new ExponentialHistogram(1000, 0.01);
+    let ehAdvT = 0;
+    for (let k = 0; k < 4000; k++) ehAdv.add(ehAdvT++, 1);
+    let ehAdvSink = 0;
+    const ehAdvStep = () => {
+        ehAdv.add(ehAdvT, 1);            // re-prime one bucket (keeps live content to expire)
+        ehAdvT += 3;
+        ehAdv.advance(ehAdvT);           // slide the window forward -> expire the now-stale buckets
+        ehAdvSink = (ehAdvSink + ehAdv.bucketCount) | 0;   // observe (defeat DCE)
+    };
+    const ehAdvRes = measureAllocs(ehAdvStep, { iterations: 100000, batches: 8 });
+    const ehAdvBpc = ehAdvRes.bytesPerCall === null ? 0 : ehAdvRes.bytesPerCall;
+    const ehAdvBytes = Math.max(0, Math.round(ehAdvBpc));
+    const ehAdvOk = ehAdvBytes === 0;
+
+    // EH advanceFrom: the ZERO-BOX slide -- now = buf[0] read UNBOXED, fractional epoch-ms clock.
+    const ehAdvF = new ExponentialHistogram(1000, 0.01);
+    const EHAVBUF = new Float64Array(2);
+    let ehAvfT = 1.75e12;
+    for (let k = 0; k < 4000; k++) { EHAVBUF[0] = ehAvfT; EHAVBUF[1] = 1; ehAdvF.addFrom(EHAVBUF, 0); ehAvfT += 1.5; }
+    let ehAvfSink = 0;
+    const ehAvfStep = () => {
+        EHAVBUF[0] = ehAvfT; EHAVBUF[1] = 1; ehAdvF.addFrom(EHAVBUF, 0);   // re-prime
+        ehAvfT += 4.5; EHAVBUF[0] = ehAvfT;
+        ehAdvF.advanceFrom(EHAVBUF, 0);          // slide under test (reads buf[0] UNBOXED)
+        ehAvfSink = (ehAvfSink + ehAdvF.bucketCount) | 0;
+    };
+    const ehAvfRes = measureAllocs(ehAvfStep, { iterations: 100000, batches: 8 });
+    const ehAvfBpc = ehAvfRes.bytesPerCall === null ? 0 : ehAvfRes.bytesPerCall;
+    const ehAvfBytes = Math.max(0, Math.round(ehAvfBpc));
+    const ehAvfOk = ehAvfBytes === 0;
+
+    // SlidingHyperLogLog advance: clock-only bump (count() lazily expires off _now).
+    const slAdv = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 12 });
+    let slAdvT = 0;
+    for (let k = 0; k < 4000; k++) slAdv.add(slAdvT++, (k * 2654435761) % 3000);
+    let slAdvSink = 0;
+    const slAdvStep = () => {
+        slAdv.add(slAdvT, (slAdvT * 2654435761) % 3000);   // re-prime
+        slAdvT += 3;
+        slAdv.advance(slAdvT);                              // clock-only slide
+        slAdvSink = (slAdvSink + slAdv.overflows) | 0;
+    };
+    const slAdvRes = measureAllocs(slAdvStep, { iterations: 100000, batches: 8 });
+    const slAdvBpc = slAdvRes.bytesPerCall === null ? 0 : slAdvRes.bytesPerCall;
+    const slAdvBytes = Math.max(0, Math.round(slAdvBpc));
+    const slAdvOk = slAdvBytes === 0;
+
+    // SlidingHyperLogLog advanceFrom: ZERO-BOX epoch-ms clock bump + large key re-prime.
+    const slAdvF = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 13 });
+    const SLAVBUF = new Float64Array(2);
+    let slAvfNow = 1.75e12;
+    for (let k = 0; k < 4000; k++) { SLAVBUF[0] = slAvfNow; SLAVBUF[1] = 9007199254740000 - ((k * 2654435761) % 3000); slAdvF.addFrom(SLAVBUF, 0); slAvfNow += 1; }
+    let slAvfSink = 0;
+    const slAvfStep = () => {
+        SLAVBUF[0] = slAvfNow; SLAVBUF[1] = 9007199254740000 - ((slAvfNow | 0) % 3000); slAdvF.addFrom(SLAVBUF, 0);
+        slAvfNow += 3.5; SLAVBUF[0] = slAvfNow;
+        slAdvF.advanceFrom(SLAVBUF, 0);
+        slAvfSink = (slAvfSink + slAdvF.overflows) | 0;
+    };
+    const slAvfRes = measureAllocs(slAvfStep, { iterations: 100000, batches: 8 });
+    const slAvfBpc = slAvfRes.bytesPerCall === null ? 0 : slAvfRes.bytesPerCall;
+    const slAvfBytes = Math.max(0, Math.round(slAvfBpc));
+    const slAvfOk = slAvfBytes === 0;
+
+    // SlidingDDSketch advance: slide the pane ring forward (rotate + clear stale panes).
+    const sdAdv = new SlidingDDSketch(1000, { alpha: 0.01, panes: 32 });
+    let sdAdvT = 0;
+    for (let k = 0; k < 4000; k++) sdAdv.add(sdAdvT++, ((k * 2654435761) % 9973) + 1);
+    let sdAdvSink = 0;
+    const sdAdvStep = () => {
+        sdAdv.add(sdAdvT, ((sdAdvT * 2654435761) % 9973) + 1);   // re-prime
+        sdAdvT += 3;
+        sdAdv.advance(sdAdvT);                                   // pane-ring slide
+        sdAdvSink = (sdAdvSink + (sdAdv.collapsed ? 1 : 0)) | 0;
+    };
+    const sdAdvRes = measureAllocs(sdAdvStep, { iterations: 100000, batches: 8 });
+    const sdAdvBpc = sdAdvRes.bytesPerCall === null ? 0 : sdAdvRes.bytesPerCall;
+    const sdAdvBytes = Math.max(0, Math.round(sdAdvBpc));
+    const sdAdvOk = sdAdvBytes === 0;
+
+    // SlidingDDSketch advanceFrom: ZERO-BOX epoch-ms clock + fractional value re-prime, pane slide.
+    const sdAdvF = new SlidingDDSketch(1000, { alpha: 0.01, panes: 32 });
+    const SDAVBUF = new Float64Array(2);
+    let sdAvfNow = 1.75e12;
+    for (let k = 0; k < 4000; k++) { SDAVBUF[0] = sdAvfNow; SDAVBUF[1] = ((k * 40503) % 9973) + 0.5; sdAdvF.addFrom(SDAVBUF, 0); sdAvfNow += 1.5; }
+    let sdAvfSink = 0, sdAvfI = 0;
+    const sdAvfStep = () => {
+        SDAVBUF[0] = sdAvfNow; SDAVBUF[1] = ((sdAvfI * 40503) % 9973) + 0.5; sdAdvF.addFrom(SDAVBUF, 0);
+        sdAvfNow += 4.5; SDAVBUF[0] = sdAvfNow; sdAvfI = (sdAvfI + 1) | 0;
+        sdAdvF.advanceFrom(SDAVBUF, 0);
+        sdAvfSink = (sdAvfSink + (sdAdvF.collapsed ? 1 : 0)) | 0;
+    };
+    const sdAvfRes = measureAllocs(sdAvfStep, { iterations: 100000, batches: 8 });
+    const sdAvfBpc = sdAvfRes.bytesPerCall === null ? 0 : sdAvfRes.bytesPerCall;
+    const sdAvfBytes = Math.max(0, Math.round(sdAvfBpc));
+    const sdAvfOk = sdAvfBytes === 0;
+
+    // advance retention: construct -> fill -> advance(idle, empties the window) -> clear cycles;
+    // fixed store bytes constant + windowed count returns to baseline over 10 cycles.
+    let advRetOk = true, advRetBase = -1;
+    const arEh = new ExponentialHistogram(1000, 0.01);
+    const arSl = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 11 });
+    const arSd = new SlidingDDSketch(1000, { alpha: 0.01, panes: 16 });
+    const arEhCap0 = arEh.capacity, arSlB0 = arSl.bytes, arSdB0 = arSd.bytes;
+    let arT = 0;
+    for (let cyc = 0; cyc < 10; cyc++) {
+        arEh.clear(); arSl.clear(); arSd.clear();
+        for (let k = 0; k < 500; k++) { arEh.add(arT, 1); arSl.add(arT, arT); arSd.add(arT, (arT % 100) + 1); arT++; }
+        const ehC = arEh.count();
+        const j = arT + 2 * 1000;
+        arEh.advance(j); arSl.advance(j); arSd.advance(j);        // idle slide past the window
+        if (arEh.count() !== 0 || arSl.count() !== 0 || arSd.count() !== 0) advRetOk = false;
+        if (!Number.isNaN(arSd.quantile(0.5))) advRetOk = false;   // drained sketch -> NaN
+        if (arEh.capacity !== arEhCap0 || arSl.bytes !== arSlB0 || arSd.bytes !== arSdB0) advRetOk = false;
+        if (advRetBase < 0) advRetBase = ehC; else if (ehC !== advRetBase) advRetOk = false;
+        arT += 2 * 1000;   // keep the clock monotone across cycles (clear unlocks the mode anyway)
+    }
+
+    // ---- phase 2a-novies: BIG-JUMP advance lanes (closes the reviewer's coverage nit). The three
+    // lanes above only step the clock by +3 / +4.5 per call, so they exercise the 0-1-bucket EH
+    // expire and the 0-1-pane SlidingDDSketch rotate. Neither the EH "expire many buckets in one
+    // call" path nor the SlidingDDSketch "jump >= panes widths -> grid-re-anchor" branch (the
+    // awkward-to-reach path the reviewer flagged) is touched by those lanes. Each step here
+    // re-fills the window near CAPACITY, then advances by many window-widths in ONE call so the
+    // bounded hot loop runs to its full bound on every measured call. ----
+
+    // EH big-jump: refill toward capacity (~300 buckets spread across W), then jump 50*W in one
+    // advance -> the expire loop drains up to ~300 live buckets in a single call (vs. 0-1 above).
+    const ehBig = new ExponentialHistogram(1000, 0.01);
+    let ehBigT = 0;
+    for (let k = 0; k < 300; k++) { ehBig.add(ehBigT, 1); ehBigT += 1000 / 300; }
+    let ehBigSink = 0;
+    const ehBigStep = () => {
+        for (let k = 0; k < 300; k++) { ehBig.add(ehBigT, 1); ehBigT += 1000 / 300; }   // re-fill near capacity
+        ehBigT += 50 * 1000;                 // BIG jump: 50 window-widths at once
+        ehBig.advance(ehBigT);               // the full-cap expire loop runs to completion
+        ehBigSink = (ehBigSink + ehBig.bucketCount) | 0;
+    };
+    const ehBigRes = measureAllocs(ehBigStep, { iterations: 5000, batches: 4 });
+    const ehBigBpc = ehBigRes.bytesPerCall === null ? 0 : ehBigRes.bytesPerCall;
+    const ehBigBytes = Math.max(0, Math.round(ehBigBpc));
+    const ehBigOk = ehBigBytes === 0 && ehBig.bucketCount === 0;   // the big jump must ALSO empty it
+
+    // SlidingHyperLogLog big-jump: advance is CLOCK-ONLY (O(1) regardless of jump size), but gate
+    // a many-window jump anyway -- proves the clock-bump body is 0 B/op at ANY magnitude, not just
+    // the small +3 step above.
+    const slBig = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 14 });
+    let slBigT = 0;
+    let slBigK = 0;
+    for (let k = 0; k < 300; k++) { slBig.add(slBigT, k); slBigT += 1000 / 300; }
+    let slBigSink = 0;
+    const slBigStep = () => {
+        slBig.add(slBigT, (slBigK = (slBigK + 1) % 3000)); slBigT += 1000 / 300;
+        slBigT += 50 * 1000;
+        slBig.advance(slBigT);
+        slBigSink = (slBigSink + slBig.overflows) | 0;
+    };
+    const slBigRes = measureAllocs(slBigStep, { iterations: 5000, batches: 4 });
+    const slBigBpc = slBigRes.bytesPerCall === null ? 0 : slBigRes.bytesPerCall;
+    const slBigBytes = Math.max(0, Math.round(slBigBpc));
+    const slBigOk = slBigBytes === 0 && slBig.count() === 0;
+
+    // SlidingDDSketch big-jump: refill EVERY pane (panes=32), then jump 50*W in one advance -- far
+    // beyond the `rot < B` bounded-rotation cap, forcing the grid-RE-ANCHOR branch (the path that
+    // clears all B panes via the loop, then re-anchors) on every measured call.
+    const sdBig = new SlidingDDSketch(1000, { alpha: 0.01, panes: 32 });
+    let sdBigT = 0;
+    for (let k = 0; k < 300; k++) { sdBig.add(sdBigT, ((k * 40503) % 9973) + 1); sdBigT += 1000 / 300; }
+    let sdBigSink = 0;
+    const sdBigStep = () => {
+        for (let k = 0; k < 300; k++) { sdBig.add(sdBigT, ((k * 40503) % 9973) + 1); sdBigT += 1000 / 300; }
+        sdBigT += 50 * 1000;                 // BIG jump: forces the grid-re-anchor branch in _advance
+        sdBig.advance(sdBigT);
+        sdBigSink = (sdBigSink + (sdBig.collapsed ? 1 : 0)) | 0;
+    };
+    const sdBigRes = measureAllocs(sdBigStep, { iterations: 5000, batches: 4 });
+    const sdBigBpc = sdBigRes.bytesPerCall === null ? 0 : sdBigRes.bytesPerCall;
+    const sdBigBytes = Math.max(0, Math.round(sdBigBpc));
+    const sdBigOk = sdBigBytes === 0 && sdBig.count() === 0;   // the big jump must ALSO empty it
+
+    // ---- phase 2a-decies: an ASTRONOMICAL (1e15-scale) single-call jump -- correctness + speed,
+    // not just allocation. Fresh, freshly-filled instances; one advance() each; must complete fast
+    // and land on the CORRECT drained state (proves the bounded loops do not degrade into an
+    // unbounded scan when `now - lastNow` is huge). ----
+    let hugeOk = true;
+    {
+        const ehH = new ExponentialHistogram(1000, 0.01);
+        for (let t = 0; t < 4000; t++) ehH.add(t, 1);
+        const t0 = performance.now();
+        ehH.advance(1e15);
+        const dt = performance.now() - t0;
+        if (ehH.count() !== 0 || ehH.bucketCount !== 0 || dt >= 50) hugeOk = false;
+
+        const slH = new SlidingHyperLogLog(1000, { p: 10 });
+        for (let t = 0; t < 4000; t++) slH.add(t, t);
+        const t1 = performance.now();
+        slH.advance(1e15);
+        const dt1 = performance.now() - t1;
+        if (slH.count() !== 0 || dt1 >= 50) hugeOk = false;
+
+        const sdH = new SlidingDDSketch(1000, { alpha: 0.01, panes: 32 });
+        for (let t = 0; t < 4000; t++) sdH.add(t, (t % 100) + 1);
+        const t2 = performance.now();
+        sdH.advance(1e15);
+        const dt2 = performance.now() - t2;
+        if (sdH.count() !== 0 || !Number.isNaN(sdH.quantile(0.5)) || dt2 >= 50) hugeOk = false;
+    }
+
     // ---- phase 2b: GC budget over a long hot run (millions of add + reshaping ops) ----
     const gc = new GcProfiler().start();
     const HOT = 4000000;
@@ -573,11 +788,17 @@ async function main() {
         slStep(); slFromStep(); slClearStep();
         ddPhStep(); ddCuStep(); ddFromStep(); ddClearStep();
         sdStep(); sdFromStep();
+        ehAdvStep(); ehAvfStep(); slAdvStep(); slAvfStep(); sdAdvStep(); sdAvfStep();
     }
+    // big-jump lanes are heavier per call (a window-refill inside the step) -- run them separately,
+    // outside the 4M-iteration HOT loop, at their own (already-measured) iteration count above; fold
+    // their sinks into the same anti-DCE accumulator.
     SINK += addSink + addTSink + adSink + fpSink + frSink + ehFromSink + fdFromSink + ehBoxedSink + fdBoxedSink +
         hkSink + hkFromSink + hkBoxedSink + adFromSink + hkClearSink + slSink + slFromSink + slClearSink +
         ddPhSink + ddCuSink + ddFromSink + ddClearSink +
-        sdSink + sdFromSink + sdQSink + sdIntoSink + sdClearSink;
+        sdSink + sdFromSink + sdQSink + sdIntoSink + sdClearSink +
+        ehAdvSink + ehAvfSink + slAdvSink + slAvfSink + sdAdvSink + sdAvfSink +
+        ehBigSink + slBigSink + sdBigSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -621,7 +842,9 @@ async function main() {
         addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk &&
         hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk &&
         ddPhOk && ddCuOk && ddFromOk && ddClearOk &&
-        sdOk && sdFromOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk && report.ok && abOk;
+        sdOk && sdFromOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk &&
+        ehAdvOk && ehAvfOk && slAdvOk && slAvfOk && sdAdvOk && sdAvfOk && advRetOk &&
+        ehBigOk && slBigOk && sdBigOk && hugeOk && report.ok && abOk;
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=0' +
@@ -648,7 +871,13 @@ async function main() {
         sdFromBytes + ' B/op (SlidingDDSketch addFrom fractional) ' +
         sdQBytes + ' B/op (SlidingDDSketch quantile merge) ' +
         sdIntoBytes + ' B/op (SlidingDDSketch quantileInto) ' +
-        sdClearBytes + ' B/op (SlidingDDSketch clear)' +
+        sdClearBytes + ' B/op (SlidingDDSketch clear) ' +
+        ehAdvBytes + ' B/op (ExponentialHistogram advance) ' +
+        ehAvfBytes + ' B/op (ExponentialHistogram advanceFrom) ' +
+        slAdvBytes + ' B/op (SlidingHyperLogLog advance) ' +
+        slAvfBytes + ' B/op (SlidingHyperLogLog advanceFrom) ' +
+        sdAdvBytes + ' B/op (SlidingDDSketch advance) ' +
+        sdAvfBytes + ' B/op (SlidingDDSketch advanceFrom)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta +
         ' diag: add-boxed-fractional EH=' + ehBoxedBytes + ' B/op FD=' + fdBoxedBytes +
@@ -682,6 +911,13 @@ async function main() {
         if (!sdIntoOk) console.error('  alloc ' + sdIntoBytes + ' B/op SlidingDDSketch quantileInto (raw ' + sdIntoBpc + ')');
         if (!sdClearOk) console.error('  alloc ' + sdClearBytes + ' B/op SlidingDDSketch clear (raw ' + sdClearBpc + ')');
         if (!sdRetOk) console.error('  retention: SlidingDDSketch bytes/count drifted over clear/refill cycles');
+        if (!ehAdvOk) console.error('  alloc ' + ehAdvBytes + ' B/op ExponentialHistogram advance (raw ' + ehAdvBpc + ')');
+        if (!ehAvfOk) console.error('  alloc ' + ehAvfBytes + ' B/op ExponentialHistogram advanceFrom (raw ' + ehAvfBpc + ')');
+        if (!slAdvOk) console.error('  alloc ' + slAdvBytes + ' B/op SlidingHyperLogLog advance (raw ' + slAdvBpc + ')');
+        if (!slAvfOk) console.error('  alloc ' + slAvfBytes + ' B/op SlidingHyperLogLog advanceFrom (raw ' + slAvfBpc + ')');
+        if (!sdAdvOk) console.error('  alloc ' + sdAdvBytes + ' B/op SlidingDDSketch advance (raw ' + sdAdvBpc + ')');
+        if (!sdAvfOk) console.error('  alloc ' + sdAvfBytes + ' B/op SlidingDDSketch advanceFrom (raw ' + sdAvfBpc + ')');
+        if (!advRetOk) console.error('  retention: advance idle-slide bytes/count drifted over cycles');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

@@ -8,6 +8,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.4.0] - 2026-09-24
+
+The R11 "idle streams must still slide" sweep. **NOT a pure append**: this ADDS methods to three
+EXISTING classes. Every existing method + hot body of `ExponentialHistogram`, `SlidingHyperLogLog`,
+and `SlidingDDSketch` (ctor, `add`, `addFrom`, `count` / `sum` / `query` / `quantile` /
+`quantileInto`, `clear`, all getters) is BYTE-IDENTICAL; the only additions are the two new methods
+per class (+ their cold throwers). The four other classes (`ADWIN`, `ForwardDecay`, `HeavyKeeper`,
+`DriftDetector`) are BYTE-IDENTICAL. MINOR bump (new API, no break).
+
+### Added
+
+- **`advance(now)` + `advanceFrom(buf, i)` on the three TIME-windowed members** (ADR 0009). A windowed
+  query anchored to the last applied time FREEZES while a stream is idle -- `count()` still shows the
+  last burst an hour later. `advance(now)` moves the window's reference time forward to `now` WITHOUT
+  adding a value, applying the same expiry / rotation `add` would, so a subsequent query reflects the
+  window ending at `now` (an idle channel's readout empties instead of lying). Both are HOT, **0 B/op**;
+  EXPLICIT-time only (a count-locked instance throws; the first `advance` locks EXPLICIT); monotone (a
+  `now` below the last applied time throws `[lite-adaptive]` as a byte-identical no-op); chainable
+  (return `this`). `advanceFrom(buf, i)` is the zero-box sibling (reads `now = buf[i]` unboxed for a
+  fractional / epoch-ms `now`). Per member:
+  - **`ExponentialHistogram.advance(now)`** -- expires buckets older than `now - W` (the expiry half of
+    `add`, no bucket opened).
+  - **`SlidingHyperLogLog.advance(now)`** -- clock-only (moves the reference time); `count(w?)` already
+    lazily expires `stamp <= now - W` relative to it, so the ring is untouched and `overflows` /
+    `degraded` are unaffected. O(1).
+  - **`SlidingDDSketch.advance(now)`** -- rotates + clears panes as `now` passes their boundaries
+    (bounded to `panes` clears), so the quantile / count reflects the window ending at `now`.
+- **Excluded, by design (ADR 0009):** `ADWIN` and `DriftDetector` are ITEM-INDEXED (no clock), so
+  `advance(now)` is meaningless; `ForwardDecay` already satisfies R11 the other sanctioned way -- its
+  `count(now?)` / `sum(now?)` / `mean(now?)` / `rate(now?)` queries take an optional query time and
+  stay pure, so no mutating `advance` is added.
+- WITNESSED (the honesty anchor, ADR 0009): after a burst then an idle gap, `advance(lastNow + 2*W)`
+  empties the window for all three members (`ExponentialHistogram` / `SlidingHyperLogLog` `count()` -> 0,
+  `SlidingDDSketch` `count()` -> 0 and `quantile()` -> `NaN`), matching an oracle advanced the same way;
+  and `advance(t)` then `add(t, v)` is state-equivalent to `add(t, v)` directly (per SoA column), with
+  `advance` idempotent. A negative control -- an `advance` that moves the clock but SKIPS the expiry /
+  rotation -- leaves the window frozen and is REJECTED by the same gate.
+- **`VERSION`** is now `'1.4.0'`.
+
 ## [1.3.0] - 2026-09-24
 
 The third additive post-1.0 member. **PURE APPEND**: the six prior classes
