@@ -1,0 +1,1075 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>lite-adaptive - recency witness</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap"
+          rel="stylesheet">
+    <style>
+        /* Reset + tokens ---------------------------------------------------- */
+        *, *::before, *::after { box-sizing: border-box; }
+
+        :root {
+            --bg-0: #07090d;
+            --bg-1: #0d1117;
+            --bg-2: #131922;
+            --bg-3: #1a2230;
+            --line: rgba(255, 255, 255, 0.06);
+            --line-strong: rgba(255, 255, 255, 0.14);
+            --text: #d8d6d2;
+            --text-dim: #8b8d94;
+            --text-faint: #555960;
+            /* lite-adaptive accent: recency violet (the ONLY swap from the lite-o1 / lite-sketch chassis) */
+            --accent: #8b7cf6;
+            --accent-oklch: oklch(0.68 0.16 285);
+            --accent-dim: #5a4fb0;
+            --cyan: #7dd3fc;
+            --amber: #f5b942;
+            --magenta: #e879a8;
+            --red: #f87171;
+            --green: #5fe39f;
+            --glow-accent: 0 0 12px rgba(139, 124, 246, 0.55), 0 0 30px rgba(139, 124, 246, 0.20);
+            --glow-red: 0 0 12px rgba(248, 113, 113, 0.6);
+        }
+
+        html, body { height: 100%; margin: 0; }
+
+        body {
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            color: var(--text);
+            background: var(--bg-0);
+            overflow: hidden;
+            font-feature-settings: "ss01", "ss02", "cv02", "cv11", "tnum";
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image: radial-gradient(circle at 20% 0%, rgba(139, 124, 246, 0.05) 0%, transparent 40%),
+            radial-gradient(circle at 80% 100%, rgba(125, 211, 252, 0.03) 0%, transparent 50%);
+            z-index: 0;
+        }
+
+        body::after {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background: repeating-linear-gradient(0deg, transparent 0, transparent 2px,
+                    rgba(255, 255, 255, 0.012) 2px, rgba(255, 255, 255, 0.012) 3px);
+            z-index: 1;
+        }
+
+        #app { position: relative; z-index: 2; height: 100vh; display: flex; flex-direction: column; }
+
+        /* Header ------------------------------------------------------------ */
+        header.top {
+            display: flex;
+            align-items: center;
+            gap: 24px;
+            padding: 14px 24px;
+            border-bottom: 1px solid var(--line);
+            background: linear-gradient(to bottom, var(--bg-1), var(--bg-0));
+        }
+
+        .brand { display: flex; align-items: baseline; gap: 12px; font-family: 'Space Mono', 'JetBrains Mono', monospace; }
+        .brand .mark { color: var(--accent); font-weight: 700; font-size: 16px; letter-spacing: -0.02em; text-shadow: var(--glow-accent); }
+        .brand .pkg { color: var(--text); font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
+        .brand .ver { color: var(--text-faint); font-size: 11px; }
+
+        .tagline { color: var(--text-dim); font-size: 11px; margin-left: auto; letter-spacing: 0.04em; text-transform: uppercase; }
+        .tagline .dot {
+            display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+            background: var(--accent); box-shadow: var(--glow-accent); margin-right: 6px;
+            animation: pulse 2s infinite ease-in-out; vertical-align: 1px;
+        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+        /* Tab nav ----------------------------------------------------------- */
+        nav.tabs { display: flex; background: var(--bg-1); border-bottom: 1px solid var(--line); padding: 0 18px; }
+        nav.tabs button {
+            background: none; border: 0; color: var(--text-dim); font-family: inherit; font-size: 12px;
+            padding: 12px 18px; cursor: pointer; letter-spacing: 0.02em; position: relative; transition: color .15s;
+        }
+        @media (hover: hover) { nav.tabs button:hover { color: var(--text); } }
+        nav.tabs button[aria-current="true"] { color: var(--accent); }
+        nav.tabs button[aria-current="true"]::after {
+            content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px;
+            background: var(--accent); box-shadow: var(--glow-accent);
+        }
+        nav.tabs .scene-num { color: var(--text-faint); margin-right: 8px; font-weight: 300; }
+
+        /* Scene container --------------------------------------------------- */
+        main { flex: 1; min-height: 0; display: flex; position: relative; }
+        .scene { flex: 1; display: none; min-height: 0; }
+        .scene[data-active] { display: flex; }
+        .stage { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+        .stage canvas { display: block; width: 100%; height: 100%; }
+
+        .panel {
+            width: 350px; border-left: 1px solid var(--line); background: var(--bg-1);
+            display: flex; flex-direction: column; overflow-y: auto;
+        }
+        .panel .panel-head {
+            padding: 16px 20px 8px; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase;
+            color: var(--text-faint); border-bottom: 1px solid var(--line);
+        }
+        .panel section { padding: 16px 20px; border-bottom: 1px solid var(--line); }
+        .panel section h3 {
+            margin: 0 0 12px; font-size: 10px; font-weight: 700; letter-spacing: 0.16em;
+            text-transform: uppercase; color: var(--cyan);
+        }
+
+        /* Inputs & buttons -------------------------------------------------- */
+        button.btn {
+            font-family: inherit; font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase;
+            background: var(--bg-3); color: var(--text); border: 1px solid var(--line-strong);
+            padding: 8px 14px; cursor: pointer; transition: all .12s;
+        }
+        @media (hover: hover) {
+            button.btn:hover { background: var(--bg-2); border-color: var(--accent-dim); color: var(--accent); }
+            button.btn.danger:hover { border-color: var(--red); color: var(--red); }
+        }
+        button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+
+        .field { margin-bottom: 12px; }
+        .field label {
+            display: block; font-size: 10px; letter-spacing: 0.08em; color: var(--text-faint);
+            text-transform: uppercase; margin-bottom: 4px;
+        }
+        .field input[type="range"] { width: 100%; accent-color: var(--accent); }
+        .field-value { color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+        .help-line { color: var(--text-dim); font-size: 11px; line-height: 1.55; margin: 10px 0 0; }
+        .help-line code { color: var(--accent); background: rgba(139, 124, 246, 0.08); padding: 0 4px; border-radius: 3px; }
+
+        /* Toggle ------------------------------------------------------------ */
+        .toggle-row { display: flex; align-items: center; gap: 10px; }
+        .toggle {
+            position: relative; width: 46px; height: 24px; border-radius: 12px;
+            background: var(--bg-3); border: 1px solid var(--line-strong); cursor: pointer; transition: all .15s;
+        }
+        .toggle::after {
+            content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
+            background: var(--accent); transition: transform .15s, background .15s;
+        }
+        .toggle[data-on="true"] { border-color: var(--magenta); background: rgba(232, 121, 168, 0.15); }
+        .toggle[data-on="true"]::after { transform: translateX(22px); background: var(--magenta); }
+        .toggle-label { font-size: 11px; letter-spacing: 0.04em; }
+        .toggle-label b { color: var(--accent); }
+        .toggle[data-on="true"] ~ .toggle-label b { color: var(--magenta); }
+
+        /* Truth panel ------------------------------------------------------- */
+        .truth { display: flex; flex-direction: column; gap: 12px; }
+        .truth .primary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); }
+        .truth .secondary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-faint); }
+        .truth canvas { width: 100%; display: block; background: var(--bg-0); border: 1px solid var(--line); }
+        .jank-c { height: 46px; }
+        .witness-c { height: 62px; }
+        .space-c { height: 52px; }
+        .jank-caption { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
+        .alloc-pair { display: flex; gap: 18px; }
+        .alloc-cell { flex: 1; }
+        .alloc-big { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+        .alloc-big.zero { color: var(--accent); text-shadow: var(--glow-accent); }
+        .alloc-big.climbing { color: var(--magenta); }
+        .alloc-sub { font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); }
+        .stat-row { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
+        .stat-row .k { color: var(--text-faint); }
+        .stat-row .v { color: var(--text); font-variant-numeric: tabular-nums; }
+        .stat-row .v.accent { color: var(--accent); font-weight: 700; }
+        .stat-row .v.inband { color: var(--green); font-weight: 700; }
+        .stat-row .v.outband { color: var(--red); font-weight: 700; }
+        .caveat { font-size: 10px; color: var(--text-faint); line-height: 1.5; }
+
+        /* Stage overlays ---------------------------------------------------- */
+        .stage-overlay { position: absolute; padding: 8px 12px; font-size: 10px; pointer-events: none; z-index: 3; }
+        .stage-overlay.tl { top: 12px; left: 16px; }
+        .stage-overlay.tr { top: 12px; right: 16px; text-align: right; }
+        .stage-overlay .label { color: var(--text-faint); letter-spacing: 0.1em; text-transform: uppercase; }
+        .stage-overlay .big { color: var(--accent); font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+        /* Footer ------------------------------------------------------------ */
+        footer.bottom {
+            display: flex; gap: 18px; align-items: center; padding: 8px 24px;
+            border-top: 1px solid var(--line); background: var(--bg-1); font-size: 10px; color: var(--text-faint);
+        }
+        footer.bottom .sep { color: var(--line-strong); }
+        footer.bottom kbd {
+            background: var(--bg-3); border: 1px solid var(--line-strong); border-radius: 3px;
+            padding: 1px 5px; color: var(--text-dim); font-family: inherit;
+        }
+    </style>
+</head>
+<body>
+<div id="app">
+
+    <!-- HEADER -->
+    <header class="top">
+        <div class="brand">
+            <span class="mark">[ad]</span>
+            <span class="pkg">@zakkster/lite-adaptive</span>
+            <span class="ver" id="brand-version">v-.-.-</span>
+        </div>
+        <div class="tagline"><span class="dot"></span>recency summaries - windowed error witnessed, proven zero-GC</div>
+    </header>
+
+    <!-- TAB NAV -->
+    <nav class="tabs" id="tabs">
+        <button data-tab="eh" aria-current="true"><span class="scene-num">01</span>ExponentialHistogram</button>
+        <button data-tab="ad"><span class="scene-num">02</span>ADWIN</button>
+        <button data-tab="fd"><span class="scene-num">03</span>ForwardDecay</button>
+        <button data-tab="hk"><span class="scene-num">04</span>HeavyKeeper</button>
+    </nav>
+
+    <main>
+        <!-- SCENE 01: EXPONENTIALHISTOGRAM -->
+        <section class="scene" data-scene="eh" data-active>
+            <div class="stage" id="eh-stage">
+                <canvas id="eh-canvas"></canvas>
+                <div class="stage-overlay tl"><span class="label">ExponentialHistogram sliding window [now-W, now] (live library instance)</span></div>
+                <div class="stage-overlay tr"><span class="label">windowed count</span><br><span class="big" id="eh-count-big">0</span></div>
+            </div>
+            <aside class="panel">
+                <div class="panel-head">scene 01 - exponentialhistogram (how many in the last W?)</div>
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="eh-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">exact ring-of-last-W: <b id="eh-mode-label">running (retains O(W))</b></span>
+                    </div>
+                    <p class="help-line">
+                        The <code>sketch</code> path streams arrivals into the REAL
+                        <code>ExponentialHistogram</code> via <code>addFrom</code> and allocates NOTHING
+                        per frame -- including the amortized merge cascade + expire sweep. The exact
+                        ring must retain every in-window timestamp; the sketch keeps a FIXED pool.
+                    </p>
+                </section>
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row"><button class="btn" id="eh-pause">pause</button></div>
+                </section>
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>window W (time units) <span class="field-value" id="eh-w-v">4096</span></label>
+                        <input type="range" id="eh-w" min="1024" max="8192" step="1024" value="4096">
+                    </div>
+                    <div class="field">
+                        <label>epsilon (windowed error knob) <span class="field-value" id="eh-eps-v">0.050</span></label>
+                        <input type="range" id="eh-eps" min="10" max="200" step="10" value="50">
+                    </div>
+                    <p class="help-line">
+                        Smaller epsilon -> more buckets -> tighter error. Sketch memory is a FIXED
+                        <span class="field-value" id="eh-mem">0 KB</span> no matter how dense the stream.
+                    </p>
+                </section>
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="eh-jank" class="jank-c"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = a frame blew past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell"><div class="alloc-big zero" id="eh-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="eh-alloc-oracle">0</div><div class="alloc-sub">exact ring path</div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - windowed relerr vs the HARD epsilon cap</div>
+                            <canvas id="eh-witness" class="witness-c"></canvas>
+                            <div class="jank-caption">cursor = measured relerr / epsilon; green = inside the HARD bound, red past 1.0</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - space: sketch fixed vs ring O(in-window)</div>
+                            <canvas id="eh-space" class="space-c"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">windowed count</span><span class="v accent" id="eh-count">0</span></div>
+                            <div class="stat-row"><span class="k">true windowed count</span><span class="v" id="eh-true">0</span></div>
+                            <div class="stat-row"><span class="k">measured rel error</span><span class="v" id="eh-relerr">0.00%</span></div>
+                            <div class="stat-row"><span class="k">epsilon (HARD)</span><span class="v" id="eh-eps">0.00%</span></div>
+                            <div class="stat-row"><span class="k">relerr / epsilon</span><span class="v inband" id="eh-frac">0.00x</span></div>
+                            <div class="stat-row"><span class="k">live buckets / cap</span><span class="v" id="eh-buckets">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">sketch bytes (fixed)</span><span class="v accent" id="eh-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">ring bytes (O(in-window))</span><span class="v" id="eh-ring-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="eh-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="eh-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+
+        <!-- SCENE 02: ADWIN -->
+        <section class="scene" data-scene="ad">
+            <div class="stage" id="ad-stage">
+                <canvas id="ad-canvas"></canvas>
+                <div class="stage-overlay tl"><span class="label">ADWIN adaptive window: mean tracks the current concept; window GROWS then SNAPS on drift</span></div>
+                <div class="stage-overlay tr"><span class="label">window mean</span><br><span class="big" id="ad-mean-big">0</span></div>
+            </div>
+            <aside class="panel">
+                <div class="panel-head">scene 02 - adwin (has the stream CHANGED?)</div>
+                <section>
+                    <h3>vs the naive foil</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="ad-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">cumulative-mean foil: <b id="ad-mode-label">running (never forgets)</b></span>
+                    </div>
+                    <p class="help-line">
+                        The stream drifts between two concept means. <code>ADWIN.add</code> GROWS its
+                        window while stationary and SHRINKS it the moment a mean shift is significant
+                        (the snap) -- 0 B/op including the cut-scan + drop-older shrink. The naive
+                        cumulative mean never forgets, so it stays a lagging blend.
+                    </p>
+                </section>
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row"><button class="btn" id="ad-pause">pause</button></div>
+                </section>
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>delta (confidence knob) <span class="field-value" id="ad-delta-v">0.100</span></label>
+                        <input type="range" id="ad-delta" min="1" max="50" step="1" value="10">
+                    </div>
+                    <p class="help-line">
+                        Smaller delta -> fewer false alarms, slower detection. Window memory is a FIXED
+                        <span class="field-value" id="ad-mem">0 KB</span> pool -- exact drift tracking
+                        would keep O(N) values.
+                    </p>
+                </section>
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="ad-jank" class="jank-c"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell"><div class="alloc-big zero" id="ad-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="ad-alloc-oracle">0</div><div class="alloc-sub">O(N) exact path</div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - adapted mean error vs the 0.05 band</div>
+                            <canvas id="ad-witness" class="witness-c"></canvas>
+                            <div class="jank-caption">cursor = |mean - concept mean| / 0.05; green = adapted, red = still lagging</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - space: window fixed vs O(N) retained</div>
+                            <canvas id="ad-space" class="space-c"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">window mean</span><span class="v accent" id="ad-mean">0</span></div>
+                            <div class="stat-row"><span class="k">current concept mean</span><span class="v" id="ad-truemean">0</span></div>
+                            <div class="stat-row"><span class="k">cumulative-mean foil</span><span class="v outband" id="ad-cummean">0</span></div>
+                            <div class="stat-row"><span class="k">window width (items)</span><span class="v" id="ad-width">0</span></div>
+                            <div class="stat-row"><span class="k">|mean - concept| / 0.05</span><span class="v inband" id="ad-frac">0.00x</span></div>
+                            <div class="stat-row"><span class="k">drifts detected</span><span class="v accent" id="ad-cuts">0</span></div>
+                            <div class="stat-row"><span class="k">items seen (N)</span><span class="v" id="ad-n">0</span></div>
+                            <div class="stat-row"><span class="k">window bytes (fixed)</span><span class="v accent" id="ad-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">exact bytes (O(N))</span><span class="v" id="ad-oracle-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="ad-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="ad-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+
+        <!-- SCENE 03: FORWARDDECAY -->
+        <section class="scene" data-scene="fd">
+            <div class="stage" id="fd-stage">
+                <canvas id="fd-canvas"></canvas>
+                <div class="stage-overlay tl"><span class="label">ForwardDecay: recent data dominates (decayed mean) while the cumulative mean lags -- EXACT modulo FP</span></div>
+                <div class="stage-overlay tr"><span class="label">decayed mean</span><br><span class="big" id="fd-mean-big">0</span></div>
+            </div>
+            <aside class="panel">
+                <div class="panel-head">scene 03 - forwarddecay (what is happening RECENTLY?)</div>
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="fd-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">brute-force decayed oracle: <b id="fd-mode-label">running (retains O(W))</b></span>
+                    </div>
+                    <p class="help-line">
+                        <code>ForwardDecay.addFrom</code> keeps TWO scalars (C, Sv) and folds age at
+                        query time -- 0 B/op including the landmark rebase. The exact oracle must store
+                        every still-weighty sample and re-weight it; the sketch's decayed count / sum /
+                        mean match it to <code>&lt;= 1e-9</code> (EXACT modulo floating point).
+                    </p>
+                </section>
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row"><button class="btn" id="fd-pause">pause</button></div>
+                    <p class="help-line">
+                        landmark <code id="fd-landmark">0</code> ticks up on each rebase; the decayed
+                        queries are UNCHANGED across it (the invariance -- the relerr stays near 0).
+                    </p>
+                </section>
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>half-life (time units) <span class="field-value" id="fd-hl-v">1000</span></label>
+                        <input type="range" id="fd-hl" min="200" max="2000" step="100" value="1000">
+                    </div>
+                    <p class="help-line">
+                        Longer half-life -> slower forgetting (a wider soft window). Sketch memory is a
+                        FIXED <span class="field-value" id="fd-mem">0 KB</span> (two scalars) whatever N is.
+                    </p>
+                </section>
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="fd-jank" class="jank-c"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell"><div class="alloc-big zero" id="fd-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="fd-alloc-oracle">0</div><div class="alloc-sub">retained samples</div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - decayed relerr vs the 1e-9 exactness cap</div>
+                            <canvas id="fd-witness" class="witness-c"></canvas>
+                            <div class="jank-caption">cursor = relerr / 1e-9; it sits pinned at the far left -- EXACT modulo FP</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - space: two scalars fixed vs samples O(W)</div>
+                            <canvas id="fd-space" class="space-c"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">decayed mean (recent)</span><span class="v accent" id="fd-mean">0</span></div>
+                            <div class="stat-row"><span class="k">cumulative mean (all-time)</span><span class="v outband" id="fd-cummean">0</span></div>
+                            <div class="stat-row"><span class="k">decayed count</span><span class="v" id="fd-count">0</span></div>
+                            <div class="stat-row"><span class="k">decayed rate</span><span class="v" id="fd-rate">0</span></div>
+                            <div class="stat-row"><span class="k">measured rel error</span><span class="v" id="fd-relerr">0</span></div>
+                            <div class="stat-row"><span class="k">relerr / 1e-9</span><span class="v inband" id="fd-frac">0.00x</span></div>
+                            <div class="stat-row"><span class="k">adds (N) / oracle samples</span><span class="v" id="fd-n">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">sketch bytes (fixed)</span><span class="v accent" id="fd-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">oracle bytes (O(W))</span><span class="v" id="fd-arr-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="fd-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="fd-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+
+        <!-- SCENE 04: HEAVYKEEPER -->
+        <section class="scene" data-scene="hk">
+            <div class="stage" id="hk-stage">
+                <canvas id="hk-canvas"></canvas>
+                <div class="stage-overlay tl"><span class="label">HeavyKeeper top-k leaderboard -- live library instance (heap order); bracket = [true - N/w, true]</span></div>
+                <div class="stage-overlay tr"><span class="label">recall of hitters > N/k</span><br><span class="big" id="hk-recall-big">100%</span></div>
+            </div>
+            <aside class="panel">
+                <div class="panel-head">scene 04 - heavykeeper (which few keys dominate NOW?)</div>
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="hk-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">exact Map + Space-Saving: <b id="hk-mode-label">running (allocates)</b></span>
+                    </div>
+                    <p class="help-line">
+                        <code>HeavyKeeper.addFrom</code> reads keys UNBOXED and PROTECTS heavy counters
+                        while PROBABILISTICALLY decaying light ones -- 0 B/op incl. the decay draw + the
+                        forest sift. It never overestimates; every leader lands in
+                        <code>[true - N/w, true]</code>, with 100% recall of the true heavy hitters.
+                    </p>
+                </section>
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row"><button class="btn" id="hk-pause">pause</button></div>
+                    <p class="help-line">
+                        marquee -- mean rel-error <code id="hk-hkerr">0%</code> (HeavyKeeper) vs
+                        <code id="hk-sserr">0%</code> (a faithful Space-Saving baseline of the same size).
+                    </p>
+                </section>
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>top-k size k <span class="field-value" id="hk-k-v">12</span></label>
+                        <input type="range" id="hk-k" min="4" max="32" step="1" value="12">
+                    </div>
+                    <p class="help-line">
+                        k sets the leaderboard depth and the <code>N/k</code> heavy-hitter threshold.
+                        Table memory is a FIXED <span class="field-value" id="hk-mem">0 KB</span>; the
+                        exact Map grows O(distinct).
+                    </p>
+                </section>
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="hk-jank" class="jank-c"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell"><div class="alloc-big zero" id="hk-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="hk-alloc-oracle">0</div><div class="alloc-sub">exact Map path</div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - recall of true hitters > N/k (target 100%)</div>
+                            <canvas id="hk-witness" class="witness-c"></canvas>
+                            <div class="jank-caption">the bar is recall; full + green = every true hitter tracked (no false negatives)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - space: table fixed vs Map O(distinct)</div>
+                            <canvas id="hk-space" class="space-c"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">recall (found / true HH)</span><span class="v inband" id="hk-recall">100%</span></div>
+                            <div class="stat-row"><span class="k">true hitters > N/k</span><span class="v" id="hk-truehh">0</span></div>
+                            <div class="stat-row"><span class="k">monitored / k</span><span class="v" id="hk-size">0 / 12</span></div>
+                            <div class="stat-row"><span class="k">max overestimate</span><span class="v inband" id="hk-maxover">0</span></div>
+                            <div class="stat-row"><span class="k">bracket holds</span><span class="v inband" id="hk-bracket">yes</span></div>
+                            <div class="stat-row"><span class="k">marquee: HK vs Space-Saving</span><span class="v accent" id="hk-marquee">--</span></div>
+                            <div class="stat-row"><span class="k">table bytes (fixed)</span><span class="v accent" id="hk-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">Map bytes (climbing)</span><span class="v" id="hk-map-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="hk-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="hk-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+    </main>
+
+    <footer class="bottom">
+        <span>how to read this: the sketch allocation counter stays pinned at 0 after warmup (that IS the zero-GC claim), and the measured recency error stays inside its witnessed bound (that IS the accuracy claim), while the exact oracle grows without bound.</span>
+        <span class="sep">|</span>
+        <span>retained heap is a coarse Chromium-only secondary signal</span>
+        <span class="sep">|</span>
+        <span><kbd>1</kbd>-<kbd>4</kbd> switch scene</span>
+        <span class="sep">|</span>
+        <span><kbd>space</kbd> pause</span>
+    </footer>
+</div>
+
+<script type="module">
+    // The demo drives the REAL shipped classes via the repo's kernels. VERSION is read from the
+    // shipped module -- NEVER hardcoded (Demo.test.mjs version-trinity gate).
+    import {
+        VERSION,
+        createAllocState,
+        createEhWorld, stepEh, stepEhOracle, renderEhPrep,
+        EH_DEFAULT_W, EH_DEFAULT_EPS, EH_BUCKET_BYTES,
+        E_COUNT, E_TRUE, E_RELERR, E_EPS, E_FRAC, E_BUCKETS, E_CAP, E_SKETCH_BYTES, E_RING_BYTES,
+        E_SKETCH_ALLOC, E_ORACLE_ALLOC,
+        createAdWorld, stepAd, stepAdOracle, renderAdPrep,
+        AD_DEFAULT_DELTA, AD_MEAN_LO, AD_MEAN_HI,
+        A_MEAN, A_TRUEMEAN, A_CUMMEAN, A_WIDTH, A_MEANFRAC, A_CUTS, A_DRIFT, A_N,
+        A_SKETCH_BYTES, A_ORACLE_BYTES, A_SKETCH_ALLOC, A_ORACLE_ALLOC,
+        createFdWorld, stepFd, stepFdOracle, renderFdPrep,
+        FD_DEFAULT_HALFLIFE,
+        D_COUNT, D_MEAN, D_CUMMEAN, D_RATE, D_RELERR, D_FRAC, D_LANDMARK, D_N, D_ORACLEN,
+        D_SKETCH_BYTES, D_ARR_BYTES, D_SKETCH_ALLOC, D_ORACLE_ALLOC,
+        createHkWorld, stepHk, stepHkOracle, renderHkPrep,
+        HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K,
+        H_RECALL, H_TRUEHH, H_MAXOVER, H_BRACKETOK, H_HKERR, H_SSERR, H_MARQUEEOK,
+        H_SIZE, H_K, H_W, H_THRESH, H_ERRBOUND, H_MAXCOUNT, H_N,
+        H_SKETCH_BYTES, H_MAP_BYTES, H_SKETCH_ALLOC, H_ORACLE_ALLOC,
+    } from './kernels.mjs';
+
+    const $ = (id) => document.getElementById(id);
+    $('brand-version').textContent = 'v' + VERSION;
+
+    // ---- high-DPI canvas sizing (reallocates ONLY here / on resize) --------------------
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    function sizeCanvas(c) {
+        const r = c.getBoundingClientRect();
+        c.width = Math.max(1, Math.floor(r.width * dpr));
+        c.height = Math.max(1, Math.floor(r.height * dpr));
+        const ctx = c.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        return { ctx, w: r.width, h: r.height };
+    }
+
+    // ---- built-once rgba cache (styling allocates only during warmup, never per frame) --
+    const _rgba = Object.create(null);
+    function rgbaq(rgb, a) {
+        let row = _rgba[rgb];
+        if (row === undefined) row = _rgba[rgb] = [];
+        const q = a <= 0 ? 0 : a >= 1 ? 20 : (a * 20 + 0.5) | 0;
+        let s = row[q];
+        if (s === undefined) s = row[q] = 'rgba(' + rgb + ',' + (q / 20) + ')';
+        return s;
+    }
+    function mem() { return (performance.memory && performance.memory.usedJSHeapSize) || 0; }
+
+    const ACCENT_RGB = '139,124,246';
+    const STALE_RGB = '120,125,140';
+    const MAGENTA_RGB = '232,121,168';
+    const RED_RGB = '248,113,113';
+    const GREEN_RGB = '95,227,159';
+    const AMBER_RGB = '245,185,66';
+    const CYAN_RGB = '125,211,252';
+    const COL_FAINT = '#555960';
+    const COL_DIM = '#8b8d94';
+    const LABEL_FONT = '11px "JetBrains Mono", monospace';
+    const PAD = 24;
+
+    // ---- shared truth-panel draws (0 alloc) --------------------------------------------
+    const DT = new Float64Array(128), DT_MASK = 127;
+    let dtPtr = 0, lastTs = performance.now(), frameN = 0;
+    let fpsLast = performance.now(), fpsFrames = 0, fpsValue = 60;
+    const JANK_MS = 18;
+    function drawJank(g, jw, jh) {
+        if (!g) return;
+        g.clearRect(0, 0, jw, jh);
+        const bw = jw / 128;
+        for (let i = 0; i < 128; i++) {
+            const dt = DT[(dtPtr + i) & DT_MASK];
+            if (dt <= 0) continue;
+            const over = dt > JANK_MS;
+            const h = Math.min(jh, (dt / 33) * jh);
+            g.fillStyle = over ? rgbaq(RED_RGB, 0.95) : rgbaq(ACCENT_RGB, 0.55);
+            g.fillRect(i * bw, jh - h, bw - 0.5, h);
+        }
+    }
+    // A [0 .. 1.3x cap]-in-units-of-bound gauge with a green (<=1) / red (>1) band + cursor. 0 alloc.
+    function drawGauge(g, x, y, w, cy, frac) {
+        const halfFull = 1.3;
+        const oneX = x + (1 / halfFull) * w;
+        g.fillStyle = rgbaq(GREEN_RGB, 0.16); g.fillRect(x, cy - 9, oneX - x, 18);
+        g.fillStyle = rgbaq(RED_RGB, 0.12); g.fillRect(oneX, cy - 9, x + w - oneX, 18);
+        g.fillStyle = rgbaq(GREEN_RGB, 0.6); g.fillRect(oneX - 1, cy - 12, 1, 24);
+        let px = frac / halfFull; if (px > 1) px = 1; if (px < 0) px = 0;
+        const cxp = x + px * w;
+        g.fillStyle = frac <= 1 ? rgbaq(GREEN_RGB, 0.95) : rgbaq(RED_RGB, 0.95);
+        g.fillRect(cxp - 2, cy - 13, 4, 26);
+    }
+    function drawSpaceBars(g, w, h, fixedB, climbB) {
+        if (!g) return;
+        g.clearRect(0, 0, w, h);
+        const scale = Math.max(fixedB, climbB, 1);
+        const barX = 6, barW = w - 12, barH = 14;
+        const y0 = h * 0.5 - barH - 4, y1 = h * 0.5 + 4;
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y0, barW, barH);
+        g.fillStyle = rgbaq(ACCENT_RGB, 0.9); g.fillRect(barX, y0, barW * (fixedB / scale), barH);
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y1, barW, barH);
+        g.fillStyle = rgbaq(MAGENTA_RGB, 0.9); g.fillRect(barX, y1, barW * (climbB / scale), barH);
+    }
+    function heapText(el, last) {
+        const mb = mem();
+        if (!mb) return last;
+        const t = Math.floor(mb / 104857.6);
+        if (t !== last) el.textContent = Math.floor(t / 10) + '.' + (t % 10) + ' MB';
+        return t;
+    }
+
+    // ---- controls / state --------------------------------------------------------------
+    let paused = false;
+    function setPaused(p) {
+        paused = p;
+        const label = p ? 'resume' : 'pause';
+        for (const id of ['eh-pause', 'ad-pause', 'fd-pause', 'hk-pause']) { const b = $(id); if (b) b.textContent = label; }
+    }
+    function wireToggle(id, labelId, onText, offText, set) {
+        const t = $(id), l = $(labelId);
+        function apply(on) { t.setAttribute('data-on', on ? 'true' : 'false'); t.setAttribute('aria-checked', on ? 'true' : 'false'); l.textContent = on ? onText : offText; set(on); }
+        t.addEventListener('click', () => apply(t.getAttribute('data-on') !== 'true'));
+        t.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); apply(t.getAttribute('data-on') !== 'true'); } });
+        return apply;
+    }
+    for (const id of ['eh-pause', 'ad-pause', 'fd-pause', 'hk-pause']) $(id).addEventListener('click', () => setPaused(!paused));
+
+    // ====================================================================================
+    // SCENE 01 -- ExponentialHistogram
+    // ====================================================================================
+    let ehW = EH_DEFAULT_W, ehEps = EH_DEFAULT_EPS;
+    let ehWorld = createEhWorld(ehW, ehEps, 0x5eed1234);
+    const ehAlloc = createAllocState();
+    let ehOracleOn = true;
+    const ehCanvas = $('eh-canvas');
+    let ehCtx = null, EHW = 0, EHH = 0, ehGX = 0, ehGY = 0, ehGW = 0, ehGH = 0;
+    function ehLayout() { const s = sizeCanvas(ehCanvas); ehCtx = s.ctx; EHW = s.w; EHH = s.h; ehGX = PAD; ehGY = PAD + 24; ehGW = EHW - PAD * 2; ehGH = EHH - PAD * 2 - 24; }
+    const ehJank = $('eh-jank'); let ehJankCtx = null, EJW = 0, EJH = 0;
+    const ehWit = $('eh-witness'); let ehWitCtx = null, EWW = 0, EWH = 0;
+    const ehSpace = $('eh-space'); let ehSpCtx = null, ESW = 0, ESH = 0;
+    function ehPanels() { let s = sizeCanvas(ehJank); ehJankCtx = s.ctx; EJW = s.w; EJH = s.h; s = sizeCanvas(ehWit); ehWitCtx = s.ctx; EWW = s.w; EWH = s.h; s = sizeCanvas(ehSpace); ehSpCtx = s.ctx; ESW = s.w; ESH = s.h; }
+    function ehStep() { stepEh(ehWorld); if (ehOracleOn) stepEhOracle(ehWorld, ehAlloc); }
+    // Arrival-density histogram scratch (reused, 0 alloc). The window picture is drawn from the
+    // demo's OWN in-window ring (world.ring) + the PUBLIC EH surface -- never library internals.
+    const EH_COLS = 80;
+    const ehBins = new Int32Array(EH_COLS);
+    function ehDraw() {
+        const g = ehCtx; if (!g) return;
+        g.clearRect(0, 0, EHW, EHH);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM;
+        g.fillText('sliding window [now-W, now]: arrival density (bars) that EH summarizes in a FIXED bucket pool; oldest = left, expiring', ehGX, ehGY - 8);
+        const eh = ehWorld.eh;
+        // window bounds from PUBLIC eh.windowSize + the demo's own monotone clock.
+        const now = ehWorld.now, W = eh.windowSize, tMin = now - W;
+        // bin the demo-owned in-window ring across the window (0 alloc; ehBins reused).
+        ehBins.fill(0);
+        const ring = ehWorld.ring, rmask = ehWorld.ringMask;
+        const head = ehWorld.ringHead, tail = ehWorld.ringTail;
+        let maxBin = 1, i = head;
+        while (i !== tail) {
+            let col = ((ring[i] - tMin) / W * EH_COLS) | 0;
+            if (col < 0) col = 0; else if (col >= EH_COLS) col = EH_COLS - 1;
+            const v = ++ehBins[col]; if (v > maxBin) maxBin = v;
+            i = (i + 1) & rmask;
+        }
+        const barW = ehGW / EH_COLS, plotH = ehGH - 18;
+        for (let c = 0; c < EH_COLS; c++) {
+            const bh = (ehBins[c] / maxBin) * plotH;
+            // the leftmost column is the oldest (expiring / straddling) window edge -> amber.
+            g.fillStyle = c === 0 ? rgbaq(AMBER_RGB, 0.8) : rgbaq(ACCENT_RGB, 0.75);
+            if (bh > 0) g.fillRect(ehGX + c * barW, ehGY + plotH - bh, barW - 0.5, bh);
+        }
+        // bucket-pool fill from the PUBLIC surface: live buckets / fixed capacity.
+        const cap = eh.capacity || 1, fill = eh.bucketCount / cap;
+        g.fillStyle = rgbaq(STALE_RGB, 0.12); g.fillRect(ehGX, ehGY + ehGH - 12, ehGW, 10);
+        g.fillStyle = rgbaq(CYAN_RGB, 0.8); g.fillRect(ehGX, ehGY + ehGH - 12, ehGW * fill, 10);
+    }
+    function ehWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, ehWorld.flat[E_FRAC]); }
+    const ehDom = { big: $('eh-count-big'), aS: $('eh-alloc-sketch'), aO: $('eh-alloc-oracle'), count: $('eh-count'), tr: $('eh-true'), rel: $('eh-relerr'), eps: $('eh-eps'), frac: $('eh-frac'), buckets: $('eh-buckets'), skb: $('eh-sketch-kb'), rkb: $('eh-ring-kb'), fps: $('eh-fps'), heap: $('eh-heap'), mem: $('eh-mem') };
+    let ehHeap = -1;
+    function ehTick() {
+        renderEhPrep(ehWorld, ehAlloc);
+        const f = ehWorld.flat;
+        ehDom.big.textContent = String(f[E_COUNT] | 0);
+        ehDom.count.textContent = String(f[E_COUNT] | 0);
+        ehDom.tr.textContent = String(f[E_TRUE] | 0);
+        ehDom.rel.textContent = (f[E_RELERR] * 100).toFixed(2) + '%';
+        ehDom.eps.textContent = (f[E_EPS] * 100).toFixed(2) + '%';
+        const fr = f[E_FRAC]; ehDom.frac.textContent = fr.toFixed(2) + 'x'; ehDom.frac.className = fr <= 1 ? 'v inband' : 'v outband';
+        ehDom.buckets.textContent = (f[E_BUCKETS] | 0) + ' / ' + (f[E_CAP] | 0);
+        ehDom.skb.textContent = (f[E_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        ehDom.rkb.textContent = (f[E_RING_BYTES] / 1024).toFixed(1) + ' KB';
+        ehDom.aS.textContent = String(f[E_SKETCH_ALLOC] | 0);
+        ehDom.aO.textContent = String(f[E_ORACLE_ALLOC]);
+        ehDom.fps.textContent = String(fpsValue);
+        ehHeap = heapText(ehDom.heap, ehHeap);
+    }
+    wireToggle('eh-mode-toggle', 'eh-mode-label', 'running (retains O(W))', 'paused (sketch only)', (on) => { ehOracleOn = on; });
+    function ehRebuild() { ehWorld = createEhWorld(ehW, ehEps, 0x5eed1234); ehAlloc.sketchCount = 0; ehAlloc.oracleCount = 0; ehDom.mem.textContent = (ehWorld.eh.capacity * EH_BUCKET_BYTES / 1024).toFixed(1) + ' KB'; ehLayout(); }
+    $('eh-w').addEventListener('input', (e) => { ehW = +e.target.value; $('eh-w-v').textContent = String(ehW); ehRebuild(); });
+    $('eh-eps').addEventListener('input', (e) => { ehEps = (+e.target.value) / 1000; $('eh-eps-v').textContent = ehEps.toFixed(3); ehRebuild(); });
+
+    // ====================================================================================
+    // SCENE 02 -- ADWIN
+    // ====================================================================================
+    let adDelta = AD_DEFAULT_DELTA;
+    let adWorld = createAdWorld(adDelta, 0xadadadad);
+    const adAlloc = createAllocState();
+    let adFoilOn = true;
+    const adCanvas = $('ad-canvas');
+    let adCtx = null, ADW = 0, ADH = 0, adGX = 0, adGY = 0, adGW = 0, adGH = 0;
+    function adLayout() { const s = sizeCanvas(adCanvas); adCtx = s.ctx; ADW = s.w; ADH = s.h; adGX = PAD; adGY = PAD + 24; adGW = ADW - PAD * 2; adGH = ADH - PAD * 2 - 24; }
+    const adJank = $('ad-jank'); let adJankCtx = null, AJW = 0, AJH = 0;
+    const adWit = $('ad-witness'); let adWitCtx = null, AWW = 0, AWH = 0;
+    const adSpace = $('ad-space'); let adSpCtx = null, ASW = 0, ASH = 0;
+    function adPanels() { let s = sizeCanvas(adJank); adJankCtx = s.ctx; AJW = s.w; AJH = s.h; s = sizeCanvas(adWit); adWitCtx = s.ctx; AWW = s.w; AWH = s.h; s = sizeCanvas(adSpace); adSpCtx = s.ctx; ASW = s.w; ASH = s.h; }
+    function adStep() { stepAd(adWorld); if (adFoilOn) stepAdOracle(adWorld, adAlloc); }
+    // 10Hz history rings for the scrolling plot (drawing state, pre-allocated, updated in adTick).
+    const AD_HIST = 256, AD_HMASK = 255;
+    const adMeanH = new Float64Array(AD_HIST), adMuH = new Float64Array(AD_HIST), adCumH = new Float64Array(AD_HIST), adDriftH = new Float64Array(AD_HIST);
+    let adHPtr = 0, adHFilled = 0;
+    function adDraw() {
+        const g = adCtx; if (!g) return;
+        g.clearRect(0, 0, ADW, ADH);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM; g.fillText('mean over time: violet = adaptive window (tracks the concept), dim = cumulative foil (lags), red flash = drift cut', adGX, adGY - 8);
+        const n = adHFilled;
+        if (n < 2) return;
+        const plotH = adGH - 20;
+        const y = (v) => adGY + plotH - v * plotH;   // value domain [0,1]
+        // drift flashes
+        for (let i = 0; i < n; i++) {
+            const idx = (adHPtr - n + i + AD_HIST) & AD_HMASK;
+            if (adDriftH[idx] > 0) { const x = adGX + (i / (n - 1)) * adGW; g.fillStyle = rgbaq(RED_RGB, 0.35); g.fillRect(x - 1, adGY, 2, plotH); }
+        }
+        // concept-mean step line (dim green), cumulative foil (stale), adaptive mean (accent)
+        drawSeries(g, adMuH, n, adGX, adGW, y, GREEN_RGB, 0.5);
+        drawSeries(g, adCumH, n, adGX, adGW, y, STALE_RGB, 0.7);
+        drawSeries(g, adMeanH, n, adGX, adGW, y, ACCENT_RGB, 0.95);
+        // width bar at the bottom
+        const wf = Math.min(1, adWorld.flat[A_WIDTH] / (adWorld.W ? adWorld.W : 1));
+        g.fillStyle = rgbaq(STALE_RGB, 0.12); g.fillRect(adGX, adGY + adGH - 12, adGW, 10);
+        g.fillStyle = rgbaq(CYAN_RGB, 0.8); g.fillRect(adGX, adGY + adGH - 12, adGW * wf, 10);
+    }
+    function drawSeries(g, ring, n, gx, gw, y, rgb, alpha) {
+        g.strokeStyle = rgbaq(rgb, alpha); g.lineWidth = 1.5; g.beginPath();
+        for (let i = 0; i < n; i++) {
+            const idx = (adHPtr - n + i + AD_HIST) & AD_HMASK;
+            const x = gx + (i / (n - 1)) * gw;
+            const yy = y(ring[idx]);
+            if (i === 0) g.moveTo(x, yy); else g.lineTo(x, yy);
+        }
+        g.stroke();
+    }
+    function adWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, adWorld.flat[A_MEANFRAC]); }
+    const adDom = { big: $('ad-mean-big'), aS: $('ad-alloc-sketch'), aO: $('ad-alloc-oracle'), mean: $('ad-mean'), tm: $('ad-truemean'), cm: $('ad-cummean'), width: $('ad-width'), frac: $('ad-frac'), cuts: $('ad-cuts'), n: $('ad-n'), skb: $('ad-sketch-kb'), okb: $('ad-oracle-kb'), fps: $('ad-fps'), heap: $('ad-heap'), mem: $('ad-mem') };
+    let adHeap = -1;
+    function adTick() {
+        renderAdPrep(adWorld, adAlloc);
+        const f = adWorld.flat;
+        adMeanH[adHPtr] = f[A_MEAN]; adMuH[adHPtr] = f[A_TRUEMEAN]; adCumH[adHPtr] = f[A_CUMMEAN]; adDriftH[adHPtr] = f[A_DRIFT];
+        adHPtr = (adHPtr + 1) & AD_HMASK; if (adHFilled < AD_HIST) adHFilled++;
+        adDom.big.textContent = f[A_MEAN].toFixed(3);
+        adDom.mean.textContent = f[A_MEAN].toFixed(3);
+        adDom.tm.textContent = f[A_TRUEMEAN].toFixed(3);
+        adDom.cm.textContent = f[A_CUMMEAN].toFixed(3);
+        adDom.width.textContent = String(f[A_WIDTH] | 0);
+        const fr = f[A_MEANFRAC]; adDom.frac.textContent = fr.toFixed(2) + 'x'; adDom.frac.className = fr <= 1 ? 'v inband' : 'v outband';
+        adDom.cuts.textContent = String(f[A_CUTS] | 0);
+        adDom.n.textContent = String(f[A_N] | 0);
+        adDom.skb.textContent = (f[A_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        adDom.okb.textContent = (f[A_ORACLE_BYTES] / 1024).toFixed(1) + ' KB';
+        adDom.aS.textContent = String(f[A_SKETCH_ALLOC] | 0);
+        adDom.aO.textContent = String(f[A_ORACLE_ALLOC]);
+        adDom.fps.textContent = String(fpsValue);
+        adHeap = heapText(adDom.heap, adHeap);
+    }
+    wireToggle('ad-mode-toggle', 'ad-mode-label', 'running (never forgets)', 'paused', (on) => { adFoilOn = on; });
+    function adRebuild() { adWorld = createAdWorld(adDelta, 0xadadadad); adAlloc.sketchCount = 0; adAlloc.oracleCount = 0; adHPtr = 0; adHFilled = 0; adDom.mem.textContent = (adWorld.ad.capacity * 32 / 1024).toFixed(1) + ' KB'; adLayout(); }
+    $('ad-delta').addEventListener('input', (e) => { adDelta = (+e.target.value) / 100; $('ad-delta-v').textContent = adDelta.toFixed(3); adRebuild(); });
+
+    // ====================================================================================
+    // SCENE 03 -- ForwardDecay
+    // ====================================================================================
+    let fdHl = FD_DEFAULT_HALFLIFE;
+    let fdWorld = createFdWorld(fdHl, 0xfdfdfdfd);
+    const fdAlloc = createAllocState();
+    let fdOracleOn = true;
+    const fdCanvas = $('fd-canvas');
+    let fdCtx = null, FDW = 0, FDH = 0, fdGX = 0, fdGY = 0, fdGW = 0, fdGH = 0;
+    function fdLayout() { const s = sizeCanvas(fdCanvas); fdCtx = s.ctx; FDW = s.w; FDH = s.h; fdGX = PAD; fdGY = PAD + 24; fdGW = FDW - PAD * 2; fdGH = FDH - PAD * 2 - 24; }
+    const fdJank = $('fd-jank'); let fdJankCtx = null, FJW = 0, FJH = 0;
+    const fdWit = $('fd-witness'); let fdWitCtx = null, FWW = 0, FWH = 0;
+    const fdSpace = $('fd-space'); let fdSpCtx = null, FSW = 0, FSH = 0;
+    function fdPanels() { let s = sizeCanvas(fdJank); fdJankCtx = s.ctx; FJW = s.w; FJH = s.h; s = sizeCanvas(fdWit); fdWitCtx = s.ctx; FWW = s.w; FWH = s.h; s = sizeCanvas(fdSpace); fdSpCtx = s.ctx; FSW = s.w; FSH = s.h; }
+    function fdStep() { stepFd(fdWorld); if (fdOracleOn) stepFdOracle(fdWorld, fdAlloc); }
+    function fdDraw() {
+        const g = fdCtx; if (!g) return;
+        g.clearRect(0, 0, FDW, FDH);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM; g.fillText('exponential decay kernel exp(-lambda*age): recent samples (right) dominate; violet = decayed mean, dim = cumulative mean', fdGX, fdGY - 8);
+        // decay curve across a few half-lives (age axis: 0 at right = now, older to the left)
+        const lambda = fdWorld.lambda;
+        g.strokeStyle = rgbaq(ACCENT_RGB, 0.85); g.lineWidth = 1.5; g.beginPath();
+        const spanAges = 6 * fdWorld.halfLife;   // show ~6 half-lives
+        for (let px = 0; px <= fdGW; px++) {
+            const age = ((fdGW - px) / fdGW) * spanAges;   // right = age 0 (now)
+            const w = Math.exp(-lambda * age);
+            const x = fdGX + px, y = fdGY + fdGH - w * fdGH;
+            if (px === 0) g.moveTo(x, y); else g.lineTo(x, y);
+        }
+        g.stroke();
+        // value markers: decayed mean vs cumulative mean, mapped into the value band [LO, HI-ish]
+        const f = fdWorld.flat;
+        const lo = 0.5, hi = 6;   // display band covering the FD value range
+        const mapV = (v) => { let t = (v - lo) / (hi - lo); if (t < 0) t = 0; if (t > 1) t = 1; return fdGY + fdGH - t * fdGH; };
+        const ym = mapV(f[D_MEAN]);
+        g.strokeStyle = rgbaq(ACCENT_RGB, 0.9); g.setLineDash([6, 4]); g.beginPath(); g.moveTo(fdGX, ym); g.lineTo(fdGX + fdGW, ym); g.stroke();
+        const yc = mapV(f[D_CUMMEAN]);
+        g.strokeStyle = rgbaq(STALE_RGB, 0.8); g.beginPath(); g.moveTo(fdGX, yc); g.lineTo(fdGX + fdGW, yc); g.stroke();
+        g.setLineDash([]);
+    }
+    function fdWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, fdWorld.flat[D_FRAC]); }
+    const fdDom = { big: $('fd-mean-big'), aS: $('fd-alloc-sketch'), aO: $('fd-alloc-oracle'), mean: $('fd-mean'), cm: $('fd-cummean'), count: $('fd-count'), rate: $('fd-rate'), rel: $('fd-relerr'), frac: $('fd-frac'), n: $('fd-n'), skb: $('fd-sketch-kb'), akb: $('fd-arr-kb'), fps: $('fd-fps'), heap: $('fd-heap'), mem: $('fd-mem'), landmark: $('fd-landmark') };
+    let fdHeap = -1;
+    function fdTick() {
+        renderFdPrep(fdWorld, fdAlloc);
+        const f = fdWorld.flat;
+        fdDom.big.textContent = f[D_MEAN].toFixed(3);
+        fdDom.mean.textContent = f[D_MEAN].toFixed(3);
+        fdDom.cm.textContent = f[D_CUMMEAN].toFixed(3);
+        fdDom.count.textContent = f[D_COUNT].toFixed(1);
+        fdDom.rate.textContent = f[D_RATE].toExponential(2);
+        fdDom.rel.textContent = f[D_RELERR].toExponential(2);
+        const fr = f[D_FRAC]; fdDom.frac.textContent = fr.toFixed(2) + 'x'; fdDom.frac.className = fr <= 1 ? 'v inband' : 'v outband';
+        fdDom.n.textContent = String(f[D_N] | 0) + ' / ' + String(f[D_ORACLEN] | 0);
+        fdDom.skb.textContent = (f[D_SKETCH_BYTES] / 1024).toFixed(3) + ' KB';
+        fdDom.akb.textContent = (f[D_ARR_BYTES] / 1024).toFixed(1) + ' KB';
+        fdDom.landmark.textContent = (f[D_LANDMARK] | 0).toString();
+        fdDom.aS.textContent = String(f[D_SKETCH_ALLOC] | 0);
+        fdDom.aO.textContent = String(f[D_ORACLE_ALLOC]);
+        fdDom.fps.textContent = String(fpsValue);
+        fdHeap = heapText(fdDom.heap, fdHeap);
+    }
+    wireToggle('fd-mode-toggle', 'fd-mode-label', 'running (retains O(W))', 'paused (sketch only)', (on) => { fdOracleOn = on; });
+    function fdRebuild() { fdWorld = createFdWorld(fdHl, 0xfdfdfdfd); fdAlloc.sketchCount = 0; fdAlloc.oracleCount = 0; fdDom.mem.textContent = (fdWorld.flat && 0.056).toFixed(3) + ' KB'; fdLayout(); }
+    $('fd-hl').addEventListener('input', (e) => { fdHl = +e.target.value; $('fd-hl-v').textContent = String(fdHl); fdRebuild(); });
+
+    // ====================================================================================
+    // SCENE 04 -- HeavyKeeper
+    // ====================================================================================
+    let hkK = HK_DEFAULT_K;
+    let hkWorld = createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, hkK, 0x243f6a88);
+    const hkAlloc = createAllocState();
+    let hkOracleOn = true;
+    const hkCanvas = $('hk-canvas');
+    let hkCtx = null, HKW = 0, HKH = 0, hkGX = 0, hkGY = 0, hkGW = 0, hkGH = 0;
+    function hkLayout() { const s = sizeCanvas(hkCanvas); hkCtx = s.ctx; HKW = s.w; HKH = s.h; hkGX = PAD + 34; hkGY = PAD + 24; hkGW = HKW - PAD * 2 - 34; hkGH = HKH - PAD * 2 - 24; }
+    const hkJank = $('hk-jank'); let hkJankCtx = null, HJW = 0, HJH = 0;
+    const hkWit = $('hk-witness'); let hkWitCtx = null, HWW = 0, HWH = 0;
+    const hkSpace = $('hk-space'); let hkSpCtx = null, HSW = 0, HSH = 0;
+    function hkPanels() { let s = sizeCanvas(hkJank); hkJankCtx = s.ctx; HJW = s.w; HJH = s.h; s = sizeCanvas(hkWit); hkWitCtx = s.ctx; HWW = s.w; HWH = s.h; s = sizeCanvas(hkSpace); hkSpCtx = s.ctx; HSW = s.w; HSH = s.h; }
+    const RANK_LABELS = []; for (let i = 0; i < 32; i++) RANK_LABELS.push('#' + (i + 1));
+    function hkStep() { stepHk(hkWorld); if (hkOracleOn) stepHkOracle(hkWorld, hkAlloc); }
+    function hkDraw() {
+        const g = hkCtx; if (!g) return;
+        g.clearRect(0, 0, HKW, HKH);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM; g.fillText('top-k leaderboard: violet = estimate, amber = [true - N/w] bracket floor, magenta = true count (must sit inside)', PAD, hkGY - 8);
+        const f = hkWorld.flat;
+        const rows = f[H_SIZE] | 0;
+        let maxCount = f[H_MAXCOUNT]; if (maxCount < 1) maxCount = 1;
+        const thresh = f[H_THRESH], errBound = f[H_ERRBOUND];
+        if (rows < 1) return;
+        const rowH = hkGH / rows, bh = rowH - 4;
+        const topBuf = hkWorld.topBuf, lbTrue = hkWorld.lbTrue;
+        for (let r = 0; r < rows; r++) {
+            const est = topBuf[r * 2 + 1], t = lbTrue[r];
+            const y = hkGY + r * rowH + 2;
+            g.fillStyle = COL_FAINT; g.fillText(RANK_LABELS[r], PAD, y + bh * 0.5 + 3);
+            g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(hkGX, y, hkGW, bh);
+            const eW = hkGW * (est / maxCount);
+            g.fillStyle = rgbaq(ACCENT_RGB, 0.85); g.fillRect(hkGX, y, eW, bh);
+            // bracket floor [est ... would sit within N/w below true]; draw the true - errBound band
+            const loW = hkGW * (Math.max(0, t - errBound) / maxCount);
+            g.fillStyle = rgbaq(AMBER_RGB, 0.5); g.fillRect(hkGX + loW, y, Math.max(0, hkGW * (t / maxCount) - loW), bh);
+            const tX = hkGX + hkGW * (t / maxCount);
+            g.fillStyle = rgbaq(MAGENTA_RGB, 0.95); g.fillRect(tX - 1, y - 1, 2, bh + 2);
+        }
+        const thX = hkGX + hkGW * (thresh / maxCount);
+        if (thX >= hkGX && thX <= hkGX + hkGW) { g.fillStyle = rgbaq(RED_RGB, 0.7); for (let y = hkGY; y < hkGY + hkGH; y += 6) g.fillRect(thX - 1, y, 2, 3); }
+    }
+    function hkWitDraw(g, w, h) {
+        if (!g) return; g.clearRect(0, 0, w, h);
+        const recall = hkWorld.flat[H_RECALL];
+        const barX = 6, barW = w - 12, barH = 22, y = h * 0.5 - barH * 0.5;
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y, barW, barH);
+        const full = recall >= 0.9999;
+        g.fillStyle = full ? rgbaq(GREEN_RGB, 0.9) : rgbaq(RED_RGB, 0.9);
+        g.fillRect(barX, y, barW * recall, barH);
+        g.fillStyle = rgbaq(GREEN_RGB, 0.7); g.fillRect(barX + barW - 1, y - 4, 2, barH + 8);
+    }
+    const hkDom = { big: $('hk-recall-big'), aS: $('hk-alloc-sketch'), aO: $('hk-alloc-oracle'), recall: $('hk-recall'), truehh: $('hk-truehh'), size: $('hk-size'), maxover: $('hk-maxover'), bracket: $('hk-bracket'), marquee: $('hk-marquee'), skb: $('hk-sketch-kb'), mkb: $('hk-map-kb'), fps: $('hk-fps'), heap: $('hk-heap'), mem: $('hk-mem'), hkerr: $('hk-hkerr'), sserr: $('hk-sserr') };
+    let hkHeap = -1;
+    function hkTick() {
+        renderHkPrep(hkWorld, hkAlloc);
+        const f = hkWorld.flat;
+        const recall = f[H_RECALL];
+        hkDom.big.textContent = (recall * 100).toFixed(0) + '%';
+        hkDom.recall.textContent = (recall * 100).toFixed(1) + '%'; hkDom.recall.className = recall >= 0.9999 ? 'v inband' : 'v outband';
+        hkDom.truehh.textContent = String(f[H_TRUEHH] | 0);
+        hkDom.size.textContent = String(f[H_SIZE] | 0) + ' / ' + String(f[H_K] | 0);
+        const mo = f[H_MAXOVER] | 0; hkDom.maxover.textContent = String(mo); hkDom.maxover.className = mo === 0 ? 'v inband' : 'v outband';
+        const bok = f[H_BRACKETOK] === 1; hkDom.bracket.textContent = bok ? 'yes' : 'NO'; hkDom.bracket.className = bok ? 'v inband' : 'v outband';
+        const won = f[H_MARQUEEOK] === 1;
+        hkDom.marquee.textContent = (f[H_HKERR] * 100).toFixed(2) + '% vs ' + (f[H_SSERR] * 100).toFixed(2) + '%';
+        hkDom.marquee.className = won ? 'v inband' : 'v';
+        hkDom.hkerr.textContent = (f[H_HKERR] * 100).toFixed(2) + '%';
+        hkDom.sserr.textContent = (f[H_SSERR] * 100).toFixed(2) + '%';
+        hkDom.skb.textContent = (f[H_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        hkDom.mkb.textContent = (f[H_MAP_BYTES] / 1024).toFixed(1) + ' KB';
+        hkDom.aS.textContent = String(f[H_SKETCH_ALLOC] | 0);
+        hkDom.aO.textContent = String(f[H_ORACLE_ALLOC]);
+        hkDom.fps.textContent = String(fpsValue);
+        hkHeap = heapText(hkDom.heap, hkHeap);
+    }
+    wireToggle('hk-mode-toggle', 'hk-mode-label', 'running (allocates)', 'paused (sketch only)', (on) => { hkOracleOn = on; });
+    function hkRebuild() { hkWorld = createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, hkK, 0x243f6a88); hkAlloc.sketchCount = 0; hkAlloc.oracleCount = 0; hkDom.mem.textContent = (hkWorld.hk.bytes / 1024).toFixed(1) + ' KB'; hkLayout(); }
+    $('hk-k').addEventListener('input', (e) => { hkK = +e.target.value; $('hk-k-v').textContent = String(hkK); hkRebuild(); });
+
+    // ---- main loop ---------------------------------------------------------------------
+    function loop(now) {
+        const dt = now - lastTs; lastTs = now;
+        DT[dtPtr] = dt; dtPtr = (dtPtr + 1) & DT_MASK;
+        fpsFrames++;
+        if (now - fpsLast >= 500) { fpsValue = Math.round(fpsFrames * 1000 / (now - fpsLast)); fpsLast = now; fpsFrames = 0; }
+
+        if (activeScene === 'eh') { if (!paused) ehStep(); ehDraw(); drawJank(ehJankCtx, EJW, EJH); ehWitDraw(ehWitCtx, EWW, EWH); drawSpaceBars(ehSpCtx, ESW, ESH, ehWorld.flat[E_SKETCH_BYTES], ehWorld.flat[E_RING_BYTES]); }
+        else if (activeScene === 'ad') { if (!paused) adStep(); adDraw(); drawJank(adJankCtx, AJW, AJH); adWitDraw(adWitCtx, AWW, AWH); drawSpaceBars(adSpCtx, ASW, ASH, adWorld.flat[A_SKETCH_BYTES], adWorld.flat[A_ORACLE_BYTES]); }
+        else if (activeScene === 'fd') { if (!paused) fdStep(); fdDraw(); drawJank(fdJankCtx, FJW, FJH); fdWitDraw(fdWitCtx, FWW, FWH); drawSpaceBars(fdSpCtx, FSW, FSH, fdWorld.flat[D_SKETCH_BYTES], fdWorld.flat[D_ARR_BYTES]); }
+        else if (activeScene === 'hk') { if (!paused) hkStep(); hkDraw(); drawJank(hkJankCtx, HJW, HJH); hkWitDraw(hkWitCtx, HWW, HWH); drawSpaceBars(hkSpCtx, HSW, HSH, hkWorld.flat[H_SKETCH_BYTES], hkWorld.flat[H_MAP_BYTES]); }
+
+        frameN++;
+        if ((frameN & 7) === 0) {
+            if (activeScene === 'eh') ehTick();
+            else if (activeScene === 'ad') adTick();
+            else if (activeScene === 'fd') fdTick();
+            else if (activeScene === 'hk') hkTick();
+        }
+        requestAnimationFrame(loop);
+    }
+
+    // ---- tabs --------------------------------------------------------------------------
+    let activeScene = 'eh';
+    const scenes = document.querySelectorAll('.scene');
+    const tabButtons = document.querySelectorAll('#tabs button');
+    function activate(tab) {
+        for (let i = 0; i < scenes.length; i++) { const on = scenes[i].getAttribute('data-scene') === tab; if (on) scenes[i].setAttribute('data-active', ''); else scenes[i].removeAttribute('data-active'); }
+        for (let i = 0; i < tabButtons.length; i++) tabButtons[i].setAttribute('aria-current', tabButtons[i].getAttribute('data-tab') === tab ? 'true' : 'false');
+        activeScene = tab;
+        if (tab === 'eh') { ehLayout(); ehPanels(); }
+        else if (tab === 'ad') { adLayout(); adPanels(); }
+        else if (tab === 'fd') { fdLayout(); fdPanels(); }
+        else if (tab === 'hk') { hkLayout(); hkPanels(); }
+    }
+    for (let i = 0; i < tabButtons.length; i++) tabButtons[i].addEventListener('click', () => activate(tabButtons[i].getAttribute('data-tab')));
+
+    window.addEventListener('resize', () => {
+        if (activeScene === 'eh') { ehLayout(); ehPanels(); }
+        else if (activeScene === 'ad') { adLayout(); adPanels(); }
+        else if (activeScene === 'fd') { fdLayout(); fdPanels(); }
+        else if (activeScene === 'hk') { hkLayout(); hkPanels(); }
+    });
+
+    window.addEventListener('keydown', (e) => {
+        if (e.key === '1') activate('eh');
+        else if (e.key === '2') activate('ad');
+        else if (e.key === '3') activate('fd');
+        else if (e.key === '4') activate('hk');
+        else if (e.key === ' ' && e.target === document.body) { e.preventDefault(); setPaused(!paused); }
+    });
+
+    // ---- boot (initial UI hooked from the built worlds, never hardcoded in HTML) --------
+    ehDom.mem.textContent = (ehWorld.eh.capacity * EH_BUCKET_BYTES / 1024).toFixed(1) + ' KB';
+    adDom.mem.textContent = (adWorld.ad.capacity * 32 / 1024).toFixed(1) + ' KB';
+    fdDom.mem.textContent = (0.056).toFixed(3) + ' KB';
+    hkDom.mem.textContent = (hkWorld.hk.bytes / 1024).toFixed(1) + ' KB';
+    ehLayout(); ehPanels();
+    requestAnimationFrame(loop);
+</script>
+</body>
+</html>
