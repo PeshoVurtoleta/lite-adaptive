@@ -14,7 +14,12 @@
 //      in-tab exact oracle (a ring / a Map / a brute-force decayed recompute) -- never hardcoded.
 // ASCII-only per suite law ("->", "<=", "x" -- never Unicode).
 
-import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, VERSION } from '../Adaptive.js';
+import {
+    ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper,
+    SlidingHyperLogLog, DriftDetector, DRIFT_PH, DRIFT_CUSUM,
+    SlidingDDSketch, SlidingCountMin, DecayedReservoir,
+    VERSION,
+} from '../Adaptive.js';
 
 // Re-export the SHIPPED VERSION so index.html and Demo.test.mjs read the one true source
 // (never a hardcoded string -- the version-trinity test in Demo.test.mjs gates this).
@@ -113,7 +118,7 @@ export function createEhWorld(W, epsilon, seed) {
     const s = (seed === undefined || seed === null) ? EH_DEFAULT_SEED : (seed >>> 0);
     const eh = new ExponentialHistogram(W, epsilon);   // throws [lite-adaptive] on a bad W/epsilon
     const world = {
-        eh, W, epsilon, seed: s,
+        eh, W, epsilon, seed: s, paused: false,
         gaps: new Float64Array(EH_STREAM_LEN),
         streamMask: EH_STREAM_LEN - 1,
         cursor: 0, frameStart: 0, frameCount: 0, frameNowStart: 0, now: 0, sink: 0,
@@ -136,6 +141,14 @@ export function createEhWorld(W, epsilon, seed) {
  * @returns {number} an int32 fold (so the loop is never dead-code-eliminated).
  */
 export function stepEh(world) {
+    if (world.paused) {
+        // idle-slide: NO add -- advance the clock so the windowed count slides to empty. 0 B/op.
+        const now = world.now + world.arrivalsPerFrame;
+        world.packed[0] = now;
+        world.eh.advanceFrom(world.packed, 0);
+        world.now = now; world.frameNowStart = now; world.frameCount = 0;
+        return 0;
+    }
     const gaps = world.gaps, mask = world.streamMask, eh = world.eh, apf = world.arrivalsPerFrame;
     const packed = world.packed;
     let pos = world.cursor, now = world.now;
@@ -832,4 +845,893 @@ export function renderHkPrep(world, allocState) {
     flat[H_SKETCH_ALLOC] = allocState.sketchCount;
     flat[H_ORACLE_ALLOC] = allocState.oracleCount;
     return recall;
+}
+
+// =======================================================================================
+// Scene 05 -- SlidingHyperLogLog (windowed distinct-count)
+// =======================================================================================
+
+/** Pre-generated key-stream length (pow2). */
+export const SHLL_STREAM_LEN = 1 << 16;
+/** Keys fed to the window per rAF frame. */
+export const SHLL_KEYS_PER_FRAME = 64;
+/** Default window span W (in `now` units), precision p, and per-register ring capacity. */
+export const SHLL_DEFAULT_W = 4096;
+export const SHLL_DEFAULT_P = 11;         // m = 2^11 = 2048 registers -> standardError ~ 2.3%
+export const SHLL_DEFAULT_RINGCAP = 16;
+/** Default stream + hash seed. */
+export const SHLL_DEFAULT_SEED = 0x51ec1a11;
+/** The distinct-key universe the stream cycles over (2*W-ish so the window holds ~W distinct). */
+export const SHLL_UNIVERSE = 1 << 13;      // 8192
+/** Exact-oracle ring capacity (pow2) -- MUST exceed W so per-frame expiry keeps it un-full. */
+export const SHLL_RING_LEN = 1 << 14;      // 16384 > any slider W
+/** The 3-sigma gate multiplier the witness applies (rel <= 3 * standardError). */
+export const SHLL_SIGMA_MULT = 3;
+
+export const S_EST = 0;          // sl.count() -- the windowed distinct estimate
+export const S_TRUE = 1;         // exact in-window distinct (oracle Map size)
+export const S_RELERR = 2;       // |est - true| / true
+export const S_GATE = 3;         // 3 * standardError (the theoretical band)
+export const S_FRAC = 4;         // relerr / gate -- the accuracy cursor (must stay <= 1)
+export const S_M = 5;            // register count m
+export const S_W = 6;            // window span W
+export const S_DEGRADED = 7;     // 1 if a ring overflowed (the accuracy bound no longer guaranteed)
+export const S_OVERFLOWS = 8;    // ring-overflow count
+export const S_N = 9;            // total adds
+export const S_SKETCH_BYTES = 10;// sl.bytes (fixed)
+export const S_ORACLE_BYTES = 11;// map.size*MAP_BYTES_PER_ENTRY + ring bytes (O(in-window))
+export const S_NOW = 12;         // the current monotone now
+export const S_SKETCH_ALLOC = 13;
+export const S_ORACLE_ALLOC = 14;
+export const SHLL_FLAT_LEN = 15;
+
+/** Fill the reused key stream: a deterministic spread over SHLL_UNIVERSE (one key per tick). */
+function fillShllStream(world) {
+    const stream = world.stream, len = stream.length, U = SHLL_UNIVERSE;
+    const rng = makeRng(world.seed);
+    for (let i = 0; i < len; i++) stream[i] = (rng() * U) | 0;
+}
+
+/**
+ * Build the Scene-05 world ONCE. The REAL SlidingHyperLogLog, an exact windowed-distinct oracle
+ * (a Map<key,count> + a preallocated (t, key) ring), the reused key stream, and the flat buffer.
+ * Fails closed on a bad W / p / ringCap / seed via the SlidingHyperLogLog ctor guard.
+ * @param {number} W        window span (finite > 0).
+ * @param {number} p        precision (register count 2^p).
+ * @param {number} ringCap  per-register LFPM ring capacity.
+ * @param {number} [seed]   uint32 stream + hash seed.
+ */
+export function createShllWorld(W, p, ringCap, seed) {
+    const s = (seed === undefined || seed === null) ? SHLL_DEFAULT_SEED : (seed >>> 0);
+    const sl = new SlidingHyperLogLog(W, { p, ringCap, seed: s });   // throws [lite-adaptive] on bad args
+    const world = {
+        sl, W, p, ringCap, seed: s, paused: false,
+        stream: new Uint32Array(SHLL_STREAM_LEN),
+        streamMask: SHLL_STREAM_LEN - 1,
+        cursor: 0, frameStart: 0, frameCount: 0, frameNowStart: 0, now: 0, n: 0, sink: 0,
+        keysPerFrame: SHLL_KEYS_PER_FRAME,
+        packed: new Float64Array(2),                   // [now, key] scratch for addFrom (reused)
+        oMap: new Map(),                               // exact in-window distinct (allocates on new keys)
+        oT: new Float64Array(SHLL_RING_LEN),           // in-window arrival times (ring)
+        oKey: new Float64Array(SHLL_RING_LEN),         // in-window keys (ring)
+        oMask: SHLL_RING_LEN - 1, oHead: 0, oTail: 0,
+        flat: new Float64Array(SHLL_FLAT_LEN),
+    };
+    fillShllStream(world);
+    return world;
+}
+
+/**
+ * One SKETCH-path frame: advance the monotone clock and feed `keysPerFrame` keys UNBOXED to the REAL
+ * SlidingHyperLogLog.addFrom (0 B/op incl. the windowed LFPM eviction). While paused, idle-slides via
+ * advanceFrom (NO add) so the windowed distinct count slides to empty. 0 B/op.
+ * @param {object} world
+ * @returns {number} an int32 fold (defeat DCE).
+ */
+export function stepShll(world) {
+    if (world.paused) {
+        const now = world.now + world.keysPerFrame;
+        world.packed[0] = now;
+        world.sl.advanceFrom(world.packed, 0);
+        world.now = now; world.frameNowStart = now; world.frameCount = 0;
+        return 0;
+    }
+    const stream = world.stream, mask = world.streamMask, sl = world.sl, kpf = world.keysPerFrame;
+    const packed = world.packed;
+    let pos = world.cursor, now = world.now;
+    world.frameStart = pos & mask;
+    world.frameNowStart = now;
+    let sink = 0;
+    for (let i = 0; i < kpf; i++) {
+        now = now + 1;
+        packed[0] = now; packed[1] = stream[pos & mask];
+        sl.addFrom(packed, 0);
+        sink = (sink + (now | 0)) | 0;
+        pos = pos + 1;
+    }
+    world.cursor = pos & 0x3fffffff;
+    world.now = now; world.frameCount = kpf;
+    world.sink = (world.sink + sink) | 0;
+    return sink;
+}
+
+/**
+ * One EXACT-ORACLE frame: replay the frame's keys into the exact windowed-distinct Map (a genuinely
+ * NEW distinct-in-window key allocates a Map entry -- the climbing contrast) + the (t, key) ring, then
+ * expire entries older than now - W (decrementing / deleting the Map). Returns the in-window distinct
+ * count (Map size). The ring is preallocated (sized > W so it never fills before expiry). 0 B/op
+ * except a genuine new-distinct-key Map insert.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} the exact in-window distinct count.
+ */
+export function stepShllOracle(world, allocState) {
+    const stream = world.stream, mask = world.streamMask, map = world.oMap;
+    const oT = world.oT, oKey = world.oKey, omask = world.oMask, W = world.W;
+    const start = world.frameStart, count = world.frameCount;
+    let now = world.frameNowStart, head = world.oHead, tail = world.oTail;
+    for (let i = 0; i < count; i++) {
+        now = now + 1;
+        const key = stream[(start + i) & mask];
+        oT[tail] = now; oKey[tail] = key; tail = (tail + 1) & omask;
+        const c = map.get(key);
+        if (c === undefined) { map.set(key, 1); allocState.oracleCount++; }   // a new distinct-in-window entry
+        else map.set(key, c + 1);
+    }
+    const cutoff = now - W;
+    while (head !== tail && oT[head] <= cutoff) {
+        const k = oKey[head];
+        const c = map.get(k);
+        if (c === 1) map.delete(k); else map.set(k, c - 1);
+        head = (head + 1) & omask;
+    }
+    world.oHead = head; world.oTail = tail;
+    world.n = (world.n + count) | 0;
+    return map.size;
+}
+
+/**
+ * Render-prep (~10Hz): re-derive every displayed SlidingHyperLogLog number LIVE from the shipped
+ * instance vs the exact windowed-distinct Map. sl.count() is O(m) 0-alloc; map.size is O(1). 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} the windowed distinct estimate (folded).
+ */
+export function renderShllPrep(world, allocState) {
+    const sl = world.sl, flat = world.flat, map = world.oMap;
+    const est = sl.count();
+    const trueD = map.size;
+    const relerr = trueD > 0 ? Math.abs(est - trueD) / trueD : 0;
+    const gate = SHLL_SIGMA_MULT * sl.standardError;
+    const live = (world.oTail - world.oHead) & world.oMask;
+    flat[S_EST] = est;
+    flat[S_TRUE] = trueD;
+    flat[S_RELERR] = relerr;
+    flat[S_GATE] = gate;
+    flat[S_FRAC] = gate > 0 ? relerr / gate : 0;
+    flat[S_M] = sl.m;
+    flat[S_W] = sl.W;
+    flat[S_DEGRADED] = sl.degraded ? 1 : 0;
+    flat[S_OVERFLOWS] = sl.overflows;
+    flat[S_N] = world.n;
+    flat[S_SKETCH_BYTES] = sl.bytes;
+    flat[S_ORACLE_BYTES] = trueD * MAP_BYTES_PER_ENTRY + live * (BYTES_PER_F64 * 2);
+    flat[S_NOW] = world.now;
+    flat[S_SKETCH_ALLOC] = allocState.sketchCount;
+    flat[S_ORACLE_ALLOC] = allocState.oracleCount;
+    return est;
+}
+
+// =======================================================================================
+// Scene 06 -- DriftDetector (scalar Page-Hinkley vs CUSUM change detection)
+// =======================================================================================
+
+/** Pre-generated value-stream length (pow2). */
+export const DD_STREAM_LEN = 1 << 16;
+/** Values fed per rAF frame. */
+export const DD_VALUES_PER_FRAME = 32;
+/** Default magnitude allowance (delta) and decision level (threshold). */
+export const DD_DEFAULT_DELTA = 0.005;
+export const DD_DEFAULT_THRESHOLD = 5;
+/** Regime length (items per stationary segment). The stream steps between two means at each boundary. */
+export const DD_REGIME = 6000;
+/** The two regime means the stream alternates between (the CUSUM target is the LO mean). */
+export const DD_MEAN_LO = 0.0;
+export const DD_MEAN_HI = 1.0;
+/** The fixed CUSUM in-control target mu0 (= the LO baseline). */
+export const DD_TARGET = 0.0;
+/** Uniform noise half-width (matches the witness ddDetect noise band). */
+export const DD_NOISE = 0.2;
+/** Internal (non-parameterized) stream seed -- DriftDetector itself has NO seed. */
+const DD_STREAM_SEED = 0x0dd15ea5;
+
+export const G_PH_STAT = 0;      // ph.statistic
+export const G_PH_THRESH = 1;    // ph.threshold
+export const G_PH_FRAC = 2;      // ph.statistic / ph.threshold (fire cursor)
+export const G_CU_STAT = 3;      // cu.statistic
+export const G_CU_THRESH = 4;    // cu.threshold
+export const G_CU_FRAC = 5;      // cu.statistic / cu.threshold
+export const G_PH_FIRES = 6;     // total PH fires
+export const G_CU_FIRES = 7;     // total CUSUM fires
+export const G_PH_FIRED = 8;     // 1 if PH fired this frame
+export const G_CU_FIRED = 9;     // 1 if CUSUM fired this frame
+export const G_TRUEMEAN = 10;    // current regime mean (ground truth)
+export const G_PH_MEAN = 11;     // ph.mean (online running mean)
+export const G_CU_MEAN = 12;     // cu.mean
+export const G_N = 13;           // items seen
+export const G_CP = 14;          // ground-truth changepoints crossed
+export const G_SKETCH_BYTES = 15;// both detectors' fixed scalar state
+export const G_ORACLE_BYTES = 16;// N*8 -- exact detection retains O(N) values
+export const G_SKETCH_ALLOC = 17;
+export const G_ORACLE_ALLOC = 18;
+export const DD_FLAT_LEN = 19;
+
+/** Fixed scalar footprint of the two detectors (both share the tiny O(1)-state class). */
+export const DD_SKETCH_BYTES = 128;
+
+/** The regime mean for a buffer index: alternates LO / HI every DD_REGIME items. */
+function ddRegimeMean(bufIdx) {
+    return ((((bufIdx / DD_REGIME) | 0) & 1) ? DD_MEAN_HI : DD_MEAN_LO);
+}
+
+/** Fill the reused value stream: regime mean + tight uniform noise. Warmup / topology only. */
+function fillDdStream(world) {
+    const stream = world.stream, len = stream.length;
+    const rng = makeRng(DD_STREAM_SEED);
+    for (let i = 0; i < len; i++) stream[i] = ddRegimeMean(i) + (rng() - 0.5) * (2 * DD_NOISE);
+}
+
+/**
+ * Build the Scene-06 world ONCE. TWO REAL DriftDetectors -- Page-Hinkley (adaptive online mean) and
+ * CUSUM (fixed target mu0) -- fed the SAME signal, plus a fixed-noise regime-stepping stream (the
+ * injected changepoints are the ground truth). Fails closed on a bad delta / threshold via the ctor.
+ * @param {number} delta      magnitude allowance (>= 0).
+ * @param {number} threshold  decision level (> 0).
+ */
+export function createDdWorld(delta, threshold) {
+    const ph = new DriftDetector(DRIFT_PH, { delta, threshold });                 // throws on bad args
+    const cu = new DriftDetector(DRIFT_CUSUM, { delta, threshold, target: DD_TARGET });
+    const world = {
+        ph, cu, delta, threshold,
+        stream: new Float64Array(DD_STREAM_LEN),
+        streamMask: DD_STREAM_LEN - 1,
+        cursor: 0, frameStart: 0, frameCount: 0, sink: 0,
+        valuesPerFrame: DD_VALUES_PER_FRAME,
+        n: 0, phFires: 0, cuFires: 0, phFired: 0, cuFired: 0, cp: 0, curMu: DD_MEAN_LO,
+        flat: new Float64Array(DD_FLAT_LEN),
+    };
+    fillDdStream(world);
+    return world;
+}
+
+/**
+ * One SKETCH-path frame: feed `valuesPerFrame` values UNBOXED to BOTH detectors' addFrom (0 B/op),
+ * counting fires per channel + ground-truth changepoints crossed this frame. 0 B/op.
+ * @param {object} world
+ * @returns {number} an int32 fold (defeat DCE).
+ */
+export function stepDd(world) {
+    const stream = world.stream, mask = world.streamMask, ph = world.ph, cu = world.cu;
+    const vpf = world.valuesPerFrame;
+    let pos = world.cursor;
+    world.frameStart = pos & mask;
+    let sink = 0, phF = 0, cuF = 0, cp = 0, prevReg = ((world.n / DD_REGIME) | 0);
+    for (let i = 0; i < vpf; i++) {
+        const idx = pos & mask;
+        const reg = (((world.n + i) / DD_REGIME) | 0);
+        if (reg !== prevReg) { cp = 1; prevReg = reg; }
+        const pf = ph.addFrom(stream, idx);
+        const cf = cu.addFrom(stream, idx);
+        if (pf) { phF = 1; world.phFires = (world.phFires + 1) | 0; }
+        if (cf) { cuF = 1; world.cuFires = (world.cuFires + 1) | 0; }
+        sink = (sink + (pf ? 1 : 0) + (cf ? 1 : 0)) | 0;
+        pos = pos + 1;
+    }
+    world.cursor = pos & 0x3fffffff;
+    world.n = (world.n + vpf) | 0;
+    world.curMu = ddRegimeMean((pos - 1) & mask);
+    world.phFired = phF; world.cuFired = cuF;
+    if (cp) world.cp = (world.cp + 1) | 0;
+    world.frameCount = vpf;
+    world.sink = (world.sink + sink) | 0;
+    return sink;
+}
+
+/**
+ * One EXACT-ORACLE frame (the allowed-to-allocate-in-spirit contrast): exact drift detection must
+ * retain O(N) values to re-test any window; we bump the owned counter per value (the retained-values
+ * contrast) without keeping them (the point is that the sketch keeps only O(1) scalars). 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} total items seen.
+ */
+export function stepDdOracle(world, allocState) {
+    const count = world.frameCount;
+    for (let i = 0; i < count; i++) allocState.oracleCount++;   // a retained value exact detection keeps
+    return world.n;
+}
+
+/**
+ * Render-prep (~10Hz): re-derive every displayed DriftDetector number LIVE from BOTH shipped detectors.
+ * statistic / threshold / mean are O(1) 0-alloc getters. 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} the PH statistic (folded).
+ */
+export function renderDdPrep(world, allocState) {
+    const ph = world.ph, cu = world.cu, flat = world.flat;
+    const ps = ph.statistic, pt = ph.threshold, cs = cu.statistic, ct = cu.threshold;
+    flat[G_PH_STAT] = ps;
+    flat[G_PH_THRESH] = pt;
+    flat[G_PH_FRAC] = pt > 0 ? ps / pt : 0;
+    flat[G_CU_STAT] = cs;
+    flat[G_CU_THRESH] = ct;
+    flat[G_CU_FRAC] = ct > 0 ? cs / ct : 0;
+    flat[G_PH_FIRES] = world.phFires;
+    flat[G_CU_FIRES] = world.cuFires;
+    flat[G_PH_FIRED] = world.phFired;
+    flat[G_CU_FIRED] = world.cuFired;
+    flat[G_TRUEMEAN] = world.curMu;
+    flat[G_PH_MEAN] = ph.mean;
+    flat[G_CU_MEAN] = cu.mean;
+    flat[G_N] = world.n;
+    flat[G_CP] = world.cp;
+    flat[G_SKETCH_BYTES] = DD_SKETCH_BYTES;
+    flat[G_ORACLE_BYTES] = world.n * BYTES_PER_F64;
+    flat[G_SKETCH_ALLOC] = allocState.sketchCount;
+    flat[G_ORACLE_ALLOC] = allocState.oracleCount;
+    return ps;
+}
+
+// =======================================================================================
+// Scene 07 -- SlidingDDSketch (windowed relative-error quantiles)
+// =======================================================================================
+
+/** Pre-generated value-stream length (pow2). */
+export const SLD_STREAM_LEN = 1 << 16;
+/** Values fed per rAF frame. */
+export const SLD_VALUES_PER_FRAME = 32;
+/** Default window span W, relative-error target alpha, and pane-ring size B. */
+export const SLD_DEFAULT_W = 2048;
+export const SLD_DEFAULT_ALPHA = 0.02;
+export const SLD_DEFAULT_PANES = 32;
+/** Exact-oracle ring capacity (pow2) -- MUST exceed W + one pane so per-frame expiry keeps it un-full. */
+export const SLD_ORACLE_LEN = 1 << 13;     // 8192 > any slider W
+/** Internal (non-parameterized) value seed -- SlidingDDSketch has NO seed (no hash). */
+const SLD_STREAM_SEED = 0x5d5d5d5d;
+/** The value stream shifts its lognormal center at the midpoint of each buffer lap (recent-vs-old). */
+export const SLD_MU_LO = 1.0;
+export const SLD_MU_HI = 2.0;
+export const SLD_SIGMA = 0.55;
+
+export const Q_P50 = 0;          // sd.quantile(0.5)
+export const Q_P50T = 1;         // exact windowed p50 (oracle)
+export const Q_P90 = 2;
+export const Q_P90T = 3;
+export const Q_P99 = 4;
+export const Q_P99T = 5;
+export const Q_MAXREL = 6;       // max rel error over the three quantiles
+export const Q_ALPHA = 7;        // the alpha bound
+export const Q_FRAC = 8;         // maxrel / alpha (accuracy cursor, must stay <= 1)
+export const Q_COUNT = 9;        // sd.count() -- windowed value count
+export const Q_LIVE = 10;        // exact live pane-content count (oracle occupancy)
+export const Q_EDGE = 11;        // |live - min(N, W)| -- window-edge error (<= one pane width)
+export const Q_COLLAPSED = 12;   // 1 if any live pane folded mass into its collapsed floor
+export const Q_PANES = 13;
+export const Q_W = 14;
+export const Q_NOW = 15;
+export const Q_N = 16;
+export const Q_SKETCH_BYTES = 17;// sd.bytes (fixed)
+export const Q_ORACLE_BYTES = 18;// live * 16 ((t, value) pairs, O(W))
+export const Q_SKETCH_ALLOC = 19;
+export const Q_ORACLE_ALLOC = 20;
+export const SLD_FLAT_LEN = 21;
+
+/** The grid-pane end covering time `t` for pane width `pw` (matches test/witness.mjs sldPaneEnd). */
+function sldPaneEnd(t, pw) { return (Math.floor(t / pw) + 1) * pw; }
+
+/** The lognormal center for a buffer index: LO for the first half of each lap, HI for the second. */
+function sldMu(bufIdx, len) { return (bufIdx < (len >> 1)) ? SLD_MU_LO : SLD_MU_HI; }
+
+/** Fill the reused positive value stream (lognormal via Box-Muller). Warmup / topology only. */
+function fillSldStream(world) {
+    const vals = world.vals, len = vals.length;
+    const rng = makeRng(SLD_STREAM_SEED);
+    for (let i = 0; i < len; i++) {
+        let u1 = rng(); if (u1 < 1e-12) u1 = 1e-12;
+        const u2 = rng();
+        const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        vals[i] = Math.exp(sldMu(i, len) + SLD_SIGMA * z);   // strictly positive
+    }
+}
+
+/**
+ * Build the Scene-07 world ONCE. The REAL SlidingDDSketch, an exact windowed sorted-array oracle over
+ * the LIVE pane content (a preallocated (t, value) ring + a PREALLOCATED sort buffer -- insertion-sorted
+ * per query, NEVER .sort()/allocated), the reused value stream, and the flat buffer. Fails closed on a
+ * bad W / alpha / panes via the ctor guard.
+ * @param {number} W       window span (finite > 0).
+ * @param {number} alpha   relative-error target in (0, 1).
+ * @param {number} panes   pane-ring size B in [2, 1024].
+ */
+export function createSldWorld(W, alpha, panes) {
+    const sd = new SlidingDDSketch(W, { alpha, panes });   // throws [lite-adaptive] on bad args
+    const world = {
+        sd, W, alpha, panes, pw: W / panes, paused: false,
+        vals: new Float64Array(SLD_STREAM_LEN),
+        streamMask: SLD_STREAM_LEN - 1,
+        cursor: 0, frameStart: 0, frameCount: 0, frameNowStart: 0, now: 0, n: 0, sink: 0,
+        valuesPerFrame: SLD_VALUES_PER_FRAME,
+        packed: new Float64Array(2),                   // [now, value] scratch for addFrom (reused)
+        oT: new Float64Array(SLD_ORACLE_LEN),          // in-window arrival times (ring)
+        oV: new Float64Array(SLD_ORACLE_LEN),          // in-window values (ring)
+        oMask: SLD_ORACLE_LEN - 1, oHead: 0, oTail: 0,
+        sortBuf: new Float64Array(SLD_ORACLE_LEN),     // preallocated insertion-sort scratch (NO per-query alloc)
+        flat: new Float64Array(SLD_FLAT_LEN),
+    };
+    fillSldStream(world);
+    return world;
+}
+
+/**
+ * One SKETCH-path frame: advance the clock and feed `valuesPerFrame` (now, value) pairs to the REAL
+ * SlidingDDSketch.addFrom (0 B/op incl. pane rotation). While paused, idle-slides via advanceFrom (NO
+ * add) so the windowed quantiles slide to NaN. 0 B/op.
+ * @param {object} world
+ * @returns {number} an int32 fold (defeat DCE).
+ */
+export function stepSld(world) {
+    if (world.paused) {
+        const now = world.now + world.valuesPerFrame;
+        world.packed[0] = now;
+        world.sd.advanceFrom(world.packed, 0);
+        world.now = now; world.frameNowStart = now; world.frameCount = 0;
+        return 0;
+    }
+    const vals = world.vals, mask = world.streamMask, sd = world.sd, vpf = world.valuesPerFrame;
+    const packed = world.packed;
+    let pos = world.cursor, now = world.now;
+    world.frameStart = pos & mask;
+    world.frameNowStart = now;
+    let sink = 0;
+    for (let i = 0; i < vpf; i++) {
+        const idx = pos & mask;
+        now = now + 1;
+        packed[0] = now; packed[1] = vals[idx];
+        sd.addFrom(packed, 0);
+        sink = (sink + (now | 0)) | 0;
+        pos = pos + 1;
+    }
+    world.cursor = pos & 0x3fffffff;
+    world.now = now; world.frameCount = vpf;
+    world.sink = (world.sink + sink) | 0;
+    return sink;
+}
+
+/**
+ * One EXACT-ORACLE frame: replay the frame's values into the (t, value) ring (bumping the owned
+ * retained-samples counter -- the O(W) contrast) and expire entries whose grid pane has fallen out of
+ * the window (matching the sketch's physically-retained content EXACTLY, so the render's rel-error is
+ * purely bucket error). The ring is preallocated (sized > W). 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} the live oracle sample count.
+ */
+export function stepSldOracle(world, allocState) {
+    const vals = world.vals, mask = world.streamMask;
+    const start = world.frameStart, count = world.frameCount, W = world.W, pw = world.pw;
+    const oT = world.oT, oV = world.oV, omask = world.oMask;
+    let now = world.frameNowStart, head = world.oHead, tail = world.oTail;
+    for (let i = 0; i < count; i++) {
+        now = now + 1;
+        oT[tail] = now; oV[tail] = vals[(start + i) & mask]; tail = (tail + 1) & omask;
+        allocState.oracleCount++;                       // a retained sample the sketch refuses to keep
+    }
+    const liveCut = sldPaneEnd(now, pw) - W;
+    while (head !== tail && sldPaneEnd(oT[head], pw) <= liveCut) head = (head + 1) & omask;
+    world.oHead = head; world.oTail = tail;
+    world.n = (world.n + count) | 0;
+    return (tail - head) & omask;
+}
+
+/**
+ * Render-prep (~10Hz): re-derive every displayed SlidingDDSketch number LIVE from the shipped instance
+ * vs an exact sorted-array oracle over the LIVE pane content. The oracle scans the ring, insertion-sorts
+ * the live values into the PREALLOCATED sortBuf (0 alloc, NO .sort()), and reads the p50/p90/p99. The
+ * sd.quantile queries are COLD 0-alloc. 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} the windowed p50 (folded).
+ */
+export function renderSldPrep(world, allocState) {
+    const sd = world.sd, flat = world.flat, pw = world.pw, W = world.W;
+    const oT = world.oT, oV = world.oV, omask = world.oMask, sortBuf = world.sortBuf;
+    const liveCut = sldPaneEnd(world.now, pw) - W;
+    // insertion-sort the live pane content into the preallocated buffer (0 alloc).
+    let m = 0, i = world.oHead;
+    const tail = world.oTail;
+    while (i !== tail) {
+        if (sldPaneEnd(oT[i], pw) > liveCut) {
+            const v = oV[i];
+            let j = m - 1;
+            while (j >= 0 && sortBuf[j] > v) { sortBuf[j + 1] = sortBuf[j]; j--; }
+            sortBuf[j + 1] = v; m++;
+        }
+        i = (i + 1) & omask;
+    }
+    const p50e = sd.quantile(0.5), p90e = sd.quantile(0.9), p99e = sd.quantile(0.99);
+    let p50t = NaN, p90t = NaN, p99t = NaN, maxRel = 0;
+    if (m > 0) {
+        p50t = sortBuf[(0.5 * (m - 1)) | 0];
+        p90t = sortBuf[(0.9 * (m - 1)) | 0];
+        p99t = sortBuf[(0.99 * (m - 1)) | 0];
+        if (p50t > 0) { const r = Math.abs(p50e - p50t) / p50t; if (r > maxRel) maxRel = r; }
+        if (p90t > 0) { const r = Math.abs(p90e - p90t) / p90t; if (r > maxRel) maxRel = r; }
+        if (p99t > 0) { const r = Math.abs(p99e - p99t) / p99t; if (r > maxRel) maxRel = r; }
+    }
+    const cnt = sd.count();
+    const exactWin = world.n < W ? world.n : W;
+    flat[Q_P50] = p50e; flat[Q_P50T] = p50t;
+    flat[Q_P90] = p90e; flat[Q_P90T] = p90t;
+    flat[Q_P99] = p99e; flat[Q_P99T] = p99t;
+    flat[Q_MAXREL] = maxRel;
+    flat[Q_ALPHA] = sd.alpha;
+    flat[Q_FRAC] = sd.alpha > 0 ? maxRel / sd.alpha : 0;
+    flat[Q_COUNT] = cnt;
+    flat[Q_LIVE] = m;
+    flat[Q_EDGE] = Math.abs(m - exactWin);
+    flat[Q_COLLAPSED] = sd.collapsed ? 1 : 0;
+    flat[Q_PANES] = sd.panes;
+    flat[Q_W] = sd.W;
+    flat[Q_NOW] = world.now;
+    flat[Q_N] = world.n;
+    flat[Q_SKETCH_BYTES] = sd.bytes;
+    flat[Q_ORACLE_BYTES] = m * (BYTES_PER_F64 * 2);
+    flat[Q_SKETCH_ALLOC] = allocState.sketchCount;
+    flat[Q_ORACLE_ALLOC] = allocState.oracleCount;
+    return p50e;
+}
+
+// =======================================================================================
+// Scene 08 -- SlidingCountMin (windowed per-label frequency)
+// =======================================================================================
+
+/** Pre-generated key-stream length (pow2). */
+export const SCM_STREAM_LEN = 1 << 16;
+/** Keys fed per rAF frame (one now-tick per key). */
+export const SCM_KEYS_PER_FRAME = 64;
+/** Default window span W, relative-error target epsilon, and pane-ring size B. */
+export const SCM_DEFAULT_W = 2048;
+export const SCM_DEFAULT_EPS = 0.02;
+export const SCM_DEFAULT_PANES = 32;
+/** Default hash seed. */
+export const SCM_DEFAULT_SEED = 0x9e3779b1;
+/** Number of tracked keys drawn on the leaderboard (the hottest keys). */
+export const SCM_TRACKED = 4;
+/** The Zipfian key universe + skew for the stream. */
+export const SCM_UNIVERSE = 512;
+export const SCM_SKEW = 1.05;
+/** Exact-oracle ring capacity (pow2) -- MUST exceed W + one pane. */
+export const SCM_RING_LEN = 1 << 13;       // 8192 > any slider W
+/** Flat stride per tracked key: [est, true(W), upperBound]. */
+export const SCM_STRIDE = 3;
+
+// per-tracked-key slots occupy [0, SCM_TRACKED*SCM_STRIDE); est at i*3, true(W) at i*3+1, upper at i*3+2.
+export const C_BOUNDOK = SCM_TRACKED * SCM_STRIDE;     // 12: 1 if every tracked key's est is inside the one-sided band
+export const C_SATURATED = C_BOUNDOK + 1;              // saturated-increment count (honesty flag)
+export const C_NLIVE = C_BOUNDOK + 2;                  // live (windowed) item count
+export const C_N = C_BOUNDOK + 3;                      // total adds
+export const C_EPS = C_BOUNDOK + 4;                    // epsilon
+export const C_PANES = C_BOUNDOK + 5;
+export const C_W = C_BOUNDOK + 6;
+export const C_NOW = C_BOUNDOK + 7;
+export const C_SKETCH_BYTES = C_BOUNDOK + 8;           // scm.bytes (fixed)
+export const C_ORACLE_BYTES = C_BOUNDOK + 9;           // live * 16 ((t, key) pairs, O(W))
+export const C_SKETCH_ALLOC = C_BOUNDOK + 10;
+export const C_ORACLE_ALLOC = C_BOUNDOK + 11;
+export const SCM_FLAT_LEN = C_BOUNDOK + 12;
+
+/** The grid-pane end covering time `t` for pane width `pw` (matches the SlidingCountMin pane math). */
+function scmPaneEnd(t, pw) { return (Math.floor(t / pw) + 1) * pw; }
+
+/** Fill the reused Zipfian key stream (cached CDF). Warmup / topology only. */
+function fillScmStream(world) {
+    const stream = world.stream, len = stream.length, U = SCM_UNIVERSE, skew = world.skew;
+    const rng = makeRng(world.seed);
+    const cdf = new Float64Array(U);
+    let sum = 0;
+    for (let i = 0; i < U; i++) { sum += 1 / Math.pow(i + 1, skew); cdf[i] = sum; }
+    for (let i = 0; i < U; i++) cdf[i] /= sum;
+    for (let n = 0; n < len; n++) {
+        const u = rng();
+        let lo = 0, hi = U - 1;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (cdf[mid] < u) lo = mid + 1; else hi = mid; }
+        stream[n] = lo;
+    }
+}
+
+/**
+ * Build the Scene-08 world ONCE. The REAL SlidingCountMin, an exact per-key windowed (t, key) ring
+ * oracle, the reused Zipfian key stream, the tracked-key list (the hottest keys 0..SCM_TRACKED-1), and
+ * the flat buffer. Fails closed on a bad W / epsilon / panes / seed via the ctor guard.
+ * @param {number} W        window span (finite > 0).
+ * @param {number} epsilon  relative-error target in (0, 1).
+ * @param {number} panes    pane-ring size B in [2, 1024].
+ * @param {number} [seed]   uint32 hash seed.
+ */
+export function createScmWorld(W, epsilon, panes, seed) {
+    const s = (seed === undefined || seed === null) ? SCM_DEFAULT_SEED : (seed >>> 0);
+    const scm = new SlidingCountMin(W, { epsilon, panes, seed: s });   // throws [lite-adaptive] on bad args
+    const tracked = new Float64Array(SCM_TRACKED);
+    for (let i = 0; i < SCM_TRACKED; i++) tracked[i] = i;   // the hottest Zipfian keys
+    const world = {
+        scm, W, epsilon, panes, seed: s, pw: W / panes, paused: false,
+        skew: SCM_SKEW, tracked,
+        stream: new Uint32Array(SCM_STREAM_LEN),
+        streamMask: SCM_STREAM_LEN - 1,
+        cursor: 0, frameStart: 0, frameCount: 0, frameNowStart: 0, now: 0, n: 0, sink: 0,
+        keysPerFrame: SCM_KEYS_PER_FRAME,
+        packed: new Float64Array(3),                   // [now, key, count] scratch for addFrom (reused)
+        oT: new Float64Array(SCM_RING_LEN),            // in-window arrival times (ring)
+        oKey: new Float64Array(SCM_RING_LEN),          // in-window keys (ring)
+        oMask: SCM_RING_LEN - 1, oHead: 0, oTail: 0,
+        flat: new Float64Array(SCM_FLAT_LEN),
+    };
+    fillScmStream(world);
+    return world;
+}
+
+/**
+ * One SKETCH-path frame: advance the clock and feed `keysPerFrame` [now, key, 1] triples UNBOXED to
+ * the REAL SlidingCountMin.addFrom (amortized 0 B/op incl. pane rotate + clear). While paused,
+ * idle-slides via advanceFrom (NO add) so tracked-key estimates slide to 0. 0 B/op.
+ * @param {object} world
+ * @returns {number} an int32 fold (defeat DCE).
+ */
+export function stepScm(world) {
+    if (world.paused) {
+        const now = world.now + world.keysPerFrame;
+        world.packed[0] = now;
+        world.scm.advanceFrom(world.packed, 0);
+        world.now = now; world.frameNowStart = now; world.frameCount = 0;
+        return 0;
+    }
+    const stream = world.stream, mask = world.streamMask, scm = world.scm, kpf = world.keysPerFrame;
+    const packed = world.packed;
+    let pos = world.cursor, now = world.now;
+    world.frameStart = pos & mask;
+    world.frameNowStart = now;
+    let sink = 0;
+    for (let i = 0; i < kpf; i++) {
+        now = now + 1;
+        packed[0] = now; packed[1] = stream[pos & mask]; packed[2] = 1;
+        scm.addFrom(packed, 0);
+        sink = (sink + (now | 0)) | 0;
+        pos = pos + 1;
+    }
+    world.cursor = pos & 0x3fffffff;
+    world.now = now; world.frameCount = kpf;
+    world.sink = (world.sink + sink) | 0;
+    return sink;
+}
+
+/**
+ * One EXACT-ORACLE frame: replay the frame's keys into the (t, key) ring (bumping the owned counter --
+ * the O(W) retained-pairs contrast) and expire entries whose grid pane has fallen out of the window.
+ * The ring is preallocated (sized > W). 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} the live oracle sample count.
+ */
+export function stepScmOracle(world, allocState) {
+    const stream = world.stream, mask = world.streamMask;
+    const start = world.frameStart, count = world.frameCount, W = world.W, pw = world.pw;
+    const oT = world.oT, oKey = world.oKey, omask = world.oMask;
+    let now = world.frameNowStart, head = world.oHead, tail = world.oTail;
+    for (let i = 0; i < count; i++) {
+        now = now + 1;
+        oT[tail] = now; oKey[tail] = stream[(start + i) & mask]; tail = (tail + 1) & omask;
+        allocState.oracleCount++;                       // a retained (t, key) pair the sketch refuses
+    }
+    const liveCut = scmPaneEnd(now, pw) - W;
+    while (head !== tail && scmPaneEnd(oT[head], pw) <= liveCut) head = (head + 1) & omask;
+    world.oHead = head; world.oTail = tail;
+    world.n = (world.n + count) | 0;
+    return (tail - head) & omask;
+}
+
+/**
+ * Render-prep (~10Hz): re-derive every tracked key's shipped SlidingCountMin.estimate vs the EXACT
+ * one-sided band [true(W), true(W+W/B) + eps*N] computed from the (t, key) ring in ONE scan. Verifies
+ * the bound per tracked key. scm.estimate is COLD 0-alloc; the ring scan is 0-alloc. 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} tracked key 0's estimate (folded).
+ */
+export function renderScmPrep(world, allocState) {
+    const scm = world.scm, flat = world.flat, pw = world.pw, W = world.W, eps = world.epsilon;
+    const oT = world.oT, oKey = world.oKey, omask = world.oMask, tracked = world.tracked;
+    const now = world.now;
+    const liveThresh = scmPaneEnd(now, pw) - W;   // an add is LIVE iff paneEnd(t) >= this
+    const idealCut = now - W;                      // ideal window (now - W, now]
+    const nt = SCM_TRACKED;
+    // one scan over the live ring, bucketing per tracked key. trueIdeal / trueLive live in the flat slots.
+    let nLive = 0;
+    for (let k = 0; k < nt; k++) { flat[k * SCM_STRIDE + 1] = 0; flat[k * SCM_STRIDE + 2] = 0; }  // reuse +1/+2 as accumulators
+    let i = world.oHead;
+    const tail = world.oTail;
+    while (i !== tail) {
+        const pe = scmPaneEnd(oT[i], pw);
+        if (pe >= liveThresh) {
+            nLive++;
+            const key = oKey[i];
+            const ideal = oT[i] > idealCut ? 1 : 0;
+            for (let k = 0; k < nt; k++) {
+                if (tracked[k] === key) {
+                    if (ideal) flat[k * SCM_STRIDE + 1] += 1;   // true(W)
+                    flat[k * SCM_STRIDE + 2] += 1;              // trueLive (W + W/B)
+                    break;
+                }
+            }
+        }
+        i = (i + 1) & omask;
+    }
+    let boundOk = 1;
+    for (let k = 0; k < nt; k++) {
+        const est = scm.estimate(tracked[k]);
+        const trueW = flat[k * SCM_STRIDE + 1];
+        const trueLive = flat[k * SCM_STRIDE + 2];
+        const upper = trueLive + eps * nLive;
+        if (est < trueW - 1e-9 || est > upper + 1e-9) boundOk = 0;
+        flat[k * SCM_STRIDE] = est;
+        flat[k * SCM_STRIDE + 1] = trueW;
+        flat[k * SCM_STRIDE + 2] = upper;
+    }
+    flat[C_BOUNDOK] = boundOk;
+    flat[C_SATURATED] = scm.saturated;
+    flat[C_NLIVE] = nLive;
+    flat[C_N] = world.n;
+    flat[C_EPS] = eps;
+    flat[C_PANES] = scm.panes;
+    flat[C_W] = scm.W;
+    flat[C_NOW] = now;
+    flat[C_SKETCH_BYTES] = scm.bytes;
+    flat[C_ORACLE_BYTES] = nLive * (BYTES_PER_F64 * 2);
+    flat[C_SKETCH_ALLOC] = allocState.sketchCount;
+    flat[C_ORACLE_ALLOC] = allocState.oracleCount;
+    return flat[0];
+}
+
+// =======================================================================================
+// Scene 09 -- DecayedReservoir (recency-biased fixed-k sample)
+// =======================================================================================
+
+/** Pre-generated add-stream length (pow2). Values are the arrival timestamps (explicit mode). */
+export const DR_STREAM_LEN = 1 << 16;
+/** Adds fed per rAF frame (one now-tick per add). */
+export const DR_ADDS_PER_FRAME = 32;
+/** Default sample size k and decay half-life. */
+export const DR_DEFAULT_K = 24;
+export const DR_DEFAULT_HALFLIFE = 2048;
+/** Default PRNG seed. */
+export const DR_DEFAULT_SEED = 0x2545f491;
+/** Age-histogram bin count (the inclusion-by-age view). */
+export const DR_AGE_BINS = 32;
+/** The age span (in now-units) the histogram covers (~ a few half-lives). */
+export const DR_AGE_SPAN_MULT = 4;
+
+export const R_SIZE = 0;         // dr.size (retained values, <= k)
+export const R_K = 1;            // the sample size k
+export const R_MEANAGE = 2;      // mean age of the current sample (in now-units)
+export const R_NEWEST = 3;       // newest (smallest) age in the sample
+export const R_OLDEST = 4;       // oldest (largest) age in the sample
+export const R_RECENCYFRAC = 5;  // fraction of the sample younger than one half-life
+export const R_HALFLIFE = 6;     // decay half-life
+export const R_LAMBDA = 7;       // decay rate lambda
+export const R_N = 8;            // total adds
+export const R_SKETCH_BYTES = 9; // dr.bytes (fixed)
+export const R_ORACLE_BYTES = 10;// n*8 -- brute-force decayed sampling retains O(N)
+export const R_SKETCH_ALLOC = 11;
+export const R_ORACLE_ALLOC = 12;
+export const DR_FLAT_LEN = 13;
+
+/**
+ * Build the Scene-09 world ONCE. The REAL DecayedReservoir (EXPLICIT time; the stored value IS the
+ * arrival timestamp so age = now - value), a preallocated sample buffer + age histogram, and the
+ * flat buffer. Fails closed on a bad k / halfLife / seed via the ctor guard.
+ * @param {number} k         sample size (positive integer).
+ * @param {number} halfLife  decay half-life (finite > 0).
+ * @param {number} [seed]    uint32 PRNG seed.
+ */
+export function createDrWorld(k, halfLife, seed) {
+    const s = (seed === undefined || seed === null) ? DR_DEFAULT_SEED : (seed >>> 0);
+    const dr = new DecayedReservoir(k, halfLife, { seed: s });   // throws [lite-adaptive] on bad args
+    const world = {
+        dr, k, halfLife, lambda: Math.LN2 / halfLife, seed: s,
+        cursor: 0, frameCount: 0, now: 0, n: 0, sink: 0,
+        addsPerFrame: DR_ADDS_PER_FRAME,
+        packed: new Float64Array(2),                   // [now, value] scratch for addFrom (reused)
+        sampleBuf: new Float64Array(k),                // sampleInto target (reused)
+        ageHist: new Int32Array(DR_AGE_BINS),          // inclusion-by-age view (reused)
+        flat: new Float64Array(DR_FLAT_LEN),
+    };
+    return world;
+}
+
+/**
+ * One SKETCH-path frame: advance the clock and offer `addsPerFrame` (now, value=now) pairs to the REAL
+ * DecayedReservoir.addFrom (amortized 0 B/op incl. the PRNG draw + min-forest sift + landmark rebase).
+ * The stored value is the timestamp so the sample's recency is directly readable. 0 B/op.
+ * @param {object} world
+ * @returns {number} an int32 fold (defeat DCE).
+ */
+export function stepDr(world) {
+    const dr = world.dr, apf = world.addsPerFrame, packed = world.packed;
+    let now = world.now;
+    let sink = 0;
+    for (let i = 0; i < apf; i++) {
+        now = now + 1;
+        packed[0] = now; packed[1] = now;   // value = arrival timestamp
+        dr.addFrom(packed, 0);
+        sink = (sink + dr.size) | 0;
+    }
+    world.now = now; world.n = (world.n + apf) | 0; world.frameCount = apf;
+    world.sink = (world.sink + sink) | 0;
+    return sink;
+}
+
+/**
+ * One EXACT-ORACLE frame (the allowed-to-allocate-in-spirit contrast): an unbiased brute-force decayed
+ * sample would retain EVERY value and re-draw; we bump the owned counter per add (the O(N) retained
+ * contrast) -- the sketch keeps only k. 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} total adds.
+ */
+export function stepDrOracle(world, allocState) {
+    const count = world.frameCount;
+    for (let i = 0; i < count; i++) allocState.oracleCount++;   // a retained value brute-force sampling keeps
+    return world.n;
+}
+
+/**
+ * Render-prep (~10Hz): copy the current sample into the preallocated buffer (0 alloc), derive its age
+ * distribution (age = now - value) into the reused age histogram, and re-derive every displayed number
+ * LIVE from the shipped DecayedReservoir. sampleInto is 0-alloc; the histogram fill is 0-alloc. 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} the sample size (folded).
+ */
+export function renderDrPrep(world, allocState) {
+    const dr = world.dr, flat = world.flat, buf = world.sampleBuf, hist = world.ageHist;
+    const now = world.now, halfLife = world.halfLife;
+    const c = dr.sampleInto(buf);
+    const span = DR_AGE_SPAN_MULT * halfLife;
+    hist.fill(0);
+    let sumAge = 0, newest = Infinity, oldest = 0, recent = 0;
+    for (let i = 0; i < c; i++) {
+        let age = now - buf[i]; if (age < 0) age = 0;
+        sumAge += age;
+        if (age < newest) newest = age;
+        if (age > oldest) oldest = age;
+        if (age < halfLife) recent++;
+        let b = span > 0 ? ((age / span) * DR_AGE_BINS) | 0 : 0;
+        if (b < 0) b = 0; else if (b >= DR_AGE_BINS) b = DR_AGE_BINS - 1;
+        hist[b]++;
+    }
+    if (c === 0) newest = 0;
+    flat[R_SIZE] = c;
+    flat[R_K] = dr.k;
+    flat[R_MEANAGE] = c > 0 ? sumAge / c : 0;
+    flat[R_NEWEST] = newest;
+    flat[R_OLDEST] = oldest;
+    flat[R_RECENCYFRAC] = c > 0 ? recent / c : 0;
+    flat[R_HALFLIFE] = dr.halfLife;
+    flat[R_LAMBDA] = dr.lambda;
+    flat[R_N] = world.n;
+    flat[R_SKETCH_BYTES] = dr.bytes;
+    flat[R_ORACLE_BYTES] = world.n * BYTES_PER_F64;
+    flat[R_SKETCH_ALLOC] = allocState.sketchCount;
+    flat[R_ORACLE_ALLOC] = allocState.oracleCount;
+    return c;
 }

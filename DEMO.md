@@ -54,7 +54,7 @@ identity.
 
 ---
 
-## 2. Roster -> scene map (all 4 shipped members demoed)
+## 2. Roster -> scene map (all 9 shipped members demoed)
 
 One scene per member. Each scene streams a pre-generated stream (a reused typed
 array, no per-frame RNG alloc) into BOTH the member and a live exact oracle, and
@@ -68,6 +68,11 @@ gap (member fixed vs oracle growing).
 | 02 | **ADWIN** | has the stream CHANGED? | mean-over-time plot; window grows then SNAPS on drift | naive cumulative mean (never forgets) | false-alarm `<= delta`; adapted `|mean-mu| < 0.05` | cap*32 B fixed vs O(N) retained |
 | 03 | **ForwardDecay** | what is happening RECENTLY? | decay kernel curve; decayed vs cumulative mean | brute-force decayed recompute over recent (t,v) | EXACT `relerr <= 1e-9` (modulo FP) | two scalars fixed vs samples O(W) |
 | 04 | **HeavyKeeper** | which few keys dominate NOW? | k-counter top-k leaderboard | exact `Map` + faithful Space-Saving | recall 100% > N/k; `[true - N/w, true]` | hk.bytes fixed vs Map O(distinct) |
+| 05 | **SlidingHyperLogLog** | how many DISTINCT in the last W? | windowed distinct-over-time (est vs exact) line | exact in-window `Map<key,count>` + (t,key) ring | `relerr <= 3 * 1.04/sqrt(m)`; not degraded | sl.bytes fixed vs Map O(distinct) |
+| 06 | **DriftDetector** | has this SIGNAL shifted? | ONE signal, TWO channels (PH vs CUSUM) + fire markers | injected changepoints (ground truth); O(N) retained foil | mode load-bearing: PH fires << CUSUM on a ramp | two scalars fixed vs O(N) retained |
+| 07 | **SlidingDDSketch** | what are the last-W QUANTILES? | log-bin p50/p90/p99 bars + alpha band | exact sorted-array over live pane content (PREALLOCATED buffer, no `.sort()`) | `relerr <= alpha`; edge `<= W/panes` | sd.bytes fixed vs samples O(W) |
+| 08 | **SlidingCountMin** | how OFTEN did key k occur in the last W? | tracked-key est bars inside the one-sided band | exact per-key windowed (t,key) ring | `true(W) <= est <= true(W+W/B) + eps*N` | scm.bytes fixed vs ring O(W) |
+| 09 | **DecayedReservoir** | give me k RECENT items | the k-sample by AGE (recent = left) | brute-force decayed sampler (retains O(N)) | inclusion rate by age `~ exp(-lambda*age)` | dr.bytes fixed vs O(N) retained |
 
 ---
 
@@ -113,10 +118,70 @@ gap (member fixed vs oracle growing).
   rel-error is far BELOW a faithful Space-Saving baseline of the same size.
 - Slider: top-k `k` (drives the `N/k` threshold).
 
+### Scene 05 -- SlidingHyperLogLog (windowed distinct-count)
+- A key stream cycling over a fixed universe flies in via `addFrom([now, key])`; the
+  canvas scrolls the windowed DISTINCT estimate (violet) against the exact in-window
+  `Map` size (magenta). The register bank is a FIXED `m = 2^p`; the oracle keeps every
+  in-window key. Idle-slide toggle -> `advanceFrom` empties the window to 0.
+- **Bound band**: `relerr <= 3 sigma = 3 * 1.04/sqrt(m)` (reuse the `test/witness.mjs`
+  slDrive gate), and `degraded === false`; the cursor is `relerr / 3-sigma`, `<= 1`.
+- Sliders: window `W`, precision `p`. Pause-the-stream toggle (windowed member).
+
+### Scene 06 -- DriftDetector (Page-Hinkley vs CUSUM)
+- ONE regime-stepping signal feeds TWO O(1)-state detectors via `addFrom` -- Page-Hinkley
+  (references its ONLINE mean, adaptive) and CUSUM (references a FIXED `mu0`). The canvas
+  draws the signal, the two fire cursors (`statistic / threshold`), the fire line at 1.0,
+  and red fire markers. The injected changepoints are the ground truth.
+- **Bound band**: the mode is LOAD-BEARING (reuse the `test/witness.mjs` ddRampFires
+  divergence gate): on a slow mean ramp CUSUM fires far more than PH. Two witness gauges
+  (PH statistic/threshold, CUSUM statistic/threshold). NO pause toggle (item-indexed).
+- Sliders: `threshold`, `delta`.
+
+### Scene 07 -- SlidingDDSketch (windowed relative-error quantiles)
+- A positive lognormal stream (its center shifts each lap) flies in via
+  `addFrom([now, value])`; the canvas draws p50/p90/p99 as log-scaled bars -- estimate
+  (violet), the `+-alpha` band (amber), the exact quantile (magenta) inside it. The exact
+  oracle sorts the LIVE pane content into a PREALLOCATED buffer via insertion sort (NEVER
+  `.sort()` / never allocates per query -- the one oracle allowed to be alloc-free).
+- **Bound band**: `relerr <= alpha` per quantile (reuse the `test/witness.mjs` sldDrive
+  gate) and window-edge `<= one pane width W/panes`; cursor `relerr / alpha`, `<= 1`.
+- Sliders: window `W`, `alpha`. Pause-the-stream toggle (windowed member).
+
+### Scene 08 -- SlidingCountMin (windowed per-label frequency)
+- A Zipfian key stream flies in via `addFrom([now, key, count])`; the canvas draws a few
+  tracked (hot) keys, each an estimate bar inside the one-sided band `[true(W), true(W +
+  W/B) + eps*N]` (amber), the `true(W)` marker (magenta). The exact oracle keeps a
+  per-key windowed `(t, key)` ring.
+- **Bound band**: `true(W) <= est <= true(W + W/B) + eps*N` on 100% of tracked-key
+  queries (reuse the `test/witness.mjs` scmDrive one-sided gate); the saturated flag is
+  the honesty signal.
+- Sliders: window `W`, `epsilon`. Pause-the-stream toggle (windowed member).
+
+### Scene 09 -- DecayedReservoir (recency-biased fixed-k sample)
+- A stream flies in via `addFrom([now, value])` (value = the arrival timestamp, so age =
+  now - value); the canvas draws the k-sample as an AGE histogram (recent = left), its
+  mass leaning recent because retention decays `exp(-lambda*age)`. The brute-force oracle
+  would retain EVERY value; the sketch keeps only k real recent items.
+- **Bound band**: the inclusion rate by item age tracks `exp(-lambda*age)` -- the fitted
+  ln(rate)-vs-age slope equals `-lambda` within +-15% (reuse the `test/witness.mjs`
+  drReservoirSlope gate); the no-decay (huge half-life) control is REJECTED. NO pause
+  toggle (a sample, not a hard window -- it correctly holds its last decayed sample).
+- Sliders: sample size `k`, `halfLife`.
+
+### Pause the stream (idle-slide) -- the FOUR windowed scenes only
+Scenes 01 / 05 / 07 / 08 (ExponentialHistogram, SlidingHyperLogLog, SlidingDDSketch,
+SlidingCountMin) carry a per-scene "pause the stream" toggle that sets `world.paused`.
+While paused, `stepX` performs NO add: it advances the clock once per frame via the
+member's `advanceFrom([now], 0)` (R11 idle-slide, 0 B/op), so the readout slides to empty
+with no traffic -- count/distinct -> 0, quantile -> NaN, estimate -> 0. This is the
+demo's proof of the idle-slide contract. ADWIN / ForwardDecay / HeavyKeeper /
+DriftDetector / DecayedReservoir get NO such toggle (they are item-indexed or decay-based,
+not hard windows).
+
 ### Contrast (a cross-scene footer line)
-Four recency questions, four fixed-memory members, one theme: each trades a bounded,
-witnessed WINDOWED / DECAYED / DRIFT error for O(1) space where the exact oracle grows
-without bound.
+Nine recency questions, nine fixed-memory members, one theme: each trades a bounded,
+witnessed WINDOWED / DECAYED / DRIFT error for O(1)/O(k) space where the exact oracle
+grows without bound.
 
 ---
 
@@ -146,7 +211,7 @@ lite-sketch verbatim); item 4 is the lite-adaptive family witness.
 ## 5-6. Layout, interaction, zero-GC guardrails
 
 Verbatim from `../LiteSketch/DEMO.md` sections 5-6: header / tab nav / active scene /
-footer; number keys 1-4 switch scenes, space pauses; high-DPI canvas sized once on
+footer; number keys 1-9 switch scenes, space pauses; high-DPI canvas sized once on
 load + resize (the ONLY place canvas buffers reallocate). Pre-allocate all canvas /
 scratch buffers AND the pre-generated stream at warmup; the ONLY reallocation is on an
 explicit resize or a topology change (a new W / epsilon / delta / halfLife / k
@@ -160,20 +225,35 @@ ALLOCATES by contract -- the render path uses `topKInto` / `forEach` only. ASCII
 
 - **Faithfulness**: every value the demo displays as a library result is re-derived
   from the ACTUAL imported classes (`import { ExponentialHistogram, ADWIN,
-  ForwardDecay, HeavyKeeper, VERSION } from '../Adaptive.js'`), not hardcoded. The
-  displayed count / mean / estimate equal the library's on the same stream.
+  ForwardDecay, HeavyKeeper, SlidingHyperLogLog, DriftDetector, SlidingDDSketch,
+  SlidingCountMin, DecayedReservoir, VERSION } from '../Adaptive.js'`), not hardcoded.
+  The displayed count / mean / estimate / quantile / sample equal the library's on the
+  same stream.
 - **Witness faithfulness (reuse `test/witness.mjs` thresholds)**: EH `relerr <=
   epsilon`; ADWIN false-alarm `<= delta` + adapted `|mean - mu| < 0.05`; ForwardDecay
   `relerr <= 1e-9`; HeavyKeeper recall `1.0` + never overestimates + beats
-  Space-Saving on drift. The thresholds are mirrored with a citation, never loosened.
-- **Version trinity**: kernels.mjs VERSION === `Adaptive.js` VERSION ===
-  `package.json` version === `1.0.0`.
+  Space-Saving on drift; SlidingHyperLogLog `relerr <= 3 * 1.04/sqrt(m)` + not
+  degraded; DriftDetector mode-divergence (PH fires << CUSUM on a ramp); SlidingDDSketch
+  `relerr <= alpha` + edge `<= W/panes`; SlidingCountMin `true(W) <= est <= true(W+W/B)
+  + eps*N`; DecayedReservoir inclusion rate by age `~ exp(-lambda*age)`. The thresholds
+  are mirrored with a citation, never loosened.
+- **Version trinity (dynamic)**: kernels.mjs VERSION re-export === `Adaptive.js` VERSION
+  === `package.json` version, asserted as a three-way equality with NO hardcoded semver
+  literal (so a release bump can never leave the demo pinned to a stale version -- the
+  1.0.0-pin rot this update fixed).
 - **Zero-alloc gate**: every scene's `stepX` + `renderXPrep` measure 0 B/op
   (`measureAllocs`) and trigger 0 major GC over ~200k ops (`GcProfiler` + `checkNoGc`,
-  `maxMajor: 0`), mirroring `test/torture.mjs`. The oracle steps are the
+  `maxMajor: 0`), mirroring `test/torture.mjs`. A PAUSED `stepX` (the idle-slide
+  `advanceFrom` branch) is also measured at 0 B/op. The oracle steps are the
   allowed-to-allocate contrast and are kept OUT of the measured loop.
-- **Retention**: 50 clear()/refill cycles -- `hk.size` returns to 0, `eh.bucketCount`
-  stays `<= capacity`.
+- **Retention + idle-slide**: 50 clear()/refill cycles -- `hk.size` returns to 0,
+  `eh.bucketCount` stays `<= capacity`; and after pause cycles on the four windowed
+  scenes the readout slides to empty (`eh.count()` / `shll.count()` / `scm.estimate(k)`
+  -> 0, `sld.quantile(0.5)` -> NaN).
+- **`demo:check` in `verify`**: a fast lane (trinity + faithfulness + one alloc batch
+  per scene, skipping the 200k-frame GC lanes) runs as the last step of `npm run verify`,
+  so the demo can never silently rot behind a library release again. The full
+  `npm run demo` (with the GC lanes) stays a separate script.
 
 `demo/serve.mjs` provides `npm run demo:serve` (a static file server, no deps);
 `npm run demo` headless-runs the honesty suite. `files[]` UNCHANGED.
@@ -185,11 +265,15 @@ ALLOCATES by contract -- the render path uses `topKInto` / `forEach` only. ASCII
 - **Files** (all repo-only), the settled four-file `demo/` split identical to
   `../LiteSketch/demo/`: `index.html`, `kernels.mjs`, `Demo.test.mjs`, `serve.mjs`,
   plus this `DEMO.md`.
-- **package.json**: two scripts EXACTLY as the siblings spell them --
-  `"demo": "node --expose-gc --test demo/Demo.test.mjs"` and
-  `"demo:serve": "node demo/serve.mjs"`. `files[]` UNCHANGED (6 entries);
-  `npm pack --dry-run` still shows exactly 7 files with `demo/` absent. `Adaptive.js`
-  is NOT touched (the demo imports it, read-only); VERSION stays 1.0.0.
+- **package.json**: three demo scripts --
+  `"demo": "node --expose-gc --test demo/Demo.test.mjs"` (the full suite incl. the
+  200k-frame GC lanes), `"demo:check": "LITE_DEMO_FAST=1 node --expose-gc --test
+  demo/Demo.test.mjs"` (a fast lane -- trinity + faithfulness + one alloc batch per
+  scene, skipping the GC lanes), and `"demo:serve": "node demo/serve.mjs"`. `demo:check`
+  is appended to the `verify` chain so the demo can never silently rot behind a release.
+  `files[]` UNCHANGED (6 entries); `npm pack --dry-run` still shows exactly 7 files with
+  `demo/` absent. `Adaptive.js` is NOT touched (the demo imports it, read-only); the
+  library VERSION stays 1.6.0 (a demo update never bumps the library).
 - **Pipeline**: coder builds -> reviewer audits the diff for per-frame allocation AND
   fail-open metric lies (a band that can't be exceeded, a hardcoded error) -> qa
   proves faithfulness + witness + version-trinity + 0-B/op + non-vacuous. USER

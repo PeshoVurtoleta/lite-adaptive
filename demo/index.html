@@ -228,6 +228,11 @@
         <button data-tab="ad"><span class="scene-num">02</span>ADWIN</button>
         <button data-tab="fd"><span class="scene-num">03</span>ForwardDecay</button>
         <button data-tab="hk"><span class="scene-num">04</span>HeavyKeeper</button>
+        <button data-tab="shll"><span class="scene-num">05</span>SlidingHyperLogLog</button>
+        <button data-tab="dd"><span class="scene-num">06</span>DriftDetector</button>
+        <button data-tab="sld"><span class="scene-num">07</span>SlidingDDSketch</button>
+        <button data-tab="scm"><span class="scene-num">08</span>SlidingCountMin</button>
+        <button data-tab="dr"><span class="scene-num">09</span>DecayedReservoir</button>
     </nav>
 
     <main>
@@ -256,6 +261,14 @@
                 <section>
                     <h3>action</h3>
                     <div class="btn-row"><button class="btn" id="eh-pause">pause</button></div>
+                    <div class="toggle-row">
+                        <div class="toggle" id="eh-stream-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">pause the stream (idle-slide): <b id="eh-stream-label">streaming</b></span>
+                    </div>
+                    <p class="help-line">
+                        Pausing the STREAM stops adds but keeps advancing the clock via
+                        <code>advanceFrom</code> (0 B/op) -- the windowed count slides to 0 with no traffic.
+                    </p>
                 </section>
                 <section>
                     <h3>topology</h3>
@@ -570,6 +583,442 @@
                 </section>
             </aside>
         </section>
+
+        <!-- SCENE 05: SLIDINGHYPERLOGLOG -->
+        <section class="scene" data-scene="shll">
+            <div class="stage" id="shll-stage">
+                <canvas id="shll-canvas"></canvas>
+                <div class="stage-overlay tl"><span class="label">SlidingHyperLogLog: DISTINCT keys in the last W (live) vs an exact windowed Map -- within 3 sigma</span></div>
+                <div class="stage-overlay tr"><span class="label">windowed distinct</span><br><span class="big" id="shll-distinct-big">0</span></div>
+            </div>
+            <aside class="panel">
+                <div class="panel-head">scene 05 - slidinghyperloglog (how many DISTINCT in the last W?)</div>
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="shll-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">exact windowed Map: <b id="shll-mode-label">running (O(distinct))</b></span>
+                    </div>
+                    <p class="help-line">
+                        <code>SlidingHyperLogLog.addFrom</code> streams keys into a FIXED register bank
+                        and evicts the window per-register (LFPM) -- 0 B/op. The exact oracle keeps a
+                        <code>Map</code> of every in-window key; the sketch's distinct estimate stays
+                        within <code>3 sigma = 3 * 1.04/sqrt(m)</code>.
+                    </p>
+                </section>
+                <section>
+                    <h3>action</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="shll-stream-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">pause the stream (idle-slide): <b id="shll-stream-label">streaming</b></span>
+                    </div>
+                    <p class="help-line">
+                        Pausing keeps advancing the clock via <code>advanceFrom</code> (0 B/op) -- the
+                        windowed distinct count slides to 0 with no traffic.
+                    </p>
+                </section>
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>window W (time units) <span class="field-value" id="shll-w-v">4096</span></label>
+                        <input type="range" id="shll-w" min="1024" max="8192" step="1024" value="4096">
+                    </div>
+                    <div class="field">
+                        <label>precision p (registers m = 2^p) <span class="field-value" id="shll-p-v">11</span></label>
+                        <input type="range" id="shll-p" min="8" max="13" step="1" value="11">
+                    </div>
+                    <p class="help-line">
+                        Larger p -> more registers -> tighter distinct error. Sketch memory is a FIXED
+                        <span class="field-value" id="shll-mem">0 KB</span> no matter how many distinct keys.
+                    </p>
+                </section>
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="shll-jank" class="jank-c"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell"><div class="alloc-big zero" id="shll-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="shll-alloc-oracle">0</div><div class="alloc-sub">exact Map path</div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - distinct relerr vs the 3-sigma band</div>
+                            <canvas id="shll-witness" class="witness-c"></canvas>
+                            <div class="jank-caption">cursor = measured relerr / 3-sigma; green = inside the band, red past 1.0</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - space: registers fixed vs Map O(distinct)</div>
+                            <canvas id="shll-space" class="space-c"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">windowed distinct (est)</span><span class="v accent" id="shll-est">0</span></div>
+                            <div class="stat-row"><span class="k">true windowed distinct</span><span class="v" id="shll-true">0</span></div>
+                            <div class="stat-row"><span class="k">measured rel error</span><span class="v" id="shll-relerr">0.00%</span></div>
+                            <div class="stat-row"><span class="k">3-sigma band</span><span class="v" id="shll-gate">0.00%</span></div>
+                            <div class="stat-row"><span class="k">relerr / 3-sigma</span><span class="v inband" id="shll-frac">0.00x</span></div>
+                            <div class="stat-row"><span class="k">registers m</span><span class="v" id="shll-m">0</span></div>
+                            <div class="stat-row"><span class="k">degraded (ring overflow)</span><span class="v inband" id="shll-degraded">no</span></div>
+                            <div class="stat-row"><span class="k">sketch bytes (fixed)</span><span class="v accent" id="shll-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">Map bytes (O(distinct))</span><span class="v" id="shll-oracle-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="shll-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="shll-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+
+        <!-- SCENE 06: DRIFTDETECTOR -->
+        <section class="scene" data-scene="dd">
+            <div class="stage" id="dd-stage">
+                <canvas id="dd-canvas"></canvas>
+                <div class="stage-overlay tl"><span class="label">DriftDetector: ONE signal, TWO channels -- Page-Hinkley (adaptive) vs CUSUM (fixed mu0); fire markers</span></div>
+                <div class="stage-overlay tr"><span class="label">PH statistic</span><br><span class="big" id="dd-ph-big">0</span></div>
+            </div>
+            <aside class="panel">
+                <div class="panel-head">scene 06 - driftdetector (has this SIGNAL shifted?)</div>
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="dd-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">O(N) exact-detector foil: <b id="dd-mode-label">running (retains O(N))</b></span>
+                    </div>
+                    <p class="help-line">
+                        The SAME signal feeds two O(1)-state detectors via <code>addFrom</code> (0 B/op).
+                        Page-Hinkley references its ONLINE mean (adaptive); CUSUM references a FIXED mu0.
+                        The mode is load-bearing -- on a ramp CUSUM fires far more than PH.
+                    </p>
+                </section>
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>threshold (decision level) <span class="field-value" id="dd-thr-v">5</span></label>
+                        <input type="range" id="dd-thr" min="2" max="30" step="1" value="5">
+                    </div>
+                    <div class="field">
+                        <label>delta (magnitude allowance) <span class="field-value" id="dd-delta-v">0.005</span></label>
+                        <input type="range" id="dd-delta" min="0" max="50" step="1" value="5">
+                    </div>
+                    <p class="help-line">
+                        Higher threshold -> fewer false alarms, slower detection. Detector memory is a
+                        FIXED <span class="field-value" id="dd-mem">0 KB</span> -- exact detection keeps O(N).
+                    </p>
+                </section>
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="dd-jank" class="jank-c"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell"><div class="alloc-big zero" id="dd-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="dd-alloc-oracle">0</div><div class="alloc-sub">O(N) exact path</div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - PH (top) vs CUSUM (bottom) statistic / threshold</div>
+                            <canvas id="dd-witness" class="witness-c"></canvas>
+                            <div class="jank-caption">each cursor = statistic / threshold; a channel FIRES when it crosses 1.0</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - space: two scalars fixed vs O(N) retained</div>
+                            <canvas id="dd-space" class="space-c"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">PH statistic / threshold</span><span class="v accent" id="dd-ph">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">CUSUM statistic / threshold</span><span class="v" id="dd-cu">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">PH fires</span><span class="v" id="dd-ph-fires">0</span></div>
+                            <div class="stat-row"><span class="k">CUSUM fires</span><span class="v" id="dd-cu-fires">0</span></div>
+                            <div class="stat-row"><span class="k">changepoints crossed</span><span class="v accent" id="dd-cp">0</span></div>
+                            <div class="stat-row"><span class="k">current concept mean</span><span class="v" id="dd-truemean">0</span></div>
+                            <div class="stat-row"><span class="k">items seen (N)</span><span class="v" id="dd-n">0</span></div>
+                            <div class="stat-row"><span class="k">detector bytes (fixed)</span><span class="v accent" id="dd-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">exact bytes (O(N))</span><span class="v" id="dd-oracle-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="dd-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="dd-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+
+        <!-- SCENE 07: SLIDINGDDSKETCH -->
+        <section class="scene" data-scene="sld">
+            <div class="stage" id="sld-stage">
+                <canvas id="sld-canvas"></canvas>
+                <div class="stage-overlay tl"><span class="label">SlidingDDSketch: last-W log-bin quantiles (p50/p90/p99) vs an exact sorted-array oracle -- within alpha</span></div>
+                <div class="stage-overlay tr"><span class="label">windowed p99</span><br><span class="big" id="sld-p99-big">0</span></div>
+            </div>
+            <aside class="panel">
+                <div class="panel-head">scene 07 - slidingddsketch (what are the last-W QUANTILES?)</div>
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="sld-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">exact sorted-array oracle: <b id="sld-mode-label">running (O(W))</b></span>
+                    </div>
+                    <p class="help-line">
+                        <code>SlidingDDSketch.addFrom</code> bins each value on a log scale into a FIXED
+                        pane ring -- 0 B/op. The exact oracle sorts the live pane content (into a
+                        PREALLOCATED buffer, never <code>.sort()</code>); every quantile is within
+                        <code>alpha</code>, edge error within one pane width.
+                    </p>
+                </section>
+                <section>
+                    <h3>action</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="sld-stream-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">pause the stream (idle-slide): <b id="sld-stream-label">streaming</b></span>
+                    </div>
+                    <p class="help-line">
+                        Pausing advances the clock via <code>advanceFrom</code> (0 B/op) -- the windowed
+                        quantiles slide to NaN as the panes empty.
+                    </p>
+                </section>
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>window W (time units) <span class="field-value" id="sld-w-v">2048</span></label>
+                        <input type="range" id="sld-w" min="1024" max="4096" step="512" value="2048">
+                    </div>
+                    <div class="field">
+                        <label>alpha (relative-error target) <span class="field-value" id="sld-alpha-v">0.020</span></label>
+                        <input type="range" id="sld-alpha" min="5" max="100" step="5" value="20">
+                    </div>
+                    <p class="help-line">
+                        Smaller alpha -> more log bins -> tighter quantiles. Sketch memory is a FIXED
+                        <span class="field-value" id="sld-mem">0 KB</span> whatever the value range.
+                    </p>
+                </section>
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="sld-jank" class="jank-c"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell"><div class="alloc-big zero" id="sld-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="sld-alloc-oracle">0</div><div class="alloc-sub">retained samples</div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - max quantile relerr vs the alpha cap</div>
+                            <canvas id="sld-witness" class="witness-c"></canvas>
+                            <div class="jank-caption">cursor = measured relerr / alpha; green = inside the bound, red past 1.0</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - space: panes fixed vs samples O(W)</div>
+                            <canvas id="sld-space" class="space-c"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">p50 (est / true)</span><span class="v" id="sld-p50">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">p90 (est / true)</span><span class="v" id="sld-p90">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">p99 (est / true)</span><span class="v accent" id="sld-p99">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">max rel error</span><span class="v" id="sld-relerr">0.00%</span></div>
+                            <div class="stat-row"><span class="k">relerr / alpha</span><span class="v inband" id="sld-frac">0.00x</span></div>
+                            <div class="stat-row"><span class="k">windowed count / edge</span><span class="v" id="sld-count">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">collapsed</span><span class="v inband" id="sld-collapsed">no</span></div>
+                            <div class="stat-row"><span class="k">sketch bytes (fixed)</span><span class="v accent" id="sld-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">oracle bytes (O(W))</span><span class="v" id="sld-oracle-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="sld-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="sld-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+
+        <!-- SCENE 08: SLIDINGCOUNTMIN -->
+        <section class="scene" data-scene="scm">
+            <div class="stage" id="scm-stage">
+                <canvas id="scm-canvas"></canvas>
+                <div class="stage-overlay tl"><span class="label">SlidingCountMin: tracked-key windowed frequency (est) inside the one-sided band [true(W), true(W+W/B)+eps*N]</span></div>
+                <div class="stage-overlay tr"><span class="label">one-sided bound</span><br><span class="big" id="scm-bound-big">holds</span></div>
+            </div>
+            <aside class="panel">
+                <div class="panel-head">scene 08 - slidingcountmin (how OFTEN did key k occur in the last W?)</div>
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="scm-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">exact per-key ring: <b id="scm-mode-label">running (O(W))</b></span>
+                    </div>
+                    <p class="help-line">
+                        <code>SlidingCountMin.addFrom</code> hashes each key into a FIXED pane grid --
+                        0 B/op (amortized). Every tracked key's estimate stays inside the one-sided band
+                        <code>true(W) &lt;= est &lt;= true(W + W/B) + eps*N</code> (it never under-counts).
+                    </p>
+                </section>
+                <section>
+                    <h3>action</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="scm-stream-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">pause the stream (idle-slide): <b id="scm-stream-label">streaming</b></span>
+                    </div>
+                    <p class="help-line">
+                        Pausing advances the clock via <code>advanceFrom</code> (0 B/op) -- every tracked
+                        key's estimate slides to 0 with no traffic.
+                    </p>
+                </section>
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>window W (time units) <span class="field-value" id="scm-w-v">2048</span></label>
+                        <input type="range" id="scm-w" min="1024" max="4096" step="512" value="2048">
+                    </div>
+                    <div class="field">
+                        <label>epsilon (relative-error target) <span class="field-value" id="scm-eps-v">0.020</span></label>
+                        <input type="range" id="scm-eps" min="5" max="100" step="5" value="20">
+                    </div>
+                    <p class="help-line">
+                        Smaller epsilon -> wider grid -> tighter overestimate. Sketch memory is a FIXED
+                        <span class="field-value" id="scm-mem">0 KB</span> -- exact per-key counting keeps O(W).
+                    </p>
+                </section>
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="scm-jank" class="jank-c"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell"><div class="alloc-big zero" id="scm-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="scm-alloc-oracle">0</div><div class="alloc-sub">exact ring path</div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - one-sided bound holds on every tracked key</div>
+                            <canvas id="scm-witness" class="witness-c"></canvas>
+                            <div class="jank-caption">green = every estimate inside [true(W), true(W+W/B)+eps*N]; red = a violation</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - space: grid fixed vs ring O(W)</div>
+                            <canvas id="scm-space" class="space-c"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">bound holds (all tracked)</span><span class="v inband" id="scm-bound">yes</span></div>
+                            <div class="stat-row"><span class="k">saturated increments</span><span class="v inband" id="scm-saturated">0</span></div>
+                            <div class="stat-row"><span class="k">windowed items (N live)</span><span class="v" id="scm-nlive">0</span></div>
+                            <div class="stat-row"><span class="k">items seen (N)</span><span class="v" id="scm-n">0</span></div>
+                            <div class="stat-row"><span class="k">sketch bytes (fixed)</span><span class="v accent" id="scm-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">ring bytes (O(W))</span><span class="v" id="scm-oracle-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="scm-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="scm-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+
+        <!-- SCENE 09: DECAYEDRESERVOIR -->
+        <section class="scene" data-scene="dr">
+            <div class="stage" id="dr-stage">
+                <canvas id="dr-canvas"></canvas>
+                <div class="stage-overlay tl"><span class="label">DecayedReservoir: a recency-biased k-sample -- recent items dominate; inclusion-by-age tracks exp(-lambda*age)</span></div>
+                <div class="stage-overlay tr"><span class="label">sample size</span><br><span class="big" id="dr-size-big">0</span></div>
+            </div>
+            <aside class="panel">
+                <div class="panel-head">scene 09 - decayedreservoir (give me k RECENT items)</div>
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="dr-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">brute-force O(N) sampler: <b id="dr-mode-label">running (retains O(N))</b></span>
+                    </div>
+                    <p class="help-line">
+                        <code>DecayedReservoir.addFrom</code> keeps a size-k A-Res forest whose retention
+                        decays with age -- 0 B/op. An unbiased brute-force decayed sample would retain
+                        EVERY value; the sketch keeps only k real recent items.
+                    </p>
+                </section>
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>sample size k <span class="field-value" id="dr-k-v">24</span></label>
+                        <input type="range" id="dr-k" min="8" max="48" step="4" value="24">
+                    </div>
+                    <div class="field">
+                        <label>half-life (time units) <span class="field-value" id="dr-hl-v">2048</span></label>
+                        <input type="range" id="dr-hl" min="512" max="4096" step="512" value="2048">
+                    </div>
+                    <p class="help-line">
+                        Longer half-life -> older items survive longer. Sample memory is a FIXED
+                        <span class="field-value" id="dr-mem">0 KB</span> whatever N is.
+                    </p>
+                </section>
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="dr-jank" class="jank-c"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell"><div class="alloc-big zero" id="dr-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="dr-alloc-oracle">0</div><div class="alloc-sub">O(N) retained</div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - sample age histogram (recent = left, decays right)</div>
+                            <canvas id="dr-witness" class="witness-c"></canvas>
+                            <div class="jank-caption">bars = # of sampled items per age bucket; the mass leans recent (exp(-lambda*age))</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">recency witness - space: k sample fixed vs O(N) retained</div>
+                            <canvas id="dr-space" class="space-c"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">sample size / k</span><span class="v accent" id="dr-size">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">mean sample age</span><span class="v" id="dr-meanage">0</span></div>
+                            <div class="stat-row"><span class="k">newest / oldest age</span><span class="v" id="dr-agespan">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">younger than 1 half-life</span><span class="v inband" id="dr-recency">0%</span></div>
+                            <div class="stat-row"><span class="k">half-life / lambda</span><span class="v" id="dr-hl">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">items seen (N)</span><span class="v" id="dr-n">0</span></div>
+                            <div class="stat-row"><span class="k">sample bytes (fixed)</span><span class="v accent" id="dr-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">exact bytes (O(N))</span><span class="v" id="dr-oracle-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="dr-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="dr-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
     </main>
 
     <footer class="bottom">
@@ -577,7 +1026,7 @@
         <span class="sep">|</span>
         <span>retained heap is a coarse Chromium-only secondary signal</span>
         <span class="sep">|</span>
-        <span><kbd>1</kbd>-<kbd>4</kbd> switch scene</span>
+        <span><kbd>1</kbd>-<kbd>9</kbd> switch scene</span>
         <span class="sep">|</span>
         <span><kbd>space</kbd> pause</span>
     </footer>
@@ -606,6 +1055,26 @@
         H_RECALL, H_TRUEHH, H_MAXOVER, H_BRACKETOK, H_HKERR, H_SSERR, H_MARQUEEOK,
         H_SIZE, H_K, H_W, H_THRESH, H_ERRBOUND, H_MAXCOUNT, H_N,
         H_SKETCH_BYTES, H_MAP_BYTES, H_SKETCH_ALLOC, H_ORACLE_ALLOC,
+        createShllWorld, stepShll, stepShllOracle, renderShllPrep,
+        SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, SHLL_DEFAULT_SEED,
+        S_EST, S_TRUE, S_RELERR, S_GATE, S_FRAC, S_M, S_DEGRADED, S_SKETCH_BYTES, S_ORACLE_BYTES,
+        S_SKETCH_ALLOC, S_ORACLE_ALLOC,
+        createDdWorld, stepDd, stepDdOracle, renderDdPrep,
+        DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD, DD_SKETCH_BYTES,
+        G_PH_STAT, G_PH_THRESH, G_PH_FRAC, G_CU_STAT, G_CU_THRESH, G_CU_FRAC, G_PH_FIRES, G_CU_FIRES,
+        G_PH_FIRED, G_CU_FIRED, G_TRUEMEAN, G_PH_MEAN, G_N, G_CP, G_SKETCH_BYTES, G_ORACLE_BYTES,
+        G_SKETCH_ALLOC, G_ORACLE_ALLOC,
+        createSldWorld, stepSld, stepSldOracle, renderSldPrep,
+        SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES,
+        Q_P50, Q_P50T, Q_P90, Q_P90T, Q_P99, Q_P99T, Q_MAXREL, Q_ALPHA, Q_FRAC, Q_COUNT, Q_LIVE,
+        Q_EDGE, Q_COLLAPSED, Q_N, Q_SKETCH_BYTES, Q_ORACLE_BYTES, Q_SKETCH_ALLOC, Q_ORACLE_ALLOC,
+        createScmWorld, stepScm, stepScmOracle, renderScmPrep,
+        SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, SCM_DEFAULT_SEED, SCM_TRACKED, SCM_STRIDE,
+        C_BOUNDOK, C_SATURATED, C_NLIVE, C_N, C_SKETCH_BYTES, C_ORACLE_BYTES, C_SKETCH_ALLOC, C_ORACLE_ALLOC,
+        createDrWorld, stepDr, stepDrOracle, renderDrPrep,
+        DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, DR_AGE_BINS,
+        R_SIZE, R_K, R_MEANAGE, R_NEWEST, R_OLDEST, R_RECENCYFRAC, R_HALFLIFE, R_LAMBDA, R_N,
+        R_SKETCH_BYTES, R_ORACLE_BYTES, R_SKETCH_ALLOC, R_ORACLE_ALLOC,
     } from './kernels.mjs';
 
     const $ = (id) => document.getElementById(id);
@@ -645,6 +1114,11 @@
     const COL_DIM = '#8b8d94';
     const LABEL_FONT = '11px "JetBrains Mono", monospace';
     const PAD = 24;
+    // hoisted dash patterns -- setLineDash([...]) with a literal allocates an array every call, so
+    // reuse these consts in per-frame draw paths (0-alloc).
+    const DASH_44 = [4, 4];
+    const DASH_64 = [6, 4];
+    const DASH_NONE = [];
 
     // ---- shared truth-panel draws (0 alloc) --------------------------------------------
     const DT = new Float64Array(128), DT_MASK = 127;
@@ -782,7 +1256,8 @@
         ehHeap = heapText(ehDom.heap, ehHeap);
     }
     wireToggle('eh-mode-toggle', 'eh-mode-label', 'running (retains O(W))', 'paused (sketch only)', (on) => { ehOracleOn = on; });
-    function ehRebuild() { ehWorld = createEhWorld(ehW, ehEps, 0x5eed1234); ehAlloc.sketchCount = 0; ehAlloc.oracleCount = 0; ehDom.mem.textContent = (ehWorld.eh.capacity * EH_BUCKET_BYTES / 1024).toFixed(1) + ' KB'; ehLayout(); }
+    wireToggle('eh-stream-toggle', 'eh-stream-label', 'stream paused (sliding to empty)', 'streaming', (on) => { ehWorld.paused = on; });
+    function ehRebuild() { const p = ehWorld.paused; ehWorld = createEhWorld(ehW, ehEps, 0x5eed1234); ehWorld.paused = p; ehAlloc.sketchCount = 0; ehAlloc.oracleCount = 0; ehDom.mem.textContent = (ehWorld.eh.capacity * EH_BUCKET_BYTES / 1024).toFixed(1) + ' KB'; ehLayout(); }
     $('eh-w').addEventListener('input', (e) => { ehW = +e.target.value; $('eh-w-v').textContent = String(ehW); ehRebuild(); });
     $('eh-eps').addEventListener('input', (e) => { ehEps = (+e.target.value) / 1000; $('eh-eps-v').textContent = ehEps.toFixed(3); ehRebuild(); });
 
@@ -899,10 +1374,10 @@
         const lo = 0.5, hi = 6;   // display band covering the FD value range
         const mapV = (v) => { let t = (v - lo) / (hi - lo); if (t < 0) t = 0; if (t > 1) t = 1; return fdGY + fdGH - t * fdGH; };
         const ym = mapV(f[D_MEAN]);
-        g.strokeStyle = rgbaq(ACCENT_RGB, 0.9); g.setLineDash([6, 4]); g.beginPath(); g.moveTo(fdGX, ym); g.lineTo(fdGX + fdGW, ym); g.stroke();
+        g.strokeStyle = rgbaq(ACCENT_RGB, 0.9); g.setLineDash(DASH_64); g.beginPath(); g.moveTo(fdGX, ym); g.lineTo(fdGX + fdGW, ym); g.stroke();
         const yc = mapV(f[D_CUMMEAN]);
         g.strokeStyle = rgbaq(STALE_RGB, 0.8); g.beginPath(); g.moveTo(fdGX, yc); g.lineTo(fdGX + fdGW, yc); g.stroke();
-        g.setLineDash([]);
+        g.setLineDash(DASH_NONE);
     }
     function fdWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, fdWorld.flat[D_FRAC]); }
     const fdDom = { big: $('fd-mean-big'), aS: $('fd-alloc-sketch'), aO: $('fd-alloc-oracle'), mean: $('fd-mean'), cm: $('fd-cummean'), count: $('fd-count'), rate: $('fd-rate'), rel: $('fd-relerr'), frac: $('fd-frac'), n: $('fd-n'), skb: $('fd-sketch-kb'), akb: $('fd-arr-kb'), fps: $('fd-fps'), heap: $('fd-heap'), mem: $('fd-mem'), landmark: $('fd-landmark') };
@@ -1011,6 +1486,344 @@
     function hkRebuild() { hkWorld = createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, hkK, 0x243f6a88); hkAlloc.sketchCount = 0; hkAlloc.oracleCount = 0; hkDom.mem.textContent = (hkWorld.hk.bytes / 1024).toFixed(1) + ' KB'; hkLayout(); }
     $('hk-k').addEventListener('input', (e) => { hkK = +e.target.value; $('hk-k-v').textContent = String(hkK); hkRebuild(); });
 
+    // ---- shared scrolling-history line drawer (0 alloc; the ring is caller-owned) ------
+    function drawHistLine(g, ring, ptr, mask, n, cap, gx, gy, gw, gh, vmax, rgb, alpha) {
+        if (n < 2 || vmax <= 0) return;
+        g.strokeStyle = rgbaq(rgb, alpha); g.lineWidth = 1.5; g.beginPath();
+        for (let i = 0; i < n; i++) {
+            const idx = (ptr - n + i + cap) & mask;
+            const x = gx + (i / (n - 1)) * gw;
+            let v = ring[idx] / vmax; if (v > 1) v = 1; if (v < 0) v = 0;
+            const yy = gy + gh - v * gh;
+            if (i === 0) g.moveTo(x, yy); else g.lineTo(x, yy);
+        }
+        g.stroke();
+    }
+
+    // ====================================================================================
+    // SCENE 05 -- SlidingHyperLogLog
+    // ====================================================================================
+    let shllW = SHLL_DEFAULT_W, shllP = SHLL_DEFAULT_P;
+    let shllWorld = createShllWorld(shllW, shllP, SHLL_DEFAULT_RINGCAP, SHLL_DEFAULT_SEED);
+    const shllAlloc = createAllocState();
+    let shllOracleOn = true;
+    const shllCanvas = $('shll-canvas');
+    let shllCtx = null, SHW = 0, SHH = 0, shGX = 0, shGY = 0, shGW = 0, shGH = 0;
+    function shllLayout() { const s = sizeCanvas(shllCanvas); shllCtx = s.ctx; SHW = s.w; SHH = s.h; shGX = PAD; shGY = PAD + 24; shGW = SHW - PAD * 2; shGH = SHH - PAD * 2 - 24; }
+    const shllJank = $('shll-jank'); let shllJankCtx = null, SHJW = 0, SHJH = 0;
+    const shllWit = $('shll-witness'); let shllWitCtx = null, SHWW = 0, SHWH = 0;
+    const shllSpace = $('shll-space'); let shllSpCtx = null, SHSW = 0, SHSH = 0;
+    function shllPanels() { let s = sizeCanvas(shllJank); shllJankCtx = s.ctx; SHJW = s.w; SHJH = s.h; s = sizeCanvas(shllWit); shllWitCtx = s.ctx; SHWW = s.w; SHWH = s.h; s = sizeCanvas(shllSpace); shllSpCtx = s.ctx; SHSW = s.w; SHSH = s.h; }
+    function shllStep() { stepShll(shllWorld); if (shllOracleOn) stepShllOracle(shllWorld, shllAlloc); }
+    const SHLL_HIST = 256, SHLL_HMASK = 255;
+    const shllEstH = new Float64Array(SHLL_HIST), shllTrueH = new Float64Array(SHLL_HIST);
+    let shllHPtr = 0, shllHFilled = 0, shllVMax = 1;
+    function shllDraw() {
+        const g = shllCtx; if (!g) return;
+        g.clearRect(0, 0, SHW, SHH);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM;
+        g.fillText('windowed distinct over time: violet = SlidingHyperLogLog estimate, magenta = exact in-window Map; they track within 3 sigma', shGX, shGY - 8);
+        const plotH = shGH - 12;
+        drawHistLine(g, shllTrueH, shllHPtr, SHLL_HMASK, shllHFilled, SHLL_HIST, shGX, shGY, shGW, plotH, shllVMax, MAGENTA_RGB, 0.8);
+        drawHistLine(g, shllEstH, shllHPtr, SHLL_HMASK, shllHFilled, SHLL_HIST, shGX, shGY, shGW, plotH, shllVMax, ACCENT_RGB, 0.95);
+    }
+    function shllWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, shllWorld.flat[S_FRAC]); }
+    const shllDom = { big: $('shll-distinct-big'), aS: $('shll-alloc-sketch'), aO: $('shll-alloc-oracle'), est: $('shll-est'), tr: $('shll-true'), rel: $('shll-relerr'), gate: $('shll-gate'), frac: $('shll-frac'), m: $('shll-m'), deg: $('shll-degraded'), skb: $('shll-sketch-kb'), okb: $('shll-oracle-kb'), fps: $('shll-fps'), heap: $('shll-heap'), mem: $('shll-mem') };
+    let shllHeap = -1;
+    function shllTick() {
+        renderShllPrep(shllWorld, shllAlloc);
+        const f = shllWorld.flat;
+        shllEstH[shllHPtr] = f[S_EST]; shllTrueH[shllHPtr] = f[S_TRUE];
+        shllHPtr = (shllHPtr + 1) & SHLL_HMASK; if (shllHFilled < SHLL_HIST) shllHFilled++;
+        let vm = 1; for (let i = 0; i < shllHFilled; i++) { const a = shllEstH[i], b = shllTrueH[i]; if (a > vm) vm = a; if (b > vm) vm = b; } shllVMax = vm;
+        shllDom.big.textContent = String(f[S_EST] | 0);
+        shllDom.est.textContent = String(f[S_EST] | 0);
+        shllDom.tr.textContent = String(f[S_TRUE] | 0);
+        shllDom.rel.textContent = (f[S_RELERR] * 100).toFixed(2) + '%';
+        shllDom.gate.textContent = (f[S_GATE] * 100).toFixed(2) + '%';
+        const fr = f[S_FRAC]; shllDom.frac.textContent = fr.toFixed(2) + 'x'; shllDom.frac.className = fr <= 1 ? 'v inband' : 'v outband';
+        shllDom.m.textContent = String(f[S_M] | 0);
+        const deg = f[S_DEGRADED] === 1; shllDom.deg.textContent = deg ? 'YES' : 'no'; shllDom.deg.className = deg ? 'v outband' : 'v inband';
+        shllDom.skb.textContent = (f[S_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        shllDom.okb.textContent = (f[S_ORACLE_BYTES] / 1024).toFixed(1) + ' KB';
+        shllDom.aS.textContent = String(f[S_SKETCH_ALLOC] | 0);
+        shllDom.aO.textContent = String(f[S_ORACLE_ALLOC]);
+        shllDom.fps.textContent = String(fpsValue);
+        shllHeap = heapText(shllDom.heap, shllHeap);
+    }
+    wireToggle('shll-mode-toggle', 'shll-mode-label', 'running (O(distinct))', 'paused (sketch only)', (on) => { shllOracleOn = on; });
+    wireToggle('shll-stream-toggle', 'shll-stream-label', 'stream paused (sliding to empty)', 'streaming', (on) => { shllWorld.paused = on; });
+    function shllRebuild() { const p = shllWorld.paused; shllWorld = createShllWorld(shllW, shllP, SHLL_DEFAULT_RINGCAP, SHLL_DEFAULT_SEED); shllWorld.paused = p; shllAlloc.sketchCount = 0; shllAlloc.oracleCount = 0; shllHPtr = 0; shllHFilled = 0; shllDom.mem.textContent = (shllWorld.sl.bytes / 1024).toFixed(1) + ' KB'; shllLayout(); }
+    $('shll-w').addEventListener('input', (e) => { shllW = +e.target.value; $('shll-w-v').textContent = String(shllW); shllRebuild(); });
+    $('shll-p').addEventListener('input', (e) => { shllP = +e.target.value; $('shll-p-v').textContent = String(shllP); shllRebuild(); });
+
+    // ====================================================================================
+    // SCENE 06 -- DriftDetector
+    // ====================================================================================
+    let ddDelta = DD_DEFAULT_DELTA, ddThr = DD_DEFAULT_THRESHOLD;
+    let ddWorld = createDdWorld(ddDelta, ddThr);
+    const ddAlloc = createAllocState();
+    let ddOracleOn = true;
+    const ddCanvas = $('dd-canvas');
+    let ddCtx = null, DDW = 0, DDH = 0, ddGX = 0, ddGY = 0, ddGW = 0, ddGH = 0;
+    function ddLayout() { const s = sizeCanvas(ddCanvas); ddCtx = s.ctx; DDW = s.w; DDH = s.h; ddGX = PAD; ddGY = PAD + 24; ddGW = DDW - PAD * 2; ddGH = DDH - PAD * 2 - 24; }
+    const ddJank = $('dd-jank'); let ddJankCtx = null, DJW = 0, DJH = 0;
+    const ddWit = $('dd-witness'); let ddWitCtx = null, DWW = 0, DWH = 0;
+    const ddSpace = $('dd-space'); let ddSpCtx = null, DSW = 0, DSH = 0;
+    function ddPanels() { let s = sizeCanvas(ddJank); ddJankCtx = s.ctx; DJW = s.w; DJH = s.h; s = sizeCanvas(ddWit); ddWitCtx = s.ctx; DWW = s.w; DWH = s.h; s = sizeCanvas(ddSpace); ddSpCtx = s.ctx; DSW = s.w; DSH = s.h; }
+    function ddStep() { stepDd(ddWorld); if (ddOracleOn) stepDdOracle(ddWorld, ddAlloc); }
+    const DD_HIST = 256, DD_HMASK = 255;
+    const ddSigH = new Float64Array(DD_HIST), ddPhH = new Float64Array(DD_HIST), ddCuH = new Float64Array(DD_HIST), ddFireH = new Float64Array(DD_HIST);
+    let ddHPtr = 0, ddHFilled = 0;
+    function ddDraw() {
+        const g = ddCtx; if (!g) return;
+        g.clearRect(0, 0, DDW, DDH);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM;
+        g.fillText('the SIGNAL (dim) with regime steps; violet = PH fire cursor, cyan = CUSUM fire cursor (statistic / threshold); red = a fire', ddGX, ddGY - 8);
+        const n = ddHFilled; if (n < 2) return;
+        const plotH = ddGH - 12;
+        // fires
+        for (let i = 0; i < n; i++) { const idx = (ddHPtr - n + i + DD_HIST) & DD_HMASK; if (ddFireH[idx] > 0) { const x = ddGX + (i / (n - 1)) * ddGW; g.fillStyle = rgbaq(RED_RGB, 0.3); g.fillRect(x - 1, ddGY, 2, plotH); } }
+        // the raw signal (normalized to [0,1] over its LO..HI band)
+        drawHistLine(g, ddSigH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.2, STALE_RGB, 0.6);
+        // the two fire cursors (statistic / threshold, clamped to [0,1.3])
+        drawHistLine(g, ddPhH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.3, ACCENT_RGB, 0.95);
+        drawHistLine(g, ddCuH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.3, CYAN_RGB, 0.9);
+        // the fire threshold (1.0) line
+        const ty = ddGY + plotH - (1 / 1.3) * plotH;
+        g.strokeStyle = rgbaq(RED_RGB, 0.4); g.setLineDash(DASH_44); g.beginPath(); g.moveTo(ddGX, ty); g.lineTo(ddGX + ddGW, ty); g.stroke(); g.setLineDash(DASH_NONE);
+    }
+    function ddWitDraw(g, w, h) {
+        if (!g) return; g.clearRect(0, 0, w, h);
+        drawGauge(g, 8, h * 0.30, w - 16, h * 0.30, ddWorld.flat[G_PH_FRAC]);
+        drawGauge(g, 8, h * 0.72, w - 16, h * 0.72, ddWorld.flat[G_CU_FRAC]);
+    }
+    const ddDom = { big: $('dd-ph-big'), aS: $('dd-alloc-sketch'), aO: $('dd-alloc-oracle'), ph: $('dd-ph'), cu: $('dd-cu'), phf: $('dd-ph-fires'), cuf: $('dd-cu-fires'), cp: $('dd-cp'), tm: $('dd-truemean'), n: $('dd-n'), skb: $('dd-sketch-kb'), okb: $('dd-oracle-kb'), fps: $('dd-fps'), heap: $('dd-heap'), mem: $('dd-mem') };
+    let ddHeap = -1;
+    function ddTick() {
+        renderDdPrep(ddWorld, ddAlloc);
+        const f = ddWorld.flat;
+        ddSigH[ddHPtr] = f[G_PH_MEAN]; ddPhH[ddHPtr] = f[G_PH_FRAC]; ddCuH[ddHPtr] = f[G_CU_FRAC]; ddFireH[ddHPtr] = (f[G_PH_FIRED] || f[G_CU_FIRED]) ? 1 : 0;
+        ddHPtr = (ddHPtr + 1) & DD_HMASK; if (ddHFilled < DD_HIST) ddHFilled++;
+        ddDom.big.textContent = f[G_PH_STAT].toFixed(2);
+        ddDom.ph.textContent = f[G_PH_STAT].toFixed(2) + ' / ' + f[G_PH_THRESH].toFixed(0);
+        ddDom.cu.textContent = f[G_CU_STAT].toFixed(2) + ' / ' + f[G_CU_THRESH].toFixed(0);
+        ddDom.phf.textContent = String(f[G_PH_FIRES] | 0);
+        ddDom.cuf.textContent = String(f[G_CU_FIRES] | 0);
+        ddDom.cp.textContent = String(f[G_CP] | 0);
+        ddDom.tm.textContent = f[G_TRUEMEAN].toFixed(3);
+        ddDom.n.textContent = String(f[G_N] | 0);
+        ddDom.skb.textContent = (f[G_SKETCH_BYTES] / 1024).toFixed(3) + ' KB';
+        ddDom.okb.textContent = (f[G_ORACLE_BYTES] / 1024).toFixed(1) + ' KB';
+        ddDom.aS.textContent = String(f[G_SKETCH_ALLOC] | 0);
+        ddDom.aO.textContent = String(f[G_ORACLE_ALLOC]);
+        ddDom.fps.textContent = String(fpsValue);
+        ddHeap = heapText(ddDom.heap, ddHeap);
+    }
+    wireToggle('dd-mode-toggle', 'dd-mode-label', 'running (retains O(N))', 'paused (sketch only)', (on) => { ddOracleOn = on; });
+    function ddRebuild() { ddWorld = createDdWorld(ddDelta, ddThr); ddAlloc.sketchCount = 0; ddAlloc.oracleCount = 0; ddHPtr = 0; ddHFilled = 0; ddDom.mem.textContent = (DD_SKETCH_BYTES / 1024).toFixed(3) + ' KB'; ddLayout(); }
+    $('dd-thr').addEventListener('input', (e) => { ddThr = +e.target.value; $('dd-thr-v').textContent = String(ddThr); ddRebuild(); });
+    $('dd-delta').addEventListener('input', (e) => { ddDelta = (+e.target.value) / 1000; $('dd-delta-v').textContent = ddDelta.toFixed(3); ddRebuild(); });
+
+    // ====================================================================================
+    // SCENE 07 -- SlidingDDSketch
+    // ====================================================================================
+    let sldW = SLD_DEFAULT_W, sldAlpha = SLD_DEFAULT_ALPHA;
+    let sldWorld = createSldWorld(sldW, sldAlpha, SLD_DEFAULT_PANES);
+    const sldAlloc = createAllocState();
+    let sldOracleOn = true;
+    const sldCanvas = $('sld-canvas');
+    let sldCtx = null, SDW = 0, SDH = 0, sdGX = 0, sdGY = 0, sdGW = 0, sdGH = 0;
+    function sldLayout() { const s = sizeCanvas(sldCanvas); sldCtx = s.ctx; SDW = s.w; SDH = s.h; sdGX = PAD + 34; sdGY = PAD + 24; sdGW = SDW - PAD * 2 - 34; sdGH = SDH - PAD * 2 - 24; }
+    const sldJank = $('sld-jank'); let sldJankCtx = null, SDJW = 0, SDJH = 0;
+    const sldWit = $('sld-witness'); let sldWitCtx = null, SDWW = 0, SDWH = 0;
+    const sldSpace = $('sld-space'); let sldSpCtx = null, SDSW = 0, SDSH = 0;
+    function sldPanels() { let s = sizeCanvas(sldJank); sldJankCtx = s.ctx; SDJW = s.w; SDJH = s.h; s = sizeCanvas(sldWit); sldWitCtx = s.ctx; SDWW = s.w; SDWH = s.h; s = sizeCanvas(sldSpace); sldSpCtx = s.ctx; SDSW = s.w; SDSH = s.h; }
+    function sldStep() { stepSld(sldWorld); if (sldOracleOn) stepSldOracle(sldWorld, sldAlloc); }
+    const SLD_QLAB = ['p50', 'p90', 'p99'];
+    const SLD_EST_IDX = [Q_P50, Q_P90, Q_P99];
+    const SLD_TRUE_IDX = [Q_P50T, Q_P90T, Q_P99T];
+    function sldDraw() {
+        const g = sldCtx; if (!g) return;
+        g.clearRect(0, 0, SDW, SDH);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM;
+        g.fillText('windowed quantiles: violet = SlidingDDSketch estimate, magenta = exact sorted-array oracle, amber = +-alpha band (log axis)', PAD, sdGY - 8);
+        const f = sldWorld.flat;
+        // value axis: log-scaled over the observed range (read via hoisted index arrays -- no per-frame literals)
+        let vmax = 1; for (let i = 0; i < 3; i++) { const e = f[SLD_EST_IDX[i]], tv = f[SLD_TRUE_IDX[i]]; if (e > vmax) vmax = e; if (tv > vmax) vmax = tv; }
+        const rowH = sdGH / 3;
+        for (let r = 0; r < 3; r++) {
+            const y = sdGY + r * rowH + 4, bh = rowH - 12;
+            g.fillStyle = COL_FAINT; g.fillText(SLD_QLAB[r], PAD, y + bh * 0.5 + 3);
+            g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(sdGX, y, sdGW, bh);
+            const est = f[SLD_EST_IDX[r]], t = f[SLD_TRUE_IDX[r]];
+            if (!(est > 0)) continue;
+            const ew = sdGW * (est / vmax);
+            // +- alpha band around the estimate
+            const loW = sdGW * (Math.max(0, est * (1 - sldAlpha)) / vmax), hiW = sdGW * (Math.min(vmax, est * (1 + sldAlpha)) / vmax);
+            g.fillStyle = rgbaq(AMBER_RGB, 0.45); g.fillRect(sdGX + loW, y, Math.max(1, hiW - loW), bh);
+            g.fillStyle = rgbaq(ACCENT_RGB, 0.85); g.fillRect(sdGX, y, ew, bh);
+            if (t > 0) { const tX = sdGX + sdGW * (t / vmax); g.fillStyle = rgbaq(MAGENTA_RGB, 0.95); g.fillRect(tX - 1, y - 1, 2, bh + 2); }
+        }
+    }
+    function sldWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, sldWorld.flat[Q_FRAC]); }
+    const sldDom = { big: $('sld-p99-big'), aS: $('sld-alloc-sketch'), aO: $('sld-alloc-oracle'), p50: $('sld-p50'), p90: $('sld-p90'), p99: $('sld-p99'), rel: $('sld-relerr'), frac: $('sld-frac'), count: $('sld-count'), coll: $('sld-collapsed'), skb: $('sld-sketch-kb'), okb: $('sld-oracle-kb'), fps: $('sld-fps'), heap: $('sld-heap'), mem: $('sld-mem') };
+    let sldHeap = -1;
+    function sldFmt(v) { return Number.isNaN(v) ? 'NaN' : v.toFixed(2); }
+    function sldTick() {
+        renderSldPrep(sldWorld, sldAlloc);
+        const f = sldWorld.flat;
+        sldDom.big.textContent = sldFmt(f[Q_P99]);
+        sldDom.p50.textContent = sldFmt(f[Q_P50]) + ' / ' + sldFmt(f[Q_P50T]);
+        sldDom.p90.textContent = sldFmt(f[Q_P90]) + ' / ' + sldFmt(f[Q_P90T]);
+        sldDom.p99.textContent = sldFmt(f[Q_P99]) + ' / ' + sldFmt(f[Q_P99T]);
+        sldDom.rel.textContent = (f[Q_MAXREL] * 100).toFixed(2) + '%';
+        const fr = f[Q_FRAC]; sldDom.frac.textContent = fr.toFixed(2) + 'x'; sldDom.frac.className = fr <= 1 ? 'v inband' : 'v outband';
+        sldDom.count.textContent = String(f[Q_COUNT] | 0) + ' / ' + String(f[Q_EDGE] | 0);
+        const coll = f[Q_COLLAPSED] === 1; sldDom.coll.textContent = coll ? 'yes' : 'no'; sldDom.coll.className = coll ? 'v outband' : 'v inband';
+        sldDom.skb.textContent = (f[Q_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        sldDom.okb.textContent = (f[Q_ORACLE_BYTES] / 1024).toFixed(1) + ' KB';
+        sldDom.aS.textContent = String(f[Q_SKETCH_ALLOC] | 0);
+        sldDom.aO.textContent = String(f[Q_ORACLE_ALLOC]);
+        sldDom.fps.textContent = String(fpsValue);
+        sldHeap = heapText(sldDom.heap, sldHeap);
+    }
+    wireToggle('sld-mode-toggle', 'sld-mode-label', 'running (O(W))', 'paused (sketch only)', (on) => { sldOracleOn = on; });
+    wireToggle('sld-stream-toggle', 'sld-stream-label', 'stream paused (sliding to empty)', 'streaming', (on) => { sldWorld.paused = on; });
+    function sldRebuild() { const p = sldWorld.paused; sldWorld = createSldWorld(sldW, sldAlpha, SLD_DEFAULT_PANES); sldWorld.paused = p; sldAlloc.sketchCount = 0; sldAlloc.oracleCount = 0; sldDom.mem.textContent = (sldWorld.sd.bytes / 1024).toFixed(1) + ' KB'; sldLayout(); }
+    $('sld-w').addEventListener('input', (e) => { sldW = +e.target.value; $('sld-w-v').textContent = String(sldW); sldRebuild(); });
+    $('sld-alpha').addEventListener('input', (e) => { sldAlpha = (+e.target.value) / 1000; $('sld-alpha-v').textContent = sldAlpha.toFixed(3); sldRebuild(); });
+
+    // ====================================================================================
+    // SCENE 08 -- SlidingCountMin
+    // ====================================================================================
+    let scmW = SCM_DEFAULT_W, scmEps = SCM_DEFAULT_EPS;
+    let scmWorld = createScmWorld(scmW, scmEps, SCM_DEFAULT_PANES, SCM_DEFAULT_SEED);
+    const scmAlloc = createAllocState();
+    let scmOracleOn = true;
+    const scmCanvas = $('scm-canvas');
+    let scmCtx = null, SCW = 0, SCH = 0, scGX = 0, scGY = 0, scGW = 0, scGH = 0;
+    function scmLayout() { const s = sizeCanvas(scmCanvas); scmCtx = s.ctx; SCW = s.w; SCH = s.h; scGX = PAD + 40; scGY = PAD + 24; scGW = SCW - PAD * 2 - 40; scGH = SCH - PAD * 2 - 24; }
+    const scmJank = $('scm-jank'); let scmJankCtx = null, SCJW = 0, SCJH = 0;
+    const scmWit = $('scm-witness'); let scmWitCtx = null, SCWW = 0, SCWH = 0;
+    const scmSpace = $('scm-space'); let scmSpCtx = null, SCSW = 0, SCSH = 0;
+    function scmPanels() { let s = sizeCanvas(scmJank); scmJankCtx = s.ctx; SCJW = s.w; SCJH = s.h; s = sizeCanvas(scmWit); scmWitCtx = s.ctx; SCWW = s.w; SCWH = s.h; s = sizeCanvas(scmSpace); scmSpCtx = s.ctx; SCSW = s.w; SCSH = s.h; }
+    function scmStep() { stepScm(scmWorld); if (scmOracleOn) stepScmOracle(scmWorld, scmAlloc); }
+    const SCM_KLAB = []; for (let i = 0; i < 8; i++) SCM_KLAB.push('key ' + i);
+    function scmDraw() {
+        const g = scmCtx; if (!g) return;
+        g.clearRect(0, 0, SCW, SCH);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM;
+        g.fillText('tracked keys: violet = estimate, amber = one-sided band [true(W), true(W+W/B)+eps*N], magenta = true(W) (est must sit inside)', PAD, scGY - 8);
+        const f = scmWorld.flat;
+        let vmax = 1; for (let k = 0; k < SCM_TRACKED; k++) { const u = f[k * SCM_STRIDE + 2], e = f[k * SCM_STRIDE]; if (u > vmax) vmax = u; if (e > vmax) vmax = e; }
+        const rowH = scGH / SCM_TRACKED;
+        for (let k = 0; k < SCM_TRACKED; k++) {
+            const est = f[k * SCM_STRIDE], trueW = f[k * SCM_STRIDE + 1], upper = f[k * SCM_STRIDE + 2];
+            const y = scGY + k * rowH + 4, bh = rowH - 12;
+            g.fillStyle = COL_FAINT; g.fillText(SCM_KLAB[k], PAD, y + bh * 0.5 + 3);
+            g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(scGX, y, scGW, bh);
+            // one-sided band [true(W) .. upper]
+            const loW = scGW * (trueW / vmax), hiW = scGW * (upper / vmax);
+            g.fillStyle = rgbaq(AMBER_RGB, 0.4); g.fillRect(scGX + loW, y, Math.max(1, hiW - loW), bh);
+            // estimate bar
+            g.fillStyle = rgbaq(ACCENT_RGB, 0.85); g.fillRect(scGX, y, scGW * (est / vmax), bh);
+            // true(W) tick
+            const tX = scGX + scGW * (trueW / vmax);
+            g.fillStyle = rgbaq(MAGENTA_RGB, 0.95); g.fillRect(tX - 1, y - 1, 2, bh + 2);
+        }
+    }
+    function scmWitDraw(g, w, h) {
+        if (!g) return; g.clearRect(0, 0, w, h);
+        const ok = scmWorld.flat[C_BOUNDOK] === 1;
+        const barX = 6, barW = w - 12, barH = 22, y = h * 0.5 - barH * 0.5;
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y, barW, barH);
+        g.fillStyle = ok ? rgbaq(GREEN_RGB, 0.9) : rgbaq(RED_RGB, 0.9);
+        g.fillRect(barX, y, ok ? barW : barW * 0.5, barH);
+    }
+    const scmDom = { big: $('scm-bound-big'), aS: $('scm-alloc-sketch'), aO: $('scm-alloc-oracle'), bound: $('scm-bound'), sat: $('scm-saturated'), nlive: $('scm-nlive'), n: $('scm-n'), skb: $('scm-sketch-kb'), okb: $('scm-oracle-kb'), fps: $('scm-fps'), heap: $('scm-heap'), mem: $('scm-mem') };
+    let scmHeap = -1;
+    function scmTick() {
+        renderScmPrep(scmWorld, scmAlloc);
+        const f = scmWorld.flat;
+        const ok = f[C_BOUNDOK] === 1;
+        scmDom.big.textContent = ok ? 'holds' : 'VIOLATED';
+        scmDom.bound.textContent = ok ? 'yes' : 'NO'; scmDom.bound.className = ok ? 'v inband' : 'v outband';
+        const sat = f[C_SATURATED] | 0; scmDom.sat.textContent = String(sat); scmDom.sat.className = sat === 0 ? 'v inband' : 'v outband';
+        scmDom.nlive.textContent = String(f[C_NLIVE] | 0);
+        scmDom.n.textContent = String(f[C_N] | 0);
+        scmDom.skb.textContent = (f[C_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        scmDom.okb.textContent = (f[C_ORACLE_BYTES] / 1024).toFixed(1) + ' KB';
+        scmDom.aS.textContent = String(f[C_SKETCH_ALLOC] | 0);
+        scmDom.aO.textContent = String(f[C_ORACLE_ALLOC]);
+        scmDom.fps.textContent = String(fpsValue);
+        scmHeap = heapText(scmDom.heap, scmHeap);
+    }
+    wireToggle('scm-mode-toggle', 'scm-mode-label', 'running (O(W))', 'paused (sketch only)', (on) => { scmOracleOn = on; });
+    wireToggle('scm-stream-toggle', 'scm-stream-label', 'stream paused (sliding to empty)', 'streaming', (on) => { scmWorld.paused = on; });
+    function scmRebuild() { const p = scmWorld.paused; scmWorld = createScmWorld(scmW, scmEps, SCM_DEFAULT_PANES, SCM_DEFAULT_SEED); scmWorld.paused = p; scmAlloc.sketchCount = 0; scmAlloc.oracleCount = 0; scmDom.mem.textContent = (scmWorld.scm.bytes / 1024).toFixed(1) + ' KB'; scmLayout(); }
+    $('scm-w').addEventListener('input', (e) => { scmW = +e.target.value; $('scm-w-v').textContent = String(scmW); scmRebuild(); });
+    $('scm-eps').addEventListener('input', (e) => { scmEps = (+e.target.value) / 1000; $('scm-eps-v').textContent = scmEps.toFixed(3); scmRebuild(); });
+
+    // ====================================================================================
+    // SCENE 09 -- DecayedReservoir
+    // ====================================================================================
+    let drK = DR_DEFAULT_K, drHl = DR_DEFAULT_HALFLIFE;
+    let drWorld = createDrWorld(drK, drHl, 0x2545f491);
+    const drAlloc = createAllocState();
+    let drOracleOn = true;
+    const drCanvas = $('dr-canvas');
+    let drCtx = null, DRW = 0, DRH = 0, drGX = 0, drGY = 0, drGW = 0, drGH = 0;
+    function drLayout() { const s = sizeCanvas(drCanvas); drCtx = s.ctx; DRW = s.w; DRH = s.h; drGX = PAD; drGY = PAD + 24; drGW = DRW - PAD * 2; drGH = DRH - PAD * 2 - 24; }
+    const drJank = $('dr-jank'); let drJankCtx = null, DRJW = 0, DRJH = 0;
+    const drWit = $('dr-witness'); let drWitCtx = null, DRWW = 0, DRWH = 0;
+    const drSpace = $('dr-space'); let drSpCtx = null, DRSW = 0, DRSH = 0;
+    function drPanels() { let s = sizeCanvas(drJank); drJankCtx = s.ctx; DRJW = s.w; DRJH = s.h; s = sizeCanvas(drWit); drWitCtx = s.ctx; DRWW = s.w; DRWH = s.h; s = sizeCanvas(drSpace); drSpCtx = s.ctx; DRSW = s.w; DRSH = s.h; }
+    function drStep() { stepDr(drWorld); if (drOracleOn) stepDrOracle(drWorld, drAlloc); }
+    function drAgeBars(g, gx, gy, gw, gh) {
+        const hist = drWorld.ageHist, bins = DR_AGE_BINS;
+        let maxBin = 1; for (let i = 0; i < bins; i++) if (hist[i] > maxBin) maxBin = hist[i];
+        const bw = gw / bins;
+        for (let i = 0; i < bins; i++) {
+            const bh = (hist[i] / maxBin) * gh;
+            // recent (left) = accent, decaying to stale as age grows (right)
+            const t = i / (bins - 1);
+            g.fillStyle = t < 0.5 ? rgbaq(ACCENT_RGB, 0.85 - t * 0.5) : rgbaq(STALE_RGB, 0.6);
+            if (bh > 0) g.fillRect(gx + i * bw, gy + gh - bh, bw - 0.5, bh);
+        }
+    }
+    function drDraw() {
+        const g = drCtx; if (!g) return;
+        g.clearRect(0, 0, DRW, DRH);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM;
+        g.fillText('the k-sample by AGE (recent = left): retention decays exp(-lambda*age) so the sample mass leans toward recent arrivals', drGX, drGY - 8);
+        drAgeBars(g, drGX, drGY, drGW, drGH - 12);
+    }
+    function drWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drAgeBars(g, 8, 6, w - 16, h - 12); }
+    const drDom = { big: $('dr-size-big'), aS: $('dr-alloc-sketch'), aO: $('dr-alloc-oracle'), size: $('dr-size'), meanage: $('dr-meanage'), agespan: $('dr-agespan'), recency: $('dr-recency'), hl: $('dr-hl'), n: $('dr-n'), skb: $('dr-sketch-kb'), okb: $('dr-oracle-kb'), fps: $('dr-fps'), heap: $('dr-heap'), mem: $('dr-mem') };
+    let drHeap = -1;
+    function drTick() {
+        renderDrPrep(drWorld, drAlloc);
+        const f = drWorld.flat;
+        drDom.big.textContent = String(f[R_SIZE] | 0);
+        drDom.size.textContent = String(f[R_SIZE] | 0) + ' / ' + String(f[R_K] | 0);
+        drDom.meanage.textContent = f[R_MEANAGE].toFixed(0);
+        drDom.agespan.textContent = (f[R_NEWEST] | 0) + ' / ' + (f[R_OLDEST] | 0);
+        drDom.recency.textContent = (f[R_RECENCYFRAC] * 100).toFixed(0) + '%';
+        drDom.hl.textContent = (f[R_HALFLIFE] | 0) + ' / ' + f[R_LAMBDA].toExponential(2);
+        drDom.n.textContent = String(f[R_N] | 0);
+        drDom.skb.textContent = (f[R_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        drDom.okb.textContent = (f[R_ORACLE_BYTES] / 1024).toFixed(1) + ' KB';
+        drDom.aS.textContent = String(f[R_SKETCH_ALLOC] | 0);
+        drDom.aO.textContent = String(f[R_ORACLE_ALLOC]);
+        drDom.fps.textContent = String(fpsValue);
+        drHeap = heapText(drDom.heap, drHeap);
+    }
+    wireToggle('dr-mode-toggle', 'dr-mode-label', 'running (retains O(N))', 'paused (sketch only)', (on) => { drOracleOn = on; });
+    function drRebuild() { drWorld = createDrWorld(drK, drHl, 0x2545f491); drAlloc.sketchCount = 0; drAlloc.oracleCount = 0; drDom.mem.textContent = (drWorld.dr.bytes / 1024).toFixed(1) + ' KB'; drLayout(); }
+    $('dr-k').addEventListener('input', (e) => { drK = +e.target.value; $('dr-k-v').textContent = String(drK); drRebuild(); });
+    $('dr-hl').addEventListener('input', (e) => { drHl = +e.target.value; $('dr-hl-v').textContent = String(drHl); drRebuild(); });
+
     // ---- main loop ---------------------------------------------------------------------
     function loop(now) {
         const dt = now - lastTs; lastTs = now;
@@ -1022,6 +1835,11 @@
         else if (activeScene === 'ad') { if (!paused) adStep(); adDraw(); drawJank(adJankCtx, AJW, AJH); adWitDraw(adWitCtx, AWW, AWH); drawSpaceBars(adSpCtx, ASW, ASH, adWorld.flat[A_SKETCH_BYTES], adWorld.flat[A_ORACLE_BYTES]); }
         else if (activeScene === 'fd') { if (!paused) fdStep(); fdDraw(); drawJank(fdJankCtx, FJW, FJH); fdWitDraw(fdWitCtx, FWW, FWH); drawSpaceBars(fdSpCtx, FSW, FSH, fdWorld.flat[D_SKETCH_BYTES], fdWorld.flat[D_ARR_BYTES]); }
         else if (activeScene === 'hk') { if (!paused) hkStep(); hkDraw(); drawJank(hkJankCtx, HJW, HJH); hkWitDraw(hkWitCtx, HWW, HWH); drawSpaceBars(hkSpCtx, HSW, HSH, hkWorld.flat[H_SKETCH_BYTES], hkWorld.flat[H_MAP_BYTES]); }
+        else if (activeScene === 'shll') { if (!paused) shllStep(); shllDraw(); drawJank(shllJankCtx, SHJW, SHJH); shllWitDraw(shllWitCtx, SHWW, SHWH); drawSpaceBars(shllSpCtx, SHSW, SHSH, shllWorld.flat[S_SKETCH_BYTES], shllWorld.flat[S_ORACLE_BYTES]); }
+        else if (activeScene === 'dd') { if (!paused) ddStep(); ddDraw(); drawJank(ddJankCtx, DJW, DJH); ddWitDraw(ddWitCtx, DWW, DWH); drawSpaceBars(ddSpCtx, DSW, DSH, ddWorld.flat[G_SKETCH_BYTES], ddWorld.flat[G_ORACLE_BYTES]); }
+        else if (activeScene === 'sld') { if (!paused) sldStep(); sldDraw(); drawJank(sldJankCtx, SDJW, SDJH); sldWitDraw(sldWitCtx, SDWW, SDWH); drawSpaceBars(sldSpCtx, SDSW, SDSH, sldWorld.flat[Q_SKETCH_BYTES], sldWorld.flat[Q_ORACLE_BYTES]); }
+        else if (activeScene === 'scm') { if (!paused) scmStep(); scmDraw(); drawJank(scmJankCtx, SCJW, SCJH); scmWitDraw(scmWitCtx, SCWW, SCWH); drawSpaceBars(scmSpCtx, SCSW, SCSH, scmWorld.flat[C_SKETCH_BYTES], scmWorld.flat[C_ORACLE_BYTES]); }
+        else if (activeScene === 'dr') { if (!paused) drStep(); drDraw(); drawJank(drJankCtx, DRJW, DRJH); drWitDraw(drWitCtx, DRWW, DRWH); drawSpaceBars(drSpCtx, DRSW, DRSH, drWorld.flat[R_SKETCH_BYTES], drWorld.flat[R_ORACLE_BYTES]); }
 
         frameN++;
         if ((frameN & 7) === 0) {
@@ -1029,6 +1847,11 @@
             else if (activeScene === 'ad') adTick();
             else if (activeScene === 'fd') fdTick();
             else if (activeScene === 'hk') hkTick();
+            else if (activeScene === 'shll') shllTick();
+            else if (activeScene === 'dd') ddTick();
+            else if (activeScene === 'sld') sldTick();
+            else if (activeScene === 'scm') scmTick();
+            else if (activeScene === 'dr') drTick();
         }
         requestAnimationFrame(loop);
     }
@@ -1041,25 +1864,33 @@
         for (let i = 0; i < scenes.length; i++) { const on = scenes[i].getAttribute('data-scene') === tab; if (on) scenes[i].setAttribute('data-active', ''); else scenes[i].removeAttribute('data-active'); }
         for (let i = 0; i < tabButtons.length; i++) tabButtons[i].setAttribute('aria-current', tabButtons[i].getAttribute('data-tab') === tab ? 'true' : 'false');
         activeScene = tab;
+        layoutActive(tab);
+    }
+    function layoutActive(tab) {
         if (tab === 'eh') { ehLayout(); ehPanels(); }
         else if (tab === 'ad') { adLayout(); adPanels(); }
         else if (tab === 'fd') { fdLayout(); fdPanels(); }
         else if (tab === 'hk') { hkLayout(); hkPanels(); }
+        else if (tab === 'shll') { shllLayout(); shllPanels(); }
+        else if (tab === 'dd') { ddLayout(); ddPanels(); }
+        else if (tab === 'sld') { sldLayout(); sldPanels(); }
+        else if (tab === 'scm') { scmLayout(); scmPanels(); }
+        else if (tab === 'dr') { drLayout(); drPanels(); }
     }
     for (let i = 0; i < tabButtons.length; i++) tabButtons[i].addEventListener('click', () => activate(tabButtons[i].getAttribute('data-tab')));
 
-    window.addEventListener('resize', () => {
-        if (activeScene === 'eh') { ehLayout(); ehPanels(); }
-        else if (activeScene === 'ad') { adLayout(); adPanels(); }
-        else if (activeScene === 'fd') { fdLayout(); fdPanels(); }
-        else if (activeScene === 'hk') { hkLayout(); hkPanels(); }
-    });
+    window.addEventListener('resize', () => layoutActive(activeScene));
 
     window.addEventListener('keydown', (e) => {
         if (e.key === '1') activate('eh');
         else if (e.key === '2') activate('ad');
         else if (e.key === '3') activate('fd');
         else if (e.key === '4') activate('hk');
+        else if (e.key === '5') activate('shll');
+        else if (e.key === '6') activate('dd');
+        else if (e.key === '7') activate('sld');
+        else if (e.key === '8') activate('scm');
+        else if (e.key === '9') activate('dr');
         else if (e.key === ' ' && e.target === document.body) { e.preventDefault(); setPaused(!paused); }
     });
 
@@ -1068,6 +1899,11 @@
     adDom.mem.textContent = (adWorld.ad.capacity * 32 / 1024).toFixed(1) + ' KB';
     fdDom.mem.textContent = (0.056).toFixed(3) + ' KB';
     hkDom.mem.textContent = (hkWorld.hk.bytes / 1024).toFixed(1) + ' KB';
+    shllDom.mem.textContent = (shllWorld.sl.bytes / 1024).toFixed(1) + ' KB';
+    ddDom.mem.textContent = (DD_SKETCH_BYTES / 1024).toFixed(3) + ' KB';
+    sldDom.mem.textContent = (sldWorld.sd.bytes / 1024).toFixed(1) + ' KB';
+    scmDom.mem.textContent = (scmWorld.scm.bytes / 1024).toFixed(1) + ' KB';
+    drDom.mem.textContent = (drWorld.dr.bytes / 1024).toFixed(1) + ' KB';
     ehLayout(); ehPanels();
     requestAnimationFrame(loop);
 </script>

@@ -400,5 +400,56 @@ Design warnings specific to the Tier-2 members (numbers from the ROADMAP 6.2 siz
 - **Decayed Reservoir and DDM/EDDM have no lite-hud demand.** If either ships, the reservoir must
   never hold caller objects (retention outside the member's control; store numbers and ids only).
 
+---
+
+## 13. Final-sweep audit of 1.6.0 (2026-09-24) -- the record behind ROADMAP section 7
+
+Two parallel read-only audits of d37b271. Probes ran outside the repo, and patched scratch copies
+were used only to confirm fixes. The allocation method: count minor GCs (scavenges) at N=200k and
+8N under `--max-semi-space-size=4`, one lane per process, run fresh AND after a warm-up with
+differently-configured instances of all 9 members. Keys, clocks and counts were read from
+Float64Arrays, so the harness itself never boxed. One 16 B box per op reads 12 scavenges at 8N.
+
+### 13.1 Why the gates passed
+
+- **The perf gate threshold was coarser than the signal.** `maxScavenges: 16` against a 12-scavenge
+  box. The floor existed because the gate's own drivers boxed (`t += 1.5` in a local).
+- **measureAllocs cannot see transient boxes.** The torture "boxed" diagnostics print 0 while
+  scaling shows 32 B/op, and the torture lanes are labelled "NOT a gate".
+- **Several plain-add controls have no teeth.** FD.add and DD.add are inlined in a monomorphic
+  probe and read 0, so the lane cannot prove it would catch a box.
+- **Accuracy witnesses shared the bug they gate.** The SlidingDDSketch oracle is pane-aligned
+  (`E-W`), the same under-coverage as the code (F7).
+- **Correctness lanes used sparse explicit streams.** EH's NaN needs about 7 or more events per
+  time unit (F1).
+
+### 13.2 The High findings (independently reproduced)
+
+| id | finding | numbers |
+| --- | --- | --- |
+| H1 | EH cascade writes past the last level (silently ignored) and returns NaN | `EH(10,.1)`: NaN at add 43 at one `now`; `EH(1000,.01)` at 10 kHz: NaN at add 6477 |
+| H2 | SlidingDDSketch strict throws on in-range values | `add(0,1); add(1,1.05)` throws |
+| A1 | HeavyKeeper.addFrom boxes via non-inlined key-taking helpers | keys >= 2^31: 12 (16 B/op), <= -2^31: 25; re-measured 5 -> 27 vs small keys 1 -> 2 |
+| A2 | perf gate `maxScavenges: 16` passes a 16 B/op lane | at 0, FD addFrom 6, HK addFrom 12, DR add 1 fail |
+
+### 13.3 Lessons (new, beyond section 12)
+
+1. **A zero-box ENTRY is not a zero-box PATH.** `addFrom` read the key unboxed, then passed it as an
+   argument to four internal helpers. The value must stay in a slot for the whole hot path, not
+   just at the door.
+2. **A gate threshold must sit below one box per op.** Calibrate every scavenge gate against a
+   deliberate one-box-per-op control (N1), not against a large allocation.
+3. **The harness is code too.** A fractional clock in a driver local boxes. Keep driver clocks and
+   keys in Float64Array slots, or the floor you tolerate hides the library.
+4. **An oracle must be independent of the design.** A pane-aligned oracle for a pane-based sketch
+   agrees with the bug. Oracles use the TRUE window definition.
+5. **Silent typed-array OOB writes are a fail-open channel.** Any computed index into a
+   fixed-level structure is bound-checked before the first state change.
+6. **Node is not the browser.** Node here has 32-bit Smis; Chrome 152 has 31-bit. A key or hash in
+   [2^30, 2^31) is a Smi in one and a HeapNumber in the other. Browser-bound consumers (lite-hud)
+   need a browser lane (N6).
+7. **Streaming variance uses Welford/Chan, never E[x^2] - mean^2.** At a 1.7e12 offset the naive
+   form reads variance 0 and alarms constantly.
+
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com> -- never "Karadjov".

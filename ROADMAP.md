@@ -6,7 +6,15 @@ complete at 1.0.0). See `RESEARCH.md` for the identity, the two witnesses (recen
 change response), the roster rationale (incl. the verdict on the inherited backlog), and the
 open questions. ASCII-only (`->`, `<=`, `x`, "epsilon", "alpha", "delta").
 
-Status: PRE-CODE / PROPOSED (2026-09-23). Two calls to SETTLE before M1: the scope/theme (is
+> **NEXT (2026-09-24): H1 hardening -- v1.7.0** (section 7; audit record in RESEARCH.md section 13).
+> The 1.6.0 final sweep found 4 High findings the shipped gates pass:
+> - `ExponentialHistogram` goes to `count() = NaN` on a dense explicit stream.
+> - `SlidingDDSketch` strict mode throws on in-range values.
+> - `HeavyKeeper.addFrom` boxes large keys.
+> - The perf gate's `maxScavenges: 16` cannot see a 16 B/op box.
+> lite-hud M4 (EH) and the HeavyKeeper drop-in wait for this release.
+
+Status (historical; the roster SHIPPED through 1.6.0): PRE-CODE / PROPOSED (2026-09-23). Two calls to SETTLE before M1: the scope/theme (is
 this the sliding-window + decay + drift package, with Exponential Histogram as reference?) and
 the TIME SOURCE + bucket-pool substrate (ADR 0001). Each milestone is then a full pipeline
 session (planner -> settle -> coder -> reviewer -> qa); the maintainer commits/publishes;
@@ -387,5 +395,79 @@ its later sessions. Each member's planner copies R1-R10 into its brief as gates.
 **HeavyKeeper** (0.4.0): see the M4 brief. Weighted `add(key, weight)`, `addFrom`, `forEach`, a
 seeded PRNG, getters, a 0-alloc `clear`, and `merge` optional. **ADWIN.addFrom** lands before
 1.0.0.
+
+---
+
+## 7. H1 hardening -- v1.7.0 (final-sweep audit of 1.6.0, 2026-09-24)  [PLANNED]
+
+Baseline at audit (d37b271): `npm test` 368/368, `test:perf` 28/28, torture `ok` (exit 0), and
+every torture lane prints 0 B/op. Two parallel read-only audits covered (a) allocation + gate
+honesty and (b) fail-closed + correctness + doc truth. The evidence is in RESEARCH.md section 13.
+H1, H2, M1 and A1 were re-run independently and reproduced.
+
+**Fixes (F)**
+
+| id | finding | task | falsifiable gate |
+| --- | --- | --- | --- |
+| F1 | H1 (H) EH explicit mode: the merge cascade writes past the last level (`Adaptive.js:255`, `:443`, `:565`; typed-array OOB writes are silently ignored). Buckets are orphaned, and `count()` / `sum()` return NaN from ~6-7 events per time unit, e.g. `EH(10, .1)` NaN at add 43. The README quick-start `EH(60000, .01)` at 8 kHz hits it. The "overflow throw" described in ADR 0001 fires only later, as "this is a bug". | Check `nl >= levels` BEFORE any state change and throw a tagged error (a byte-identical no-op). Size levels for the full range (settle S3: 53 levels) or add a `maxCount` option. | `EH(1000, .01)` at 10 kHz for 70 s: `count()` never NaN. Each count is within eps of a deque oracle, OR a tagged throw with the state snapshot unchanged. |
+| F2 | H2 (H) SlidingDDSketch `strict`: the first value sits at the TOP bin (`:3798`, `:3830`), so any larger in-range value throws "would collapse" (`add(0,1); add(1,1.05)` throws). The meaning also differs from lite-sketch DDSketch, where strict = a declared range. | Anchor so that a throw happens only when mass would really be lost. Align the meaning with lite-sketch DDSketch (declared range + `strict` / `minIndexable` / `maxIndexable` getters with the same accepted band). | Strict with values 1, 1.05, ... up to 1e3 (within the bin budget) accepts every add. One value that forces a real collapse throws. A cross-check shows the getters' band equals lite-sketch DDSketch's for the same alpha. |
+| F3 | A1 (H) `HeavyKeeper.addFrom` boxes: key >= 2^31 or 2^53-1 gives 12 scavenges at 8N (16 B/op), key <= -2^31 gives 25, weight near 2^30 gives 15. Fresh and warm. The key passes through non-inlined `hkHash` (`:1761`), `_promote` (`:2007`/`:2066`) and `_mapFind`/`_mapSet`/`_mapDel` (`:2168-2280`), and `hkMapHash` returns `>>> 0` (`:1785-1795`). Re-measured independently: small keys 1->2, keys >= 2^31 5->27. | Pass the key and estimate through Float64Array slots (a module `HK_KIN[0]`, `this._kslot`), and have `hkMapHash` return `\| 0`. The audit's scratch patch measured 0/0 with the plain-add control still at 12 and identical `topK`. | The N3 matrix row for HK equals baseline for all 6 key classes and weights near 2^30, fresh and warmed. |
+| F4 | A2 + A3 (H) the perf gate's `maxScavenges: 16` (`PerfGate.test.mjs:775`) passes a known 16 B/op lane (12). The fractional drivers box in the HARNESS (`t += 1.5` in a local), which is why a floor was needed. At 0, FD addFrom (6), HK addFrom (12) and DR add (1) fail. | Keep driver clocks and keys in a Float64Array slot, then set `maxScavenges: 0`. Any remaining floor is per lane, measured, and reasoned in writing (ROADMAP 3.5b). | N1 (below) fails at 0. Every shipped lane passes at 0 after F3/F5. |
+| F5 | A5 (M) SlidingDDSketch queries allocate: `_merge(this._now - effW)` passes a computed double (`:3961`/`:3982`) and `out[j] = this._walk(q)` returns a computed double (`:3983`). `quantileInto` (3 qs) is ~64 B/call and `quantile` ~32 B/call. The docs say 0-alloc. | Write the cut into a slot and add `_walkInto(qs, out, j)` returning void. The scratch patch measured `quantileInto` 24 -> 0 with byte-identical output. `quantile()` keeps its one boxed return (16 B/call): document it and point to `quantileInto`. | The N4 query lane shows `quantileInto` at 0, fresh and warmed. |
+| F6 | A6 (L) returned doubles box: EH `sum()`, SCM `estimate` >= 2^31, HK `estimate` after warm-up, each 16 B/call. llms.txt:686 claims 0-alloc. | Document them as "one boxed return per call", or add `Into` forms (R7). | The docs state it, or an `Into` lane is at 0. |
+| F7 | M1 (M) SlidingDDSketch keeps B panes and DROPS up to one pane EARLY (under-coverage). The README (275), ADR 0008 (30-31) and the class comment (`:3343`) say the straddling pane is "counted in full". Against a true `(now-W, now]` oracle, 172 of 1053 quantile queries are beyond alpha (worst 50x), and `add(10,5); advance(105)` with W=100, B=2 reads count 0. The witness oracle `sldDrive` is pane-aligned, so it has the same bug. | Use B+1 panes as SlidingCountMin does, so the covered span is [W, W+W/B]. Switch the witness oracle to the TRUE window. | Against the true-window oracle, `count() >= true` on 100% of queries and quantiles are within alpha of the covered span. A B-pane control variant fails. |
+| F8 | M2 (M) `SlidingHyperLogLog.count()` destructively expires ring entries (`:2788-2789`, `:2661`), so `overflows` / `degraded` depend on query frequency (2694 vs 162 on the same stream). llms.txt:789 and ADR 0009 say queries are PURE. | In the add push, drop expired heads first (`stamp <= t - W`) and count an overflow only for an in-window drop. Make `count()` non-destructive. | Two instances, one queried and one not, have equal `overflows`. A ring snapshot is unchanged across `count()`. |
+| F9 | M3 (M) ADWIN false alarms at large offsets: variance is computed as E[x^2] - mean^2 (`:975-981`, `:1171`). Stationary N(0,1): 0 alarms at offset 0, 18 at 1e9, 66 at 1.7e12 (variance reads 0). | Per-bucket variance with the Chan/Welford merge (the ADWIN reference), or centred sums. | False alarms and step-detection delay at offsets 1e9 and 1.7e12 are within +-2 items of offset 0. |
+| F10 | M4 (M) HeavyKeeper stores the weight unclamped into a Uint32 cell (`:1987`, `:2002`, `:2047`, `:2061`): `add(7, 2^32)` estimates 0. | Reject `weight > 2^32-1` (SCM parity) or clamp at store. | `estimate` equals the top-k entry for weights 2^32 and 2^33, or they throw tagged. |
+| F11 | M5 (M) doors that abort the PROCESS: `new HeavyKeeper(64, 2**30, 1)` and `new ExponentialHistogram(10, 1e-12)` hit an uncatchable V8 fatal. DR `k` is uncapped too. | Add a cells cap (like `SCM_CELLS_CAP`) to HK / EH / DR and throw a tagged RangeError before allocation. | Each case throws tagged in a subprocess, with no abort. |
+| F12 | M6 (M) three contracts for a bad query argument: SDD `quantile(2)` throws (lite-sketch returns NaN), SCM `estimate(k, badW)` returns 0 (fail-open for an upper-bound sketch), and SHLL/SDD `count(badW)` throws. | One contract. Lean: NaN, never throw, matching lite-sketch. | A table test across SDD / SHLL / SCM. |
+| F13 | M7 (M) the option-key lists for HK, SHLL, DD, SDD, SCM and DR are plain object literals, so `{constructor: 1}` / `{toString: 1}` are accepted. Arrays are accepted as the bag. The promised did-you-mean hint does not exist (R6). EH / ADWIN / FD use `Object.create(null)` correctly. | Use `Object.create(null)` lists (or `Object.keys` + an own-check), reject arrays, and add a did-you-mean hint on all doors, including `withAccuracy`. | `{toString:1}` and `[]` throw on all 11 doors. `{sede:1}` suggests `seed`. |
+| F14 | L1 (L) a subnormal `halfLife` gives `lambda = Infinity`, then NaN. DR fails open (priorities NaN, the sample freezes). FD fails only at query time. | Reject when `!(Math.LN2 / halfLife < Infinity)`. | `DR(2, 1e-320)` and `FD(1e-320)` throw tagged. |
+| F15 | L2, L6, L7 (L) EH `sum()` has no finiteness guard (`add(0,1e308)` twice gives Infinity). The DR idle-gap comment (`:4994`) and the CHANGELOG 1.6.0 disagree (keys do reach -Infinity; harmless ordering). The HK overestimate range is written backwards (`:1805-1806`). | Guard or document `sum()`, and correct the two texts. | Grep the corrected texts. `sum()` is finite or documented. |
+| F16 | L3, L4, L5 (L) the lockfile `version` is 0.1.0. The README Testing section has no test count (368). ROADMAP statuses are stale (M0-M4 "planned", SCM "IN DEVELOPMENT", Reservoir "unscheduled"). | Fix all three. | `npm i --package-lock-only` produces no diff. The README states the count. |
+
+**New gates (N)**
+
+| id | gate | must fail today |
+| --- | --- | --- |
+| N1 | mustFail: a scenario that boxes exactly one 16 B HeapNumber per op (12 scavenges at 8N). It must FAIL at `maxScavenges: 0`. It replaces the `new Array(64)` control, which is ~30x the signal. | passes today at 16 |
+| N2 | A plain-add fractional control per member, required to reach >= 10 scavenges. For FD, DD and `advance`, call through ONE call site shared by >= 5 classes, so inlining cannot hide the box. | FD / DD read 0 today |
+| N3 | The key x clock matrix: each member's `addFrom` x {performance.now, epoch-ms} x keys {2^30, 2^31, 2^32-1, -2^31, 2^53-1} x counts {1, 2^30} x {fresh, warmed by other configs + sibling members}, equal to baseline. | HK: 12-27 |
+| N4 | Query scaling lanes (the ones a consumer calls at 10-15 Hz): `quantileInto`, `count`, `estimate`, `sum`, `forEach`, `sampleInto`. | `quantileInto`: 24 |
+| N5 | A +1e12 timing gate for SlidingCountMin (< 1 ms at the default size), with a per-skipped-pane loop subclass that must FAIL it. Add FD and DR huge-jump timing. | no SCM lane today |
+| N6 | The same key-class lanes in a 31-bit-Smi runtime (headless Chrome). On this Node build 2^31-1 is still a Smi; in Chrome 152 `%IsSmi(2**30)` is false. Every Node "0" is from the 32-bit-Smi build. Keep hot-path int32 hashes in an Int32Array slot or hand-inline them (F3-style). | not measured yet (PLAUSIBLE) |
+
+**Settle calls (maintainer)**, lean in brackets:
+- S1 CUSUM re-fires on a sustained shift (850 alarms in 5000 items after a +10 step; disclosed in
+  ADR 0007). Section 6.2's one-alarm-per-regime, direction and `lastDriftIndex` did not ship.
+  [Add `lastDirection` (+-1) and `lastDriftIndex` getters plus an optional latch. lite-hud uses PH.]
+- S2 SlidingCountMin has no `total(w?)`. ADR 0010 rejected it by reasoning about CU cells, but 6.2
+  asked for a separate exact Float64 total per pane. [Ship it: 8 B/pane, exact. A consumer needs N
+  for the epsilon x N bound.]
+- S3 EH level sizing for F1. [53 levels by default, with the memory figure stated.]
+- S4 SCM `seed` is coerced with `\| 0` (2^32+1 == 1), while HK / SHLL / DR reject a non-uint32.
+  [Keep it for lite-sketch CMS parity (the differential gate relies on it); document it.]
+- S5 `lastNow` reads 0 before the first add (SHLL / SDD / SCM), and the ADWIN / DD empty `mean`
+  is 0. [NaN: null is not zero. Or document "check `mode`".]
+
+**Checked clean (no task):**
+- d.ts vs runtime reflection: no gaps.
+- `add` / `addFrom` validation is identical.
+- 13+ rejection classes per member leave byte-identical state.
+- SHLL equals lite-sketch HLL (0 mismatches / 50k keys to +-2^53) and is within 0.76 sigma at
+  epoch-ms incl. after `advance`.
+- SCM one-sided on 0 of 94,350 queries under the true count, equals lite-sketch CMS key for key,
+  saturation and sums > 2^32 are correct, and a +1e12 jump is bounded (36 us default, 2.1 ms at
+  269 MB).
+- FD is exact to ~1e-15 at epoch-ms across rebases.
+- R11 `advance` empties EH / SHLL / SCM / SDD.
+- HK weighted recall@10 = 1.0.
+- DR is seeded-reproducible, empty = size 0, numbers only.
+- Every other `addFrom` / `advanceFrom` lane is 0 fresh and warmed at both clock scales.
+- Steady-state reshaping p99.9 <= 2.4 us, and every rotation loop is capped at B+1 panes.
+- ASCII / MIT / `files[]` / VERSION are clean.
+
+**Exit:** F1-F16 and N1-N5 green, and N1 and the N2 controls FAIL when the fixes are reverted.
+N6 is measured, or recorded as an open item with a browser lane plan.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

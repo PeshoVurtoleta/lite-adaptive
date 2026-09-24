@@ -29,7 +29,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import {
-    ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, VERSION as ADAPTIVE_VERSION,
+    ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper,
+    SlidingHyperLogLog, DriftDetector, SlidingDDSketch, SlidingCountMin, DecayedReservoir,
+    VERSION as ADAPTIVE_VERSION,
 } from '../Adaptive.js';
 import {
     VERSION as KERNEL_VERSION, createAllocState,
@@ -50,6 +52,27 @@ import {
     HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K, HK_DRIFT_OFFSET, HK_SS_MULT,
     H_RECALL, H_TRUEHH, H_MAXOVER, H_BRACKETOK, H_HKERR, H_SSERR, H_MARQUEEOK, H_SIZE, H_N,
     H_SKETCH_ALLOC, H_ORACLE_ALLOC,
+    // Scene 05 -- SlidingHyperLogLog
+    createShllWorld, stepShll, stepShllOracle, renderShllPrep,
+    SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, SHLL_KEYS_PER_FRAME, SHLL_SIGMA_MULT,
+    S_EST, S_TRUE, S_RELERR, S_GATE, S_FRAC, S_M, S_DEGRADED, S_N, S_SKETCH_ALLOC, S_ORACLE_ALLOC,
+    // Scene 06 -- DriftDetector
+    createDdWorld, stepDd, stepDdOracle, renderDdPrep,
+    DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD,
+    G_PH_STAT, G_PH_THRESH, G_CU_STAT, G_CU_THRESH, G_PH_FIRES, G_CU_FIRES, G_CP, G_N,
+    G_SKETCH_ALLOC, G_ORACLE_ALLOC,
+    // Scene 07 -- SlidingDDSketch
+    createSldWorld, stepSld, stepSldOracle, renderSldPrep,
+    SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES, SLD_VALUES_PER_FRAME,
+    Q_P50, Q_P90, Q_P99, Q_MAXREL, Q_ALPHA, Q_COUNT, Q_LIVE, Q_EDGE, Q_N, Q_SKETCH_ALLOC, Q_ORACLE_ALLOC,
+    // Scene 08 -- SlidingCountMin
+    createScmWorld, stepScm, stepScmOracle, renderScmPrep,
+    SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, SCM_KEYS_PER_FRAME, SCM_TRACKED, SCM_STRIDE,
+    C_BOUNDOK, C_NLIVE, C_SATURATED, C_N, C_SKETCH_ALLOC, C_ORACLE_ALLOC,
+    // Scene 09 -- DecayedReservoir
+    createDrWorld, stepDr, stepDrOracle, renderDrPrep,
+    DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, DR_ADDS_PER_FRAME,
+    R_SIZE, R_K, R_MEANAGE, R_RECENCYFRAC, R_N, R_SKETCH_ALLOC, R_ORACLE_ALLOC,
 } from './kernels.mjs';
 
 // Dev-only peer (already a devDependency -- the same tool test/torture.mjs uses). Used ONLY by the
@@ -59,6 +82,14 @@ import { GcProfiler, checkNoGc, measureAllocs } from '@zakkster/lite-gc-profiler
 const DEMO_DIR = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const PKG = require('../package.json');
+
+// `demo:check` (fast) sets LITE_DEMO_FAST=1: run trinity + faithfulness + boundary + seed + ONE alloc
+// batch per scene, and skip the SLOWEST lanes -- the 200k-frame GC gates and the DR inclusion-slope
+// sweep (the two multi-second lanes). The witness faithfulness sweeps + the HK marquee still run under
+// demo:check (fast enough, and they re-prove the demo kernels' accuracy in the verify tail). The full
+// `demo` script leaves LITE_DEMO_FAST unset and runs everything, incl. the 200k-frame GC lanes.
+const FAST = process.env.LITE_DEMO_FAST === '1';
+const ALLOC_BATCHES = FAST ? 1 : 8;
 
 /** A deterministic mulberry32 PRNG (matches test/witness.mjs mulberry32) -- reused for the
  *  stationary false-alarm run + the drift marquee, so every number here is reproducible. */
@@ -74,10 +105,9 @@ function mulberry32(seed) {
 
 /* ============================ version trinity ============================== */
 
-test('version trinity: kernels re-export === Adaptive.js VERSION === package.json version === 1.0.0', () => {
+test('version trinity: kernels re-export === Adaptive.js VERSION === package.json version (dynamic, no literal)', () => {
     assert.equal(KERNEL_VERSION, ADAPTIVE_VERSION, 'kernels.mjs must re-export the shipped VERSION');
     assert.equal(ADAPTIVE_VERSION, PKG.version, 'Adaptive.js VERSION must equal package.json version');
-    assert.equal(ADAPTIVE_VERSION, '1.0.0', 'the frozen API is pinned at 1.0.0');
     assert.match(ADAPTIVE_VERSION, /^\d+\.\d+\.\d+$/, 'VERSION must be a clean semver string');
 });
 
@@ -386,6 +416,319 @@ test('HK seed: null/undefined fall back to the default; an explicit 0 is honored
     assert.equal(createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K, 7).seed, 7, 'a genuine nonzero seed passes through');
 });
 
+/* =============================================================================================
+ * SCENE 05 -- SlidingHyperLogLog (windowed distinct-count)
+ * ============================================================================================= */
+
+test('SHLL faithfulness: renderShllPrep displays exactly the shipped count() and the exact-Map distinct', () => {
+    const world = createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 0xAB01);
+    const a = createAllocState();
+    for (let f = 0; f < 400; f++) { stepShll(world); stepShllOracle(world, a); }
+    renderShllPrep(world, a);
+    assert.equal(world.flat[S_EST], world.sl.count(), 'displayed estimate must be the shipped SlidingHyperLogLog.count()');
+    assert.equal(world.flat[S_TRUE], world.oMap.size, 'displayed true distinct must be the exact in-window Map size');
+    assert.equal(world.flat[S_M], world.sl.m, 'displayed m must be the shipped getter');
+    assert.equal(world.flat[S_DEGRADED], world.sl.degraded ? 1 : 0, 'displayed degraded flag must be the shipped getter');
+});
+
+test('SHLL witness: measured windowed distinct relerr stays <= 3*standardError, NOT degraded, over >= 2000 queries', () => {
+    const world = createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 0x0BAD5EED);
+    const a = createAllocState();
+    const fpl = Math.ceil(SHLL_DEFAULT_W / SHLL_KEYS_PER_FRAME);
+    let maxRel = 0, checks = 0, gate = 0;
+    for (let f = 0; f < fpl * 40; f++) {
+        stepShll(world); stepShllOracle(world, a);
+        if (f > fpl) { renderShllPrep(world, a); if (world.flat[S_RELERR] > maxRel) maxRel = world.flat[S_RELERR]; gate = world.flat[S_GATE]; checks++; }
+    }
+    assert.ok(checks >= 2000, 'the witness must sample >= 2000 windowed-distinct queries, got ' + checks);
+    assert.equal(gate, SHLL_SIGMA_MULT * world.sl.standardError, 'the gate must be 3 * standardError (the theoretical band)');
+    assert.ok(maxRel <= gate, 'measured relerr ' + maxRel.toFixed(5) + ' must be <= 3*standardError ' + gate.toFixed(5));
+    assert.equal(world.sl.degraded, false, 'the sketch must never degrade on this workload (the bound is guaranteed)');
+});
+
+test('SHLL boundary: a bad W / p / ringCap fails closed at the ctor', () => {
+    assert.throws(() => createShllWorld(0, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP), /\[lite-adaptive\]/, 'W=0 must fail closed');
+    assert.throws(() => createShllWorld(-1, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP), /\[lite-adaptive\]/, 'W<0 must fail closed');
+    assert.throws(() => createShllWorld(NaN, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP), /\[lite-adaptive\]/, 'W=NaN must fail closed');
+    assert.throws(() => createShllWorld(SHLL_DEFAULT_W, 0, SHLL_DEFAULT_RINGCAP), /\[lite-adaptive\]/, 'p=0 must fail closed');
+    assert.doesNotThrow(() => createShllWorld(1024, 10, 8), 'a valid (W, p, ringCap) must construct');
+});
+
+test('SHLL seed: null/undefined fall back to the default; an explicit 0 is honored (null is not zero)', () => {
+    assert.equal(createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, null).seed, 0x51ec1a11, 'seed=null falls back');
+    assert.equal(createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, undefined).seed, 0x51ec1a11, 'seed=undefined falls back');
+    assert.equal(createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 0).seed, 0, 'seed=0 is honored, not aliased');
+    assert.equal(createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 7).seed, 7, 'a genuine nonzero seed passes through');
+});
+
+/* =============================================================================================
+ * SCENE 06 -- DriftDetector (Page-Hinkley vs CUSUM)
+ * ============================================================================================= */
+
+test('DD faithfulness: renderDdPrep displays exactly both shipped detectors statistic / threshold / mean', () => {
+    const world = createDdWorld(DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD);
+    const a = createAllocState();
+    for (let f = 0; f < 1000; f++) { stepDd(world); stepDdOracle(world, a); }
+    renderDdPrep(world, a);
+    assert.equal(world.flat[G_PH_STAT], world.ph.statistic, 'displayed PH statistic must be the shipped getter');
+    assert.equal(world.flat[G_PH_THRESH], world.ph.threshold, 'displayed PH threshold must be the shipped getter');
+    assert.equal(world.flat[G_CU_STAT], world.cu.statistic, 'displayed CUSUM statistic must be the shipped getter');
+    assert.equal(world.flat[G_CU_THRESH], world.cu.threshold, 'displayed CUSUM threshold must be the shipped getter');
+});
+
+test('DD witness: the mode is LOAD-BEARING -- on a slow mean ramp CUSUM (fixed mu0) fires FAR more than PH (adaptive)', () => {
+    // Reuse test/witness.mjs ddRampFires semantics verbatim: PH's ONLINE reference tracks the ramp and
+    // stays quiet, while CUSUM's FIXED mu0=0 sees an ever-growing departure. GATE: PH fires < CUSUM.
+    function ramp(mode) {
+        const opts = mode === 1 ? { delta: 0.005, threshold: 5, target: 0 } : { delta: 0.005, threshold: 5 };
+        const dd = new DriftDetector(mode, opts);
+        const r = mulberry32(1);
+        let fires = 0;
+        for (let i = 0; i < 20000; i++) if (dd.add(i * 0.002 + (r() - 0.5) * 0.1)) fires++;
+        return fires;
+    }
+    const phFires = ramp(0), cuFires = ramp(1);
+    assert.ok(phFires < cuFires && cuFires > phFires * 5,
+        'PH fires ' + phFires + ' must be far below CUSUM ' + cuFires + ' (mode is load-bearing)');
+    // and the live scene actually detects the injected changepoints (non-vacuous).
+    const world = createDdWorld(DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD);
+    const a = createAllocState();
+    for (let f = 0; f < 800; f++) { stepDd(world); stepDdOracle(world, a); }
+    renderDdPrep(world, a);
+    assert.ok(world.flat[G_CP] > 0, 'the stream must have crossed >= 1 ground-truth changepoint');
+    assert.ok(world.flat[G_PH_FIRES] > 0 && world.flat[G_CU_FIRES] > 0, 'both detectors must have fired on the regime shifts');
+});
+
+test('DD boundary: a bad threshold / delta fails closed at the ctor', () => {
+    assert.throws(() => createDdWorld(DD_DEFAULT_DELTA, 0), /\[lite-adaptive\]/, 'threshold=0 must fail closed');
+    assert.throws(() => createDdWorld(DD_DEFAULT_DELTA, -1), /\[lite-adaptive\]/, 'threshold<0 must fail closed');
+    assert.throws(() => createDdWorld(DD_DEFAULT_DELTA, NaN), /\[lite-adaptive\]/, 'threshold=NaN must fail closed');
+    assert.throws(() => createDdWorld(-1, DD_DEFAULT_THRESHOLD), /\[lite-adaptive\]/, 'delta<0 must fail closed');
+    assert.doesNotThrow(() => createDdWorld(DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD), 'valid (delta, threshold) must construct');
+});
+
+/* =============================================================================================
+ * SCENE 07 -- SlidingDDSketch (windowed relative-error quantiles)
+ * ============================================================================================= */
+
+test('SLD faithfulness: renderSldPrep displays exactly the shipped quantile() and count()', () => {
+    const world = createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES);
+    const a = createAllocState();
+    for (let f = 0; f < 300; f++) { stepSld(world); stepSldOracle(world, a); }
+    renderSldPrep(world, a);
+    assert.equal(world.flat[Q_P50], world.sd.quantile(0.5), 'displayed p50 must be the shipped SlidingDDSketch.quantile(0.5)');
+    assert.equal(world.flat[Q_P90], world.sd.quantile(0.9), 'displayed p90 must be the shipped quantile(0.9)');
+    assert.equal(world.flat[Q_P99], world.sd.quantile(0.99), 'displayed p99 must be the shipped quantile(0.99)');
+    assert.equal(world.flat[Q_COUNT], world.sd.count(), 'displayed count must be the shipped count()');
+});
+
+test('SLD witness: measured quantile relerr <= alpha and window-edge error <= one pane width, over >= 2000 queries', () => {
+    const world = createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES);
+    const a = createAllocState();
+    const fpl = Math.ceil(SLD_DEFAULT_W / SLD_VALUES_PER_FRAME);
+    const paneW = SLD_DEFAULT_W / SLD_DEFAULT_PANES;
+    let maxRel = 0, maxEdge = 0, checks = 0;
+    for (let f = 0; f < fpl * 40; f++) {
+        stepSld(world); stepSldOracle(world, a);
+        if (f > fpl) {
+            renderSldPrep(world, a);
+            if (world.flat[Q_MAXREL] > maxRel) maxRel = world.flat[Q_MAXREL];
+            if (world.flat[Q_EDGE] > maxEdge) maxEdge = world.flat[Q_EDGE];
+            checks += 3;   // three quantiles gated per render
+        }
+    }
+    assert.ok(checks >= 2000, 'the witness must sample >= 2000 windowed-quantile queries, got ' + checks);
+    assert.ok(maxRel <= SLD_DEFAULT_ALPHA + 1e-9, 'measured quantile relerr ' + maxRel.toFixed(5) + ' must be <= alpha ' + SLD_DEFAULT_ALPHA);
+    assert.ok(maxEdge <= paneW, 'window-edge error ' + maxEdge + ' must be <= one pane width ' + paneW);
+});
+
+test('SLD boundary: a bad W / alpha / panes fails closed at the ctor', () => {
+    assert.throws(() => createSldWorld(0, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES), /\[lite-adaptive\]/, 'W=0 must fail closed');
+    assert.throws(() => createSldWorld(SLD_DEFAULT_W, 0, SLD_DEFAULT_PANES), /\[lite-adaptive\]/, 'alpha=0 must fail closed');
+    assert.throws(() => createSldWorld(SLD_DEFAULT_W, 1, SLD_DEFAULT_PANES), /\[lite-adaptive\]/, 'alpha=1 must fail closed');
+    assert.throws(() => createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, 1), /\[lite-adaptive\]/, 'panes<2 must fail closed');
+    assert.doesNotThrow(() => createSldWorld(1024, 0.05, 16), 'a valid (W, alpha, panes) must construct');
+});
+
+/* =============================================================================================
+ * SCENE 08 -- SlidingCountMin (windowed per-label frequency)
+ * ============================================================================================= */
+
+test('SCM faithfulness: renderScmPrep leader estimates are exactly the shipped SlidingCountMin.estimate', () => {
+    const world = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0xC001);
+    const a = createAllocState();
+    for (let f = 0; f < 300; f++) { stepScm(world); stepScmOracle(world, a); }
+    renderScmPrep(world, a);
+    for (let k = 0; k < SCM_TRACKED; k++) {
+        assert.equal(world.flat[k * SCM_STRIDE], world.scm.estimate(world.tracked[k]),
+            'tracked key ' + k + ' estimate must equal the shipped SlidingCountMin.estimate(key)');
+    }
+    assert.equal(world.flat[C_SATURATED], world.scm.saturated, 'displayed saturated flag must be the shipped getter');
+});
+
+test('SCM witness: the one-sided bound true(W) <= est <= true(W+W/B) + eps*N holds on 100% of >= 2000 queries', () => {
+    const world = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0x5C1);
+    const a = createAllocState();
+    const fpl = Math.ceil(SCM_DEFAULT_W / SCM_KEYS_PER_FRAME);
+    let viol = 0, checks = 0;
+    for (let f = 0; f < fpl * 40; f++) {
+        stepScm(world); stepScmOracle(world, a);
+        if (f > fpl) {
+            renderScmPrep(world, a);
+            if (world.flat[C_BOUNDOK] !== 1) viol++;
+            checks += SCM_TRACKED;   // one bound check per tracked key
+        }
+    }
+    assert.ok(checks >= 2000, 'the witness must sample >= 2000 per-key windowed-frequency queries, got ' + checks);
+    assert.equal(viol, 0, 'the one-sided bound must hold on 100% of renders (violating renders: ' + viol + ')');
+});
+
+test('SCM boundary: a bad W / epsilon / panes fails closed at the ctor', () => {
+    assert.throws(() => createScmWorld(0, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES), /\[lite-adaptive\]/, 'W=0 must fail closed');
+    assert.throws(() => createScmWorld(SCM_DEFAULT_W, 0, SCM_DEFAULT_PANES), /\[lite-adaptive\]/, 'epsilon=0 must fail closed');
+    assert.throws(() => createScmWorld(SCM_DEFAULT_W, 1, SCM_DEFAULT_PANES), /\[lite-adaptive\]/, 'epsilon=1 must fail closed');
+    assert.throws(() => createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, 1), /\[lite-adaptive\]/, 'panes<2 must fail closed');
+    assert.doesNotThrow(() => createScmWorld(1024, 0.05, 16), 'a valid (W, epsilon, panes) must construct');
+});
+
+test('SCM seed: null/undefined fall back to the default; an explicit 0 is honored (null is not zero)', () => {
+    assert.equal(createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, null).seed, 0x9e3779b1, 'seed=null falls back');
+    assert.equal(createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, undefined).seed, 0x9e3779b1, 'seed=undefined falls back');
+    assert.equal(createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0).seed, 0, 'seed=0 is honored, not aliased');
+    assert.equal(createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 7).seed, 7, 'a genuine nonzero seed passes through');
+});
+
+/* =============================================================================================
+ * SCENE 09 -- DecayedReservoir (recency-biased fixed-k sample)
+ * ============================================================================================= */
+
+test('DR faithfulness: renderDrPrep displays exactly the shipped size / k and a sample read via sampleInto', () => {
+    const world = createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, 0xD901);
+    const a = createAllocState();
+    for (let f = 0; f < 400; f++) { stepDr(world); stepDrOracle(world, a); }
+    renderDrPrep(world, a);
+    assert.equal(world.flat[R_SIZE], world.dr.size, 'displayed size must be the shipped DecayedReservoir.size');
+    assert.equal(world.flat[R_K], world.dr.k, 'displayed k must be the shipped getter');
+    // independent sampleInto: the displayed size must equal what the shipped instance returns.
+    const buf = new Float64Array(world.dr.k);
+    assert.equal(world.dr.sampleInto(buf), world.dr.size, 'sampleInto count must equal size');
+    assert.ok(world.flat[R_RECENCYFRAC] >= 0 && world.flat[R_RECENCYFRAC] <= 1, 'recency fraction must be a valid probability');
+});
+
+test('DR witness: inclusion rate by item age tracks exp(-lambda*age); the no-decay control is REJECTED', (t) => {
+    if (FAST) { t.skip('fast (demo:check skips the many-trial slope fit)'); return; }
+    // Reuse test/witness.mjs drReservoirSlope semantics via the PUBLIC surface (addFrom + sampleInto):
+    // fit the ln(rate)-vs-age slope over the rare-inclusion tail; it must equal -lambda within +-15%.
+    const DR_BAND = 0.15;
+    function slope(halfLife, N, k, trials, lo, hi) {
+        const incl = new Float64Array(N);
+        const buf = new Float64Array(k);
+        const packed = new Float64Array(2);
+        for (let s = 0; s < trials; s++) {
+            const r = new DecayedReservoir(k, halfLife, { seed: (s * 2654435761) >>> 0 });
+            for (let tk = 0; tk < N; tk++) { packed[0] = tk; packed[1] = tk; r.addFrom(packed, 0); }
+            const c = r.sampleInto(buf);
+            for (let i = 0; i < c; i++) incl[buf[i] | 0]++;
+        }
+        const xs = [], ys = [];
+        for (let age = 0; age < N; age++) { const rate = incl[N - 1 - age] / trials; if (rate > lo && rate < hi) { xs.push(age); ys.push(Math.log(rate)); } }
+        const n = xs.length;
+        let sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for (let i = 0; i < n; i++) { sx += xs[i]; sy += ys[i]; sxx += xs[i] * xs[i]; sxy += xs[i] * ys[i]; }
+        return { slope: (n * sxy - sx * sy) / (n * sxx - sx * sx), points: n };
+    }
+    const halfLife = 50, lambda = Math.LN2 / halfLife;
+    const r = slope(halfLife, 400, 8, 6000, 0.004, 0.14);
+    assert.ok(r.points >= 5, 'the slope fit must have >= 5 measurable points, got ' + r.points);
+    const ratio = r.slope / -lambda;
+    assert.ok(Math.abs(ratio - 1) <= DR_BAND, 'fitted slope ' + r.slope.toFixed(5) + ' must match -lambda within +-15% (ratio ' + ratio.toFixed(3) + ')');
+    // CONTROL (public API, decay load-bearing): a HUGE half-life -> near-flat slope -> OUT of the -lambda band.
+    const flat = slope(1e12, 400, 8, 6000, 0.004, 0.14);
+    const flatRatio = flat.slope / -lambda;
+    assert.ok(!(Math.abs(flatRatio - 1) <= DR_BAND), 'the no-decay (huge half-life) control must be REJECTED by the slope gate (ratio ' + flatRatio.toFixed(3) + ')');
+});
+
+test('DR boundary: a bad k / halfLife fails closed at the ctor', () => {
+    assert.throws(() => createDrWorld(0, DR_DEFAULT_HALFLIFE), /\[lite-adaptive\]/, 'k=0 must fail closed');
+    assert.throws(() => createDrWorld(1.5, DR_DEFAULT_HALFLIFE), /\[lite-adaptive\]/, 'k non-integer must fail closed');
+    assert.throws(() => createDrWorld(DR_DEFAULT_K, 0), /\[lite-adaptive\]/, 'halfLife=0 must fail closed');
+    assert.throws(() => createDrWorld(DR_DEFAULT_K, -5), /\[lite-adaptive\]/, 'halfLife<0 must fail closed');
+    assert.doesNotThrow(() => createDrWorld(16, 1000), 'a valid (k, halfLife) must construct');
+});
+
+test('DR seed: null/undefined fall back to the default; an explicit 0 is honored (null is not zero)', () => {
+    assert.equal(createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, null).seed, 0x2545f491, 'seed=null falls back');
+    assert.equal(createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, undefined).seed, 0x2545f491, 'seed=undefined falls back');
+    assert.equal(createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, 0).seed, 0, 'seed=0 is honored, not aliased');
+    assert.equal(createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, 7).seed, 7, 'a genuine nonzero seed passes through');
+});
+
+/* ============================ pause-the-stream (idle-slide) lanes =========================== */
+
+// The FOUR time-windowed scenes ship a "pause the stream" toggle: while paused, stepX calls the
+// member's advanceFrom (NO add) so the window slides to empty (count/distinct/quantile/estimate -> 0/NaN)
+// with 0 B/op. Each lane proves the PAUSED step is 0-B/op AND drives the readout empty + ring to 0.
+
+function pauseLane(t, name, make, step, oracle, isEmpty) {
+    const world = make();
+    const a = createAllocState();
+    for (let f = 0; f < 200; f++) { step(world); oracle(world, a); }
+    world.paused = true;
+    for (let f = 0; f < 400; f++) { step(world); oracle(world, a); }
+    const occ = (world.oTail - world.oHead) & world.oMask;
+    assert.equal(occ, 0, name + ' paused: the exact oracle ring occupancy must slide back to 0');
+    isEmpty(world);
+    if (typeof global.gc !== 'function') { t.skip('needs --expose-gc for the paused 0-B/op measure'); return; }
+    for (let i = 0; i < 5000; i++) step(world);
+    const res = measureAllocs(() => step(world), { iterations: 100000, batches: ALLOC_BATCHES });
+    const bpc = res.bytesPerCall === null ? 0 : res.bytesPerCall;
+    process.stdout.write('  ' + name + ' paused stepX measureAllocs: ' + bpc.toFixed(3) + ' B/call\n');
+    assert.equal(Math.max(0, Math.round(bpc)), 0, name + ' paused stepX must measure 0 B/call, got ' + bpc);
+}
+
+test('pause EH: paused stepEh idle-slides count() -> 0 with 0 B/op', (t) => {
+    pauseLane(t, 'EH', () => createEhWorld(EH_DEFAULT_W, EH_DEFAULT_EPS, 1), stepEh, stepEhOracle,
+        (w) => assert.equal(w.eh.count(), 0, 'EH.count() must slide to 0 while paused'));
+});
+test('pause SHLL: paused stepShll idle-slides count() -> 0 with 0 B/op', (t) => {
+    pauseLane(t, 'SHLL', () => createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 1), stepShll, stepShllOracle,
+        (w) => { assert.equal(w.sl.count(), 0, 'SHLL.count() must slide to 0'); assert.equal(w.oMap.size, 0, 'the exact Map must empty'); });
+});
+test('pause SLD: paused stepSld idle-slides quantile() -> NaN, count() -> 0 with 0 B/op', (t) => {
+    pauseLane(t, 'SLD', () => createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES), stepSld, stepSldOracle,
+        (w) => { assert.equal(w.sd.count(), 0, 'SLD.count() must slide to 0'); assert.ok(Number.isNaN(w.sd.quantile(0.5)), 'SLD.quantile(0.5) must be NaN on an empty window'); });
+});
+test('pause SCM: paused stepScm idle-slides estimate() -> 0 with 0 B/op', (t) => {
+    pauseLane(t, 'SCM', () => createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 1), stepScm, stepScmOracle,
+        (w) => assert.equal(w.scm.estimate(0), 0, 'SCM.estimate(key) must slide to 0 while paused'));
+});
+
+test('pause retention: over 5 pause cycles every windowed readout returns to empty and the oracle ring to 0', () => {
+    const eh = createEhWorld(EH_DEFAULT_W, EH_DEFAULT_EPS, 5); const ea = createAllocState();
+    const sh = createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 5); const sa = createAllocState();
+    const sd = createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES); const da = createAllocState();
+    const sc = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 5); const ca = createAllocState();
+    const occ = (w) => (w.oTail - w.oHead) & w.oMask;
+    for (let cycle = 0; cycle < 5; cycle++) {
+        for (const w of [eh, sh, sd, sc]) w.paused = false;
+        for (let f = 0; f < 120; f++) {
+            stepEh(eh); stepEhOracle(eh, ea); stepShll(sh); stepShllOracle(sh, sa);
+            stepSld(sd); stepSldOracle(sd, da); stepScm(sc); stepScmOracle(sc, ca);
+        }
+        for (const w of [eh, sh, sd, sc]) w.paused = true;
+        for (let f = 0; f < 400; f++) {
+            stepEh(eh); stepEhOracle(eh, ea); stepShll(sh); stepShllOracle(sh, sa);
+            stepSld(sd); stepSldOracle(sd, da); stepScm(sc); stepScmOracle(sc, ca);
+        }
+        assert.equal(eh.eh.count(), 0, 'cycle ' + cycle + ': eh.count() must return to 0');
+        assert.equal(sh.sl.count(), 0, 'cycle ' + cycle + ': shll.count() must return to 0');
+        assert.equal(sd.sd.count(), 0, 'cycle ' + cycle + ': sld.count() must return to 0');
+        assert.ok(Number.isNaN(sd.sd.quantile(0.5)), 'cycle ' + cycle + ': sld.quantile(0.5) must be NaN');
+        assert.equal(sc.scm.estimate(0), 0, 'cycle ' + cycle + ': scm.estimate(0) must return to 0');
+        for (const w of [eh, sh, sd, sc]) assert.equal(occ(w), 0, 'cycle ' + cycle + ': the oracle ring occupancy must return to 0');
+    }
+});
+
 /* ============================ retention (clear/refill) ====================== */
 
 test('retention: over 50 clear()/refill cycles hk.size returns to 0 and eh.bucketCount stays <= capacity', () => {
@@ -411,15 +754,28 @@ test('re-entrant: renderXPrep called twice with no intervening step is byte-iden
     const ad = createAdWorld(AD_DEFAULT_DELTA, 2); const aa = createAllocState();
     const fd = createFdWorld(FD_DEFAULT_HALFLIFE, 3); const fa = createAllocState();
     const hk = createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K, 4); const ha = createAllocState();
+    const sh = createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 5); const sha = createAllocState();
+    const dd = createDdWorld(DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD); const dda = createAllocState();
+    const sd = createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES); const sda = createAllocState();
+    const sc = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 6); const sca = createAllocState();
+    const dr = createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, 7); const dra = createAllocState();
     for (let f = 0; f < 300; f++) {
         stepEh(eh); stepEhOracle(eh, ea);
         stepAd(ad); stepAdOracle(ad, aa);
         stepFd(fd); stepFdOracle(fd, fa);
         stepHk(hk); stepHkOracle(hk, ha);
+        stepShll(sh); stepShllOracle(sh, sha);
+        stepDd(dd); stepDdOracle(dd, dda);
+        stepSld(sd); stepSldOracle(sd, sda);
+        stepScm(sc); stepScmOracle(sc, sca);
+        stepDr(dr); stepDrOracle(dr, dra);
     }
     for (const [name, render, world, alloc] of [
         ['EH', renderEhPrep, eh, ea], ['ADWIN', renderAdPrep, ad, aa],
         ['FD', renderFdPrep, fd, fa], ['HK', renderHkPrep, hk, ha],
+        ['SHLL', renderShllPrep, sh, sha], ['DD', renderDdPrep, dd, dda],
+        ['SLD', renderSldPrep, sd, sda], ['SCM', renderScmPrep, sc, sca],
+        ['DR', renderDrPrep, dr, dra],
     ]) {
         render(world, alloc);
         const first = Array.from(world.flat);
@@ -437,7 +793,7 @@ test('re-entrant: renderXPrep called twice with no intervening step is byte-iden
 function measure0(t, name, warm, step) {
     if (typeof global.gc !== 'function') { t.skip('needs --expose-gc'); return; }
     for (let i = 0; i < warm; i++) step();
-    const res = measureAllocs(step, { iterations: 100000, batches: 8 });
+    const res = measureAllocs(step, { iterations: 100000, batches: ALLOC_BATCHES });
     const bpc = res.bytesPerCall === null ? 0 : res.bytesPerCall;
     process.stdout.write('  ' + name + ' measureAllocs: ' + bpc.toFixed(3) + ' B/call\n');
     assert.equal(Math.max(0, Math.round(bpc)), 0, name + ' must measure 0 B/call, got ' + bpc);
@@ -486,11 +842,65 @@ test('0-B/op (measureAllocs): renderHkPrep alone measures 0 bytes/call', (t) => 
     measure0(t, 'renderHkPrep', 300, () => renderHkPrep(w, a));
 });
 
+test('0-B/op (measureAllocs): stepShll alone measures 0 bytes/call', (t) => {
+    const w = createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 0x1234);
+    measure0(t, 'stepShll', 40000, () => stepShll(w));
+});
+test('0-B/op (measureAllocs): renderShllPrep alone measures 0 bytes/call', (t) => {
+    const w = createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 0x1234); const a = createAllocState();
+    for (let i = 0; i < 2000; i++) { stepShll(w); stepShllOracle(w, a); }
+    measure0(t, 'renderShllPrep', 500, () => renderShllPrep(w, a));
+});
+test('0-B/op (measureAllocs): stepDd alone measures 0 bytes/call', (t) => {
+    const w = createDdWorld(DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD);
+    measure0(t, 'stepDd', 40000, () => stepDd(w));
+});
+test('0-B/op (measureAllocs): renderDdPrep alone measures 0 bytes/call', (t) => {
+    const w = createDdWorld(DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD); const a = createAllocState();
+    for (let i = 0; i < 2000; i++) { stepDd(w); stepDdOracle(w, a); }
+    measure0(t, 'renderDdPrep', 500, () => renderDdPrep(w, a));
+});
+test('0-B/op (measureAllocs): stepSld alone measures 0 bytes/call', (t) => {
+    const w = createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES);
+    measure0(t, 'stepSld', 40000, () => stepSld(w));
+});
+test('0-B/op (measureAllocs): renderSldPrep alone measures 0 bytes/call', (t) => {
+    // warm a BOUNDED number of arrivals so the insertion-sort-into-preallocated-buffer stays cheap
+    // (the sort is O(live^2); the live-demo render path is 10Hz so this only bounds the tight measure loop).
+    const w = createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES); const a = createAllocState();
+    for (let i = 0; i < 8; i++) { stepSld(w); stepSldOracle(w, a); }
+    if (typeof global.gc !== 'function') { t.skip('needs --expose-gc'); return; }
+    for (let i = 0; i < 500; i++) renderSldPrep(w, a);
+    const res = measureAllocs(() => renderSldPrep(w, a), { iterations: 10000, batches: FAST ? 1 : 3 });
+    const bpc = res.bytesPerCall === null ? 0 : res.bytesPerCall;
+    process.stdout.write('  renderSldPrep measureAllocs: ' + bpc.toFixed(3) + ' B/call\n');
+    assert.equal(Math.max(0, Math.round(bpc)), 0, 'renderSldPrep must measure 0 B/call, got ' + bpc);
+});
+test('0-B/op (measureAllocs): stepScm alone measures 0 bytes/call', (t) => {
+    const w = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0x1234);
+    measure0(t, 'stepScm', 40000, () => stepScm(w));
+});
+test('0-B/op (measureAllocs): renderScmPrep alone measures 0 bytes/call', (t) => {
+    const w = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0x1234); const a = createAllocState();
+    for (let i = 0; i < 40; i++) { stepScm(w); stepScmOracle(w, a); }   // bounded ring so the per-key scan stays cheap
+    measure0(t, 'renderScmPrep', 500, () => renderScmPrep(w, a));
+});
+test('0-B/op (measureAllocs): stepDr alone measures 0 bytes/call', (t) => {
+    const w = createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, 0x1234);
+    measure0(t, 'stepDr', 40000, () => stepDr(w));
+});
+test('0-B/op (measureAllocs): renderDrPrep alone measures 0 bytes/call', (t) => {
+    const w = createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, 0x1234); const a = createAllocState();
+    for (let i = 0; i < 2000; i++) { stepDr(w); stepDrOracle(w, a); }
+    measure0(t, 'renderDrPrep', 500, () => renderDrPrep(w, a));
+});
+
 // Per-scene combined 0-major-GC gate: stepX every frame + renderXPrep every 64th over ~200k stepX
 // ops (the DEMO.md "sketch path stays zero-GC while it runs" claim), mirroring test/torture.mjs's
 // `checkNoGc(s, { maxMajor: 0 })`. The oracle steps are NOT in this loop -- they are the
 // allowed-to-allocate contrast, and including them would poison the measurement (the planner's RISK).
 async function gcGate(t, name, world, alloc, step, render) {
+    if (FAST) { t.skip('fast (demo:check skips the 200k-frame lanes)'); return; }
     if (typeof global.gc !== 'function') { t.skip('needs --expose-gc'); return; }
     for (let i = 0; i < 20000; i++) { step(); if ((i & 63) === 0) render(world, alloc); }
     global.gc(); global.gc();
@@ -539,6 +949,38 @@ test('0-major-GC: HK sketch path (stepHk + renderHkPrep) over 200k frames', asyn
     a.oracleCount = 0;
     w.__sketchAllocIdx = H_SKETCH_ALLOC;
     await gcGate(t, 'HK', w, a, () => stepHk(w), renderHkPrep);
+});
+
+test('0-major-GC: SHLL sketch path (stepShll + renderShllPrep) over 200k frames', async (t) => {
+    const w = createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 0x1A2B); const a = createAllocState();
+    for (let i = 0; i < 40; i++) { stepShll(w); stepShllOracle(w, a); }
+    a.oracleCount = 0;
+    w.__sketchAllocIdx = S_SKETCH_ALLOC;
+    await gcGate(t, 'SHLL', w, a, () => stepShll(w), renderShllPrep);
+});
+test('0-major-GC: DD sketch path (stepDd + renderDdPrep) over 200k frames', async (t) => {
+    const w = createDdWorld(DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD); const a = createAllocState();
+    w.__sketchAllocIdx = G_SKETCH_ALLOC;
+    await gcGate(t, 'DD', w, a, () => stepDd(w), renderDdPrep);
+});
+test('0-major-GC: SLD sketch path (stepSld + renderSldPrep) over 200k frames', async (t) => {
+    const w = createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES); const a = createAllocState();
+    for (let i = 0; i < 40; i++) { stepSld(w); stepSldOracle(w, a); }
+    a.oracleCount = 0;
+    w.__sketchAllocIdx = Q_SKETCH_ALLOC;
+    await gcGate(t, 'SLD', w, a, () => stepSld(w), renderSldPrep);
+});
+test('0-major-GC: SCM sketch path (stepScm + renderScmPrep) over 200k frames', async (t) => {
+    const w = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0x1A2B); const a = createAllocState();
+    for (let i = 0; i < 40; i++) { stepScm(w); stepScmOracle(w, a); }
+    a.oracleCount = 0;
+    w.__sketchAllocIdx = C_SKETCH_ALLOC;
+    await gcGate(t, 'SCM', w, a, () => stepScm(w), renderScmPrep);
+});
+test('0-major-GC: DR sketch path (stepDr + renderDrPrep) over 200k frames', async (t) => {
+    const w = createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, 0x1A2B); const a = createAllocState();
+    w.__sketchAllocIdx = R_SKETCH_ALLOC;
+    await gcGate(t, 'DR', w, a, () => stepDr(w), renderDrPrep);
 });
 
 /* ============================ non-vacuous contrast ========================== */
