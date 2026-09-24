@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.2.0
+Version: 1.3.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -34,7 +34,11 @@ over the register bank. It is a PURE APPEND: the four frozen core classes stay B
 ForwardDecay, SlidingHyperLogLog) and the item-based members (ADWIN, HeavyKeeper) each expose a
 zero-box `addFrom(buf, i)` for callers whose inputs are read from a Float64Array. Members are
 tree-shakeable named exports; prior members stay byte-identical on append (only the header +
-VERSION change).
+VERSION change). v1.2.0 adds DriftDetector (scalar Page-Hinkley / CUSUM change detection). v1.3.0 adds
+SlidingDDSketch (windowed relative-error QUANTILES over the last W; Masson-Rim-Lee, VLDB 2019, over a
+fixed-B pane ring) -- the recency sibling of lite-sketch's cumulative DDSketch and the quantile
+complement of SlidingHyperLogLog. Each post-1.0 member is a PURE APPEND: the prior classes stay
+BYTE-IDENTICAL (only the file header + VERSION change).
 
 ## Exports (from the single main file Adaptive.js)
 
@@ -136,8 +140,23 @@ VERSION change).
   mode / delta / threshold / target / option / x throws [lite-adaptive] typeof-first (byte-identical
   no-op). DDM / EDDM (Bernoulli error-bit + tri-state output) are deliberately OUT of this class -- a
   future member.
+- `SlidingDDSketch` -- class. A zero-GC WINDOWED relative-error QUANTILE summary over the LAST W
+  (Masson-Rim-Lee, "DDSketch", VLDB 2019, over a fixed-B pane ring; ADR 0008) -- the recency sibling of
+  lite-sketch's cumulative DDSketch and the quantile complement of SlidingHyperLogLog. A ring of B
+  preallocated DDSketch panes, each covering W/B of the window; `add(now, value) -> this` (count mode via
+  `add(undefined, value)`) bins the value on the SAME log scale (gamma = (1+alpha)/(1-alpha),
+  key = ceil(log_gamma value), collapse-lowest default + strict opt-in) and writes the current pane,
+  rotating + clearing panes as `now` advances -- 0 B/op incl. rotation. `addFrom(buf, i)` is the zero-box
+  entry (`now = buf[i]`, `value = buf[i+1]` read UNBOXED). `quantile(q, w?) -> number` /
+  `quantileInto(qs, out) -> count` / `count(w?) -> number` merge the live panes into an INSTANCE-OWNED
+  preallocated scratch (cold, 0 alloc) -- per-query relative error `<= alpha`, plus a window-edge error of
+  up to one pane width W/panes (disclosed + WITNESSED, since each pane collapses INDEPENDENTLY). Value
+  domain is positive + zero (negatives / out-of-indexable throw); a bad value / now / q / w / option throws
+  [lite-adaptive] typeof-first (byte-identical no-op). Empty window -> NaN quantile / 0 count. Getters:
+  `alpha` / `strict` / `panes` / `W` / `mode` / `lastNow` / `minIndexable` / `maxIndexable` / `collapsed`
+  / `bytes`.
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.2.0'.
+- `VERSION` -- string, '1.3.0'.
 
 ## ExponentialHistogram
 
@@ -474,6 +493,72 @@ reference distinction (and the cumsum-minus-running-min identity that forces it)
 equations, the DD_X_MAX / delta / target overflow fail-closed argument, and the reset-on-detection
 rationale.
 
+## SlidingDDSketch (ADR 0008)
+
+Windowed relative-error QUANTILES -- the p50 / p90 / p99 of the values in the LAST W, in FIXED
+preallocated space with the SAME per-query bound as lite-sketch's cumulative DDSketch (Masson-Rim-Lee,
+"DDSketch", VLDB 2019): `|q_est - q_true| <= alpha * q_true`. The recency sibling of cumulative DDSketch
+and the quantile complement of SlidingHyperLogLog. It is the QUANTILE corner on the time axis.
+
+Window model (ADR 0008, model A -- a fixed-B pane ring): B preallocated DDSketch panes, each covering
+W/B of the window, held in a ring. add() writes the CURRENT pane; when `now` crosses a pane boundary the
+ring rotates to the next pane and CLEARS it (fill(0), 0-alloc). A `now` jump of many pane-widths expires
+multiple panes in a bounded while-loop CAPPED at B iterations (skipping >= B panes clears them ALL, then
+re-anchors around `now`). quantile / quantileInto / count MERGE the live panes into an INSTANCE-OWNED
+preallocated scratch (cold, 0-alloc -- NEVER a per-query allocation). The window is grid-aligned to the
+current pane end, so the retained window is up to one pane width (W/B) SHORTER than the ideal
+(now-W, now] -- the disclosed EDGE error. Rejected alternatives: B (an EH/DGIM-style histogram OF
+DDSketches -- merge-on-add allocates, not 0 B/op) and C (Arasu-Manku -- unbounded per-item state, not
+zero-GC). Default panes B = 32 (edge error W/32; `panes` is a caller-tunable integer in [2, 1024]).
+
+DDSketch mapping (INLINED, never an import -- a consumer like lite-hud pre-checks a value identically to
+lite-sketch DDSketch, so a shared dependency's divergence would be a breaking surprise): gamma =
+(1+alpha)/(1-alpha), key(x) = ceil(ln(x) * multiplier); x > 0 bins on the log scale, x === 0 routes to a
+per-pane zero counter, x < 0 fails closed. Collapse-lowest by default (protects the p90/p99 tail);
+`strict` opts into a throw on a collapse instead. The indexable band is computed with DDSketch's exact
+ctor-time loop, so the ACCEPTED VALUE BAND is identical to lite-sketch DDSketch at every practical alpha.
+SLD_KEY_MAX = 2^30 caps |key| fail-closed (per-pane offsets live in Int32Array; the ADWIN/DriftDetector
+overflow lesson). SLD_MAX_BINS = 2048 (parity with lite-sketch DDSketch's default maxBins).
+
+Constructor: `new SlidingDDSketch(W, options?)` where options = { alpha (a number in (0, 1), default
+0.01), strict (a boolean, default false -- null is not false), panes (an integer in [2, 1024], default
+32) }. A bad W / alpha / strict / panes / option throws [lite-adaptive] at the ctor door BEFORE any
+allocation.
+
+- add(now, value) -> this        HOT, 0 B/op incl. pane rotate + clear. EXPLICIT mode: a finite,
+                                 non-decreasing `now`. COUNT mode: add(undefined, value) auto-ticks (W in
+                                 items). The mode LOCKS at the first add. value >= 0 (negatives / out-of-
+                                 indexable throw). Value + time validated BEFORE any state write (a reject
+                                 is a byte-identical no-op); a strict-collapse reject throws before any
+                                 bin write (time has legitimately advanced, state intact).
+- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX: now = buf[i], value = buf[i+1] read UNBOXED.
+                                 EXPLICIT-time only. Same validation + body (duplicated) as add().
+- quantile(q, w?) -> number      COLD, 0 alloc. Merge the live panes into the scratch, walk it. q in
+                                 [0, 1] (outside throws). `w` an optional sub-window in (0, W] (outside
+                                 throws). NaN on an empty window. rel error <= alpha (+ edge W/panes).
+- quantileInto(qs, out) -> count COLD, 0 alloc render: merge ONCE, write each qs[j] -> out[j] (NaN for a
+                                 bad q / empty window). Returns qs.length. Rejects non-Float64Array args
+                                 or out.length < qs.length.
+- count(w?) -> number            COLD, O(panes). Items in the last W (or sub-window w), incl. zeros. 0 on
+                                 empty. `w` outside (0, W] throws.
+- clear() -> this                0-alloc reset (reuse the arrays; unlocks the mode).
+- alpha / strict / panes / W / mode / lastNow / minIndexable / maxIndexable / collapsed / bytes
+                                 Getters: the knobs, the locked mode, the last applied time, the DDSketch
+                                 indexable band, whether any live pane collapsed, the fixed memory figure.
+
+Windowed-quantile contract (the honesty anchor): the witness drives against an EXACT sorted-array oracle
+over the sketch's LIVE pane content and gates rel error <= alpha on 100% of >= 2000 queries across 3 W x
+3 alpha + a distribution SHIFT + a post-burst edge, AND asserts the window-edge error <= one pane width
+W/panes. Negative controls rejected by the same gates: a NO-EXPIRY variant (clear-on-rotate disabled ->
+stale values linger -> rel >> alpha) and a COARSE panes=2 variant (edge ~W/2, above the fine W/32 bound).
+Bin counts are Uint32Array (saturate at 0xFFFFFFFF, never wrap -- the CountMinSketch precedent; the one
+recorded deviation from lite-sketch DDSketch's Float64 bins), the merge scratch is Float64Array so B
+near-saturated panes sum exactly to 2^53. Memory ~ panes * 2048 * 4 B + scratch; panes=32 -> ~256 KB,
+never grows. ADR 0008 records the pane-ring choice (vs the rejected histogram-of-sketches / Arasu-Manku),
+the rotate-and-clear model, the edge-error disclosure, the merge-into-instance-scratch 0-alloc argument,
+the DDSketch mapping/collapse parity (and why inlined), the SLD_KEY_MAX overflow cap, and the
+independent-pane-collapse subtlety (why the bound is witnessed, not assumed).
+
 ## The time source + the bucket pool (ADR 0001)
 
 A caller-supplied MONOTONE `now` (logical tick or ms; count-mode convenience when
@@ -502,6 +587,7 @@ adaptive window) -> ForwardDecay (0.3.0, time-decayed aggregates) -> HeavyKeeper
 (0.4.0, decayed / windowed heavy hitters) -> 1.0.0 (API freeze -- the four-member roster
 is COMPLETE, no new member; a docs / stability milestone) -> 1.1.0 (SlidingHyperLogLog --
 windowed distinct-count; the FIRST additive post-1.0 member, a PURE APPEND) -> 1.2.0 (DriftDetector
--- scalar Page-Hinkley / CUSUM change detection; the SECOND additive post-1.0 member, a PURE APPEND).
-Post-1.2: windowed quantiles, windowed Count-Min, a decayed Reservoir, an error-rate DDM / EDDM
-detector -- one per release, each a pure append that keeps the frozen core byte-identical.
+-- scalar Page-Hinkley / CUSUM change detection; the SECOND additive post-1.0 member, a PURE APPEND)
+-> 1.3.0 (SlidingDDSketch -- windowed relative-error quantiles; the THIRD additive post-1.0 member, a
+PURE APPEND). Post-1.3: windowed Count-Min, a decayed Reservoir, an error-rate DDM / EDDM detector --
+one per release, each a pure append that keeps the frozen core byte-identical.

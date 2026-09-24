@@ -266,6 +266,13 @@ its later sessions. Each member's planner copies R1-R10 into its brief as gates.
 - **R9 Seeded randomness.** Any randomized member (HeavyKeeper, the reservoir) uses an internal
   Uint32 PRNG with a `seed` option and getter, never Math.random. The witness and the demo must be
   reproducible.
+- **R11 Idle streams must still slide.** A windowed query that expires relative to `lastNow`
+  FREEZES while the stream is idle: SlidingHLL.count() still shows the last burst an hour later.
+  Every windowed member (SlidingHLL, Windowed Count-Min, sliding quantiles, EH) needs a way to move
+  time without an item: either `advance(now)` (0-alloc, the same monotone check, also has an
+  `advanceFrom(buf, i)`) or an optional `now` on the cold query. Lean: `advance(now)`. It keeps
+  queries pure (R7) and is additive to the shipped members. lite-hud calls it at render with the
+  latest record time, so an idle channel's readout decays to empty instead of lying.
 - **R10 The space triple in the README memory table:** bytes at the default AND at a
   consumer-realistic size (lite-hud: per channel x ~10-50 channels). A member whose default costs
   more than ~64 KB per instance says so in its headline.
@@ -286,41 +293,84 @@ its later sessions. Each member's planner copies R1-R10 into its brief as gates.
 - Witness: within 3 x (1.04/sqrt(m)) of an exact windowed Set, including right at the window
   edge and just after a burst of expiries.
 
-**DriftDetector** (scalar Page-Hinkley / CUSUM / DDM / EDDM)
-- The modes have DIFFERENT input domains: PH and CUSUM take a real x; DDM and EDDM take a 0/1 error
-  bit. Validate per mode and expose a `mode` getter. A 0.5 fed to DDM is a throw, never a silent
-  round.
-- The result must carry DDM's warning level. Lean: `addFrom` returns a boolean (drift) to match
-  ADWIN, plus a `state` getter (0 none, 1 warning, 2 drift) and a `lastDriftIndex` getter.
-- State the post-alarm semantics (auto-reset vs sticky until `clear()`), the direction (one-sided
-  up by default? a two-sided option?) and the warm-up count (a getter). PH keeps alarming if not
-  reset, and a HUD marker must fire once per regime change.
+**DriftDetector** (scalar Page-Hinkley / CUSUM, REAL-valued x). lite-hud M6 uses it.
+- The input is a finite real x. DDM/EDDM (the Bernoulli error-rate stream) are split out into their
+  own contract, below.
+- `addFrom(buf, i)` returns a boolean (drift), matching ADWIN. Getters: `lastDriftIndex` and the
+  warm-up count.
+- State the post-alarm semantics (auto-reset vs sticky until `clear()`). Page-Hinkley keeps
+  alarming if it is not reset, and a HUD marker must fire ONCE per regime change.
+- State the direction: one-sided up by default (the HUD watches latency regressions), with a
+  two-sided option.
 - Item-indexed, no clock. The docs say that a consumer with irregular cadence gets item-latency,
   not time-latency.
-- Witness (3.2): stationary false-alarm rate and step-change detection delay per mode, as NUMBERS,
+- Witness (3.2): the stationary false-alarm rate and the step-change detection delay as NUMBERS,
   beside ADWIN on the same streams.
 
-**Decayed Reservoir** (Aggarwal VLDB'06, exponential bias)
-- No lite-hud use yet (a possible demo "recent samples" strip), so it is lowest priority.
-- Samples live in a Float64Array (+ an optional Int32/Float64 id column). NEVER store caller objects:
-  retention would be the consumer's leak, and it breaks the zero-GC story.
-- R9 applies directly. State the fill semantics (the probability p_in while filling, the bias
-  lambda vs capacity n constraint), with `size` vs `capacity` getters, and empty reads as
-  size 0, not a zero sample.
-- Reader: `forEach(fn)` / `copyInto(buf)` (R7).
+**Decayed Reservoir** and **DDM/EDDM error-rate detector** (unscheduled; NO lite-hud demand)
+- Neither is a lite-hud requirement. The HUD never samples: its panels are aggregates. Its only 0/1
+  stream (budget verdicts) is served by ADWIN.
+- If either ships, the shared rules R1-R10 still apply, plus:
+  - Reservoir: a Float64Array of samples plus an optional id column, and NEVER caller objects
+    (retention). R9 seeded PRNG. `size` vs `capacity` getters, with empty reading as size 0.
+    `forEach`/`copyInto` readers.
+  - DDM/EDDM: a tri-state result (none / warning / drift) through a `state` getter. The input is
+    strictly 0/1: a 0.5 throws, never a silent round.
 
-**Windowed Count-Min** (settle the design in an ADR FIRST)
-- MEMORY WARNING for the naive design: an EH per cell costs d x w x EH_CAP x 16 B. At d=4, w=1024,
-  eps 0.1, W 1e4 (EH_CAP ~93) that is ~6 MB per instance. Not viable for a per-channel consumer.
-- Honest alternatives, each stating its recency model:
-  - (a) PANES: B CMS panes rotated by time. The query sums them. The error adds at most one
-    pane's worth at the edge. Memory B x d x w x 4 B. This generalizes lite-hud's A/B rotation (B=2).
-  - (b) forward-decayed float counters (a decay model, not a window).
-  - Lean: (a) as the hard-ish window, with B a knob and the edge error disclosed.
-- Match lite-sketch CountMinSketch: the same key domain, hash, seed and d/w sizing
-  (`withAccuracy`), SATURATION at 2^32-1 (never wrap), and `estimate` that never throws, so it can
-  be swapped in for a windowed use.
-- `addFrom(buf, i)`: now, key, count.
+**Windowed Count-Min** (IN DEVELOPMENT 2026-09-24; design suggestions from the lite-hud side)
+- REJECT an EH per cell. That is the "ECM-sketch" (Papapetrou et al., VLDB 2012), and it costs
+  d x w x EH_CAP x 16 B: ~6 MB at d=4, w=1024, eps 0.1, W 1e4. Record it in the ADR as the
+  rejected alternative, as ADR 0006 did for panes.
+- PANES, with B+1 of them. Pane width is W/B. The query covers the live panes, so the covered span
+  is in [W, W + W/B]: it ALWAYS covers the full W, with at most one extra pane. INCLUDE the
+  partially-expired oldest pane, never drop it. Then the estimate stays a ONE-SIDED upper bound,
+  the Count-Min property:
+      true(W) <= est <= true(W + W/B) + epsilon * N(W + W/B)   (with prob >= 1 - delta)
+  Dropping the oldest pane would under-count, which silently breaks the one-sided contract.
+- Query = for each row, SUM the key's cell across the live panes, then MIN over rows (sum-then-min,
+  not min-then-sum). O(d x (B+1)), COLD.
+- ABSOLUTE pane alignment: pane = floor(now / paneWidth). Two instances with the same W/B then
+  align, so `merge` is an element-wise saturating add. Compute the pane index INLINE in add (R3:
+  never return the double from a helper).
+- BOUNDED ROTATION (a real trap). When `now` jumps k panes ahead, clear min(k, B+1) panes, never
+  loop k times. An epoch-ms jump or an idle hour must cost O(B x d x w) at most. A single rotation
+  is an O(d x w) `fill(0)` spike inside add: disclose it as amortized, and give a timing gate for a
+  1e12 jump.
+- Counters: Uint32 per pane, SATURATING at 2^32-1, exactly like lite-sketch CountMinSketch. A window
+  sum can pass 2^32, so return it as a double. A `saturated` getter (count of saturated
+  increments) is the honesty flag, like SlidingHLL's `degraded`.
+- Conservative update is PER PANE: min over the CURRENT pane's d cells. A sum of per-pane
+  overestimates is still an overestimate, and it stays O(d). Do not run CU over window sums
+  (O(d x B) per add). This is an option matching lite-sketch (`conservative`).
+- Hash + seed + row derivation IDENTICAL to lite-sketch CountMinSketch. That gives the witness a
+  DIFFERENTIAL gate with teeth: with every add inside one window (or W = Infinity in count mode),
+  `estimate` must EQUAL lite-sketch's CMS on the same stream, key for key (lite-sketch as a
+  devDep). It also makes the two swappable for a consumer.
+- Surface, following SlidingHLL:
+  - `addFrom(buf, i)`: now = buf[i], key = buf[i+1], count = buf[i+2], matching SlidingHLL's
+    (now, key) with the count appended.
+  - `add(now, key, count = 1)`.
+  - EXPLICIT and COUNT modes, locked at the first add.
+  - `estimate(key, w?)`: w is rounded UP to whole panes (disclose this); never throws; 0 when not
+    seen.
+  - `total(w?)`: the exact windowed N from a Float64 total per pane. The consumer needs it for the
+    epsilon x N bound.
+  - `merge(other)`: same d / w / seed / W / B, else throw.
+  - `clear()`.
+  - Static `withAccuracy(epsilon, delta, W, options?)` through the same option door (R6).
+  - Getters: W, B, paneWidth, d, w, epsilon, delta, seed, conservative, lastNow, mode, saturated,
+    bytes.
+- Memory: (B+1) x d x w x 4 B + (B+1) x 8 B. The default is B=8, d=4, w=1024, about 147 KB. Show a
+  row for a smaller consumer size too (R10).
+- Witness:
+  - Against an EXACT windowed Map oracle: est >= true(W) on 100% of queries. est <= true(W + W/B)
+    + eps x N on >= (1 - delta) of queries.
+  - The differential gate against lite-sketch.
+  - Negative controls, each rejected: an EXCLUDE-oldest-pane variant (undercounts, fails the
+    one-sided gate), a NO-ROTATION variant (stale counts), and an UNBOUNDED-jump variant (fails
+    the timing gate).
+  - R2 scaling lane: epoch-ms now, keys near 2^53, counts near 2^30.
+- NON-GOAL: heavy hitters or top-k from the CMS (it keeps no key identities; that is HeavyKeeper).
 
 **Sliding-window quantiles** (pane-based DDSketch; Arasu-Manku only if zero-GC is proven)
 - The SAME mapping and accuracy contract as lite-sketch DDSketch: alpha, gamma, the collapsing lowest

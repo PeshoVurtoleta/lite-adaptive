@@ -525,3 +525,110 @@ export class DriftDetector {
     /** Reset all scalar state; keep the mode / delta / threshold. */
     clear(): this;
 }
+
+/** The locked time mode of a SlidingDDSketch. */
+export type SlidingDDSketchMode = 'unset' | 'explicit' | 'count';
+
+/**
+ * Constructor options for SlidingDDSketch. `strict = false` is the default (guarded distinctly from
+ * `undefined`); an unknown key throws [lite-adaptive].
+ */
+export interface SlidingDDSketchOptions {
+    /** The relative-error target alpha; a number in (0, 1) (default 0.01). */
+    alpha?: number;
+    /** Fail closed on a collapse instead of collapsing-lowest (default false). */
+    strict?: boolean;
+    /** The pane-ring size B; an integer in [2, 1024] (default 32). Edge error is W / panes. */
+    panes?: number;
+}
+
+/**
+ * SlidingDDSketch -- a zero-GC WINDOWED relative-error QUANTILE summary over the LAST W (Masson-Rim-
+ * Lee, "DDSketch", VLDB 2019, over a fixed-B pane ring; ADR 0008) -- the recency sibling of
+ * lite-sketch's cumulative DDSketch and the quantile complement of SlidingHyperLogLog. A ring of B
+ * preallocated DDSketch panes, each covering W/B of the window; `add(now, value)` / the zero-box
+ * `addFrom(buf, i)` bin the value on the SAME log scale (gamma = (1+alpha)/(1-alpha),
+ * key = ceil(log_gamma value), collapse-lowest default + strict opt-in) and write the current pane,
+ * rotating + clearing panes as `now` advances (0 B/op). `quantile(q, w?)` / `quantileInto(qs, out)` /
+ * `count(w?)` merge the live panes into an INSTANCE-OWNED preallocated scratch (cold, 0 alloc). The
+ * per-query relative error is `<= alpha`, plus a window-edge error of up to one pane width W/panes.
+ */
+export class SlidingDDSketch {
+    /**
+     * @param W       window size; a finite number > 0 (items in count mode, or the `now`-unit span).
+     * @param options { alpha?, strict?, panes? }; an unknown key throws [lite-adaptive].
+     * Throws [lite-adaptive] on a bad W / alpha / strict / panes / option BEFORE any allocation.
+     */
+    constructor(W: number, options?: SlidingDDSketchOptions);
+
+    /** The relative-error target alpha. O(1). */
+    readonly alpha: number;
+
+    /** Whether strict mode is on (a collapse throws instead of folding). O(1). */
+    readonly strict: boolean;
+
+    /** The pane-ring size B (edge error is W / panes). O(1). */
+    readonly panes: number;
+
+    /** Window size W. O(1). */
+    readonly W: number;
+
+    /** The last applied time t (0 before the first add). O(1). */
+    readonly lastNow: number;
+
+    /** The locked time mode: 'unset' before the first add, then 'explicit' or 'count'. O(1). */
+    readonly mode: SlidingDDSketchMode;
+
+    /** The smallest x > 0 that `add` accepts at this alpha (EXCLUSIVE lower floor). O(1). */
+    readonly minIndexable: number;
+
+    /** The largest x that `add` accepts at this alpha (INCLUSIVE ceiling). O(1). */
+    readonly maxIndexable: number;
+
+    /** Whether any live pane has folded nonzero mass into its collapsed floor. COLD, O(panes). */
+    readonly collapsed: boolean;
+
+    /** A fixed memory figure in bytes (all pane columns + the merge scratch). O(1). */
+    readonly bytes: number;
+
+    /**
+     * Add one value `value` observed at `now`. HOT, 0 B/op incl. pane rotation. The mode LOCKS at the
+     * first call: pass `now` (a finite, non-decreasing number) for EXPLICIT mode, or omit it
+     * (`add(undefined, value)`) for COUNT mode (auto-ticks; W is then in items). `value` must be a
+     * finite number >= 0 (negatives / out-of-indexable throw). Throws [lite-adaptive] on a bad value,
+     * a mode switch, or a non-finite / decreasing `now` (a byte-identical no-op).
+     */
+    add(now: number | undefined, value: number): this;
+
+    /**
+     * Add one value from a caller-owned PACKED `[now, value]` Float64Array pair (`buf[i]` = now,
+     * `buf[i+1]` = value). HOT, 0 B/op -- the ZERO-BOX entry (reads both UNBOXED). EXPLICIT-time only:
+     * a count-locked instance throws, the first addFrom locks EXPLICIT mode. Same validation /
+     * byte-identical-no-op-on-reject as `add`. Throws [lite-adaptive] on a non-Float64Array `buf` or a
+     * non-integer / out-of-range `i`.
+     */
+    addFrom(buf: Float64Array, i: number): this;
+
+    /**
+     * Estimate the value at quantile q over the last W (or a sub-window `w <= W`). COLD, 0 alloc.
+     * Returns NaN on an empty window. Throws [lite-adaptive] on q outside [0, 1] or a `w` outside (0, W].
+     */
+    quantile(q: number, w?: number): number;
+
+    /**
+     * Render several quantiles into a caller-owned Float64Array, merging the live panes ONCE (0-alloc
+     * render path). Each `qs[j]` in [0, 1] is written to `out[j]` (NaN for a bad q or an empty window).
+     * COLD. Returns the number of quantiles written (= qs.length). Throws [lite-adaptive] on a
+     * non-Float64Array `qs` / `out` or `out.length < qs.length`.
+     */
+    quantileInto(qs: Float64Array, out: Float64Array): number;
+
+    /**
+     * The number of values in the last W (or a sub-window `w <= W`), including zeros. COLD, O(panes).
+     * Returns 0 on an empty window. Throws [lite-adaptive] on a `w` outside (0, W].
+     */
+    count(w?: number): number;
+
+    /** Reset to the empty window; reuse the arrays (also unlocks the mode). */
+    clear(): this;
+}

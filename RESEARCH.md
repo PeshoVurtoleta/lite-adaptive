@@ -381,18 +381,24 @@ Design warnings specific to the Tier-2 members (numbers from the ROADMAP 6.2 siz
 - **SlidingHLL memory.** A per-register ring is the only honest zero-GC form (open question 4), and
   it multiplies HLL's m bytes by ~9 x ringCap. p=12 with ring 8 is ~288 KB. The default must be
   chosen for a consumer running many instances, and ring overflow must be visible.
-- **Windowed Count-Min memory.** An EH per cell is ~6 MB at ordinary sizes, so panes (a jumping
-  window with a disclosed edge error) or forward decay are the viable designs. Settle it in an ADR
-  before code.
+- **Windowed Count-Min.** An EH per cell (the ECM-sketch, VLDB 2012) is ~6 MB at ordinary sizes, so
+  use B+1 panes. Keep the oldest partial pane, so the estimate stays a one-sided upper bound, and
+  sum across panes before taking the min over rows. The rotation loop must be bounded by B+1
+  panes, not by the size of the time jump. Suggestions in ROADMAP 6.2.
+- **Idle-stream freeze (R11).** Every windowed member expires lazily relative to `lastNow`, so a
+  stream that stops receiving adds keeps reporting its last window forever. That fails open for a
+  live display: a "0 distinct in the last 5 s" reads as the old burst. `advance(now)` fixes it
+  without making queries mutate.
 - **Sliding quantiles are a compatibility problem more than an algorithm problem.** If the accepted
   value band, the zero/negative policy or the empty-window readout differs from lite-sketch
   DDSketch, every consumer's pre-check (lite-hud M2's getter-driven band) is silently wrong. Reuse
   the mapping.
-- **DriftDetector modes have different input domains** (real x vs 0/1 error bit). One class with a
-  mode flag must validate per mode, or the bundled form is a fail-open trap. Post-alarm reset
-  semantics decide whether a consumer's "regime changed" marker fires once or keeps firing.
-- **Decayed Reservoir** must never hold caller objects. A sample array of references is retention
-  outside the member's control. Store numbers and ids only.
+- **DriftDetector is real-valued only** (Page-Hinkley / CUSUM). The Bernoulli error-rate detectors
+  (DDM/EDDM, tri-state) were split into their own unscheduled contract, because one class with
+  mixed input domains is a fail-open trap. Post-alarm reset semantics decide whether a consumer's
+  "regime changed" marker fires once or keeps firing.
+- **Decayed Reservoir and DDM/EDDM have no lite-hud demand.** If either ships, the reservoir must
+  never hold caller objects (retention outside the member's control; store numbers and ids only).
 
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com> -- never "Karadjov".

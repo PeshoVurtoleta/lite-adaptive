@@ -8,6 +8,67 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.3.0] - 2026-09-24
+
+The third additive post-1.0 member. **PURE APPEND**: the six prior classes
+(`ExponentialHistogram`, `ADWIN`, `ForwardDecay`, `HeavyKeeper`, `SlidingHyperLogLog`,
+`DriftDetector`) are BYTE-IDENTICAL; only the file header and the `VERSION` const change above the
+append point. MINOR bump (new API, no break).
+
+### Added
+
+- **`SlidingDDSketch` -- windowed relative-error quantiles** (Masson-Rim-Lee, "DDSketch", VLDB 2019,
+  over a fixed-B pane ring; ADR 0008). Answers p50 / p99 / any quantile over the LAST W in fixed
+  memory at DDSketch accuracy -- the recency sibling of lite-sketch's cumulative `DDSketch`, for
+  lite-hud's M2 windowed percentiles. Window model A (fixed-B pane ring): `panes` preallocated
+  DDSketch panes (default 32), each covering `W / panes` of the window; `add` writes the current
+  pane, and crossing a pane boundary rotates to the next pane and clears it (a `fill(0)`, 0-alloc; a
+  `now` jump of k pane-widths clears `min(k, panes)` panes, never loops unbounded). `quantile` /
+  `quantileInto` / `count` merge the live panes into an INSTANCE-OWNED preallocated scratch (cold,
+  0-alloc -- never allocated per query). The edge error is disclosed: the window is soft to within
+  one pane width `W / panes` (~3% at the default 32), the price of a fixed-memory sliding window
+  over an exact O(W) sort.
+  - DESIGN PARITY with lite-sketch `DDSketch` (inlined, never a dependency -- the
+    `SlidingHyperLogLog` precedent): the SAME mapping `gamma = (1 + alpha) / (1 - alpha)`,
+    `key = ceil(log_gamma(v))`, the collapsing-lowest-bins default + a `strict` opt-in, and the
+    getters `alpha` / `strict` / `minIndexable` / `maxIndexable` / `collapsed` -- so a consumer
+    (lite-hud M2) pre-checks a value's indexable range EXACTLY as it does against lite-sketch. `alpha`
+    defaults to `0.01` (1% relative error); `maxBins` per pane is 2048 (`SLD_MAX_BINS`, matching
+    lite-sketch's `DD_MAX_BINS_DEFAULT`). Per-pane bin counts are `Uint32Array`, SATURATING at
+    `2^32-1` (never wrap); the merge scratch sums panes in `Float64` so a merged window count stays
+    exact past `2^32`.
+  - `new SlidingDDSketch(W, { alpha?, strict?, panes? })` -- `W` a finite number `> 0` (a `now`-span
+    in explicit mode, items in count mode) is the required positional (the `SlidingHyperLogLog`
+    `(W, options)` convention; `alpha` is an option here, not the positional it is on lite-sketch
+    `DDSketch`); `panes` an integer `>= 2` (default 32). Throws `[lite-adaptive]` typeof-first on a
+    bad `W` / `alpha` / `strict` / `panes` / unknown option BEFORE any allocation.
+  - `add(now, value) -> this` -- HOT, 0 B/op incl. the pane rotate + clear. EXPLICIT mode (a finite,
+    non-decreasing `now`) or COUNT mode via `add(undefined, value)` (auto-tick); the mode LOCKS at
+    the first add (a switch throws). Value domain + zero / `-0` / negative policy stated in the SAME
+    words as lite-sketch `DDSketch`. Fail closed: a mode switch, a non-finite / decreasing `now`, an
+    out-of-policy value, or a value whose bin key would exceed `SLD_KEY_MAX` (`1 << 30`) is a
+    byte-identical no-op / throw.
+  - `addFrom(buf, i) -> this` -- HOT, 0 B/op ZERO-BOX entry: `now = buf[i]`, `value = buf[i+1]` read
+    UNBOXED from a packed `Float64Array` (EXPLICIT-time only). Same validation + body as `add`.
+  - `quantile(q, w?) -> number` -- COLD; the windowed quantile for `q` in `[0, 1]` (outside throws),
+    over the full `W` or an optional sub-window `w` in `(0, W]` (outside throws). Returns `NaN` on an
+    empty window (never 0). `quantileInto(qs, out) -> number` packs several quantiles into a caller
+    array, 0-alloc (the render path). `count(w?) -> number` is the windowed population (0 on empty).
+  - `clear() -> this` -- 0-alloc reset (reuse the arrays; unlock the mode). Getters:
+    `W` / `panes` / `alpha` / `strict` / `minIndexable` / `maxIndexable` / `collapsed` / `mode` /
+    `lastNow` / `bytes`.
+  - WITNESSED (the honesty anchor, ADR 0008): windowed quantile relative error `<= alpha` vs an
+    EXACT windowed-sorted-array oracle on 100% of `>= 2000` queries across a `W` x `alpha` sweep, a
+    distribution shift, and a post-burst edge; the edge error bounded by one pane width `W / panes`;
+    empty = `NaN` with `count() === 0`. Negative controls REJECTED by the same gate: a NO-EXPIRY
+    variant (counts stale out-of-window values) and a `panes = 1` variant (breaks the edge bound).
+    ADR 0008 records the fixed-B pane-ring choice and the rejected alternatives -- an EH / DGIM of
+    DDSketches (merge-on-add allocates, not 0 B/op) and Arasu-Manku true windowed quantiles
+    (unbounded per-item state, not zero-GC) -- plus the pane-boundary collapse subtlety (each pane
+    collapses its lowest bins independently, so the merged min-key can differ from a single sketch's;
+    the edge bound is witnessed, not assumed).
+- **`VERSION`** is now `'1.3.0'`.
+
 ## [1.2.0] - 2026-09-24
 
 The second additive post-1.0 member. **PURE APPEND**: the five prior classes

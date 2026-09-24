@@ -11,7 +11,7 @@
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
 import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM } from '../../Adaptive.js';
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch } from '../../Adaptive.js';
 
 const W = 1000;
 const EPS = 0.01;
@@ -368,6 +368,92 @@ const ddCusumStream = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** Zero-alloc counter for SlidingDDSketch: the bins column's byte length -- fixed at construction. */
+function growsSd(s) { return s.sd._bins.buffer.byteLength; }
+
+/**
+ * SlidingDDSketch add on an explicit-time positive stream: the log-bucket key + pane rotate/clear +
+ * the current-pane increment (and the cold collapse tail), over a full, churning window so every
+ * measured add periodically crosses a pane boundary (rotate + clear must stay flat + 0 old-gen).
+ */
+const sdAddStream = {
+    name: 'SlidingDDSketch add explicit-time (log-bucket key + pane rotate/clear + increment)',
+    setup() {
+        const sd = new SlidingDDSketch(1000, { alpha: 0.01, panes: 8 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) sd.add(t++, ((k * 2654435761) % 9973) + 1);
+        return { sd, t, sink: 0 };
+    },
+    hot(s, n) {
+        const sd = s.sd;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            sd.add(t, ((t * 2654435761) % 9973) + 1);
+            t = (t + 1) | 0;
+            sink = (sink + (sd.collapsed ? 1 : 0)) | 0;   // observe state (defeat DCE)
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsSd(s) }; },
+};
+
+/**
+ * SlidingDDSketch addFrom on a packed [now, value] Float64Array with an epoch-ms `now` (a non-Smi
+ * double) + a FRACTIONAL value read UNBOXED -- the zero-box entry (a plain-arg add would box both).
+ * Same key + pane rotate/clear + increment; must stay flat + 0 old-gen.
+ */
+const sdAddFromStream = {
+    name: 'SlidingDDSketch addFrom epoch-ms + fractional value (zero-box key + pane rotate/clear)',
+    setup() {
+        const sd = new SlidingDDSketch(1000, { alpha: 0.01, panes: 8 });
+        const buf = new Float64Array(2);
+        let now = 1.75e12;
+        for (let k = 0; k < 4000; k++) { now += 1.5; buf[0] = now; buf[1] = ((k * 40503) % 9973) + 0.5; sd.addFrom(buf, 0); }
+        return { sd, buf, now, i: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const sd = s.sd, buf = s.buf;
+        let now = s.now, i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            now += 1.5;
+            buf[0] = now; buf[1] = ((i * 40503) % 9973) + 0.5;
+            sd.addFrom(buf, 0);
+            i = (i + 1) | 0;
+            sink = (sink + (sd.collapsed ? 1 : 0)) | 0;   // observe state (defeat DCE)
+        }
+        s.now = now; s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsSd(s) }; },
+};
+
+/**
+ * The teeth for the SlidingDDSketch lane: add + a fresh escaping array per op -- it MUST trip the
+ * gate, proving the SlidingDDSketch scenarios' flat result is a real 0-alloc measurement.
+ */
+const sdMustFailAlloc = {
+    name: 'SlidingDDSketch add + a fresh escaping array per op (MUST allocate)',
+    setup() {
+        const sd = new SlidingDDSketch(1000, { alpha: 0.01, panes: 8 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) sd.add(t++, ((k * 2654435761) % 9973) + 1);
+        return { sd, t, leak: null, sink: 0 };
+    },
+    hot(s, n) {
+        const sd = s.sd;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            sd.add(t, ((t * 2654435761) % 9973) + 1);
+            t = (t + 1) | 0;
+            const arr = new Array(64);
+            arr[0] = t;
+            s.leak = arr;
+            sink = (sink + arr[0]) | 0;
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 /**
  * The teeth for the DriftDetector lane: add + a fresh escaping array per op -- it MUST trip the
  * gate, proving the DriftDetector scenarios' flat result is a real 0-alloc measurement.
@@ -523,7 +609,8 @@ zgcSuite({
     scenarios: [
         addCountStream, addTimeStream, adwinDriftStream, fdAddStream, addFromStream, fdAddFromStream,
         hkAddStream, hkAddFromStream, slAddStream, slAddCountStream, slAddFromStream,
-        ddPhStream, ddCusumStream,
+        ddPhStream, ddCusumStream, sdAddStream, sdAddFromStream,
     ],
-    mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc, slMustFailAlloc, ddMustFailAlloc],
+    mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc, slMustFailAlloc, ddMustFailAlloc,
+        sdMustFailAlloc],
 });

@@ -83,6 +83,21 @@
  * BYTE-IDENTICAL; only this header + VERSION change above the append point plus the appended
  * DriftDetector class (and its DRIFT_PH / DRIFT_CUSUM mode consts).
  *
+ * v1.3.0 adds SlidingDDSketch (ADR 0008; Masson-Rim-Lee, "DDSketch", VLDB 2019, on a windowed
+ * pane ring): WINDOWED relative-error QUANTILES over the LAST W in FIXED preallocated space --
+ * the recency sibling of lite-sketch's cumulative DDSketch. A ring of B preallocated DDSketch
+ * PANES, each covering W/B of the window; add(now, value) / the zero-box addFrom(buf, i) bin the
+ * value on the SAME log scale as DDSketch (gamma = (1+alpha)/(1-alpha), key = ceil(log_gamma v),
+ * collapse-lowest default + strict opt-in), writing the current pane; crossing a pane boundary
+ * rotates to the next pane and clears it (0 B/op, a bounded while-loop capped at B). quantile /
+ * quantileInto / count merge the live panes into an INSTANCE-OWNED preallocated scratch (cold,
+ * 0-alloc -- never a per-query allocation). Edge error is up to one pane width W/B, disclosed and
+ * WITNESSED (each pane collapses its lowest bins INDEPENDENTLY, so the merged min-key can differ
+ * from a single sketch's). The THIRD additive post-1.0 member: a PURE APPEND -- the six prior
+ * classes (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
+ * DriftDetector) stay BYTE-IDENTICAL; only this header + VERSION change above the append point
+ * plus the appended SlidingDDSketch class (and its SLD_* consts).
+ *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
  *
@@ -90,7 +105,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -3020,5 +3035,751 @@ export class DriftDetector {
         throw new TypeError(
             '[lite-adaptive] DriftDetector.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
             'integer index (0 <= i < buf.length), got ' + String(buf) + ', ' + String(i));
+    }
+}
+
+// ===========================================================================
+// SlidingDDSketch (ADR 0008) -- windowed relative-error quantiles over the LAST W
+// (Masson-Rim-Lee, "DDSketch", VLDB 2019, on a fixed-B pane ring)
+// ===========================================================================
+//
+// SlidingDDSketch answers "what is the p50 / p90 / p99 of the values in the LAST W" in FIXED
+// preallocated space with the SAME per-query relative-error guarantee as lite-sketch's cumulative
+// DDSketch (|q_est - q_true| <= alpha * q_true), on the RECENCY axis. It is the quantile sibling
+// of SlidingHyperLogLog (windowed distinct-count) -- both keep a hard last-W window over a
+// caller-supplied MONOTONE `now`, never the wall clock.
+//
+// WINDOW MODEL (ADR 0008, model A -- fixed-B pane ring): B preallocated DDSketch PANES, each
+// covering W/B of the window, held in a ring. add() writes the CURRENT pane; when `now` crosses a
+// pane boundary the ring rotates to the next pane and CLEARS it (fill(0), 0-alloc). A `now` jump of
+// many pane-widths expires multiple panes in a bounded while-loop capped at B iterations (skipping
+// >= B panes clears them ALL, then re-anchors the ring around `now`). quantile / quantileInto /
+// count MERGE the live panes into an INSTANCE-OWNED preallocated scratch (cold, 0-alloc -- never a
+// per-query allocation). The edge error is up to one pane width (W/B), disclosed: the oldest live
+// pane straddles the window boundary and is counted in full. Each pane collapses its lowest bins
+// INDEPENDENTLY, so the merged min-key across the B panes can differ from a single sketch's -- the
+// accuracy/edge bound is therefore WITNESSED, not assumed.
+//
+// DDSketch MAPPING (inlined, NOT a dependency -- a consumer pre-checks against this identically to
+// lite-sketch DDSketch; any divergence in the accepted band is a breaking surprise): with
+// `gamma = (1 + alpha) / (1 - alpha)` a value x > 0 lands in bucket `key(x) = ceil(ln(x) * mult)`
+// (mult = 1/ln(gamma)); x === 0 routes to a per-pane zero counter; x < 0 fails closed (log is
+// undefined for non-positives). Bins collapse-lowest by default (protects the p90/p99 tail),
+// `strict` opts into a fail-closed throw on a collapse instead. Bin counts are `Uint32Array`
+// (non-negative frequencies; saturate at 0xFFFFFFFF, NEVER wrap -- the CountMinSketch precedent;
+// lite-sketch DDSketch uses Float64 bins, the one recorded deviation -- see ADR 0008); the merge
+// scratch is `Float64Array` so summing B near-saturated panes stays exact to 2^53.
+
+/** Frozen marker of the known SlidingDDSketch option keys -- an unknown key throws with a hint. */
+const SLD_KNOWN_OPTS = Object.freeze({ alpha: true, strict: true, panes: true });
+/** Default relative-error target alpha (a common DDSketch setting; the option is tunable). */
+const SLD_DEFAULT_ALPHA = 0.01;
+/** Default pane count B (edge error W/32). */
+const SLD_DEFAULT_PANES = 32;
+/** Fewest panes: at least 2 so the window is meaningfully sub-divided. */
+const SLD_PANES_MIN = 2;
+/** Most panes: bounds the preallocated store (panes * SLD_MAX_BINS Uint32 bins). */
+const SLD_PANES_MAX = 1024;
+/**
+ * SLD_MAX_BINS -- dense bin-array length PER PANE. Matches lite-sketch DDSketch's default maxBins
+ * (2048) so the per-pane accuracy contract is identical: the alpha guarantee holds for the upper
+ * quantiles unless a pane's value RANGE exceeds 2048 log-buckets and its low end collapses.
+ */
+const SLD_MAX_BINS = 2048;
+/**
+ * SLD_KEY_MAX -- hard cap on |bin key| before a value is rejected fail-closed (the ADWIN /
+ * DriftDetector overflow lesson). Per-pane bin offsets live in `Int32Array`; a key beyond this
+ * would overflow the offset arithmetic and silently corrupt the merge. 2^30 stays well within the
+ * Int32 range. For every practical alpha the per-alpha indexable band (computed at the ctor like
+ * DDSketch) is far tighter than SLD_KEY_MAX, so the ACCEPTED VALUE BAND is identical to lite-sketch
+ * DDSketch; SLD_KEY_MAX only bites at a pathologically small alpha whose offsets would not fit Int32.
+ */
+const SLD_KEY_MAX = 1 << 30;
+
+/**
+ * SlidingDDSketch -- WINDOWED relative-error QUANTILE estimation over the LAST W (a hard sliding
+ * window) in FIXED space (Masson-Rim-Lee, "DDSketch", VLDB 2019, over a fixed-B pane ring). The
+ * recency sibling of lite-sketch's cumulative DDSketch and the quantile complement of
+ * SlidingHyperLogLog.
+ *
+ * Headline (the family TRIPLE):
+ *   - SPACE: a FIXED ring of B panes, each a dense `Uint32Array(SLD_MAX_BINS)` log-bucket store
+ *     (+ per-pane offset / max-key / count bookkeeping) + one instance-owned Float64 merge scratch;
+ *     never grows (panes=32 -> ~256 KB at 2048 bins).
+ *   - ERROR: a HARD per-query relative bound `|q_est - q_true| <= alpha * q_true` on the merged live
+ *     window, PLUS a window-edge error of up to one pane width W/B (the straddling oldest pane).
+ *   - RECENCY: a HARD last-W window (forgets at the window edge, +/- one pane width) with a
+ *     sub-window query `quantile(q, w)` / `count(w)` for any `w <= W`.
+ *
+ * Hot path (`add` / `addFrom`, 0 B/op INCLUDING pane rotation): validate value + time, compute the
+ * ONE log-bucket key, rotate + clear panes if `now` crossed a boundary (a bounded, alloc-free
+ * while-loop), and in the steady state increment ONE Uint32 cell of the current pane. The window
+ * slide + collapse (`_addKeyPane`) is a cold tail-call off the hot body.
+ *
+ * Cold path: `quantile(q, w?)` / `quantileInto(qs, out)` / `count(w?)` MERGE the live panes into the
+ * preallocated scratch (0 alloc, never per-query) then walk it -- a disclosed co-headline, NOT a
+ * per-add cost. `clear()` reuses every array.
+ *
+ * Fail closed: a bad W / alpha / strict / panes / option throws `[lite-adaptive]` at the ctor door
+ * BEFORE any allocation; `add` / `addFrom` reject a non-number / NaN / +-Infinity / NEGATIVE value,
+ * a value whose key is out of the indexable range (or would exceed SLD_KEY_MAX), a mode switch, a
+ * non-finite / decreasing `now` -- typeof-first, and every value-domain / indexable / time rejection
+ * is a BYTE-IDENTICAL no-op (validated before any state write); a STRICT collapse rejection throws
+ * before any bin write (the time model has legitimately advanced -- time is monotone and
+ * value-independent; the quantile/count state is intact). `quantile` throws on q outside [0, 1] or a
+ * sub-window outside (0, W], and returns NaN on an empty window; `count` returns 0 on empty. null is
+ * not zero (strict = false and value = 0 are guarded distinctly).
+ */
+export class SlidingDDSketch {
+    /**
+     * @param {number} W        window size; a finite number > 0 (items in count mode, or the
+     *                          `now`-unit span in explicit mode).
+     * @param {{alpha?: number, strict?: boolean, panes?: number}} [options]
+     *   alpha:  relative-error target; a number in (0, 1) (default 0.01).
+     *   strict: fail closed on a collapse instead of collapsing-lowest (default false).
+     *   panes:  pane-ring size B; an integer in [2, 1024] (default 32). Edge error is W / panes.
+     */
+    constructor(W, options) {
+        // typeof guard FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
+        if (typeof W !== 'number' || W !== W || W === Infinity || W === -Infinity || W <= 0) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingDDSketch W must be a finite number > 0, got ' + String(W));
+        }
+        let alpha = SLD_DEFAULT_ALPHA;
+        let strict = false;
+        let panes = SLD_DEFAULT_PANES;
+        if (options !== undefined) {
+            if (typeof options !== 'object' || options === null) {
+                throw new TypeError('[lite-adaptive] SlidingDDSketch options must be an object');
+            }
+            for (const key in options) {
+                if (!(key in SLD_KNOWN_OPTS)) {
+                    throw new RangeError('[lite-adaptive] SlidingDDSketch unknown option "' + key + '"');
+                }
+            }
+            if (options.alpha !== undefined) {
+                const a = options.alpha;
+                if (typeof a !== 'number' || !(a > 0 && a < 1)) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingDDSketch alpha must be a number in (0, 1), got ' + String(a));
+                }
+                alpha = a;
+            }
+            // strict = false is the default; guard `undefined`, and require a real boolean (null is not false).
+            if (options.strict !== undefined) {
+                const st = options.strict;
+                if (typeof st !== 'boolean') {
+                    throw new TypeError(
+                        '[lite-adaptive] SlidingDDSketch strict must be a boolean, got ' + String(st));
+                }
+                strict = st;
+            }
+            if (options.panes !== undefined) {
+                const p = options.panes;
+                if (typeof p !== 'number' || (p | 0) !== p || p < SLD_PANES_MIN || p > SLD_PANES_MAX) {
+                    throw new RangeError(
+                        '[lite-adaptive] SlidingDDSketch panes must be an integer in [' + SLD_PANES_MIN +
+                        ', ' + SLD_PANES_MAX + '], got ' + String(p));
+                }
+                panes = p;
+            }
+        }
+
+        const gamma = (1 + alpha) / (1 - alpha);
+        const multiplier = 1 / Math.log(gamma);
+        const lnGamma = Math.log(gamma);
+        // Indexable KEY bounds for which the representative `2*gamma^K/(gamma+1)` stays a finite,
+        // NORMAL double (the DDSketch fail-closed door, computed identically -- a sum of logs so the
+        // `MAX_VALUE*(gamma+1)/2` term never overflows, then a cold verification tightening).
+        const MIN_NORMAL = 2 ** -1022;
+        const lnHalfGammaPlus1 = Math.log((gamma + 1) / 2);
+        let maxKey = Math.floor((Math.log(Number.MAX_VALUE) + lnHalfGammaPlus1) / lnGamma);
+        while (maxKey > 0 && !Number.isFinite(2 * Math.pow(gamma, maxKey) / (gamma + 1))) maxKey--;
+        let minKey = Math.ceil((Math.log(MIN_NORMAL) + lnHalfGammaPlus1) / lnGamma);
+        while (minKey < 0 && 2 * Math.pow(gamma, minKey) / (gamma + 1) < MIN_NORMAL) minKey++;
+        // Intersect with SLD_KEY_MAX so per-pane Int32 offsets never overflow (fail-closed cap).
+        if (maxKey > SLD_KEY_MAX) maxKey = SLD_KEY_MAX;
+        if (minKey < -SLD_KEY_MAX) minKey = -SLD_KEY_MAX;
+
+        this._W = W;
+        this._alpha = alpha;
+        this._strict = strict;
+        this._panes = panes;
+        this._maxBins = SLD_MAX_BINS;
+        this._paneW = W / panes;          // per-pane time width (the disclosed edge error)
+        this._gamma = gamma;
+        this._multiplier = multiplier;
+        this._maxKey = maxKey;
+        this._minKey = minKey;
+        this._minIndexable = Math.pow(gamma, minKey - 1);  // EXCLUSIVE floor: add accepts x > this
+        this._maxIndexable = Math.pow(gamma, maxKey);      // INCLUSIVE ceiling: add accepts x <= this
+
+        const cells = panes * SLD_MAX_BINS;
+        // per-pane dense log-bucket store (pane p occupies cells [p*maxBins, p*maxBins+maxBins)):
+        this._bins = new Uint32Array(cells);         // bin counts (saturate at 0xFFFFFFFF)
+        this._offset = new Int32Array(panes);        // per-pane key at physical bin 0
+        this._maxKeyPop = new Int32Array(panes);     // per-pane highest populated key
+        this._binCount = new Int32Array(panes);      // per-pane anchored flag (0 = fresh)
+        this._paneCollapsed = new Uint8Array(panes); // per-pane collapse flag (low-end precision lost)
+        this._paneCount = new Float64Array(panes);   // per-pane total adds (incl. zeros), exact to 2^53
+        this._paneZero = new Float64Array(panes);    // per-pane zero adds
+        this._paneEnd = new Float64Array(panes);     // per-pane EXCLUSIVE upper time bound
+        // instance-owned merge scratch (Float64 so B near-saturated panes sum exactly):
+        this._scratch = new Float64Array(SLD_MAX_BINS);
+
+        this._bytes = this._bins.byteLength + this._offset.byteLength + this._maxKeyPop.byteLength +
+            this._binCount.byteLength + this._paneCollapsed.byteLength + this._paneCount.byteLength +
+            this._paneZero.byteLength + this._paneEnd.byteLength + this._scratch.byteLength;
+
+        this._initState();
+    }
+
+    /** @private Reset all pane state + time mode + scratch. Reused by clear(). 0 alloc. */
+    _initState() {
+        this._bins.fill(0);
+        this._offset.fill(0);
+        this._maxKeyPop.fill(0);
+        this._binCount.fill(0);
+        this._paneCollapsed.fill(0);
+        this._paneCount.fill(0);
+        this._paneZero.fill(0);
+        this._paneEnd.fill(0);
+        this._cur = 0;               // current (newest) pane index in the ring
+        this._mode = MODE_UNSET;     // time mode, locked at the first add
+        this._tick = 0;              // count-mode logical clock
+        this._lastNow = 0;           // explicit-mode monotone guard (init value never compared)
+        this._now = 0;               // the last applied t (query cutoff = now - W)
+        // scratch (merged) state -- rebuilt each query, reset here for a clean empty read.
+        this._sOffset = 0;
+        this._sMaxKeyPop = 0;
+        this._sBinCount = 0;
+        this._mZeros = 0;
+        this._mTotal = 0;
+    }
+
+    /** The relative-error target alpha. O(1). */
+    get alpha() { return this._alpha; }
+    /** Whether strict mode is on (a collapse throws instead of folding). O(1). */
+    get strict() { return this._strict; }
+    /** The pane-ring size B (edge error is W / panes). O(1). */
+    get panes() { return this._panes; }
+    /** Window size W. O(1). */
+    get W() { return this._W; }
+    /** The last applied time t (0 before the first add). O(1). */
+    get lastNow() { return this._now; }
+    /** The locked time mode: 'unset' | 'explicit' | 'count'. O(1). */
+    get mode() {
+        return this._mode === MODE_EXPLICIT ? 'explicit' : this._mode === MODE_COUNT ? 'count' : 'unset';
+    }
+    /**
+     * The smallest x > 0 that `add` accepts at this alpha (the EXCLUSIVE lower floor; below it the
+     * bucket representative falls denormal and loses the alpha guarantee). O(1), 0 B/op. null is not zero.
+     */
+    get minIndexable() { return this._minIndexable; }
+    /** The largest x that `add` accepts at this alpha (INCLUSIVE; above it the representative overflows). O(1). */
+    get maxIndexable() { return this._maxIndexable; }
+    /** Whether any live pane has folded nonzero mass into its collapsed floor. COLD, O(panes). */
+    get collapsed() {
+        const c = this._paneCollapsed, B = this._panes;
+        for (let p = 0; p < B; p++) if (c[p] !== 0) return true;
+        return false;
+    }
+    /** A fixed memory figure in bytes (all pane columns + the merge scratch). O(1). */
+    get bytes() { return this._bytes; }
+
+    /**
+     * Add one value `value` observed at `now`. HOT, 0 B/op INCLUDING pane rotation + clear.
+     *
+     * Time modes (LOCKED at the first add, a switch throws):
+     *   - EXPLICIT: add(now, value). `now` is a finite number, strictly NON-DECREASING across calls.
+     *   - COUNT: add(undefined, value). The member auto-increments an internal tick per add (W in items).
+     *
+     * Value domain (DDSketch parity): x > 0 is binned on the log scale; x === 0 is counted separately
+     * (the smallest value); x < 0 fails closed (log is undefined). A value whose bucket key is outside
+     * the indexable range (or would exceed SLD_KEY_MAX) fails closed.
+     *
+     * Fail closed: a non-number / NaN / +-Infinity / negative value, an out-of-indexable value, a mode
+     * switch, or a non-finite / decreasing `now` throws [lite-adaptive] (typeof-first, a BYTE-IDENTICAL
+     * no-op). In `strict` mode a value whose bucket would COLLAPSE -- fall outside the pane's representable
+     * window in EITHER direction (below the floor OR above the ceiling, forcing a slide) -- throws before
+     * any bin write; non-strict collapses silently and sets `collapsed`.
+     * @param {number} [now]  the monotone time (omit for count mode).
+     * @param {number} value  a finite number >= 0 (negatives throw).
+     * @returns {SlidingDDSketch} this
+     */
+    add(now, value) {
+        // 1. validate the VALUE first (typeof-first), before ANY state mutation.
+        if (typeof value !== 'number' || value !== value ||
+            value === Infinity || value === -Infinity) return this._badValue(value);
+        if (value < 0) return this._badValue(value);
+        // 2. compute the log-bucket key + indexable check for x > 0 (0 needs no key).
+        let k = 0;
+        if (value !== 0) {
+            k = Math.ceil(Math.log(value) * this._multiplier);
+            if (k > this._maxKey || k < this._minKey) return this._badIndexable(value);
+        }
+        // 3. resolve + lock the time mode (no mutation until every value+time check has passed).
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            if (now !== undefined) return this._badMode('count', 'explicit');
+            t = ++this._tick;
+        } else if (mode === MODE_EXPLICIT) {
+            if (now === undefined) return this._badMode('explicit', 'count');
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badNow(now);
+            }
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now === undefined) {
+                this._mode = MODE_COUNT;
+                t = ++this._tick;
+                this._anchor(t);
+            } else {
+                if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                    return this._badNow(now);
+                }
+                this._mode = MODE_EXPLICIT;
+                t = now;
+                this._lastNow = now;
+                this._anchor(t);
+            }
+        }
+        this._now = t;
+        // 4. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
+        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        // 5. write the value into the current pane.
+        const cur = this._cur;
+        if (value === 0) { this._paneZero[cur] += 1; this._paneCount[cur] += 1; return this; }
+        const maxBins = this._maxBins, bins = this._bins, base = cur * maxBins;
+        const idx = k - this._offset[cur];
+        if (this._binCount[cur] !== 0 && idx >= 0 && idx < maxBins) {
+            const c = bins[base + idx];
+            if (c !== 4294967295) {                           // saturate, never wrap
+                bins[base + idx] = c + 1;
+                this._paneCount[cur] += 1;                     // gate the count on the SAME check (no drift)
+            }
+            if (k > this._maxKeyPop[cur]) this._maxKeyPop[cur] = k;
+            return this;
+        }
+        return this._addKeyPane(cur, k);   // cold: first value / slide / collapse
+    }
+
+    /**
+     * Add one value from a caller-owned PACKED `[now, value]` Float64Array pair. HOT, 0 B/op -- the
+     * ZERO-BOX entry: `now = buf[i]` (a fractional / epoch-ms double) and `value = buf[i + 1]` are
+     * read UNBOXED, avoiding the ~16 B HeapNumber each would box as a plain argument at a non-inlined
+     * call boundary. EXPLICIT-time ONLY (addFrom always carries a `now`): a COUNT-locked instance
+     * rejects it and the first addFrom locks EXPLICIT mode. Identical validation, throws,
+     * byte-identical-no-op-on-reject, and binning as `add(now, value)`; the body is DUPLICATED (not
+     * delegated) to keep `add`'s hot body byte-identical and avoid re-boxing at an internal boundary.
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now, `buf[i+1]` = value.
+     * @param {number} i the base index of the [now, value] pair (0, 2, 4, ...).
+     * @returns {SlidingDDSketch} this
+     */
+    addFrom(buf, i) {
+        // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        const now = buf[i];         // UNBOXED Float64Array reads -- the whole point (no argument box).
+        const value = buf[i + 1];   // packed [now, value]
+        // 1. validate the VALUE first (a Float64Array read is always a number, so no typeof branch).
+        if (value !== value || value === Infinity || value === -Infinity) return this._badValue(value);
+        if (value < 0) return this._badValue(value);
+        // 2. compute the log-bucket key + indexable check for x > 0.
+        let k = 0;
+        if (value !== 0) {
+            k = Math.ceil(Math.log(value) * this._multiplier);
+            if (k > this._maxKey || k < this._minKey) return this._badIndexable(value);
+        }
+        // 3. addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify EXPLICIT.
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._anchor(t);
+        }
+        this._now = t;
+        // 4. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
+        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        // 5. write the value into the current pane (DUPLICATED from add() -- byte-identical body).
+        const cur = this._cur;
+        if (value === 0) { this._paneZero[cur] += 1; this._paneCount[cur] += 1; return this; }
+        const maxBins = this._maxBins, bins = this._bins, base = cur * maxBins;
+        const idx = k - this._offset[cur];
+        if (this._binCount[cur] !== 0 && idx >= 0 && idx < maxBins) {
+            const c = bins[base + idx];
+            if (c !== 4294967295) {                           // saturate, never wrap
+                bins[base + idx] = c + 1;
+                this._paneCount[cur] += 1;                     // gate the count on the SAME check (no drift)
+            }
+            if (k > this._maxKeyPop[cur]) this._maxKeyPop[cur] = k;
+            return this;
+        }
+        return this._addKeyPane(cur, k);   // cold: first value / slide / collapse
+    }
+
+    /**
+     * @private Anchor the pane ring around the first `now` (grid-aligned to W/panes). The current
+     * pane (index 0) covers the grid cell containing `now`; predecessors go backward by one pane
+     * width each. Cold (once per lifecycle / clear). 0 alloc.
+     */
+    _anchor(now) {
+        const B = this._panes, pw = this._paneW;
+        const E = (Math.floor(now / pw) + 1) * pw;   // EXCLUSIVE upper bound of the current pane
+        this._cur = 0;
+        this._paneEnd[0] = E;
+        let e = E, idx = 0;
+        for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; }
+    }
+
+    /**
+     * @private Rotate the ring forward so the current pane covers time `t`, clearing each pane it
+     * rotates onto. Capped at B rotations (rotating >= B panes clears them ALL, then re-anchors the
+     * ring around `t`). 0 alloc. Called only when `t` crossed the current pane boundary.
+     */
+    _advance(t) {
+        const pw = this._paneW, B = this._panes;
+        let cur = this._cur;
+        let E = this._paneEnd[cur];
+        let rot = 0;
+        while (t >= E && rot < B) {
+            cur++; if (cur === B) cur = 0;
+            this._clearPane(cur);
+            E += pw;
+            this._paneEnd[cur] = E;
+            rot++;
+        }
+        if (t >= E) {
+            // jumped >= B pane widths: every pane cleared above -> grid-re-anchor around t.
+            const newE = (Math.floor(t / pw) + 1) * pw;
+            this._paneEnd[cur] = newE;
+            let e = newE, idx = cur;
+            for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; }
+        }
+        this._cur = cur;
+    }
+
+    /** @private Clear one pane's store + bookkeeping (0 alloc). */
+    _clearPane(p) {
+        const base = p * this._maxBins;
+        this._bins.fill(0, base, base + this._maxBins);
+        this._offset[p] = 0;
+        this._maxKeyPop[p] = 0;
+        this._binCount[p] = 0;
+        this._paneCollapsed[p] = 0;
+        this._paneCount[p] = 0;
+        this._paneZero[p] = 0;
+    }
+
+    /**
+     * @private The cold window math for one pane (out-of-window key), mirroring lite-sketch DDSketch's
+     * collapsing-lowest _addKey on a Uint32 store: anchor the first key at the TOP (fill downward), fold a
+     * below-floor key into bin 0, or slide the window up folding the vacated low cells. STRICT mode throws
+     * on ANY collapse (below-floor OR slide-up) at the HEAD of that branch, before any bin mutation. Uint32
+     * bin counts saturate at 0xFFFFFFFF (never wrap); the per-pane count is gated on the same
+     * non-saturation check so the tracked total never exceeds the histogram mass. 0 alloc.
+     * @param {number} pane pane index
+     * @param {number} k    bucket key
+     * @returns {SlidingDDSketch} this
+     */
+    _addKeyPane(pane, k) {
+        const maxBins = this._maxBins;
+        const bins = this._bins;
+        const base = pane * maxBins;
+        if (this._binCount[pane] === 0) {
+            const off = k - (maxBins - 1);      // anchor at the TOP, fill downward
+            this._offset[pane] = off;
+            bins[base + (maxBins - 1)] += 1;    // fresh cell (0 -> 1, no saturation concern)
+            this._maxKeyPop[pane] = k;
+            this._binCount[pane] = 1;
+            this._paneCount[pane] += 1;
+            return this;
+        }
+        const off = this._offset[pane];
+        const idx = k - off;
+        if (idx >= 0 && idx < maxBins) {        // in-window (rare fall-through from the hot body)
+            const c = bins[base + idx];
+            if (c !== 4294967295) {             // saturate, never wrap; gate the count on the SAME check
+                bins[base + idx] = c + 1;
+                this._paneCount[pane] += 1;
+            }
+            if (k > this._maxKeyPop[pane]) this._maxKeyPop[pane] = k;
+            return this;
+        }
+        if (idx < 0) {                          // below the floor: collapsing-lowest fold (or strict throw)
+            if (this._strict) return this._badStrict(k);   // strict: NO collapse ever -- throw before any write
+            const c = bins[base];
+            if (c !== 4294967295) {             // saturate; gate the count so the total never exceeds the mass
+                bins[base] = c + 1;
+                this._paneCount[pane] += 1;
+            }
+            this._paneCollapsed[pane] = 1;
+            return this;
+        }
+        // idx > maxBins - 1: the value sits ABOVE the window ceiling -> a slide-up that WOULD collapse the
+        // low end. STRICT: no collapse ever -- throw at the HEAD, before any bin mutation (symmetric with
+        // the below-floor strict throw; both too-small and too-large fail closed, DDSketch-strict parity).
+        if (this._strict) return this._badStrict(k);
+        const newOff = k - (maxBins - 1);
+        const delta = newOff - off;             // > 0
+        if (delta >= maxBins) {                 // everything folds into bin 0
+            let m = 0;
+            for (let i = 0; i < maxBins; i++) { m += bins[base + i]; bins[base + i] = 0; }
+            if (m !== 0) this._paneCollapsed[pane] = 1;
+            bins[base] = m > 4294967295 ? 4294967295 : m;
+        } else {                                // fold the delta lowest cells into bin 0
+            let m = 0;
+            for (let i = 0; i < delta; i++) m += bins[base + i];
+            bins.copyWithin(base, base + delta, base + maxBins);      // shift counts DOWN by delta
+            bins.fill(0, base + maxBins - delta, base + maxBins);     // zero the vacated top
+            const c0 = bins[base] + m;
+            bins[base] = c0 > 4294967295 ? 4294967295 : c0;
+            if (m !== 0) this._paneCollapsed[pane] = 1;
+        }
+        this._offset[pane] = newOff;
+        bins[base + (maxBins - 1)] += 1;        // the new key sits at the top (fresh after the slide)
+        this._maxKeyPop[pane] = k;
+        this._paneCount[pane] += 1;
+        return this;
+    }
+
+    /**
+     * @private Merge the live panes (paneEnd > cut) into the instance-owned Float64 scratch. Each pane
+     * collapses INDEPENDENTLY, so keys are re-folded through the same collapsing-lowest logic on the
+     * scratch (the merged min-key may differ from a single pane's -- ADR 0008). Also accumulates the
+     * merged zero count + total. COLD, O(panes * maxBins), 0 alloc.
+     */
+    _merge(cut) {
+        const s = this._scratch;
+        s.fill(0);
+        this._sBinCount = 0;
+        this._sOffset = 0;
+        this._sMaxKeyPop = 0;
+        let zeros = 0, total = 0;
+        const B = this._panes, maxBins = this._maxBins, bins = this._bins;
+        for (let p = 0; p < B; p++) {
+            if (!(this._paneEnd[p] > cut)) continue;   // pane fully expired (its newest edge <= cut)
+            zeros += this._paneZero[p];
+            total += this._paneCount[p];
+            if (this._binCount[p] === 0) continue;     // no bucketed value in this pane
+            const base = p * maxBins;
+            const off = this._offset[p];
+            const top = this._maxKeyPop[p] - off;
+            for (let ii = 0; ii <= top; ii++) {
+                const mass = bins[base + ii];
+                if (mass !== 0) this._scratchAddKey(ii + off, mass);
+            }
+        }
+        this._mZeros = zeros;
+        this._mTotal = total;
+    }
+
+    /** @private Fold a (key, mass) pair into the Float64 merge scratch (collapsing-lowest). 0 alloc. */
+    _scratchAddKey(k, mass) {
+        const maxBins = this._maxBins, s = this._scratch;
+        if (this._sBinCount === 0) {
+            const off = k - (maxBins - 1);
+            this._sOffset = off;
+            s[maxBins - 1] += mass;
+            this._sMaxKeyPop = k;
+            this._sBinCount = 1;
+            return;
+        }
+        const off = this._sOffset;
+        const idx = k - off;
+        if (idx >= 0 && idx < maxBins) {
+            s[idx] += mass;
+            if (k > this._sMaxKeyPop) this._sMaxKeyPop = k;
+            return;
+        }
+        if (idx < 0) { s[0] += mass; return; }
+        const newOff = k - (maxBins - 1);
+        const delta = newOff - off;
+        if (delta >= maxBins) {
+            let m = 0;
+            for (let i = 0; i < maxBins; i++) { m += s[i]; s[i] = 0; }
+            s[0] = m;
+        } else {
+            let m = 0;
+            for (let i = 0; i < delta; i++) m += s[i];
+            s.copyWithin(0, delta, maxBins);
+            s.fill(0, maxBins - delta, maxBins);
+            s[0] += m;
+        }
+        this._sOffset = newOff;
+        s[maxBins - 1] += mass;
+        this._sMaxKeyPop = k;
+    }
+
+    /** @private Walk the merged scratch for quantile q in [0, 1]; NaN for a bad q or an empty merge. */
+    _walk(q) {
+        if (typeof q !== 'number' || q !== q || q < 0 || q > 1) return NaN;
+        const N = this._mTotal;
+        if (N === 0) return NaN;
+        const rank = Math.floor(q * (N - 1));   // 0-indexed target rank
+        let cum = this._mZeros;
+        if (rank < cum) return 0;               // the target falls in the zero bucket
+        const s = this._scratch, off = this._sOffset, gamma = this._gamma;
+        const top = this._sBinCount === 0 ? -1 : this._sMaxKeyPop - off;
+        for (let i = 0; i <= top; i++) {
+            cum += s[i];
+            if (cum > rank) {
+                const K = i + off;
+                return 2 * Math.pow(gamma, K) / (gamma + 1);
+            }
+        }
+        if (top >= 0) return 2 * Math.pow(gamma, this._sMaxKeyPop) / (gamma + 1);
+        return NaN;
+    }
+
+    /**
+     * Estimate the value at quantile q over the last W (or a sub-window `w <= W`). COLD, 0 alloc
+     * (merges the live panes into the instance scratch, never per-query). Returns NaN on an empty
+     * window. Throws [lite-adaptive] on q outside [0, 1] or a sub-window `w` outside (0, W].
+     * @param {number} q a number in [0, 1].
+     * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
+     * @returns {number}
+     */
+    quantile(q, w) {
+        if (typeof q !== 'number' || q !== q || q < 0 || q > 1) return this._badQ(q);
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
+                return this._badWindow(w);
+            }
+            effW = w;
+        }
+        if (this._mode === MODE_UNSET) return NaN;
+        this._merge(this._now - effW);
+        return this._walk(q);
+    }
+
+    /**
+     * Render several quantiles at once into a caller-owned Float64Array, merging the live panes ONCE
+     * (0-alloc render path). Each `qs[j]` in [0, 1] is written to `out[j]` (NaN for a q outside [0, 1]
+     * or an empty window). COLD. Returns the number of quantiles written (= qs.length).
+     * @param {Float64Array} qs the quantiles to render (each in [0, 1]).
+     * @param {Float64Array} out the receiving buffer (length must be >= qs.length).
+     * @returns {number} the count of quantiles written.
+     */
+    quantileInto(qs, out) {
+        if (!(qs instanceof Float64Array) || !(out instanceof Float64Array) || out.length < qs.length) {
+            return this._badInto(qs, out);
+        }
+        const n = qs.length;
+        if (this._mode === MODE_UNSET) {
+            for (let j = 0; j < n; j++) out[j] = NaN;
+            return n;
+        }
+        this._merge(this._now - this._W);
+        for (let j = 0; j < n; j++) out[j] = this._walk(qs[j]);
+        return n;
+    }
+
+    /**
+     * The number of values in the last W (or a sub-window `w <= W`), including zeros. COLD, O(panes),
+     * 0 alloc. Returns 0 on an empty window. Throws [lite-adaptive] on a sub-window `w` outside (0, W].
+     * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
+     * @returns {number}
+     */
+    count(w) {
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
+                return this._badWindow(w);
+            }
+            effW = w;
+        }
+        if (this._mode === MODE_UNSET) return 0;
+        const cut = this._now - effW;
+        const B = this._panes;
+        let total = 0;
+        for (let p = 0; p < B; p++) if (this._paneEnd[p] > cut) total += this._paneCount[p];
+        return total;
+    }
+
+    /** Reset to the empty window; reuse every array (also unlocks the mode). O(panes*maxBins). @returns {SlidingDDSketch} this */
+    clear() {
+        this._initState();
+        return this;
+    }
+
+    /** @private Cold thrower for a bad value (non-finite / negative). */
+    _badValue(value) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingDDSketch value must be a finite number >= 0, got ' + String(value));
+    }
+
+    /** @private Cold thrower for a value outside the indexable range (representative would over/underflow). */
+    _badIndexable(value) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingDDSketch value ' + String(value) + ' is outside the sketch\'s indexable range');
+    }
+
+    /** @private Cold thrower for a strict-mode collapse rejection (below the floor OR above the ceiling). */
+    _badStrict(k) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingDDSketch strict mode: value (bucket key ' + String(k) +
+            ') falls outside the pane\'s representable window and would collapse');
+    }
+
+    /** @private Cold thrower for a mode switch after the mode locked. */
+    _badMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingDDSketch mode is locked to ' + locked +
+            ' at the first add; got a ' + attempted + '-mode add');
+    }
+
+    /** @private Cold thrower for a non-finite `now`. */
+    _badNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingDDSketch add now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone `now`. */
+    _badMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingDDSketch add now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad quantile q. */
+    _badQ(q) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingDDSketch quantile q must be a number in [0, 1], got ' + String(q));
+    }
+
+    /** @private Cold thrower for a bad sub-window `w`. */
+    _badWindow(w) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingDDSketch sub-window w must be a finite number in (0, W] (W=' +
+            this._W + '), got ' + String(w));
+    }
+
+    /** @private Cold thrower for a bad quantileInto(qs, out). */
+    _badInto(qs, out) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingDDSketch.quantileInto(qs, out) needs two Float64Arrays with ' +
+            'out.length >= qs.length, got ' + String(qs) + ', ' + String(out));
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingDDSketch.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
     }
 }

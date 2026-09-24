@@ -51,6 +51,7 @@ last1000.count();                          // ~1000  (an exact ring would hold 1
 - [HeavyKeeper](#heavykeeper)
 - [SlidingHyperLogLog](#slidinghyperloglog)
 - [DriftDetector](#driftdetector)
+- [SlidingDDSketch](#slidingddsketch)
 - [API reference](#api-reference)
 - [Composability](#composability)
 - [Zero-GC design notes](#zero-gc-design-notes)
@@ -72,6 +73,7 @@ A recency summary is a promise: "I use `X` bytes and my answer about the last `W
 - **HeavyKeeper** -- decayed / windowed heavy hitters (Gong et al., USENIX ATC 2018): the top-k keys dominating the stream *right now*. A `d x w` fingerprint table with probabilistic exponential decay on collision (cold keys erode) + an intrusive top-k min-forest. `add(key, weight = 1)` ranks by count or any additive weight; `forEach` / `topKInto` read the leaders 0-alloc. Far lower error than Space-Saving on skewed, evolving streams. The final member of the frozen 1.0.0 core.
 - **SlidingHyperLogLog** -- windowed distinct-count (Chabchoub-Hebrail, "Sliding HyperLogLog", 2010): "how many *distinct* keys in the last `W`?" in fixed preallocated space at HLL accuracy (the recency sibling of `@zakkster/lite-sketch`'s cumulative HyperLogLog). An `m = 2^p` register bank where each register keeps a small fixed LFPM ring of `(timestamp, rho)` maxima; `add(now, key)` / `addFrom` are 0-alloc incl. the windowed eviction, `count(w?)` runs Ertl's estimator over the live window with a `1.04 / sqrt(m)` standard error. The first additive post-1.0 member (1.1.0).
 - **DriftDetector** -- scalar change detection (Page, *Biometrika* 1954): "did the mean of *this* signal just shift?" in `O(1)` state -- six scalars, no pool, no window (the lightest member). One class selects **Page-Hinkley** or two-sided **CUSUM** via a mode const; `add(x) -> boolean` returns `true` exactly on the detecting item, then resets to catch the next shift. The cheap per-channel companion to ADWIN -- run one per stream when you have many. The second additive post-1.0 member (1.2.0).
+- **SlidingDDSketch** -- windowed relative-error quantiles (Masson-Rim-Lee, "DDSketch", *VLDB* 2019): "what's p50 / p99 over the last `W`?" in fixed preallocated space at DDSketch accuracy (the recency sibling of `@zakkster/lite-sketch`'s cumulative DDSketch). A ring of `panes` preallocated DDSketch panes (default 32), each covering `W / panes`; `add(now, value)` / `addFrom` are 0-alloc incl. the pane rotate + clear, and `quantile(q, w?)` / `quantileInto` merge the live panes into an instance-owned scratch with a relative error `<= alpha`. The window is soft to within one pane width `W / panes`. The third additive post-1.0 member (1.3.0).
 - **A caller-owned time source** -- `add(now)` with a monotone `now` (a logical tick or ms), or `add()` in count mode for the "last N items" window. The member never reads the clock, so witnesses are exactly reproducible.
 - **The recency witness** -- measured windowed error vs the theoretical bound, printed side by side, with the exact-ring foil whose memory climbs O(W) while the histogram stays a fixed sliver.
 - **Zero runtime dependencies**, ESM, tree-shakeable named exports, TypeScript types, and a **0 bytes/op hot path** -- *including* the amortized bucket merge / expire reshaping -- proven by a leak + GC-profiler torture gate.
@@ -245,6 +247,32 @@ On a positive detection the accumulators + running mean are **reset** (the stand
 
 Item-indexed (no clock). `delta` is the magnitude the test ignores (widens the dead-band -> fewer detections, higher latency); `threshold` trades detection latency against false alarms. A bad `mode` / `delta` / `threshold` / option throws `[lite-adaptive]` at the ctor door, before any field init. `DDM` / `EDDM` are deliberately out of this class -- they consume a Bernoulli *error-bit* stream and emit a tri-state (stable / warning / drift) output, a different contract from `add(x) -> boolean`, and belong in a future member.
 
+## SlidingDDSketch
+
+Answer "what's p50 / p99 *over the last `W`*?" in fixed preallocated space at DDSketch accuracy. `SlidingDDSketch` is the recency sibling of `@zakkster/lite-sketch`'s cumulative DDSketch: it keeps a ring of `panes` preallocated DDSketch panes (default 32), each covering `W / panes` of the window. Every pane maps a value to the same DDSketch bin -- `key = ceil(log_gamma(value))` with `gamma = (1 + alpha) / (1 - alpha)` -- so a merge across panes is just an element-wise bin sum, and the relative error of any reported quantile stays `<= alpha` (identical mapping, collapse and getters to lite-sketch, so a consumer pre-checks a value's indexable range exactly as it does there).
+
+```js
+import { SlidingDDSketch } from '@zakkster/lite-adaptive';
+
+const q = new SlidingDDSketch(60000, { alpha: 0.01, panes: 32 });   // p50/p99 over the last 60s, 1% rel-error
+for (const [t, ms] of latencySamples) q.add(t, ms);                  // HOT, 0 B/op incl. pane rotate + clear
+
+q.quantile(0.99);            // COLD; the windowed p99 within 1% relative error (NaN on an empty window)
+const out = new Float64Array(2);
+q.quantileInto([0.5, 0.99], out);   // 0-alloc render path: out = [p50, p99]
+q.count();                   // the windowed population (0 on empty)
+```
+
+`add(now, value)` writes the current pane; when `now` crosses a pane boundary it rotates to the next pane and clears it with a `fill(0)` (0-alloc). A `now` jump of many pane-widths (an idle gap, an epoch-ms clock) clears at most `panes` panes -- the rotation is bounded, never a loop over the skipped span. `quantile` / `quantileInto` / `count` are cold reads that merge the live panes into an **instance-owned preallocated scratch** (never allocated per query); an empty window reads `NaN` with `count() === 0`, never a misleading `0`.
+
+<details>
+<summary>The pane ring, the edge error, and the counters</summary>
+
+The window is **soft to within one pane width** `W / panes`: a value can survive up to `W / panes` past the strict window edge, in the pane that has not yet rotated out. That is the disclosed price of a fixed-memory sliding window over an exact `O(W)` sort; the default 32 panes puts the edge at ~3% of `W`, and it is the caller's knob (more panes -> tighter edge, linearly more memory). Per-pane bin counts are a `Uint32Array` that **saturates at `2^32 - 1`** (never wraps); the merge scratch sums the panes in `Float64`, so a merged window count stays exact well past `2^32`. Each pane collapses its lowest bins independently (the DDSketch `maxBins = 2048` bound), so the merged min-key can differ from a single sketch's -- the accuracy bound is therefore **witnessed**, not assumed. A value whose bin key would exceed `SLD_KEY_MAX` (`1 << 30`) is rejected fail-closed, so the bin index can never overflow.
+</details>
+
+`SlidingDDSketch` locks EXPLICIT vs COUNT mode at the first add (a switch throws), and `alpha` / `strict` / `panes` / `W` are validated typeof-first before any allocation. The windowed-quantile witness gates the relative error `<= alpha` vs an exact windowed-sorted-array oracle on 100% of `>= 2000` queries across a `W` x `alpha` sweep, a distribution shift, and a post-burst edge, and asserts the edge stays within one pane width; a no-expiry variant (stale out-of-window values counted) and a coarse `panes = 2` variant (the edge bound blows past `W / 32`) are rejected by the same gate -- see [Testing](#testing).
+
 ## API reference
 
 ```js
@@ -357,6 +385,18 @@ clear() -> this                // 0-alloc reset of all scalar state (keeps mode 
 
 // getters
 mode   delta   threshold   target   count   mean   statistic
+
+// SlidingDDSketch -- windowed relative-error quantiles (fixed-space DDSketch over the last W)
+new SlidingDDSketch(W, options?)            // options: { alpha, strict, panes }
+add(now, value) -> this        // HOT, 0 B/op incl. pane rotate + clear; monotone now, DDSketch-domain value
+addFrom(buf, i) -> this        // HOT, 0 B/op ZERO-BOX: now = buf[i], value = buf[i+1] (explicit-time)
+quantile(q, w?) -> number      // COLD; windowed quantile for q in [0,1]; NaN on empty; w in (0, W]
+quantileInto(qs, out) -> number// COLD, 0-alloc; write each qs[j]'s quantile into out; returns the count
+count(w?) -> number            // COLD; windowed population (0 on empty); w in (0, W]
+clear() -> this                // 0-alloc reset (reuse the panes; unlocks the mode)
+
+// getters
+W   panes   alpha   strict   minIndexable   maxIndexable   collapsed   mode   lastNow   bytes
 ```
 
 - **`d` / `w` / `k`** -- hash rows (`~4-8`), cells per row, and the top-k size. `HeavyKeeper.withAccuracy(k, targetError)` derives `d` / `w` from a target relative error. A bad `d` / `w` / `k` / `seed` / `b` / option throws `[lite-adaptive]` typeof-first, before any allocation.
@@ -403,6 +443,20 @@ Constants that shape the detector:
 | `delta` | default `0.005`, `[0, 1e150]` | magnitude allowance / slack the test ignores (widens the dead-band) |
 | `threshold` | default `50`, `> 0` | decision level; latency vs false-alarm trade-off |
 | space | `O(1)` (six scalars) | no pool, no window; 0 B/op on `add` / `addFrom` / `clear` |
+
+- **`SlidingDDSketch(W, { alpha, strict, panes })`** -- `W` the window (items in count mode, or the `now`-unit span in explicit mode), a finite number `> 0`; `alpha` the relative-error knob in `(0, 1)` (default `0.01`); `panes` the ring size, an integer `>= 2` (default 32; the window is soft to within `W / panes`). A bad `W` / `alpha` / `strict` / `panes` / option throws `[lite-adaptive]` typeof-first, before any allocation. `alpha` is an option here (the `(W, options)` convention), where lite-sketch's cumulative `DDSketch` takes it as the leading positional -- the mapping and accuracy contract are otherwise identical.
+- **`add(now, value)`** -- `now` a finite, non-decreasing number (a decrease throws); `value` in the DDSketch domain (the same zero / `-0` / negative policy as lite-sketch `DDSketch`). Count mode (`add(undefined, value)`) auto-ticks. The mode locks at the first add (a switch throws); a bad `now` / `value`, or a `value` whose bin key would exceed `SLD_KEY_MAX` (`1 << 30`), is a byte-identical no-op.
+- **`quantile(q, w?)` / `quantileInto(qs, out)`** -- `q` in `[0, 1]` (outside throws); an empty window returns `NaN` (never `0`). `w` an optional sub-window in `(0, W]` (outside throws). `quantileInto` is the 0-alloc render path -- it writes each `qs[j]`'s quantile into the caller's `out` and returns the count written. Both merge the live panes into an instance-owned scratch (cold, 0-alloc).
+- **`minIndexable` / `maxIndexable` / `collapsed` / `strict`** -- the DDSketch accuracy-range getters, identical in name and meaning to lite-sketch: `[minIndexable, maxIndexable]` is the value range the sketch can represent within `alpha`, `collapsed` reports whether any pane collapsed its lowest bins, and `strict` (default `false`) opts out of collapse (fail-closed on an out-of-range value instead). A consumer pre-checks a value against `[minIndexable, maxIndexable]` exactly as it does for lite-sketch `DDSketch`.
+
+Constants that shape the pane ring:
+
+| Symbol | Value | Meaning |
+|--------|-------|---------|
+| `alpha` | default `0.01`, `(0, 1)` | relative-error knob; `gamma = (1 + alpha) / (1 - alpha)`, `key = ceil(log_gamma(value))` |
+| `panes` | default 32, `>= 2` | ring size; the window is soft to within one pane width `W / panes` (~3% at 32) |
+| `maxBins` | 2048 (`SLD_MAX_BINS`) | per-pane bin bound (matches lite-sketch's default); lowest bins collapse past it |
+| space | `panes * maxBins * 4 B` + scratch | `Uint32` bin counts per pane (saturating at `2^32-1`) + a `Float64` merge scratch |
 
 ## Composability
 
@@ -470,11 +524,12 @@ Gated quality numbers (`npm run verify`):
 - **`rate()` is a definition, not a theorem.** `rate = decayedCount * lambda` is the decayed events per unit time under the exponential kernel, exact only in the steady-state limit -- documented, never oversold.
 - **Fail closed, typeof-first, before allocation.** A bad `W` / `epsilon` / `halfLife` / option throws at the constructor door before any allocation; `null` is not zero; a query before the last add time throws (can't un-decay); other queries never throw.
 - **The DriftDetector mode is the *reference*, and it is load-bearing.** Page-Hinkley and CUSUM share the contract -- a real-valued `add(x) -> boolean` -- so they live behind one mode flag with a single hot body (a Welford mean + one branch). But under a *shared* reference the two rules are the identical statistic (CUSUM's floor-at-0 recursion is exactly PH's cumulative-sum-minus-running-min), so the modes differ by what they reference: PH the **online running mean** (no baseline needed), CUSUM a **fixed target `mu0`** (the SPC in-control mean). That is what makes the flag meaningful, and the witness gates the divergence so a regression back to one statistic is rejected (see ADR 0007). DDM / EDDM take a Bernoulli error bit and emit a tri-state signal -- an incompatible contract -- so they were deliberately deferred to a future member. The `delta` (and `target`) caps mirror the `x` cap so a pathological config can never turn `add` into a fail-open boolean.
+- **SlidingDDSketch is a pane ring, not an EH-of-sketches, and that is a zero-GC decision.** A windowed quantile wants to expire old values without an `O(W)` sort. The exact-edge option -- a DGIM / exponential-histogram *of DDSketches* -- has to *merge* sketches on `add`, which allocates; and Arasu-Manku true windowed quantiles keep unbounded per-item state. Both fail the 0-B/op contract. A fixed ring of `panes` preallocated sketches keeps `add` allocation-free (rotate + `fill(0)`, bounded even on a huge `now` jump) and merges only at query, into an instance-owned scratch. The cost is an honest, disclosed edge -- the window is soft to within one pane width `W / panes` -- and because each pane collapses its lowest bins independently, the merged accuracy is *witnessed* against an exact oracle rather than assumed (see ADR 0008).
 
 ## Testing
 
-- `npm test` -- the `node:test` behavioral + fail-closed suite across every member (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog, DriftDetector): ctor validation before allocation, mode-lock both ways, monotone-`now`, signed values, the landmark rebase, query-now contract, drift detection + reset, and the no-op regressions (a rejected add is byte-identical).
-- `npm run witness` -- the recency witness: the windowed error vs the `epsilon` bound (EH) + the change-response gates (ADWIN) + the exact-aggregate gate `|fd - oracle| / |oracle| <= 1e-9` (ForwardDecay) + the top-k recall / marquee (HeavyKeeper) + the windowed-distinct error vs a `Set` oracle (SlidingHyperLogLog) + the detection-latency / false-alarm gates (DriftDetector), each with rejected negative controls.
+- `npm test` -- the `node:test` behavioral + fail-closed suite across every member (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog, DriftDetector, SlidingDDSketch): ctor validation before allocation, mode-lock both ways, monotone-`now`, signed values, the landmark rebase, query-now contract, drift detection + reset, windowed-quantile / empty-window contracts, and the no-op regressions (a rejected add is byte-identical).
+- `npm run witness` -- the recency witness: the windowed error vs the `epsilon` bound (EH) + the change-response gates (ADWIN) + the exact-aggregate gate `|fd - oracle| / |oracle| <= 1e-9` (ForwardDecay) + the top-k recall / marquee (HeavyKeeper) + the windowed-distinct error vs a `Set` oracle (SlidingHyperLogLog) + the detection-latency / false-alarm gates (DriftDetector) + the windowed-quantile error `<= alpha` vs a sorted-array oracle with the edge bounded by one pane width (SlidingDDSketch), each with rejected negative controls.
 - `npm run torture` -- the 0 B/op leak + GC-profiler gate on `add` including the merge / expire reshaping (`node --expose-gc`).
 - `npm run test:perf` -- the flat-throughput perf gate + a must-allocate control.
 - `npm run test:types` -- the ambient type-surface compile check.
@@ -489,6 +544,7 @@ Gated quality numbers (`npm run verify`):
 - **Not a cumulative top-k.** HeavyKeeper decays, so it answers "who dominates *now*"; the whole-stream heavy hitters that never forget are `@zakkster/lite-sketch`'s SpaceSaving.
 - **Not a cumulative distinct-count.** SlidingHyperLogLog counts distinct keys in the last `W` and forgets older ones; for a whole-stream distinct-count that never forgets, use `@zakkster/lite-sketch`'s HyperLogLog. `SlidingHyperLogLog` is the first additive post-1.0 member (1.1.0), landing without breaking the frozen core.
 - **Not an error-rate / classifier-drift detector.** `DriftDetector` (Page-Hinkley / CUSUM) watches the mean of a *real-valued* signal and returns a boolean; the DDM / EDDM family that consumes a Bernoulli *error-bit* stream and emits a tri-state (stable / warning / drift) output is a different contract and belongs in a future member. `DriftDetector` is also not an *adaptive-window* detector -- for the auto-grown / auto-shrunk window (and the current mean / variance / width of it), use ADWIN; `DriftDetector` is the cheaper `O(1)`-state per-channel change flag (the second additive post-1.0 member, 1.2.0).
+- **Not a cumulative or an exact quantile.** `SlidingDDSketch` answers quantiles over the last `W` and forgets older values; for a whole-stream quantile that never forgets, use `@zakkster/lite-sketch`'s DDSketch. It *estimates* within `alpha` relative error (not an exact percentile -- that needs an `O(W)` sort you can hold), and its window is soft to within one pane width `W / panes` (the disclosed edge). It is the third additive post-1.0 member (1.3.0), landing without breaking the frozen core.
 
 ## Ecosystem
 

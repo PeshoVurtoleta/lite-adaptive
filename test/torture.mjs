@@ -22,7 +22,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
     const { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-        DriftDetector, DRIFT_PH, DRIFT_CUSUM } = await import('../Adaptive.js');
+        DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch } = await import('../Adaptive.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -74,6 +74,14 @@ async function main() {
             dd.mean; dd.statistic; dd.count;             // exercise the cold getters (0 alloc)
             dd.clear();
             tracker.track(dd, noop, 'driftdetector', { audit: true });
+
+            const sd = new SlidingDDSketch(1000, { alpha: 0.01, panes: 16 });
+            // a rolling explicit-time stream over a full, churning window -> rotate + clear + collapse.
+            let sdt = 0;
+            for (let k = 0; k < 4096; k++) sd.add(sdt++, ((k * 2654435761) % 9973) + 1);
+            sd.quantile(0.5); sd.quantile(0.99); sd.count();   // cold queries (0 alloc via scratch)
+            sd.clear();
+            tracker.track(sd, noop, 'slidingddsketch', { audit: true });
         }
         return tracker.size();
     }
@@ -462,6 +470,99 @@ async function main() {
     const ddClearBytes = Math.max(0, Math.round(ddClearBpc));
     const ddClearOk = ddClearBytes === 0;
 
+    // ---- phase 2a-septies: SlidingDDSketch -- add (log-bucket key + pane rotate/clear + collapse) +
+    // the ZERO-BOX addFrom on FRACTIONAL [now, value] + quantile + quantileInto + clear. ----
+    // SlidingDDSketch add: an explicit-time SMI `now` + positive value over a full, churning window so
+    // every measured add crosses pane boundaries periodically (rotate + clear must be 0-alloc). Primed.
+    const sdAdd = new SlidingDDSketch(1000, { alpha: 0.01, panes: 32 });
+    let sdT = 0;
+    for (let k = 0; k < 4000; k++) sdAdd.add(sdT++, ((k * 2654435761) % 9973) + 1);
+    let sdSink = 0;
+    const sdStep = () => {
+        sdAdd.add(sdT, ((sdT * 2654435761) % 9973) + 1);
+        sdT = (sdT + 1) | 0;
+        sdSink = (sdSink + (sdAdd.collapsed ? 1 : 0)) | 0;   // observe state (defeat DCE)
+    };
+    const sdRes = measureAllocs(sdStep, { iterations: 100000, batches: 8 });
+    const sdBpc = sdRes.bytesPerCall === null ? 0 : sdRes.bytesPerCall;
+    const sdBytes = Math.max(0, Math.round(sdBpc));
+    const sdOk = sdBytes === 0;
+
+    // SlidingDDSketch addFrom: epoch-ms `now` (non-Smi double) + FRACTIONAL value read UNBOXED from a
+    // packed [now, value] Float64Array -- the gated zero-box floor (a plain-arg add would box both).
+    const sdFrom = new SlidingDDSketch(1000, { alpha: 0.01, panes: 32 });
+    const SDBUF = new Float64Array(2);
+    let sdfNow = 1.75e12;
+    for (let k = 0; k < 4000; k++) {
+        sdfNow += 1.5; SDBUF[0] = sdfNow; SDBUF[1] = ((k * 40503) % 9973) + 0.5; sdFrom.addFrom(SDBUF, 0);
+    }
+    let sdFromSink = 0, sdfI = 0;
+    const sdFromStep = () => {
+        sdfNow += 1.5;
+        SDBUF[0] = sdfNow; SDBUF[1] = ((sdfI * 40503) % 9973) + 0.5;
+        sdFrom.addFrom(SDBUF, 0);
+        sdfI = (sdfI + 1) | 0;
+        sdFromSink = (sdFromSink + (sdFrom.collapsed ? 1 : 0)) | 0;   // observe state (defeat DCE)
+    };
+    const sdFromRes = measureAllocs(sdFromStep, { iterations: 100000, batches: 8 });
+    const sdFromBpc = sdFromRes.bytesPerCall === null ? 0 : sdFromRes.bytesPerCall;
+    const sdFromBytes = Math.max(0, Math.round(sdFromBpc));
+    const sdFromOk = sdFromBytes === 0;
+
+    // SlidingDDSketch quantile: the cold merge-into-scratch + walk must be 0-alloc (never a per-query
+    // allocation). Query a full, churning window repeatedly.
+    let sdQSink = 0;
+    const sdQStep = () => {
+        const p = sdAdd.quantile(0.99);
+        sdQSink = (sdQSink + (p > 0 ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const sdQRes = measureAllocs(sdQStep, { iterations: 20000, batches: 8 });
+    const sdQBpc = sdQRes.bytesPerCall === null ? 0 : sdQRes.bytesPerCall;
+    const sdQBytes = Math.max(0, Math.round(sdQBpc));
+    const sdQOk = sdQBytes === 0;
+
+    // SlidingDDSketch quantileInto: the 0-alloc multi-quantile render (one merge, several walks).
+    const SDQS = Float64Array.of(0.5, 0.9, 0.99);
+    const SDOUT = new Float64Array(3);
+    let sdIntoSink = 0;
+    const sdIntoStep = () => {
+        sdAdd.quantileInto(SDQS, SDOUT);
+        sdIntoSink = (sdIntoSink + (SDOUT[2] > 0 ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const sdIntoRes = measureAllocs(sdIntoStep, { iterations: 20000, batches: 8 });
+    const sdIntoBpc = sdIntoRes.bytesPerCall === null ? 0 : sdIntoRes.bytesPerCall;
+    const sdIntoBytes = Math.max(0, Math.round(sdIntoBpc));
+    const sdIntoOk = sdIntoBytes === 0;
+
+    // SlidingDDSketch clear(): re-fill between clears so every measured clear() resets non-trivial live
+    // state (all pane columns + scratch), not a no-op on an already-empty instance.
+    const sdClear = new SlidingDDSketch(1000, { alpha: 0.01, panes: 32 });
+    for (let k = 0; k < 4000; k++) sdClear.add(k, ((k * 2654435761) % 9973) + 1);
+    let sdClearSink = 0, sdClearI = 0;
+    const sdClearStep = () => {
+        sdClear.clear();
+        sdClear.add(sdClearI, ((sdClearI * 2654435761) % 9973) + 1);   // re-seed live state
+        sdClearI = (sdClearI + 1) | 0;
+        sdClearSink = (sdClearSink + (sdClear.mode === 'explicit' ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const sdClearRes = measureAllocs(sdClearStep, { iterations: 20000, batches: 8 });
+    const sdClearBpc = sdClearRes.bytesPerCall === null ? 0 : sdClearRes.bytesPerCall;
+    const sdClearBytes = Math.max(0, Math.round(sdClearBpc));
+    const sdClearOk = sdClearBytes === 0;
+
+    // SlidingDDSketch retention: bytes constant + count() returns to baseline over 10 clear/refill cycles.
+    const sdRet = new SlidingDDSketch(1000, { alpha: 0.01, panes: 16 });
+    const sdRetBytes0 = sdRet.bytes;
+    let sdRetBase = -1, sdRetOk = true;
+    for (let cyc = 0; cyc < 10; cyc++) {
+        sdRet.clear();
+        for (let k = 0; k < 2000; k++) sdRet.add(k, ((k * 2654435761) % 9973) + 1);
+        const cnt = sdRet.count();
+        if (sdRetBase < 0) sdRetBase = cnt;
+        else if (cnt !== sdRetBase) sdRetOk = false;
+        if (sdRet.bytes !== sdRetBytes0) sdRetOk = false;
+    }
+
     // ---- phase 2b: GC budget over a long hot run (millions of add + reshaping ops) ----
     const gc = new GcProfiler().start();
     const HOT = 4000000;
@@ -471,21 +572,27 @@ async function main() {
         hkStep(); hkFromStep(); adFromStep(); hkClearStep();
         slStep(); slFromStep(); slClearStep();
         ddPhStep(); ddCuStep(); ddFromStep(); ddClearStep();
+        sdStep(); sdFromStep();
     }
     SINK += addSink + addTSink + adSink + fpSink + frSink + ehFromSink + fdFromSink + ehBoxedSink + fdBoxedSink +
         hkSink + hkFromSink + hkBoxedSink + adFromSink + hkClearSink + slSink + slFromSink + slClearSink +
-        ddPhSink + ddCuSink + ddFromSink + ddClearSink;
+        ddPhSink + ddCuSink + ddFromSink + ddClearSink +
+        sdSink + sdFromSink + sdQSink + sdIntoSink + sdClearSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
 
     // ---- phase 2c: arrayBuffers growth (the fixed pool grows no store across reuse) ----
-    const abBefore = process.memoryUsage().arrayBuffers;
+    // Construct the reuse instances FIRST (a one-time, expected store allocation), THEN capture the
+    // baseline: the loop below must add / query / clear over 500 cycles WITHOUT growing the store.
     const reuse = new ExponentialHistogram(2048, 0.01);
     const reuseAd = new ADWIN(0.1);
     const reuseHk = new HeavyKeeper(4, 512, 16, { seed: 9 });
     const reuseSl = new SlidingHyperLogLog(2048, { p: 10, ringCap: 8, seed: 10 });
-    let reuseSlT = 0;
+    const reuseSd = new SlidingDDSketch(2048, { alpha: 0.01, panes: 16 });
+    globalThis.gc();
+    const abBefore = process.memoryUsage().arrayBuffers;
+    let reuseSlT = 0, reuseSdT = 0;
     for (let c = 0; c < 500; c++) {
         for (let k = 0; k < 8192; k++) reuse.add();     // full window -> expire + cascade
         reuse.count();
@@ -500,6 +607,9 @@ async function main() {
         for (let k = 0; k < 8192; k++) reuseSl.add(reuseSlT++, (k * 2654435761) % 3000);  // window churn + LFPM
         reuseSl.count();
         reuseSl.clear();                                // reuse the arrays, no new store
+        for (let k = 0; k < 8192; k++) reuseSd.add(reuseSdT++, ((k * 2654435761) % 9973) + 1);  // pane rotate + collapse
+        reuseSd.quantile(0.99);
+        reuseSd.clear();                                // reuse the arrays, no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -510,7 +620,8 @@ async function main() {
     const ok = trackedOk && live === 0 && findings.length === 0 &&
         addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk &&
         hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk &&
-        ddPhOk && ddCuOk && ddFromOk && ddClearOk && report.ok && abOk;
+        ddPhOk && ddCuOk && ddFromOk && ddClearOk &&
+        sdOk && sdFromOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk && report.ok && abOk;
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=0' +
@@ -532,7 +643,12 @@ async function main() {
         ddPhBytes + ' B/op (DriftDetector add PH) ' +
         ddCuBytes + ' B/op (DriftDetector add CUSUM) ' +
         ddFromBytes + ' B/op (DriftDetector addFrom fractional) ' +
-        ddClearBytes + ' B/op (DriftDetector clear)' +
+        ddClearBytes + ' B/op (DriftDetector clear) ' +
+        sdBytes + ' B/op (SlidingDDSketch add + pane rotate + collapse) ' +
+        sdFromBytes + ' B/op (SlidingDDSketch addFrom fractional) ' +
+        sdQBytes + ' B/op (SlidingDDSketch quantile merge) ' +
+        sdIntoBytes + ' B/op (SlidingDDSketch quantileInto) ' +
+        sdClearBytes + ' B/op (SlidingDDSketch clear)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta +
         ' diag: add-boxed-fractional EH=' + ehBoxedBytes + ' B/op FD=' + fdBoxedBytes +
@@ -560,6 +676,12 @@ async function main() {
         if (!ddCuOk) console.error('  alloc ' + ddCuBytes + ' B/op DriftDetector add CUSUM (raw ' + ddCuBpc + ')');
         if (!ddFromOk) console.error('  alloc ' + ddFromBytes + ' B/op DriftDetector addFrom (raw ' + ddFromBpc + ')');
         if (!ddClearOk) console.error('  alloc ' + ddClearBytes + ' B/op DriftDetector clear (raw ' + ddClearBpc + ')');
+        if (!sdOk) console.error('  alloc ' + sdBytes + ' B/op SlidingDDSketch add (raw ' + sdBpc + ')');
+        if (!sdFromOk) console.error('  alloc ' + sdFromBytes + ' B/op SlidingDDSketch addFrom (raw ' + sdFromBpc + ')');
+        if (!sdQOk) console.error('  alloc ' + sdQBytes + ' B/op SlidingDDSketch quantile (raw ' + sdQBpc + ')');
+        if (!sdIntoOk) console.error('  alloc ' + sdIntoBytes + ' B/op SlidingDDSketch quantileInto (raw ' + sdIntoBpc + ')');
+        if (!sdClearOk) console.error('  alloc ' + sdClearBytes + ' B/op SlidingDDSketch clear (raw ' + sdClearBpc + ')');
+        if (!sdRetOk) console.error('  retention: SlidingDDSketch bytes/count drifted over clear/refill cycles');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

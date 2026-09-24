@@ -7,13 +7,14 @@
 
 import {
     ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM, VERSION,
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, VERSION,
 } from '../../Adaptive.js';
 import type {
     ExponentialHistogramMode, ExponentialHistogramOptions, ADWINOptions,
     ForwardDecayMode, ForwardDecayOptions, HeavyKeeperOptions, HeavyKeeperEntry,
     SlidingHyperLogLogMode, SlidingHyperLogLogOptions,
     DriftDetectorMode, DriftDetectorOptions,
+    SlidingDDSketchMode, SlidingDDSketchOptions,
 } from '../../Adaptive.js';
 
 // VERSION is a string.
@@ -374,3 +375,83 @@ dd.addFrom(ddBuf, 'x');
 // @ts-expect-error -- add returns a boolean, not assignable to DriftDetector (no chaining).
 const ddChain: DriftDetector = dd.add(1);
 void ddChain;
+
+// --- SlidingDDSketch ---------------------------------------------------------
+const sd = new SlidingDDSketch(1000);
+const sd2 = new SlidingDDSketch(4096, { alpha: 0.005, strict: true, panes: 64 });
+
+// getters
+const sdAlpha: number = sd.alpha;
+const sdStrict: boolean = sd.strict;
+const sdPanes: number = sd.panes;
+const sdW: number = sd.W;
+const sdLast: number = sd.lastNow;
+const sdMode: SlidingDDSketchMode = sd.mode;
+const sdMinIx: number = sd.minIndexable;
+const sdMaxIx: number = sd.maxIndexable;
+const sdColl: boolean = sd.collapsed;
+const sdBytes: number = sd.bytes;
+void sdAlpha; void sdStrict; void sdPanes; void sdW; void sdLast; void sdMode;
+void sdMinIx; void sdMaxIx; void sdColl; void sdBytes;
+
+// add: chainable, explicit + count mode (count = add(undefined, value))
+const sdChained: SlidingDDSketch = sd.add(1, 42).add(2, 3.5);
+const sdCounted: SlidingDDSketch = sd2.add(undefined, 7);
+void sdChained; void sdCounted;
+
+// addFrom: zero-box packed [now, value] entry, chainable
+const sdBuf = new Float64Array([1, 42]);
+const sdFrom: SlidingDDSketch = sd2.addFrom(sdBuf, 0).addFrom(sdBuf, 0);
+void sdFrom;
+
+// queries return numbers, with an optional sub-window; quantileInto returns a count
+const sdQ: number = sd.quantile(0.5);
+const sdQw: number = sd.quantile(0.99, 500);
+const sdCount: number = sd.count();
+const sdCountW: number = sd.count(500);
+const sdInto: number = sd.quantileInto(new Float64Array([0.5, 0.9]), new Float64Array(2));
+void sdQ; void sdQw; void sdCount; void sdCountW; void sdInto;
+
+// clear is chainable
+const sdCleared: SlidingDDSketch = sd.clear();
+void sdCleared;
+
+// options type is assignable
+const sdOpts: SlidingDDSketchOptions = { alpha: 0.01, strict: false, panes: 32 };
+void sdOpts;
+
+// @ts-expect-error -- W must be a number.
+new SlidingDDSketch('1000');
+
+// @ts-expect-error -- alpha option must be a number.
+new SlidingDDSketch(1000, { alpha: '0.01' });
+
+// @ts-expect-error -- strict option must be a boolean.
+new SlidingDDSketch(1000, { strict: 1 });
+
+// @ts-expect-error -- panes option must be a number.
+new SlidingDDSketch(1000, { panes: '32' });
+
+// @ts-expect-error -- unknown option key.
+new SlidingDDSketch(1000, { bins: 2048 });
+
+// @ts-expect-error -- add value must be a number.
+sd.add(1, 'x');
+
+// @ts-expect-error -- addFrom buf must be a Float64Array.
+sd.addFrom([1, 42], 0);
+
+// @ts-expect-error -- addFrom index must be a number.
+sd.addFrom(sdBuf, 'x');
+
+// @ts-expect-error -- quantile q must be a number.
+sd.quantile('0.5');
+
+// @ts-expect-error -- quantileInto qs must be a Float64Array.
+sd.quantileInto([0.5], new Float64Array(1));
+
+// @ts-expect-error -- count sub-window must be a number.
+sd.count('500');
+
+// @ts-expect-error -- a readonly getter is not assignable.
+sd.alpha = 0.02;

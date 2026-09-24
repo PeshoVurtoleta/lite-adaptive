@@ -18,8 +18,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // version pin
 // ---------------------------------------------------------------------------
-test('VERSION is 1.2.0 (DriftDetector milestone)', () => {
-    assert.equal(VERSION, '1.2.0');
+test('VERSION is 1.3.0 (SlidingDDSketch milestone)', () => {
+    assert.equal(VERSION, '1.3.0');
 });
 
 // ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@
 // correction) is fed the SAME gate and MUST be REJECTED (the gate has teeth). ASCII-only.
 
 import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM, VERSION } from '../Adaptive.js';
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, VERSION } from '../Adaptive.js';
 
 const WS = [64, 1000, 65536];
 const EPS = [0.5, 0.1, 0.01];
@@ -1232,9 +1232,197 @@ console.log('');
 console.log('WITNESS DriftDetector negative controls (huge-threshold + no-reset rejected) ' +
     (ddControlsOk ? 'ok' : 'FAIL'));
 
+// ===========================================================================
+// WINDOWED-QUANTILE Witness -- SlidingDDSketch (ADR 0008; Masson-Rim-Lee, VLDB 2019, on a pane ring).
+// The quantile honesty anchor on the recency axis: drive SlidingDDSketch on positive streams, compare
+// its windowed quantile to an EXACT sorted-array oracle over the sketch's LIVE pane content, and GATE
+// the per-query relative error <= alpha on 100% of >= 2000 queries across 3 W x 3 alpha + a
+// distribution SHIFT + a post-burst edge. Separately assert the window-edge error <= one pane width
+// (W/panes). Two NEGATIVE CONTROLS the same gates reject: a NO-EXPIRY variant (`_clearPane` disabled ->
+// stale values from prior ring cycles linger -> rel > alpha) and a COARSE panes=2 variant (edge error
+// ~W/2, far above the fine W/32 bound). Because each pane collapses its lowest bins INDEPENDENTLY, the
+// merged min-key can differ from a single sketch's -- so the bound is WITNESSED here, not assumed.
+// ===========================================================================
+
+/** A NO-EXPIRY SlidingDDSketch: `_clearPane` is a no-op, so a rotated-onto pane keeps its STALE bins /
+ *  counts (the clear-on-rotate IS the expiry mechanism). On a drifting stream stale values linger and
+ *  the windowed quantile is wrong -- the accuracy gate MUST reject it. */
+class NoExpirySDS extends SlidingDDSketch {
+    _clearPane() { /* BUG: never clears -> stale values from prior ring cycles are counted as live */ }
+}
+
+/** The grid-aligned exclusive upper bound of the pane holding time `tv` (mirrors the shipped class). */
+function sldPaneEnd(tv, pw) { return (Math.floor(tv / pw) + 1) * pw; }
+
+/**
+ * Drive `Ctor` on a positive explicit-time stream (one item per tick) against an EXACT sorted-array
+ * oracle over the sketch's LIVE pane content (values whose pane is live: paneEnd(tv) > now - W --
+ * replicated exactly, so rel-error is purely the DDSketch bucket error). Gate rel <= alpha on q in
+ * {0.5, 0.9, 0.99}; also measure the window-edge error (|liveCount - exactWindowCount|). Returns
+ * { maxRel, maxEdge, queries, countMatch }.
+ */
+function sldDrive(Ctor, shape, W, alpha, panes, N, warm, gen, gateOk) {
+    const sd = new Ctor(W, { alpha, panes });
+    const pw = W / panes;
+    const tv = new Float64Array(N), val = new Float64Array(N);
+    let maxRel = 0, maxEdge = 0, queries = 0, countMatch = true;
+    for (let t = 1; t <= N; t++) {
+        const v = gen(t);
+        sd.add(t, v);
+        tv[t - 1] = t; val[t - 1] = v;
+        if (t >= warm && (t % 7) === 0) {
+            const now = t;
+            // The sketch's window is the B physically-retained panes = grid range (E - W, E], where
+            // E = the current pane's grid end. A value is live iff its grid pane end > E - W. This
+            // mirrors the sketch's actual content EXACTLY, so rel-error is purely the bucket error.
+            const E = sldPaneEnd(now, pw);
+            const liveCut = E - W;
+            const live = [];
+            for (let i = 0; i < t; i++) if (sldPaneEnd(tv[i], pw) > liveCut) live.push(val[i]);
+            live.sort((a, b) => a - b);
+            const liveCount = live.length;
+            const exactWin = Math.min(t, W);            // ideal (now - W, now] item count (one per tick)
+            const edge = Math.abs(liveCount - exactWin);
+            if (edge > maxEdge) maxEdge = edge;
+            if (sd.count() !== liveCount) countMatch = false;   // count() must mirror the live set exactly
+            if (liveCount > 0) {
+                for (const q of [0.5, 0.9, 0.99]) {
+                    const trueV = live[Math.floor(q * (liveCount - 1))];
+                    const est = sd.quantile(q);
+                    if (trueV > 0) {
+                        const rel = Math.abs(est - trueV) / trueV;
+                        if (!(rel <= maxRel)) maxRel = rel;
+                        if (rel > alpha + 1e-9 && gateOk) gateOk();
+                        queries++;
+                    }
+                }
+            }
+        }
+    }
+    return { maxRel, maxEdge, queries, countMatch, pw };
+}
+
+console.log('');
+console.log('WINDOWED-QUANTILE Witness -- SlidingDDSketch v' + VERSION + ' (Masson-Rim-Lee, VLDB 2019, ' +
+    'pane ring): windowed quantile vs an EXACT sorted-array oracle (theoretical: rel <= alpha per query)');
+console.log('');
+
+let sdOk = true;
+let sdQueries = 0;
+const sdFail = () => { sdOk = false; };
+
+// --- fairness self-check: a panes=32 sketch mirrors the oracle within alpha + edge within one pane ---
+console.log('  W        alpha   panes  shape              queries  maxRel err   theo (alpha)  maxEdge  edge<=W/p  status');
+console.log('  -------  ------  -----  -----------------  -------  -----------  ------------  -------  ---------  ------');
+
+/** A lognormal-ish deterministic positive value stream (i.i.d. per tick, stationary distribution). */
+function sldLognormal(seed) {
+    const r = mulberry32(seed);
+    return () => Math.exp(r() * 10) + 1e-6;   // positive, ~5 orders of magnitude spread
+}
+
+for (const W of [1000, 4000, 16000]) {
+    for (const alpha of [0.05, 0.01, 0.005]) {
+        const panes = 32;
+        const gen = sldLognormal(1234 + W + Math.round(alpha * 1000));
+        const r = sldDrive(SlidingDDSketch, 'lognormal', W, alpha, panes, 4 * W, W, gen, sdFail);
+        sdQueries += r.queries;
+        const relOk = r.maxRel <= alpha + 1e-9;
+        const edgeOk = r.maxEdge <= r.pw + 1;
+        if (!relOk || !edgeOk || !r.countMatch) sdOk = false;
+        console.log('  ' + nStr(W).padEnd(7) + '  ' + String(alpha).padEnd(6) + '  ' +
+            String(panes).padEnd(5) + '  ' + 'lognormal'.padEnd(17) + '  ' +
+            String(r.queries).padEnd(7) + '  ' + pct(r.maxRel).padStart(11) + '  ' +
+            pct(alpha).padStart(12) + '  ' + String(r.maxEdge).padStart(7) + '  ' +
+            (edgeOk ? 'ok' : 'FAIL').padStart(9) + '  ' + (relOk && edgeOk && r.countMatch ? 'ok' : 'FAIL'));
+    }
+}
+
+// --- distribution SHIFT: values jump regimes partway; after the old regime fully expires the windowed
+//     quantile must reflect the NEW regime within alpha (queried only after expiry). ---
+{
+    const W = 4000, alpha = 0.01, panes = 32, N = 5 * W;
+    const gen = (t) => (t < N / 2 ? 100 + ((t * 7) % 20) : 100000 + ((t * 7) % 20));   // ~100 -> ~100000
+    // query only in the post-shift SETTLED tail (old regime long gone).
+    const r = sldDrive(SlidingDDSketch, 'dist-shift', W, alpha, panes, N, N / 2 + W + 100, gen, sdFail);
+    sdQueries += r.queries;
+    const relOk = r.maxRel <= alpha + 1e-9;
+    const edgeOk = r.maxEdge <= r.pw + 1;
+    if (!relOk || !edgeOk || !r.countMatch) sdOk = false;
+    console.log('  ' + nStr(W).padEnd(7) + '  ' + String(alpha).padEnd(6) + '  ' + String(panes).padEnd(5) +
+        '  ' + 'dist-shift'.padEnd(17) + '  ' + String(r.queries).padEnd(7) + '  ' + pct(r.maxRel).padStart(11) +
+        '  ' + pct(alpha).padStart(12) + '  ' + String(r.maxEdge).padStart(7) + '  ' +
+        (edgeOk ? 'ok' : 'FAIL').padStart(9) + '  ' + (relOk && edgeOk && r.countMatch ? 'ok' : 'FAIL'));
+}
+
+// --- post-BURST edge: a dense burst of large-spread values, then a quiet tail of one repeated value;
+//     the windowed quantile must fall to the tail value as the burst leaves the window. ---
+{
+    const W = 4000, alpha = 0.01, panes = 32, N = 4 * W;
+    const burstGen = sldLognormal(555);
+    const gen = (t) => (t % (3 * W) < W) ? burstGen() : 42;   // burst third, then value 42 repeated
+    const r = sldDrive(SlidingDDSketch, 'post-burst-edge', W, alpha, panes, N, W, gen, sdFail);
+    sdQueries += r.queries;
+    const relOk = r.maxRel <= alpha + 1e-9;
+    const edgeOk = r.maxEdge <= r.pw + 1;
+    if (!relOk || !edgeOk || !r.countMatch) sdOk = false;
+    console.log('  ' + nStr(W).padEnd(7) + '  ' + String(alpha).padEnd(6) + '  ' + String(panes).padEnd(5) +
+        '  ' + 'post-burst-edge'.padEnd(17) + '  ' + String(r.queries).padEnd(7) + '  ' + pct(r.maxRel).padStart(11) +
+        '  ' + pct(alpha).padStart(12) + '  ' + String(r.maxEdge).padStart(7) + '  ' +
+        (edgeOk ? 'ok' : 'FAIL').padStart(9) + '  ' + (relOk && edgeOk && r.countMatch ? 'ok' : 'FAIL'));
+}
+
+// --- empty-window read: NaN quantile + count 0, never a throw ---
+{
+    const sd = new SlidingDDSketch(1000, { alpha: 0.01 });
+    const emptyOk = Number.isNaN(sd.quantile(0.5)) && sd.count() === 0;
+    if (!emptyOk) sdOk = false;
+    console.log('');
+    console.log('  empty window: quantile(0.5)=' + sd.quantile(0.5) + ' count=' + sd.count() +
+        ' -> ' + (emptyOk ? 'NaN / 0 (ok)' : 'FAIL'));
+}
+
+const sdEnough = sdQueries >= 2000;
+if (!sdEnough) sdOk = false;
+console.log('  total queries=' + sdQueries + ' (>= 2000 required: ' + (sdEnough ? 'ok' : 'FAIL') +
+    '); all within alpha + edge within one pane width: ' + (sdOk ? 'ok' : 'FAIL'));
+console.log('');
+console.log('WITNESS SlidingDDSketch (windowed quantile within alpha, edge within W/panes) ' + (sdOk ? 'ok' : 'FAIL'));
+
+// --- SlidingDDSketch NEGATIVE CONTROLS: expiry (clear-on-rotate) + the pane count must be load-bearing ---
+console.log('');
+console.log('NEGATIVE CONTROLS -- a broken SlidingDDSketch MUST be rejected by the same gates:');
+let sdControlsOk = true;
+// (1) NO-EXPIRY (`_clearPane` disabled) -> stale values from prior ring cycles linger -> on a drift
+//     stream the windowed quantile is wrong (rel >> alpha). Fed the SAME accuracy gate.
+{
+    const W = 4000, alpha = 0.01, panes = 32, N = 5 * W;
+    const gen = (t) => (t < N / 2 ? 100 + ((t * 7) % 20) : 100000 + ((t * 7) % 20));
+    const r = sldDrive(NoExpirySDS, 'no-expiry', W, alpha, panes, N, N / 2 + W + 100, gen, null);
+    const rejected = r.maxRel > alpha + 1e-9;
+    if (!rejected) sdControlsOk = false;
+    console.log('  no-expiry SlidingDDSketch (clear-on-rotate disabled) maxRel=' + pct(r.maxRel) +
+        ' (> alpha ' + pct(alpha) + ') -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+// (2) COARSE panes=2 -> the window edge error is ~W/2, far above the fine W/32 bound. Fed the SAME
+//     edge-bound gate (the pane count is what buys the edge accuracy).
+{
+    const W = 4000, alpha = 0.01, N = 4 * W;
+    const gen = sldLognormal(909);
+    const r = sldDrive(SlidingDDSketch, 'coarse-panes', W, alpha, 2, N, W, gen, null);
+    const fineBound = W / 32;
+    const rejected = r.maxEdge > fineBound;
+    if (!rejected) sdControlsOk = false;
+    console.log('  coarse panes=2 SlidingDDSketch maxEdge=' + r.maxEdge + ' (> fine W/32 bound ' +
+        fineBound + ') -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
+console.log('');
+console.log('WITNESS SlidingDDSketch negative controls (no-expiry + coarse-panes rejected) ' +
+    (sdControlsOk ? 'ok' : 'FAIL'));
+
 const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
-    slOk && slControlsOk && ddOk && ddControlsOk;
+    slOk && slControlsOk && ddOk && ddControlsOk && sdOk && sdControlsOk;
 console.log('');
 console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper + ' +
-    'SlidingHyperLogLog + DriftDetector) ' + (all ? 'ok' : 'FAIL'));
+    'SlidingHyperLogLog + DriftDetector + SlidingDDSketch) ' + (all ? 'ok' : 'FAIL'));
 if (!all) process.exitCode = 1;
