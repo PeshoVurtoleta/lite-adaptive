@@ -53,6 +53,7 @@ last1000.count();                          // ~1000  (an exact ring would hold 1
 - [DriftDetector](#driftdetector)
 - [SlidingDDSketch](#slidingddsketch)
 - [SlidingCountMin](#slidingcountmin)
+- [DecayedReservoir](#decayedreservoir)
 - [API reference](#api-reference)
 - [Composability](#composability)
 - [Zero-GC design notes](#zero-gc-design-notes)
@@ -76,6 +77,7 @@ A recency summary is a promise: "I use `X` bytes and my answer about the last `W
 - **DriftDetector** -- scalar change detection (Page, *Biometrika* 1954): "did the mean of *this* signal just shift?" in `O(1)` state -- six scalars, no pool, no window (the lightest member). One class selects **Page-Hinkley** or two-sided **CUSUM** via a mode const; `add(x) -> boolean` returns `true` exactly on the detecting item, then resets to catch the next shift. The cheap per-channel companion to ADWIN -- run one per stream when you have many. The second additive post-1.0 member (1.2.0).
 - **SlidingDDSketch** -- windowed relative-error quantiles (Masson-Rim-Lee, "DDSketch", *VLDB* 2019): "what's p50 / p99 over the last `W`?" in fixed preallocated space at DDSketch accuracy (the recency sibling of `@zakkster/lite-sketch`'s cumulative DDSketch). A ring of `panes` preallocated DDSketch panes (default 32), each covering `W / panes`; `add(now, value)` / `addFrom` are 0-alloc incl. the pane rotate + clear, and `quantile(q, w?)` / `quantileInto` merge the live panes into an instance-owned scratch with a relative error `<= alpha`. The window is soft to within one pane width `W / panes`. The third additive post-1.0 member (1.3.0).
 - **SlidingCountMin** -- windowed per-label frequency (Cormode-Muthukrishnan Count-Min over a B+1 pane ring): "how many times did key `k` occur in the last `W`?" in fixed memory (the recency sibling of `@zakkster/lite-sketch`'s cumulative CountMinSketch). A ring of `B+1` panes (default `panes` B = 32), each a `d x w` `Uint32` grid; `add(now, key, count?)` / `addFrom` are amortized 0-alloc incl. the pane rotate, and `estimate(key, w?)` sums the key's cells across the live panes then mins over rows -- a **one-sided upper bound**, never an under-count. Ships `advance(now)` (R11 idle-slide). The fourth additive post-1.0 member (1.5.0).
+- **DecayedReservoir** -- a recency-biased fixed-`k` *sample* of actual stream values (Efraimidis-Spirakis A-Res weighted reservoir over ForwardDecay weights): the "give me `k` real recent items" member -- the sampling complement to ForwardDecay (which gives decayed *aggregates* exactly, this gives a decayed *sample* you compute anything over). Each `add(now?, value?)` / `addFrom` draws one seeded xorshift32 uniform, forms an A-Res key in log space, and sifts it into a size-`k` min-forest; amortized 0-alloc incl. the order-preserving landmark rebase. Read the raw sample with `sampleInto(buf)` / `forEach(fn)`. A sample, not a hard window, so (like ForwardDecay) it has no `advance()`. The fifth additive post-1.0 member (1.6.0).
 - **A caller-owned time source** -- `add(now)` with a monotone `now` (a logical tick or ms), or `add()` in count mode for the "last N items" window. The member never reads the clock, so witnesses are exactly reproducible.
 - **The recency witness** -- measured windowed error vs the theoretical bound, printed side by side, with the exact-ring foil whose memory climbs O(W) while the histogram stays a fixed sliver.
 - **Zero runtime dependencies**, ESM, tree-shakeable named exports, TypeScript types, and a **0 bytes/op hot path** -- *including* the amortized bucket merge / expire reshaping -- proven by a leak + GC-profiler torture gate.
@@ -301,6 +303,33 @@ Counters are a `Uint32Array` per pane that **saturates at `2^32 - 1`** (never wr
 
 `SlidingCountMin` locks EXPLICIT vs COUNT mode at the first add (a switch throws); `W` / `epsilon` / `delta` / `w` / `d` / `panes` / `seed` are validated typeof-first before any allocation. Keys are safe integers (a non-safe-integer key throws on `add`/`addFrom` but `estimate` never throws -- it returns 0, so a render path can query freely). The windowed-frequency witness gates the one-sided bound `true(W) <= est <= true(W + W/B) + epsilon * N` on 100% of `>= 2000` queries across a `W` x `epsilon` sweep and a churny key stream; a drop-oldest-pane variant (under-counts, breaking the lower bound) and a min-then-sum variant (mis-estimates) are rejected by the same gate -- see [Testing](#testing). `advance(now)` rotates out stale panes with no increment, so an idle key's `estimate` slides to 0 instead of freezing (R11 idle-slide).
 
+## DecayedReservoir
+
+Every other member answers *one* pre-decided question. `DecayedReservoir` hands you `k` **actual retained values** biased toward the recent, and you compute *anything* over them -- any quantile, any custom function -- approximately. It is the sampling complement to `ForwardDecay`: FD gives decayed *aggregates* exactly (two scalars), this gives a decayed *sample* (`k` slots). An item's probability of being retained decays exponentially with its age (halves every `halfLife`), so at any moment the sample is a decay-weighted draw of the recent stream.
+
+```js
+import { DecayedReservoir } from '@zakkster/lite-adaptive';
+
+// a 64-value recency-biased sample; items age out over a ~30s half-life
+const r = new DecayedReservoir(64, 30000, { seed: 1 });
+for (const [t, latencyMs] of events) r.add(t, latencyMs);   // HOT, amortized 0 B/op
+
+const buf = new Float64Array(64);
+const n = r.sampleInto(buf);            // 0-alloc: copy the retained values out, returns the count
+// ...now compute whatever you like over buf.subarray(0, n): a custom percentile, a trimmed mean, a histogram
+r.forEach((v) => accumulate(v));        // or iterate the sample alloc-free
+```
+
+Under the hood it is an Efraimidis-Spirakis **A-Res** weighted reservoir over ForwardDecay weights. Each accepted item draws one seeded xorshift32 uniform `u` and forms an A-Res key **in log space** -- `log(u) * exp(-lambda * (t - L))` -- which is numerically stable (it underflows toward 0 as an item ages, instead of `exp(+...)` overflowing to `Infinity`). The `k` highest keys are held in an intrusive size-`k` **min-forest** (design-parity with `HeavyKeeper` / lite-o1 `FreqO1`, inlined -- never a dependency): a new item that beats the forest root replaces it and sifts down. Recent items get keys nearer the top, so they win -- that is the decay bias.
+
+<details>
+<summary>The order-preserving rebase, and why there is no <code>advance()</code></summary>
+
+As `now` advances from the landmark `L`, `exp(-lambda * (t - L))` shrinks toward 0. When `lambda * (t - L)` exceeds `DR_EXP_CAP` the landmark rebases and a single scalar factor is folded into every stored key at once -- a **monotone** transform, so the retained-set membership and the forest order are **unchanged**. That means the rebase is `O(1)` scalar work, not an `O(k)` sweep, and it is 0 B/op. A very large idle gap then a resume caps the rebase factor argument (`DR_F_CAP`) so a single rebase stays finite; back-to-back capped rebases while the heap is not yet full can drive an ancient stored key to `-Infinity`, which is benign by design -- no `NaN`, the sampled *values* stay finite, and those ancient items simply sink and evict first, deterministically. Because decay is applied **at insert** and membership is fixed thereafter, an idle stream correctly *holds* its last decayed sample -- there is nothing to slide to empty, so (exactly like `ForwardDecay`) `DecayedReservoir` has **no `advance()`**. Memory is `k * 16 + 64` bytes (two `Float64Array(k)` columns + scalars), fixed at construction.
+</details>
+
+`DecayedReservoir` locks EXPLICIT vs COUNT mode at the first add (a switch throws); `k` / `halfLife` / `seed` are validated typeof-first before any allocation. `value` is any finite real (signed OK; default 1); a mode switch, a non-finite / decreasing `now`, or a non-finite value is a byte-identical no-op that does **not** advance the PRNG or the landmark. The recency-sample witness gates the empirical inclusion rate by item age against the `exp(-lambda * age)` expectation over many seeds; a no-decay (uniform) reservoir (rejected by the slope fit) and a no-forest ("keep the first `k`") reservoir (rejected because its newest-age inclusion rate is ~0) are both rejected by the witness, and a long-idle-then-resume lane asserts the sample stays well-defined -- see [Testing](#testing). `add` / `addFrom` / `sampleInto` / `clear` are torture-gated at 0 B/op (incl. a rebase-heavy lane).
+
 ## API reference
 
 ```js
@@ -443,6 +472,18 @@ clear() -> this                // reset; reuse the arrays (unlocks the mode)
 
 // getters
 d   w   panes   W   seed   conservative   saturated   epsilon   delta   mode   lastNow   bytes
+
+// DecayedReservoir -- recency-biased fixed-k sample of actual values (A-Res weighted reservoir over forward-decay weights)
+new DecayedReservoir(k, halfLife, options?) // options: { seed }; k a positive int; halfLife finite > 0
+add(now, value=1) -> this      // HOT, amortized 0 B/op incl. PRNG draw + forest sift + rebase; any finite real value (signed OK)
+addFrom(buf, i) -> this        // HOT, 0 B/op ZERO-BOX: stride-2 [now, value] (explicit-time)
+sampleInto(buf) -> number      // COLD, 0-alloc; copy the retained VALUES into buf (Float64Array, length >= k); returns the count
+forEach(fn) -> void            // alloc-free; fn(value) per retained value (heap order, not sorted)
+clear() -> this                // reset; reuse the columns (unlocks the mode; replays the PRNG)
+// no advance() -- a sample, not a hard window (like ForwardDecay)
+
+// getters
+k   halfLife   lambda   seed   size   mode   bytes
 ```
 
 - **`d` / `w` / `k`** -- hash rows (`~4-8`), cells per row, and the top-k size. `HeavyKeeper.withAccuracy(k, targetError)` derives `d` / `w` from a target relative error. A bad `d` / `w` / `k` / `seed` / `b` / option throws `[lite-adaptive]` typeof-first, before any allocation.
@@ -503,6 +544,19 @@ Constants that shape the pane ring:
 | `panes` | default 32, `>= 2` | ring size; the window is soft to within one pane width `W / panes` (~3% at 32) |
 | `maxBins` | 2048 (`SLD_MAX_BINS`) | per-pane bin bound (matches lite-sketch's default); lowest bins collapse past it |
 | space | `panes * maxBins * 4 B` + scratch | `Uint32` bin counts per pane (saturating at `2^32-1`) + a `Float64` merge scratch |
+
+- **`DecayedReservoir(k, halfLife, { seed })`** -- `k` the sample size, a positive integer; `halfLife` a finite number `> 0` (`lambda = ln2 / halfLife`); `seed` a `Uint32` for the A-Res PRNG (default `0x9e3779b1`; `seed = 0` valid, guarded `!== undefined`). A bad `k` / `halfLife` / `seed` / option throws `[lite-adaptive]` typeof-first, before any allocation. There is no `advance()` -- a reservoir is a sample, not a hard window (like `ForwardDecay`).
+- **`add(now, value)` / `addFrom(buf, i)`** -- `now` a finite, non-decreasing number (a decrease throws); count mode (`add(undefined, value)`) auto-ticks. The mode locks at the first add (a switch throws). `value` is ANY finite real (signed OK; default 1). A mode switch, a bad `now`, or a non-finite value is a byte-identical no-op that does NOT advance the PRNG or the landmark; `addFrom` reads a packed stride-2 `[now, value]` unboxed (explicit-time only).
+- **`sampleInto(buf)` / `forEach(fn)`** -- `sampleInto` copies the retained sample VALUES into a caller `Float64Array` of length `>= k` (0-alloc) and returns the count written (`size`, `<= k`); `forEach(fn)` calls `fn(value)` per retained value, alloc-free. Both read in heap order, NOT sorted -- the caller computes any statistic over the sample itself.
+
+Constants that shape the reservoir:
+
+| Symbol | Value | Meaning |
+|--------|-------|---------|
+| `k` | sample size, `>= 1` | the number of values retained; the min-forest has `k` slots |
+| `halfLife` | finite `> 0` | a retained item's weight halves over this span; `lambda = ln2 / halfLife` |
+| `DR_EXP_CAP` | 40 | the `exp()` argument ceiling that triggers the order-preserving landmark rebase |
+| space | `k * 16 + 64 B` | two `Float64Array(k)` columns (value + A-Res key) + scalars; fixed at construction |
 
 ## Composability
 
@@ -576,8 +630,8 @@ Gated quality numbers (`npm run verify`):
 
 ## Testing
 
-- `npm test` -- the `node:test` behavioral + fail-closed suite across every member (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog, DriftDetector, SlidingDDSketch, SlidingCountMin): ctor validation before allocation, mode-lock both ways, monotone-`now`, signed values, the landmark rebase, query-now contract, drift detection + reset, windowed-quantile / windowed-frequency / empty-window contracts, and the no-op regressions (a rejected add is byte-identical).
-- `npm run witness` -- the recency witness: the windowed error vs the `epsilon` bound (EH) + the change-response gates (ADWIN) + the exact-aggregate gate `|fd - oracle| / |oracle| <= 1e-9` (ForwardDecay) + the top-k recall / marquee (HeavyKeeper) + the windowed-distinct error vs a `Set` oracle (SlidingHyperLogLog) + the detection-latency / false-alarm gates (DriftDetector) + the windowed-quantile error `<= alpha` vs a sorted-array oracle with the edge bounded by one pane width (SlidingDDSketch) + the one-sided windowed-frequency bound `true(W) <= est <= true(W + W/B) + epsilon * N` vs an exact windowed oracle (SlidingCountMin), each with rejected negative controls.
+- `npm test` -- the `node:test` behavioral + fail-closed suite across every member (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog, DriftDetector, SlidingDDSketch, SlidingCountMin, DecayedReservoir): ctor validation before allocation, mode-lock both ways, monotone-`now`, signed values, the landmark rebase, query-now contract, drift detection + reset, windowed-quantile / windowed-frequency / recency-sample / empty-window contracts, and the no-op regressions (a rejected add is byte-identical, and does not advance the reservoir PRNG or landmark).
+- `npm run witness` -- the recency witness: the windowed error vs the `epsilon` bound (EH) + the change-response gates (ADWIN) + the exact-aggregate gate `|fd - oracle| / |oracle| <= 1e-9` (ForwardDecay) + the top-k recall / marquee (HeavyKeeper) + the windowed-distinct error vs a `Set` oracle (SlidingHyperLogLog) + the detection-latency / false-alarm gates (DriftDetector) + the windowed-quantile error `<= alpha` vs a sorted-array oracle with the edge bounded by one pane width (SlidingDDSketch) + the one-sided windowed-frequency bound `true(W) <= est <= true(W + W/B) + epsilon * N` vs an exact windowed oracle (SlidingCountMin) + the recency-sample inclusion rate by age matching `exp(-lambda * age)` over many seeds (DecayedReservoir), each with rejected negative controls (for DecayedReservoir: a no-decay uniform reservoir and a no-forest "keep the first k" reservoir).
 - `npm run torture` -- the 0 B/op leak + GC-profiler gate on `add` including the merge / expire reshaping (`node --expose-gc`).
 - `npm run test:perf` -- the flat-throughput perf gate + a must-allocate control.
 - `npm run test:types` -- the ambient type-surface compile check.
@@ -594,6 +648,7 @@ Gated quality numbers (`npm run verify`):
 - **Not an error-rate / classifier-drift detector.** `DriftDetector` (Page-Hinkley / CUSUM) watches the mean of a *real-valued* signal and returns a boolean; the DDM / EDDM family that consumes a Bernoulli *error-bit* stream and emits a tri-state (stable / warning / drift) output is a different contract and belongs in a future member. `DriftDetector` is also not an *adaptive-window* detector -- for the auto-grown / auto-shrunk window (and the current mean / variance / width of it), use ADWIN; `DriftDetector` is the cheaper `O(1)`-state per-channel change flag (the second additive post-1.0 member, 1.2.0).
 - **Not a cumulative or an exact quantile.** `SlidingDDSketch` answers quantiles over the last `W` and forgets older values; for a whole-stream quantile that never forgets, use `@zakkster/lite-sketch`'s DDSketch. It *estimates* within `alpha` relative error (not an exact percentile -- that needs an `O(W)` sort you can hold), and its window is soft to within one pane width `W / panes` (the disclosed edge). It is the third additive post-1.0 member (1.3.0), landing without breaking the frozen core.
 - **Not a cumulative or an exact frequency counter.** `SlidingCountMin` answers per-label counts over the last `W` and forgets older ones; for a whole-stream frequency that never forgets, use `@zakkster/lite-sketch`'s CountMinSketch. It is an *overestimate* (a one-sided upper bound, tight to `~epsilon * N`), never exact; and it counts by key, not by rank -- for the *top-k heavy hitters* use HeavyKeeper. It is the fourth additive post-1.0 member (1.5.0).
+- **Not a decayed aggregate, and not a hard-window sample.** `DecayedReservoir` gives you `k` actual retained values (a recency-biased *sample*) to compute anything over; for decayed *aggregates* exactly (count / sum / mean / rate), use `ForwardDecay` -- the reservoir approximates any function, FD computes a fixed few exactly. It is a *sample*, not a hard window: it has no `advance()` and an idle stream holds its last decayed sample (rather than sliding to empty). The inclusion probability is proportional to a decay weight, so it is a *weighted* sample, not a uniform one. It is the fifth additive post-1.0 member (1.6.0), completing the confirmed post-1.0 roadmap.
 
 ## Ecosystem
 

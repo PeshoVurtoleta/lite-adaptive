@@ -11,7 +11,8 @@
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
 import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin } from '../../Adaptive.js';
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin,
+    DecayedReservoir } from '../../Adaptive.js';
 
 const W = 1000;
 const EPS = 0.01;
@@ -676,6 +677,92 @@ const scmMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** Zero-alloc counter for DecayedReservoir: the value column's byte length -- fixed at construction. */
+function growsDr(s) { return s.dr._val.buffer.byteLength; }
+
+/**
+ * DecayedReservoir add on an explicit-time value stream: the A-Res xorshift32 draw + the log-space key
+ * + the size-k min-forest sift + the periodic order-preserving landmark rebase, over a full sample so
+ * every measured add draws, keys, and sifts (admit-or-drop). Must stay flat + 0 old-gen.
+ */
+const drAddStream = {
+    name: 'DecayedReservoir add explicit-time (A-Res draw + log-space key + min-forest sift)',
+    setup() {
+        const dr = new DecayedReservoir(32, 100000, { seed: 3 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) dr.add(t++, k & 63);
+        return { dr, t, sink: 0 };
+    },
+    hot(s, n) {
+        const dr = s.dr;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            dr.add(t, t & 63);
+            t = (t + 1) | 0;
+            sink = (sink + dr.size) | 0;   // observe state (defeat DCE)
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsDr(s) }; },
+};
+
+/**
+ * DecayedReservoir addFrom on a packed stride-2 [now, value] Float64Array with an epoch-ms `now` (a
+ * non-Smi double) read UNBOXED -- the zero-box entry (a plain-arg add would box both). Same A-Res draw
+ * + key + forest sift + rebase; must stay flat + 0 old-gen.
+ */
+const drAddFromStream = {
+    name: 'DecayedReservoir addFrom epoch-ms stride-2 [now,value] (zero-box + A-Res draw + forest sift)',
+    setup() {
+        const dr = new DecayedReservoir(32, 100000, { seed: 7 });
+        const buf = new Float64Array(2);
+        let now = 1.75e12;
+        for (let k = 0; k < 4000; k++) { now += 1.5; buf[0] = now; buf[1] = k & 63; dr.addFrom(buf, 0); }
+        return { dr, buf, now, i: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const dr = s.dr, buf = s.buf;
+        let now = s.now, i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            now += 1.5;
+            buf[0] = now; buf[1] = i & 63;
+            dr.addFrom(buf, 0);
+            i = (i + 1) | 0;
+            sink = (sink + dr.size) | 0;
+        }
+        s.now = now; s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsDr(s) }; },
+};
+
+/**
+ * The teeth for the DecayedReservoir lane: add + a fresh escaping array per op -- it MUST trip the gate,
+ * proving the DecayedReservoir scenarios' flat result is a real 0-alloc measurement.
+ */
+const drMustFailAlloc = {
+    name: 'DecayedReservoir add + a fresh escaping array per op (MUST allocate)',
+    setup() {
+        const dr = new DecayedReservoir(32, 100000, { seed: 3 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) dr.add(t++, k & 63);
+        return { dr, t, leak: null, sink: 0 };
+    },
+    hot(s, n) {
+        const dr = s.dr;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            dr.add(t, t & 63);
+            t = (t + 1) | 0;
+            const arr = new Array(64);
+            arr[0] = t;
+            s.leak = arr;
+            sink = (sink + arr[0]) | 0;
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 // maxScavenges: the AUTHORITATIVE 0-B/op proof is test/torture.mjs (measureAllocs = 0 B/op on
 // add count-mode AND explicit-time, gc major 0). This perf gate proves the other invariants
 // strictly -- NO old-gen GC, NO arrayBuffer growth (grows delta 0: the fixed bucket pool never
@@ -696,7 +783,8 @@ zgcSuite({
         addCountStream, addTimeStream, adwinDriftStream, fdAddStream, addFromStream, fdAddFromStream,
         hkAddStream, hkAddFromStream, slAddStream, slAddCountStream, slAddFromStream,
         ddPhStream, ddCusumStream, sdAddStream, sdAddFromStream, scmAddStream, scmAddFromStream,
+        drAddStream, drAddFromStream,
     ],
     mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc, slMustFailAlloc, ddMustFailAlloc,
-        sdMustFailAlloc, scmMustFailAlloc],
+        sdMustFailAlloc, scmMustFailAlloc, drMustFailAlloc],
 });

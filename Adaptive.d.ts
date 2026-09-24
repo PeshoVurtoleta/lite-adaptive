@@ -803,3 +803,83 @@ export class SlidingCountMin {
     /** The fixed memory figure in bytes. */
     readonly bytes: number;
 }
+
+export interface DecayedReservoirOptions {
+    /** The Uint32 PRNG seed (default 0x9e3779b1); `seed = 0` is a valid distinct seed (guarded as undefined, not falsy). */
+    seed?: number;
+}
+
+/**
+ * DecayedReservoir -- a zero-GC RECENCY-BIASED fixed-k SAMPLE of actual stream values (Efraimidis-
+ * Spirakis A-Res weighted reservoir over ForwardDecay weights; ADR 0011). An item's retention
+ * probability decays exponentially with its age (halves every `halfLife`), so at any moment the k
+ * retained values are a decay-weighted sample of the stream -- the "give me k real recent items"
+ * member, the sampling complement to ForwardDecay (which gives decayed AGGREGATES exactly). Each
+ * `add(now?, value?)` / the zero-box `addFrom(buf, i)` (stride-2 `[now, value]`) draws one seeded
+ * xorshift32 uniform, forms an A-Res key in LOG SPACE (`log(u) * exp(-lambda*(t - L))`, numerically
+ * stable -- it underflows to 0, never overflows), and sifts it into a size-k min-forest (design-parity
+ * with HeavyKeeper / lite-o1 FreqO1, inlined -- not a dependency); amortized 0 B/op incl. the
+ * order-preserving landmark rebase. The caller reads the RAW sample (`sampleInto` / `forEach`) and
+ * computes any statistic over it. It is a SAMPLE, not a hard window, so -- like ForwardDecay -- it
+ * has NO `advance()` (an idle stream correctly holds its last decayed sample). Any finite real value
+ * is legal (signed OK). Deterministic given the seed.
+ */
+export class DecayedReservoir {
+    /**
+     * @param k         the sample size; a positive integer. The reservoir retains at most k values.
+     * @param halfLife  the decay half-life; a finite number > 0 (a retained item's weight halves over
+     *                  this span, in `now`-units in explicit mode or items in count mode).
+     * @param options   see DecayedReservoirOptions. A bad k / halfLife / seed / option throws
+     *                  [lite-adaptive] typeof-first, before any allocation.
+     */
+    constructor(k: number, halfLife: number, options?: DecayedReservoirOptions);
+
+    /**
+     * Offer `value` (default 1) at time `now` to the recency-biased sample. HOT, amortized 0 B/op
+     * incl. the PRNG draw + min-forest sift + the order-preserving landmark rebase. EXPLICIT mode (a
+     * finite, non-decreasing `now`) or COUNT mode via `add(undefined, value)` (auto-tick); the mode
+     * locks at the first add (a switch throws). `value` is ANY finite real (signed OK). Fail closed: a
+     * mode switch, a non-finite / decreasing `now`, or a non-finite value throws [lite-adaptive]
+     * (byte-identical no-op -- it does NOT advance the PRNG or the landmark).
+     */
+    add(now?: number, value?: number): this;
+
+    /**
+     * Add from a caller-owned PACKED stride-2 `[now, value]` Float64Array (`buf[i]` = now,
+     * `buf[i+1]` = value). HOT, 0 B/op -- the ZERO-BOX entry (reads both UNBOXED). EXPLICIT-time only.
+     * Same validation / byte-identical-no-op-on-reject as `add`. Throws [lite-adaptive] on a
+     * non-Float64Array `buf` or an out-of-range `i`.
+     */
+    addFrom(buf: Float64Array, i: number): this;
+
+    /**
+     * Copy the current sample VALUES into a caller-owned Float64Array (0-alloc). Returns the number
+     * written (the current `size`, <= k). `buf` must be a Float64Array of length >= k, else it throws
+     * [lite-adaptive]. Order is heap order, NOT sorted.
+     */
+    sampleInto(buf: Float64Array): number;
+
+    /**
+     * Iterate the current sample, calling `fn(value)` per retained value (alloc-free; heap order, not
+     * sorted). A non-function `fn` throws [lite-adaptive] before iteration.
+     */
+    forEach(fn: (value: number) => void): void;
+
+    /** Reset to the empty sample; reuse both columns (0-alloc), unlock the mode, replay the PRNG. */
+    clear(): this;
+
+    /** The sample size k. */
+    readonly k: number;
+    /** The decay half-life. */
+    readonly halfLife: number;
+    /** The decay rate lambda = ln2 / halfLife. */
+    readonly lambda: number;
+    /** The Uint32 PRNG seed. */
+    readonly seed: number;
+    /** The current number of retained values (<= k). */
+    readonly size: number;
+    /** The locked time mode. */
+    readonly mode: 'unset' | 'explicit' | 'count';
+    /** The fixed memory figure in bytes. */
+    readonly bytes: number;
+}

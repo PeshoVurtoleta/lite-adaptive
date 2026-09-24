@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.5.0
+Version: 1.6.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -45,7 +45,13 @@ still slides to empty with no traffic. EXPLICIT-time only, 0 B/op, every existin
 v1.5.0 adds SlidingCountMin (windowed per-label FREQUENCY over the last W; Cormode-Muthukrishnan, 2005,
 over a fixed-(B+1) pane ring) -- the recency sibling of lite-sketch's cumulative CountMinSketch and the
 frequency complement of SlidingHyperLogLog / SlidingDDSketch. It is a PURE APPEND: the seven prior
-classes stay BYTE-IDENTICAL (only the file header + VERSION change).
+classes stay BYTE-IDENTICAL (only the file header + VERSION change). v1.6.0 adds DecayedReservoir (a
+recency-biased fixed-k SAMPLE of actual stream values; Efraimidis-Spirakis A-Res weighted reservoir
+over ForwardDecay weights, 2005/2009; ADR 0011) -- the sampling complement to ForwardDecay: where FD
+gives decayed AGGREGATES exactly, DecayedReservoir gives a decayed SAMPLE from which the caller
+computes ANY statistic. It is a SAMPLE, not a hard window, so (like ForwardDecay) it has NO advance().
+It is a PURE APPEND: the eight prior classes stay BYTE-IDENTICAL (only the file header + VERSION
+change). This completes the confirmed post-1.0 roadmap.
 
 ## Exports (from the single main file Adaptive.js)
 
@@ -183,8 +189,26 @@ classes stay BYTE-IDENTICAL (only the file header + VERSION change).
   delta -> d = ceil(ln(1/delta)); explicit w / d override; defaults epsilon=delta=0.01 -> d=5, w=512,
   panes=32). No `merge` in 1.5.0. Getters: `d` / `w` / `panes` / `W` / `seed` / `conservative` / `saturated`
   (adds that hit the 2^32-1 ceiling -- the honesty flag) / `epsilon` / `delta` / `mode` / `lastNow` / `bytes`.
+- `DecayedReservoir` -- class. A zero-GC RECENCY-BIASED fixed-k SAMPLE of actual stream values
+  (Efraimidis-Spirakis A-Res weighted reservoir over ForwardDecay weights; ADR 0011) -- the sampling
+  complement to `ForwardDecay`. An item's retention probability decays exponentially with its AGE
+  (halves every `halfLife`), so the `k` retained values are always a decay-weighted sample of the
+  recent stream. `add(now?, value?) -> this` (count mode via `add(undefined, value)`) draws ONE seeded
+  xorshift32 uniform, forms an A-Res key in LOG SPACE (`log(u) * exp(-lambda*(t - L))` -- it underflows
+  to 0 gracefully, never overflows), and sifts it into a size-`k` MIN-FOREST (design-parity with
+  `HeavyKeeper` / lite-o1 `FreqO1`, inlined -- never a dep); amortized 0 B/op incl. the order-preserving
+  landmark rebase (which never disturbs the retained set, so idle time needs no sweep). `addFrom(buf, i)`
+  is the zero-box stride-2 entry (`now = buf[i]`, `value = buf[i+1]` read UNBOXED; EXPLICIT-time only).
+  `value` is ANY finite real (signed OK; default 1). The caller reads the RAW sample:
+  `sampleInto(buf) -> count` (0-alloc copy of the retained VALUES into a caller `Float64Array` of length
+  `>= k`) and `forEach(fn)` (alloc-free `fn(value)`), then computes any statistic itself. It is a
+  SAMPLE, not a hard window, so -- like `ForwardDecay` -- it has NO `advance()` (an idle stream
+  correctly holds its last decayed sample). A bad `k` / `halfLife` / `seed` / `now` / `value` / buffer
+  throws `[lite-adaptive]` typeof-first (a rejected add is a byte-identical no-op that does NOT advance
+  the PRNG or the landmark). Deterministic given the seed. Getters: `k` / `halfLife` / `lambda` /
+  `seed` / `size` / `mode` / `bytes`.
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.5.0'.
+- `VERSION` -- string, '1.6.0'.
 
 ## ExponentialHistogram
 
@@ -685,6 +709,74 @@ DROP-OLDEST-PANE variant (under-counts -> breaks the lower bound est >= true(W))
 sketch alternative, the absolute pane alignment, sum-then-min, per-pane conservative update, Uint32
 saturation + `saturated`, the W-not-capped resolution, and the lite-sketch byte-parity note.
 
+## DecayedReservoir (ADR 0011)
+
+A recency-biased fixed-k SAMPLE of ACTUAL stream values -- the "give me k real recent items" member.
+Where the other members each answer ONE pre-decided question (a count, a distinct, a quantile, a
+frequency), a reservoir hands the caller `k` retained values from which they compute ANYTHING (any
+quantile, any custom function), approximately. The sampling complement to `ForwardDecay`: FD gives
+decayed AGGREGATES exactly (two scalars), DecayedReservoir gives a decayed SAMPLE (k slots). It is the
+SAMPLE corner on the time axis.
+
+Algorithm (ADR 0011): Efraimidis-Spirakis A-Res weighted reservoir sampling (Efraimidis-Spirakis,
+"Weighted random sampling with a reservoir", 2006) with FORWARD-DECAY weights (Cormode et al., ICDE
+2009 -- the same decay model as `ForwardDecay`). Each accepted item draws ONE uniform u in (0, 1) from
+a seeded xorshift32 (the exact `HeavyKeeper` derivation, so seed=0 is a valid distinct seed) and forms
+an A-Res key. The textbook key is `u^(1/w)` with weight `w = exp(lambda*(t - L))`; DecayedReservoir
+works it in LOG SPACE -- `key = log(u) * exp(-lambda*(t - L)) * _scale` -- which is numerically STABLE
+(`exp(-lambda*age)` underflows to 0 gracefully as age grows, instead of `exp(+...)` overflowing to
+Inf). The k highest keys are kept in an intrusive size-k MIN-FOREST (design-parity with `HeavyKeeper` /
+lite-o1 `FreqO1`, inlined -- never a dep): a new item whose key beats the forest root replaces it and
+sifts down. Because recent items get keys nearer 0 (the top), they are more likely retained -- the
+decay bias. The value column stores the payload alongside its key.
+
+Landmark rebase (order-preserving, the key subtlety): as `t` advances from the landmark `L`,
+`exp(-lambda*(t - L))` shrinks toward 0. When `lambda*(t - L)` exceeds `DR_EXP_CAP = 40` the landmark
+rebases to `t` and a single scalar `_scale` absorbs the common factor -- this multiplies EVERY stored
+key by the same positive constant, a MONOTONE transform, so the retained-set membership and the forest
+order are UNCHANGED (no per-slot sweep; 0 B/op). A very large idle gap then a resume is capped at
+`DR_F_CAP = 700` on the rebase-factor argument so a key can never underflow to -0 and tie the whole
+forest (the ADWIN/FD/SLD overflow lesson, on the sampling axis). Because decay is applied at INSERT
+and membership is fixed thereafter, an idle stream correctly HOLDS its last decayed sample -- there is
+nothing to "slide to empty", so (like `ForwardDecay`) DecayedReservoir has NO `advance()`.
+
+Constructor: `new DecayedReservoir(k, halfLife, options?)` where `k` is a positive integer (the sample
+size), `halfLife` a finite number > 0 (`lambda = ln2 / halfLife`), options = { seed (uint32, default
+0x9e3779b1; seed=0 valid, guarded as `undefined`) }. A bad k / halfLife / seed / option throws
+[lite-adaptive] at the ctor door BEFORE any allocation.
+
+- add(now?, value?) -> this      HOT, amortized 0 B/op incl. the PRNG draw + forest sift + rebase.
+                                 EXPLICIT mode: a finite, non-decreasing `now`. COUNT mode:
+                                 add(undefined, value) auto-ticks. The mode LOCKS at the first add (a
+                                 switch throws). `value` is ANY finite real (signed OK), default 1.
+                                 Value + now + mode are validated FIRST -- a reject is a byte-identical
+                                 no-op that does NOT advance the PRNG or the landmark.
+- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX stride-2: now = buf[i], value = buf[i+1] read
+                                 UNBOXED from a packed [now, value] Float64Array. EXPLICIT-time only.
+                                 Same validation + body as add.
+- sampleInto(buf) -> number      COLD, 0 alloc. Copy the current retained VALUES into a caller
+                                 Float64Array (length must be >= k, else throws); returns the count
+                                 written (`size`, <= k). Order is heap order, NOT sorted.
+- forEach(fn) -> void            Alloc-free iteration over the current sample: fn(value). A non-function
+                                 fn throws [lite-adaptive] before iteration.
+- clear() -> this                0-alloc reset (reuse both columns; unlock the mode; replay the PRNG
+                                 from its seeded initial state -- a cleared reservoir replays identically).
+- k / halfLife / lambda / seed / size / mode / bytes   Getters: the sample size, the decay knob,
+                                 ln2/halfLife, the PRNG seed, the live sample size, the locked mode, and
+                                 the fixed memory figure (`k * 16 + 64` bytes: two Float64 columns + scalars).
+
+Recency-sample contract (the honesty anchor): the witness drives an evolving stream over many
+independent seeds and gates that the sample's empirical INCLUSION RATE as a function of item AGE
+decays as `exp(-lambda*age)` (recent items over-represented by exactly the decay factor), within a
+stated statistical band. Negative controls REJECTED by the witness: a NO-DECAY reservoir (a plain
+uniform draw -> flat inclusion rate, rejected by the slope fit) and a NO-FOREST reservoir (keep the
+first k forever -> recent items never sampled, rejected because its newest-age inclusion rate is ~0).
+A long-idle-then-resume lane asserts the sample stays
+well-defined (no NaN, no ambiguous ties, membership deterministic across seeds). ADR 0011 records the
+A-Res + log-space-forward-decay-key choice, the order-preserving-rebase proof, the seeded-PRNG choice,
+the advance()-excluded rationale, the raw-sample-only surface, the min-forest reuse, and the rejected
+alternatives (A-ExpJ skip-sampling; a hard-window sample; bundled convenience aggregates).
+
 ## advance() / idle-slide (ADR 0009)
 
 R11: a sliding-window summary must be able to slide even when NO data arrives. Without it, an
@@ -740,5 +832,11 @@ is COMPLETE, no new member; a docs / stability milestone) -> 1.1.0 (SlidingHyper
 windowed distinct-count; the FIRST additive post-1.0 member, a PURE APPEND) -> 1.2.0 (DriftDetector
 -- scalar Page-Hinkley / CUSUM change detection; the SECOND additive post-1.0 member, a PURE APPEND)
 -> 1.3.0 (SlidingDDSketch -- windowed relative-error quantiles; the THIRD additive post-1.0 member, a
-PURE APPEND). Post-1.3: windowed Count-Min, a decayed Reservoir, an error-rate DDM / EDDM detector --
-one per release, each a pure append that keeps the frozen core byte-identical.
+PURE APPEND) -> 1.4.0 (the R11 advance() / advanceFrom() idle-slide sweep on the three TIME-windowed
+members -- ExponentialHistogram, SlidingHyperLogLog, SlidingDDSketch; additive, existing methods
+byte-identical) -> 1.5.0 (SlidingCountMin -- windowed per-label frequency; the FOURTH additive post-1.0
+member, a PURE APPEND) -> 1.6.0 (DecayedReservoir -- recency-biased fixed-k sample; the FIFTH additive
+post-1.0 member, a PURE APPEND). This COMPLETES the confirmed post-1.0 roadmap. The one remaining
+optional / unscheduled tail member is an error-rate DDM / EDDM detector (Bernoulli error-bit stream ->
+stable / warning / drift) -- built on demand if a consumer asks; it would be a pure append that keeps
+the frozen core byte-identical.

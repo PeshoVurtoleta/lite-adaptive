@@ -9,7 +9,8 @@
 // correction) is fed the SAME gate and MUST be REJECTED (the gate has teeth). ASCII-only.
 
 import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin, VERSION } from '../Adaptive.js';
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin, DecayedReservoir,
+    VERSION } from '../Adaptive.js';
 
 const WS = [64, 1000, 65536];
 const EPS = [0.5, 0.1, 0.01];
@@ -1817,10 +1818,156 @@ console.log('');
 console.log('WITNESS SlidingCountMin negative controls (drop-oldest-pane + no-clear-on-rotate rejected) ' +
     (scmControlsOk ? 'ok' : 'FAIL'));
 
+// ===========================================================================
+// RECENCY-SAMPLE Witness -- DecayedReservoir (ADR 0011; Efraimidis-Spirakis A-Res over ForwardDecay
+// weights). The sampling honesty anchor on the recency axis: an A-Res weighted reservoir's inclusion
+// probability is proportional to an item's weight, so with forward-decay weights the inclusion RATE
+// by item age must track exp(-lambda*age). Drive many independent seeds over the SAME stream, measure
+// P(item of a given age is in the final sample), and in the RARE-INCLUSION tail (small P, where the
+// A-Res probability is ~ k*w_i/sum(w) and the saturation near P=1 has not yet flattened the curve)
+// fit the slope of ln(rate) vs age -- it MUST equal -lambda within a band. Two controls -- NO-DECAY
+// (uniform reservoir: flat rate, slope ~ 0) and NO-FOREST (keep the FIRST k forever: newest never
+// sampled) -- MUST be rejected by the same gate. ASCII-only.
+// ===========================================================================
+
+// A NO-DECAY reservoir: overrides the A-Res key to a pure Uniform draw (lambda -> 0), so inclusion is
+// UNIFORM over all items and the log-rate-vs-age slope is ~ 0 (not -lambda) -> the gate MUST reject.
+class NoDecayReservoir extends DecayedReservoir {
+    add(now, value) {
+        let v = value === undefined ? 1 : value;
+        // draw one PRNG value (parity), then offer a pure-uniform key (no time decay at all).
+        let x = this._rng | 0; x ^= x << 13; x ^= x >>> 17; x ^= x << 5; this._rng = x | 0;
+        if (this._mode === 0) { this._mode = now === undefined ? 2 : 1; }
+        const key = Math.log((x >>> 0) / 4294967296);   // NO exp(-lambda*age) factor
+        this._offer(v, key);
+        return this;
+    }
+}
+
+// A NO-FOREST reservoir: fills the first k values and NEVER evicts (a plain "keep the first k"), so
+// recent items are NEVER sampled -> the inclusion rate by age is 0 for every recent age -> reject.
+class NoForestReservoir extends DecayedReservoir {
+    add(now, value) {
+        let v = value === undefined ? 1 : value;
+        let x = this._rng | 0; x ^= x << 13; x ^= x >>> 17; x ^= x << 5; this._rng = x | 0;   // parity draw
+        if (this._mode === 0) { this._mode = now === undefined ? 2 : 1; }
+        if (this._n < this._k) { this._val[this._n] = v; this._pri[this._n] = 0; this._n++; }   // no eviction
+        return this;
+    }
+}
+
+// Run TRIALS independent seeds over a fixed count-mode stream (item i carries value i, age = N-1-i at
+// the end). Return the per-age inclusion rate, then fit the ln(rate)-vs-age slope over the measurable
+// tail (rate in [lo, hi]) by ordinary least squares. Returns { slope, points, rateNewest }.
+function drReservoirSlope(Ctor, N, k, halfLife, trials, lo, hi) {
+    const incl = new Float64Array(N);
+    const buf = new Float64Array(k);
+    for (let s = 0; s < trials; s++) {
+        const r = new (Ctor || DecayedReservoir)(k, halfLife, { seed: (s * 2654435761) >>> 0 });
+        for (let t = 0; t < N; t++) r.add(undefined, t);   // count mode, value = item index
+        const c = r.sampleInto(buf);
+        for (let i = 0; i < c; i++) incl[buf[i] | 0]++;
+    }
+    const xs = [], ys = [];
+    for (let age = 0; age < N; age++) {
+        const rate = incl[N - 1 - age] / trials;
+        if (rate > lo && rate < hi) { xs.push(age); ys.push(Math.log(rate)); }
+    }
+    const n = xs.length;
+    if (n < 5) return { slope: 0, points: n, rateNewest: incl[N - 1] / trials };
+    let sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (let i = 0; i < n; i++) { sx += xs[i]; sy += ys[i]; sxx += xs[i] * xs[i]; sxy += xs[i] * ys[i]; }
+    const slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    return { slope, points: n, rateNewest: incl[N - 1] / trials };
+}
+
+console.log('');
+console.log('RECENCY-SAMPLE Witness -- DecayedReservoir v' + VERSION + ' (Efraimidis-Spirakis A-Res over ' +
+    'forward-decay weights): inclusion rate by item age tracks exp(-lambda*age) (>= 200 seeds/trials)');
+console.log('');
+console.log('  N     k    halfLife  trials  lambda      fitted slope  slope/-lambda  points  status');
+console.log('  ----  ---  --------  ------  ----------  ------------  -------------  ------  ------');
+
+let drOk = true;
+let drTrialsTotal = 0;
+const DR_BAND = 0.15;   // the fitted slope must be within +-15% of -lambda in the rare-inclusion tail
+for (const [N, k, halfLife, trials] of [[300, 8, 40, 6000], [400, 8, 50, 6000], [500, 12, 80, 4000]]) {
+    const lambda = Math.LN2 / halfLife;
+    const r = drReservoirSlope(DecayedReservoir, N, k, halfLife, trials, 0.004, 0.14);
+    drTrialsTotal += trials;
+    const ratio = r.slope / -lambda;
+    const pass = r.points >= 5 && Math.abs(ratio - 1) <= DR_BAND;
+    if (!pass) drOk = false;
+    console.log('  ' + String(N).padEnd(4) + '  ' + String(k).padEnd(3) + '  ' + String(halfLife).padEnd(8) +
+        '  ' + String(trials).padEnd(6) + '  ' + lambda.toFixed(6) + '  ' + r.slope.toFixed(6).padStart(12) +
+        '  ' + ratio.toFixed(3).padStart(13) + '  ' + String(r.points).padStart(6) + '  ' + (pass ? 'ok' : 'FAIL'));
+}
+
+// Idle-gap / big-jump lane: a 1e12 gap then resume must leave a WELL-DEFINED sample -- no NaN, the
+// resumed value admitted, and REPRODUCIBLE for a fixed seed (deterministic membership across reruns).
+let drGapOk = true;
+{
+    const buf = new Float64Array(16);
+    const build = (seed) => {
+        const r = new DecayedReservoir(16, 50, { seed });
+        for (let t = 0; t < 5000; t++) r.add(t, t);
+        r.add(5000 + 1e12, 999999);   // astronomical idle gap then resume
+        const c = r.sampleInto(buf);
+        let nan = false; for (let i = 0; i < c; i++) if (buf[i] !== buf[i]) nan = true;
+        let has = false; for (let i = 0; i < c; i++) if (buf[i] === 999999) has = true;
+        return { c, nan, has, snap: Array.from(buf.slice(0, c)).sort((a, b) => a - b).join(',') };
+    };
+    let allDefined = true, reproducible = true;
+    for (let seed = 0; seed < 200; seed++) {
+        const a = build(seed);
+        if (a.nan || !a.has || a.c !== 16) allDefined = false;
+        const b = build(seed);   // rerun same seed
+        if (a.snap !== b.snap) reproducible = false;
+    }
+    if (!(allDefined && reproducible)) drGapOk = false;
+    console.log('');
+    console.log('  idle-gap (5000 adds, +1e12 jump, resume) over 200 seeds: well-defined=' + allDefined +
+        ' reproducible=' + reproducible + ' -> ' + (allDefined && reproducible ? 'ok' : 'FAIL'));
+}
+
+const drEnough = drTrialsTotal >= 200;
+console.log('');
+console.log('  total trials=' + drTrialsTotal + ' (>= 200 required: ' + (drEnough ? 'ok' : 'FAIL') + ')');
+drOk = drOk && drGapOk && drEnough;
+console.log('');
+console.log('WITNESS DecayedReservoir (inclusion rate by age ~ exp(-lambda*age); idle-gap well-defined) ' +
+    (drOk ? 'ok' : 'FAIL'));
+
+// --- DecayedReservoir NEGATIVE CONTROLS: the decay AND the eviction forest must be load-bearing ---
+console.log('');
+console.log('NEGATIVE CONTROLS -- a broken DecayedReservoir MUST be rejected by the same slope gate:');
+let drControlsOk = true;
+{
+    const N = 400, k = 8, halfLife = 50, trials = 6000;
+    const lambda = Math.LN2 / halfLife;
+    // NO-DECAY: uniform reservoir -> slope ~ 0, ratio to -lambda ~ 0 -> must be OUT of band.
+    const nd = drReservoirSlope(NoDecayReservoir, N, k, halfLife, trials, 0.004, 0.14);
+    const ndRatio = nd.slope / -lambda;
+    const ndRejected = !(Math.abs(ndRatio - 1) <= DR_BAND);
+    if (!ndRejected) drControlsOk = false;
+    console.log('  no-decay (uniform) reservoir: slope=' + nd.slope.toFixed(6) + ' ratio=' + ndRatio.toFixed(3) +
+        ' -> ' + (ndRejected ? 'REJECTED (ok)' : 'accepted (FAIL)'));
+    // NO-FOREST: keep the first k, never evict -> recent items never sampled -> newest rate ~ 0.
+    const nf = drReservoirSlope(NoForestReservoir, N, k, halfLife, trials, 0.004, 0.14);
+    const nfRejected = nf.rateNewest < 0.05;   // the newest item is (almost) never in a keep-first-k sample
+    if (!nfRejected) drControlsOk = false;
+    console.log('  no-forest (keep-first-k) reservoir: newest inclusion rate=' + nf.rateNewest.toFixed(4) +
+        ' -> ' + (nfRejected ? 'REJECTED (newest never sampled, ok)' : 'accepted (FAIL)'));
+}
+console.log('');
+console.log('WITNESS DecayedReservoir negative controls (no-decay + no-forest rejected) ' +
+    (drControlsOk ? 'ok' : 'FAIL'));
+
 const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
     slOk && slControlsOk && ddOk && ddControlsOk && sdOk && sdControlsOk && isOk && isControlsOk &&
-    scmOk && scmControlsOk;
+    scmOk && scmControlsOk && drOk && drControlsOk;
 console.log('');
 console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper + ' +
-    'SlidingHyperLogLog + DriftDetector + SlidingDDSketch + SlidingCountMin) ' + (all ? 'ok' : 'FAIL'));
+    'SlidingHyperLogLog + DriftDetector + SlidingDDSketch + SlidingCountMin + DecayedReservoir) ' +
+    (all ? 'ok' : 'FAIL'));
 if (!all) process.exitCode = 1;

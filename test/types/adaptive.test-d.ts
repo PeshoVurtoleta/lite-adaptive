@@ -7,7 +7,7 @@
 
 import {
     ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin, VERSION,
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin, DecayedReservoir, VERSION,
 } from '../../Adaptive.js';
 import type {
     ExponentialHistogramMode, ExponentialHistogramOptions, ADWINOptions,
@@ -15,7 +15,7 @@ import type {
     SlidingHyperLogLogMode, SlidingHyperLogLogOptions,
     DriftDetectorMode, DriftDetectorOptions,
     SlidingDDSketchMode, SlidingDDSketchOptions,
-    SlidingCountMinOptions,
+    SlidingCountMinOptions, DecayedReservoirOptions,
 } from '../../Adaptive.js';
 
 // VERSION is a string.
@@ -558,3 +558,64 @@ cm.estimate('42');
 
 // @ts-expect-error -- a readonly getter is not assignable.
 cm.saturated = 0;
+
+// --- DecayedReservoir --------------------------------------------------------
+const dr = new DecayedReservoir(32, 1000);
+const dr2 = new DecayedReservoir(16, 60000, { seed: 0 });
+
+// add / addFrom are chainable, return this; value is optional (defaults to 1); count mode via undefined now
+const drChained: DecayedReservoir = dr.add(1, 3.5).add(2, -1.5);
+const drDefaulted: DecayedReservoir = dr2.add(1);
+const drCounted: DecayedReservoir = new DecayedReservoir(4, 100).add(undefined, 9);
+void drChained; void drDefaulted; void drCounted;
+
+const drBuf = new Float64Array([1, 3.5]);
+const drFrom: DecayedReservoir = dr2.addFrom(drBuf, 0).addFrom(drBuf, 0);
+void drFrom;
+
+// sampleInto returns the count written; forEach takes a (value) => void
+const drOut = new Float64Array(32);
+const drN: number = dr.sampleInto(drOut);
+dr.forEach((v: number): void => { void v; });
+void drN;
+
+const drCleared: DecayedReservoir = dr.clear();
+void drCleared;
+
+// getters
+const drMode: 'unset' | 'explicit' | 'count' = dr.mode;
+const drNums: number = dr.k + dr.halfLife + dr.lambda + dr.seed + dr.size + dr.bytes;
+void drMode; void drNums;
+
+const drOpts: DecayedReservoirOptions = { seed: 7 };
+void drOpts;
+
+// @ts-expect-error -- k must be a number.
+new DecayedReservoir('32', 1000);
+
+// @ts-expect-error -- halfLife must be a number.
+new DecayedReservoir(32, '1000');
+
+// @ts-expect-error -- seed option must be a number.
+new DecayedReservoir(32, 1000, { seed: '0' });
+
+// @ts-expect-error -- unknown option key.
+new DecayedReservoir(32, 1000, { halfLife: 500 });
+
+// @ts-expect-error -- add value must be a number.
+dr.add(1, 'x');
+
+// @ts-expect-error -- addFrom buf must be a Float64Array.
+dr.addFrom([1, 3.5], 0);
+
+// @ts-expect-error -- sampleInto buf must be a Float64Array.
+dr.sampleInto([0, 0]);
+
+// @ts-expect-error -- forEach fn must be a function.
+dr.forEach(42);
+
+// @ts-expect-error -- DecayedReservoir has no advance() (it is a sample, not a hard window).
+dr.advance(500);
+
+// @ts-expect-error -- a readonly getter is not assignable.
+dr.size = 0;

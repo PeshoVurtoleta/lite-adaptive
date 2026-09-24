@@ -130,6 +130,24 @@
  * SlidingHyperLogLog, DriftDetector, SlidingDDSketch) stay BYTE-IDENTICAL; only this header + VERSION
  * change above the append point plus the appended SlidingCountMin class (and its SCM_* consts).
  *
+ * v1.6.0 adds DecayedReservoir (ADR 0011; Efraimidis-Spirakis "Weighted random sampling with a
+ * reservoir", IPL 2006, over FORWARD-DECAY weights): a fixed-size-k SAMPLE of ACTUAL recent stream
+ * VALUES biased toward the recent -- the "give me k real recent items" member the family lacked
+ * (every prior member returns a summary; this hands back raw values the caller computes anything
+ * over). A-Res assigns each accepted add a random key in LOG SPACE, key = log(u) * exp(-lambda*(t -
+ * L)) * scale (u ~ Uniform(0,1) from ONE seeded xorshift32 draw -- the EXACT HeavyKeeper PRNG;
+ * lambda = ln2/halfLife), and keeps the k HIGHEST keys in an INLINE size-k min-forest (design-parity
+ * with HeavyKeeper / lite-o1 FreqO1, never a dep); an item's retention probability decays as
+ * exp(-lambda*age). The landmark rebase is an ORDER-PRESERVING common-factor multiply (proven not to
+ * disturb membership) capped (DR_EXP_CAP=40 / DR_F_CAP=700) so a key never underflows to -0 or
+ * overflows to -Inf across a long idle gap. Raw-sample-only surface: add(now?, value?) / the zero-box
+ * addFrom(buf, i) (0 B/op incl. the rebase), sampleInto(buf) / forEach(fn) / clear / getters -- NO
+ * mean()/quantile() aggregates, NO advance() (a sample, not a hard window). The FIFTH additive
+ * post-1.0 member: a PURE APPEND -- the eight prior classes (ExponentialHistogram, ADWIN,
+ * ForwardDecay, HeavyKeeper, SlidingHyperLogLog, DriftDetector, SlidingDDSketch, SlidingCountMin) stay
+ * BYTE-IDENTICAL; only this header + VERSION change above the append point plus the appended
+ * DecayedReservoir class (and its DR_* consts).
+ *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
  *
@@ -137,7 +155,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.5.0';
+export const VERSION = '1.6.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -4912,5 +4930,452 @@ export class SlidingCountMin {
         throw new TypeError(
             '[lite-adaptive] SlidingCountMin.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
             'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+}
+
+// ===========================================================================
+// DecayedReservoir (ADR 0011) -- a recency-biased sample of real stream values
+// ===========================================================================
+//
+// Efraimidis-Spirakis A-Res weighted reservoir sampling (IPL 2006) over FORWARD-DECAY
+// weights (design-parity with ForwardDecay): a fixed-size-k SAMPLE of ACTUAL recent
+// stream VALUES, biased toward the recent. Every prior member returns a SUMMARY; this
+// hands back RAW values the caller computes anything they like over (custom percentile,
+// histogram, spark-line, bootstrap CI). One SEEDED xorshift32 draw u ~ Uniform(0,1) per
+// accepted add (the EXACT HeavyKeeper PRNG), an A-Res key in LOG SPACE
+//   key = log(u) * exp(-lambda*(t - L)) * scale,   lambda = ln2 / halfLife
+// and the k HIGHEST keys kept in an INLINE size-k binary MIN-HEAP (root = smallest key =
+// the eviction candidate; design-parity with HeavyKeeper / lite-o1 FreqO1, never a dep).
+// The landmark rebase is an ORDER-PRESERVING common-factor multiply (proven not to disturb
+// membership), capped so a key never underflows to -0 or overflows to -Inf. Raw-sample-only:
+// sampleInto / forEach / clear / getters -- NO aggregates, NO advance (a sample, not a window).
+
+/** Frozen marker of the known DecayedReservoir ctor option keys -- an unknown key is a throw. */
+const DR_KNOWN_OPTS = Object.freeze({ seed: true });
+/** Default per-instance seed (a uint32, nonzero). Two default-seeded reservoirs behave identically. */
+const DR_DEFAULT_SEED = 0x9e3779b1;
+/**
+ * DR_EXP_CAP -- the exp() argument ceiling that triggers a landmark rebase (mirrors FD_EXP_CAP=40).
+ * The hot path rebases the landmark to `t` BEFORE lambda*(t - L) exceeds this, so a freshly computed
+ * key never sees exp(-lambda*(t - L)) fall below exp(-40) ~= 4.2e-18 (astronomically above the
+ * smallest normal double ~2.2e-308) -- a new key never underflows to -0. A rebase then fires only
+ * every DR_EXP_CAP / ln2 ~= 57.7 half-lives of elapsed time.
+ */
+const DR_EXP_CAP = 40;
+/**
+ * DR_F_CAP -- the ceiling on the rebase FACTOR argument. A huge idle gap then a resume (t - L
+ * enormous in ONE add) would make F = exp(lambda*(t - L)) overflow to Infinity, and key * Infinity
+ * -> -Infinity would tie every retained slot. Capping the argument at 700 keeps F <= exp(700) ~=
+ * 1.01e304, so F * the worst-case |key| ~= 22.18 stays ~2.2e305 < Double.MAX ~= 1.798e308 -- finite.
+ * A common capped factor still multiplies every stored key by the SAME value, so the order (and the
+ * retained set) is still preserved; the ancient items simply sink and are evicted deterministically.
+ */
+const DR_F_CAP = 700;
+
+/**
+ * DecayedReservoir -- a fixed-size-k SAMPLE of ACTUAL recent stream VALUES, biased toward the
+ * recent (Efraimidis-Spirakis A-Res weighted reservoir sampling, IPL 2006, over ForwardDecay
+ * weights). Unlike every other family member -- which returns a count / sum / quantile / frequency
+ * / drift bit / top-k SUMMARY -- DecayedReservoir returns RAW values: the caller reads the sample
+ * and computes whatever they want over it (a custom percentile, a histogram, a spark-line). An
+ * item's retention probability decays as exp(-lambda*age), lambda = ln2 / halfLife, so a recent
+ * item is exponentially more likely to be in the sample.
+ *
+ * Headline (the recency TRIPLE):
+ *   - SPACE: O(k) -- two Float64Array(k) columns (values + A-Res keys). bytes = k*16 + 64.
+ *   - ERROR: the retained set is a correct WEIGHTED reservoir (A-Res): P(item in sample) is
+ *     proportional to its forward-decay weight exp(-lambda*age), verified in the witness.
+ *   - RECENCY: SMOOTH exponential bias (a soft "effective window" ~ halfLife / ln2), no hard edge.
+ *
+ * The A-Res key is computed in LOG SPACE, key = log(u) * exp(-lambda*(t - L)) * scale, from ONE
+ * seeded xorshift32 draw u ~ Uniform(0,1) per accepted add (the EXACT HeavyKeeper PRNG). The k
+ * HIGHEST keys live in an INLINE size-k binary MIN-HEAP (root = the smallest key = the eviction
+ * candidate). The landmark rebase (fires when lambda*(t - L) > DR_EXP_CAP) is an ORDER-PRESERVING
+ * common-factor multiply of the <= k live keys -- COLD, RARE, 0-alloc -- capped (DR_F_CAP) so a key
+ * never underflows to -0 nor overflows to -Inf across a long idle gap.
+ *
+ * Time model (mirrors ExponentialHistogram / ForwardDecay): a caller-supplied MONOTONE `now`, or
+ * count mode (auto-tick) when `now` is omitted; the mode LOCKS at the first add and a switch throws.
+ * Value domain: ANY finite real (signed OK) -- the sample stores values verbatim.
+ *
+ * Hot path (`add` / `addFrom`, 0 B/op INCLUDING the rebase branch): a typeof value guard, the mode
+ * resolve + monotone-`now` guard, ONE xorshift32 draw, one log() + one exp(), and a bounded
+ * min-heap sift. No objects, no closures, no arrays.
+ *
+ * Fail closed: a bad `k` / `halfLife` / `seed` / option throws `[lite-adaptive]` at the ctor door
+ * BEFORE any allocation; `add` validates the value + resolves/validates `now` + the mode BEFORE any
+ * state mutation (a rejected add is a BYTE-IDENTICAL no-op -- it does NOT advance the PRNG or the
+ * landmark); `sampleInto` / `forEach` reject a bad buffer / callback. null is not zero.
+ */
+export class DecayedReservoir {
+    /**
+     * @param {number} k         the reservoir size (sample capacity); a positive integer.
+     * @param {number} halfLife  the decay half-life; a finite number > 0 (the time span over which
+     *                           an item's retention weight halves). lambda = ln2 / halfLife.
+     * @param {object} [options] { seed?: uint32 (default 0x9e3779b1; seed=0 is a valid distinct
+     *                seed -- guarded as `undefined`, not falsy) }. An unknown key throws.
+     */
+    constructor(k, halfLife, options) {
+        // typeof guards FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
+        if (typeof k !== 'number' || !Number.isInteger(k) || k < 1) {
+            throw new RangeError(
+                '[lite-adaptive] DecayedReservoir k must be an integer >= 1, got ' + String(k));
+        }
+        if (typeof halfLife !== 'number' || halfLife !== halfLife || halfLife === Infinity || halfLife <= 0) {
+            throw new RangeError(
+                '[lite-adaptive] DecayedReservoir halfLife must be a finite number > 0, got ' + String(halfLife));
+        }
+        let seed = DR_DEFAULT_SEED;
+        if (options !== undefined) {
+            if (typeof options !== 'object' || options === null) {
+                throw new TypeError('[lite-adaptive] DecayedReservoir options must be an object');
+            }
+            for (const key in options) {
+                if (!(key in DR_KNOWN_OPTS)) {
+                    throw new RangeError('[lite-adaptive] DecayedReservoir unknown option "' + key + '"');
+                }
+            }
+            // seed=0 is a VALID distinct seed -- guard `undefined`, not falsy (null is not zero).
+            if (options.seed !== undefined) {
+                const s = options.seed;
+                if (typeof s !== 'number' || !Number.isInteger(s) || s < 0 || s > 4294967295) {
+                    throw new RangeError(
+                        '[lite-adaptive] DecayedReservoir seed must be a uint32 (integer in [0, 2^32-1]), got ' + String(s));
+                }
+                seed = s;
+            }
+        }
+
+        this._k = k;
+        this._halfLife = halfLife;
+        this._lambda = Math.LN2 / halfLife;   // g(x) = exp(lambda * x); retention halves every halfLife
+        this._seed = seed >>> 0;
+
+        // the k-slot min-forest columns (heap slot -> value / A-Res key). SoA, parallel.
+        this._val = new Float64Array(k);   // the stored sample value
+        this._pri = new Float64Array(k);   // the stored A-Res log-space priority key
+
+        // the seeded xorshift32 state (kept SIGNED int32 so it never boxes; the EXACT HeavyKeeper
+        // derivation, so a nonzero-forcing mix makes seed=0 a valid distinct, non-degenerate seed).
+        this._rng0 = (hkFinal((seed ^ HK_RNG_SALT) | 0) | 1) | 0;
+
+        // a fixed memory figure (bytes): two Float64Array(k) columns + scalar overhead.
+        this._bytes = k * 16 + 64;
+
+        this._initState();
+    }
+
+    /** @private Reset the heap + landmark + PRNG + time mode to empty. Reused by clear(). 0 alloc. */
+    _initState() {
+        this._n = 0;               // live heap size (<= k)
+        this._L = 0;               // the landmark time (keys are measured forward from here)
+        this._scale = 1;           // the locked key formula's global scale (see ADR 0011; held at 1)
+        this._mode = MODE_UNSET;   // time mode, locked at the first add
+        this._tick = 0;            // count-mode logical clock
+        this._lastNow = -Infinity; // explicit-mode monotone guard
+        this._now = 0;             // the last applied t
+        this._rng = this._rng0;    // replay the PRNG from its seeded initial state
+    }
+
+    /** The reservoir size (sample capacity). O(1). */
+    get k() { return this._k; }
+    /** The decay half-life (retention weight halves every halfLife time units). O(1). */
+    get halfLife() { return this._halfLife; }
+    /** The decay rate lambda = ln2 / halfLife. O(1). */
+    get lambda() { return this._lambda; }
+    /** The hash / PRNG seed (uint32). O(1). */
+    get seed() { return this._seed >>> 0; }
+    /** The number of values currently in the sample (<= k). O(1). */
+    get size() { return this._n; }
+    /** The locked time mode: 'unset' | 'explicit' | 'count'. O(1). */
+    get mode() {
+        return this._mode === MODE_EXPLICIT ? 'explicit' : this._mode === MODE_COUNT ? 'count' : 'unset';
+    }
+    /** A fixed memory figure in bytes (the two Float64Array(k) columns + scalar overhead). O(1). */
+    get bytes() { return this._bytes; }
+
+    /**
+     * Record one value into the recency-biased sample. HOT, 0 B/op INCLUDING the landmark rebase and
+     * the min-heap sift. Draws ONE seeded xorshift32 u ~ Uniform(0,1), computes the A-Res log-space
+     * key = log(u) * exp(-lambda*(t - L)) * scale, and offers it to the size-k min-forest (admitted
+     * iff it beats the current minimum key once the sample is full).
+     *
+     * Time modes (LOCKED at the first add, a switch throws):
+     *   - EXPLICIT: add(now) / add(now, value). `now` is a finite number, strictly NON-DECREASING.
+     *   - COUNT: add() / add(undefined, value). The member auto-increments an internal tick per add.
+     *
+     * `value` (both modes) defaults to 1; a supplied value must be a FINITE real (signed OK) -- it is
+     * stored verbatim and read back by sampleInto / forEach.
+     *
+     * Fail closed: a mode switch, a non-finite `now`, a `now` going backwards, or a non-finite /
+     * non-number value throws [lite-adaptive] (typeof-first, a BYTE-IDENTICAL no-op -- a rejected add
+     * does NOT advance the PRNG, the landmark, or the count tick).
+     * @param {number} [now]   the monotone time (omit for count mode).
+     * @param {number} [value] the value to sample (default 1; any finite real).
+     * @returns {DecayedReservoir} this
+     */
+    add(now, value) {
+        // --- resolve + validate the value FIRST, before ANY state mutation (incl. the PRNG), so
+        // every rejected add is a BYTE-IDENTICAL no-op. Any finite real is legal (signed OK). ---
+        let v = value;
+        if (v === undefined) {
+            v = 1;
+        } else if (typeof v !== 'number' || v !== v || v === Infinity || v === -Infinity) {
+            return this._badValue(v);
+        }
+        // --- resolve the timestamp + lock/verify the mode (typeof-first, no alloc) ---
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            if (now !== undefined) return this._badMode('count', 'explicit');
+            t = ++this._tick;
+        } else if (mode === MODE_EXPLICIT) {
+            if (now === undefined) return this._badMode('explicit', 'count');
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badNow(now);
+            }
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            // first add: lock the mode + set the landmark to the first element's time.
+            if (now === undefined) {
+                this._mode = MODE_COUNT;
+                t = ++this._tick;
+            } else {
+                if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                    return this._badNow(now);
+                }
+                this._mode = MODE_EXPLICIT;
+                t = now;
+                this._lastNow = now;
+            }
+            this._L = t;
+        }
+        this._now = t;
+
+        // --- ONE seeded xorshift32 draw (advanced EXACTLY once per ACCEPTED add, never on reject).
+        //     The state never yields 0, so u is strictly in (0, 1) -> log(u) finite < 0. No box. ---
+        let x = this._rng | 0;
+        x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+        this._rng = x | 0;
+        const u = (x >>> 0) / 4294967296;
+
+        // --- the A-Res log-space key (rebase the landmark if exp() would approach underflow -- a
+        //     cold, rare, 0-alloc, ORDER-PRESERVING common-factor rescale of the live keys) ---
+        const lambda = this._lambda;
+        if (lambda * (t - this._L) > DR_EXP_CAP) this._rebase(t);
+        const key = Math.log(u) * Math.exp(-lambda * (t - this._L)) * this._scale;
+        this._offer(v, key);
+        return this;
+    }
+
+    /**
+     * Record one value from a caller-owned PACKED `[now, value]` Float64Array pair. HOT, 0 B/op --
+     * the ZERO-BOX entry for a caller whose `now` AND `value` are both FRACTIONAL doubles: `add(now,
+     * value)` boxes each fractional argument into a ~16 B HeapNumber at a non-inlined call boundary;
+     * this reads `now = buf[i]` / `value = buf[i + 1]` UNBOXED straight from the array. The caller
+     * writes a `Float64Array(2)` scratch and calls `addFrom(scratch, 0)` (a batch steps `i` by 2).
+     * Identical draw, key, byte-identical-no-op-on-reject, and offer as `add(now, value)`; the body is
+     * DUPLICATED (not delegated) to keep `add`'s hot body byte-identical and avoid re-boxing.
+     *
+     * EXPLICIT-time ONLY: addFrom always carries a `now`, so a COUNT-locked instance rejects it and
+     * the first addFrom locks EXPLICIT (setting the landmark to the first element's time). The value
+     * is validated FIRST, then the mode, then the monotone `now` -- all BEFORE any state mutation
+     * (incl. the PRNG), so a rejected addFrom is a byte-identical no-op.
+     *
+     * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer /
+     * negative / out-of-range `i` (needs `i + 1 < buf.length`) throws [lite-adaptive].
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now, `buf[i+1]` = value.
+     * @param {number} i the base index of the [now, value] pair (0, 2, 4, ...).
+     * @returns {DecayedReservoir} this
+     */
+    addFrom(buf, i) {
+        // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        const now = buf[i];       // UNBOXED Float64Array reads -- the whole point (no argument box).
+        const v = buf[i + 1];     // packed [now, value]
+        // --- validate the value FIRST (mirror add(); any finite real is legal, signed OK; a
+        // Float64Array read is always a number so add()'s typeof branch is omitted). ---
+        if (v !== v || v === Infinity || v === -Infinity) return this._badValue(v);
+        // --- addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify
+        // EXPLICIT + the monotone `now` (typeof-first, no alloc). ---
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (now < this._lastNow) return this._badMonotone(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._L = t;   // first add: set the landmark to the first element's time
+        }
+        this._now = t;
+
+        // --- ONE seeded xorshift32 draw -- DUPLICATED from add() to keep add()'s hot body
+        //     byte-identical and avoid a boxing call boundary. ---
+        let x = this._rng | 0;
+        x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+        this._rng = x | 0;
+        const u = (x >>> 0) / 4294967296;
+        const lambda = this._lambda;
+        if (lambda * (t - this._L) > DR_EXP_CAP) this._rebase(t);
+        const key = Math.log(u) * Math.exp(-lambda * (t - this._L)) * this._scale;
+        this._offer(v, key);
+        return this;
+    }
+
+    /**
+     * @private Rebase the landmark to `t`. Cold, RARE (~every 57.7 half-lives), 0 B/op. Multiplies
+     * every live A-Res key by the common factor F = exp(min(lambda*(t - L), DR_F_CAP)) and moves the
+     * landmark to `t`. Because F is COMMON to every stored key, the multiply is a monotone transform
+     * -> the `<` order among the keys, and therefore the retained set, is UNCHANGED (ADR 0011). The
+     * DR_F_CAP cap keeps F finite across a huge idle gap so a key never overflows to -Inf.
+     */
+    _rebase(t) {
+        let arg = this._lambda * (t - this._L);
+        if (arg > DR_F_CAP) arg = DR_F_CAP;
+        const F = Math.exp(arg);
+        const n = this._n, pri = this._pri;
+        for (let i = 0; i < n; i++) pri[i] *= F;
+        this._L = t;
+    }
+
+    /**
+     * @private Offer (value, key) to the size-k min-forest. If the sample has room, insert + siftUp;
+     * else admit the item iff `key` beats the current minimum key (the heap root), replacing the root
+     * + siftDown. 0-alloc.
+     */
+    _offer(value, key) {
+        const n = this._n;
+        if (n < this._k) {
+            this._val[n] = value;
+            this._pri[n] = key;
+            this._n = n + 1;
+            this._siftUp(n);
+        } else if (key > this._pri[0]) {
+            this._val[0] = value;
+            this._pri[0] = key;
+            this._siftDown(0);
+        }
+    }
+
+    /** @private Sift heap slot i toward the root while its key is smaller than its parent's. 0-alloc. */
+    _siftUp(i) {
+        const pri = this._pri, val = this._val;
+        while (i > 0) {
+            const p = (i - 1) >> 1;
+            if (pri[p] <= pri[i]) break;
+            const vp = val[i], kp = pri[i];   // swap i, p
+            val[i] = val[p]; pri[i] = pri[p];
+            val[p] = vp; pri[p] = kp;
+            i = p;
+        }
+    }
+
+    /** @private Sift heap slot i toward the leaves while a child's key is smaller (min-heap). 0-alloc. */
+    _siftDown(i) {
+        const n = this._n, pri = this._pri, val = this._val;
+        for (;;) {
+            const l = 2 * i + 1, r = 2 * i + 2;
+            let m = i;
+            if (l < n && pri[l] < pri[m]) m = l;
+            if (r < n && pri[r] < pri[m]) m = r;
+            if (m === i) break;
+            const vi = val[i], ki = pri[i];   // swap i, m
+            val[i] = val[m]; pri[i] = pri[m];
+            val[m] = vi; pri[m] = ki;
+            i = m;
+        }
+    }
+
+    /**
+     * Copy the current sample VALUES into `buf`, returning the count written (heap order, NOT sorted).
+     * 0-alloc -- the PRIMARY read. Fail closed: `buf` must be a Float64Array of length >= k (the max
+     * sample size, so a full sample never truncates silently); a smaller buffer or a non-Float64Array
+     * throws [lite-adaptive] (a cold throw before any write).
+     * @param {Float64Array} buf a caller-owned Float64Array of length >= k.
+     * @returns {number} the number of values written (<= k).
+     */
+    sampleInto(buf) {
+        if (!(buf instanceof Float64Array) || buf.length < this._k) return this._badSampleBuf(buf);
+        const n = this._n, val = this._val;
+        for (let i = 0; i < n; i++) buf[i] = val[i];
+        return n;
+    }
+
+    /**
+     * Iterate the current sample, calling `fn(value)` per sampled value. HOT-SAFE, alloc-free (the
+     * order is heap order, NOT sorted). NEVER throws (a non-function `fn` is a cold throw before
+     * iteration).
+     * @param {(value: number) => void} fn
+     */
+    forEach(fn) {
+        if (typeof fn !== 'function') return this._badFn(fn);
+        const n = this._n, val = this._val;
+        for (let i = 0; i < n; i++) fn(val[i]);
+    }
+
+    /**
+     * Reset to the empty sample; reuse both columns (0-alloc), unlock the mode, and replay the PRNG
+     * from its seeded initial state (a cleared reservoir replays identically). O(1).
+     * @returns {DecayedReservoir} this
+     */
+    clear() {
+        this._initState();
+        return this;
+    }
+
+    /** @private Cold thrower for a mode switch after the mode locked. */
+    _badMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] DecayedReservoir mode is locked to ' + locked +
+            ' at the first add; got a ' + attempted + '-mode add');
+    }
+
+    /** @private Cold thrower for a non-finite `now`. */
+    _badNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] DecayedReservoir add now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone `now`. */
+    _badMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] DecayedReservoir add now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad value. */
+    _badValue(v) {
+        throw new TypeError(
+            '[lite-adaptive] DecayedReservoir add value must be a finite number, got ' + String(v));
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] DecayedReservoir.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+
+    /** @private Cold thrower for a too-small / non-Float64Array sampleInto buffer. */
+    _badSampleBuf(buf) {
+        throw new TypeError(
+            '[lite-adaptive] DecayedReservoir.sampleInto(buf) needs a Float64Array of length >= k (' +
+            this._k + '), got ' + String(buf));
+    }
+
+    /** @private Cold thrower for a non-function forEach callback. */
+    _badFn(fn) {
+        throw new TypeError(
+            '[lite-adaptive] DecayedReservoir.forEach(fn) needs a function, got ' + String(fn));
     }
 }

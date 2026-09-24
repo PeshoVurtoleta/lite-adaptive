@@ -22,7 +22,8 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
     const { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-        DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin } = await import('../Adaptive.js');
+        DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin,
+        DecayedReservoir } = await import('../Adaptive.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -90,6 +91,16 @@ async function main() {
             scm.estimate(1234); scm.estimate(1234, 500);   // cold sum-then-min queries (0 alloc)
             scm.clear();
             tracker.track(scm, noop, 'slidingcountmin', { audit: true });
+
+            const dr = new DecayedReservoir(16, 1000, { seed: 1 });
+            // a full, churning explicit-time stream with big steps -> exercise the A-Res draw + the
+            // min-forest sift + the periodic order-preserving landmark rebase.
+            let drt = 0;
+            for (let k = 0; k < 4096; k++) { drt += 700; dr.add(drt, k & 15); }
+            const drbuf = new Float64Array(16);
+            dr.sampleInto(drbuf); dr.forEach(noop);   // cold reads (0 alloc)
+            dr.clear();
+            tracker.track(dr, noop, 'decayedreservoir', { audit: true });
         }
         return tracker.size();
     }
@@ -948,6 +959,114 @@ async function main() {
         if (scmRet.bytes !== scmRetBytes0) scmRetOk = false;
     }
 
+    // ---- phase 2a-duodecies: DecayedReservoir -- add (A-Res draw + min-forest sift) + a REBASE-HEAVY
+    // lane (big step per add crosses DR_EXP_CAP -> the order-preserving landmark rescale every add) +
+    // the ZERO-BOX stride-2 addFrom + sampleInto + clear. All 0 B/op. ----
+    // DecayedReservoir add: explicit-time SMI now + value over a full, churning sample so every measured
+    // add draws the PRNG, computes the log-space key, and sifts the min-forest (admit-or-drop). Primed.
+    const drAdd = new DecayedReservoir(32, 100000, { seed: 3 });
+    let drT = 0;
+    for (let k = 0; k < 4000; k++) drAdd.add(drT++, k & 63);
+    let drSink = 0;
+    const drStep = () => {
+        drAdd.add(drT, drT & 63);
+        drT = (drT + 1) | 0;
+        drSink = (drSink + drAdd.size) | 0;   // observe state (defeat DCE)
+    };
+    const drRes = measureAllocs(drStep, { iterations: 100000, batches: 8 });
+    const drBpc = drRes.bytesPerCall === null ? 0 : drRes.bytesPerCall;
+    const drBytes = Math.max(0, Math.round(drBpc));
+    const drOk = drBytes === 0;
+
+    // DecayedReservoir REBASE-HEAVY add: a big step per add so lambda*(t - L) crosses DR_EXP_CAP on
+    // EVERY add -> the cold, order-preserving landmark rebase (a common-factor rescale of the <= k
+    // live keys) fires every call and MUST stay 0-alloc.
+    const drReb = new DecayedReservoir(32, 10, { seed: 4 });
+    let drRebT = 0;
+    for (let k = 0; k < 4000; k++) { drRebT += 700; drReb.add(drRebT, k & 63); }
+    let drRebSink = 0;
+    const drRebStep = () => {
+        drRebT += 700;                         // one step > DR_EXP_CAP/lambda -> rebase every add
+        drReb.add(drRebT, drRebT & 63);
+        drRebSink = (drRebSink + drReb.size) | 0;
+    };
+    const drRebRes = measureAllocs(drRebStep, { iterations: 100000, batches: 8 });
+    const drRebBpc = drRebRes.bytesPerCall === null ? 0 : drRebRes.bytesPerCall;
+    const drRebBytes = Math.max(0, Math.round(drRebBpc));
+    const drRebOk = drRebBytes === 0;
+
+    // DecayedReservoir addFrom: epoch-ms now (non-Smi double) + value read UNBOXED from a packed
+    // stride-2 [now, value] Float64Array -- the gated zero-box floor (a plain-arg add would box both).
+    const drFrom = new DecayedReservoir(32, 100000, { seed: 7 });
+    const DRBUF = new Float64Array(2);
+    let drfNow = 1.75e12;
+    for (let k = 0; k < 4000; k++) { drfNow += 1.5; DRBUF[0] = drfNow; DRBUF[1] = k & 63; drFrom.addFrom(DRBUF, 0); }
+    let drFromSink = 0, drfI = 0;
+    const drFromStep = () => {
+        drfNow += 1.5;
+        DRBUF[0] = drfNow; DRBUF[1] = drfI & 63;
+        drFrom.addFrom(DRBUF, 0);
+        drfI = (drfI + 1) | 0;
+        drFromSink = (drFromSink + drFrom.size) | 0;
+    };
+    const drFromRes = measureAllocs(drFromStep, { iterations: 100000, batches: 8 });
+    const drFromBpc = drFromRes.bytesPerCall === null ? 0 : drFromRes.bytesPerCall;
+    const drFromBytes = Math.max(0, Math.round(drFromBpc));
+    const drFromOk = drFromBytes === 0;
+
+    // DecayedReservoir add BOXED-DIAG: the SAME fractional stream via add(now, value) -- diagnostic only
+    // (add boxes each fractional arg; addFrom above is the gated 0-B/op floor). NOT gated.
+    const drBoxed = new DecayedReservoir(32, 100000, { seed: 8 });
+    let drbNow = 1.75e12;
+    for (let k = 0; k < 4000; k++) { drbNow += 1.5; drBoxed.add(drbNow, k & 63); }
+    let drBoxedSink = 0, drbI = 0;
+    const drBoxedStep = () => {
+        drbNow += 1.5;
+        drBoxed.add(drbNow, drbI & 63);
+        drbI = (drbI + 1) | 0;
+        drBoxedSink = (drBoxedSink + drBoxed.size) | 0;
+    };
+    const drBoxedRes = measureAllocs(drBoxedStep, { iterations: 100000, batches: 8 });
+    const drBoxedBpc = drBoxedRes.bytesPerCall === null ? 0 : drBoxedRes.bytesPerCall;
+    const drBoxedBytes = Math.max(0, Math.round(drBoxedBpc));
+
+    // DecayedReservoir sampleInto: 0-alloc copy of the current sample values (never a per-read alloc).
+    const DRSAMP = new Float64Array(32);
+    let drSampSink = 0;
+    const drSampStep = () => {
+        drSampSink = (drSampSink + drAdd.sampleInto(DRSAMP)) | 0;   // observe (defeat DCE)
+    };
+    const drSampRes = measureAllocs(drSampStep, { iterations: 50000, batches: 8 });
+    const drSampBpc = drSampRes.bytesPerCall === null ? 0 : drSampRes.bytesPerCall;
+    const drSampBytes = Math.max(0, Math.round(drSampBpc));
+    const drSampOk = drSampBytes === 0;
+
+    // DecayedReservoir clear(): re-fill between clears so every measured clear() resets non-trivial state.
+    const drClear = new DecayedReservoir(32, 100000, { seed: 11 });
+    for (let k = 0; k < 4000; k++) drClear.add(k, k & 63);
+    let drClearSink = 0, drClearI = 0;
+    const drClearStep = () => {
+        drClear.clear();
+        drClear.add(drClearI, drClearI & 63);   // re-seed live state
+        drClearI = (drClearI + 1) | 0;
+        drClearSink = (drClearSink + (drClear.mode === 'explicit' ? 1 : 0)) | 0;
+    };
+    const drClearRes = measureAllocs(drClearStep, { iterations: 20000, batches: 8 });
+    const drClearBpc = drClearRes.bytesPerCall === null ? 0 : drClearRes.bytesPerCall;
+    const drClearBytes = Math.max(0, Math.round(drClearBpc));
+    const drClearOk = drClearBytes === 0;
+
+    // DecayedReservoir retention: bytes constant + sample re-fills over 10 clear/refill cycles.
+    const drRet = new DecayedReservoir(16, 100000, { seed: 13 });
+    const drRetBytes0 = drRet.bytes;
+    let drRetOk = true;
+    for (let cyc = 0; cyc < 10; cyc++) {
+        drRet.clear();
+        for (let k = 0; k < 2000; k++) drRet.add(k, k & 63);
+        if (drRet.size !== 16) drRetOk = false;
+        if (drRet.bytes !== drRetBytes0) drRetOk = false;
+    }
+
     // ---- phase 2b: GC budget over a long hot run (millions of add + reshaping ops) ----
     const gc = new GcProfiler().start();
     const HOT = 4000000;
@@ -960,6 +1079,7 @@ async function main() {
         sdStep(); sdFromStep();
         ehAdvStep(); ehAvfStep(); slAdvStep(); slAvfStep(); sdAdvStep(); sdAvfStep();
         scmStep(); scmPlainStep(); scmRotStep(); scmFromStep(); scmEstStep(); scmAdvStep(); scmAvfStep();
+        drStep(); drRebStep(); drFromStep(); drSampStep();
     }
     // big-jump lanes are heavier per call (a window-refill inside the step) -- run them separately,
     // outside the 4M-iteration HOT loop, at their own (already-measured) iteration count above; fold
@@ -971,7 +1091,8 @@ async function main() {
         ehAdvSink + ehAvfSink + slAdvSink + slAvfSink + sdAdvSink + sdAvfSink +
         ehBigSink + slBigSink + sdBigSink +
         scmSink + scmPlainSink + scmRotSink + scmFromSink + scmEstSink + scmAdvSink + scmAvfSink +
-        scmClearSink + scmBigSink;
+        scmClearSink + scmBigSink +
+        drSink + drRebSink + drFromSink + drBoxedSink + drSampSink + drClearSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -985,9 +1106,10 @@ async function main() {
     const reuseSl = new SlidingHyperLogLog(2048, { p: 10, ringCap: 8, seed: 10 });
     const reuseSd = new SlidingDDSketch(2048, { alpha: 0.01, panes: 16 });
     const reuseScm = new SlidingCountMin(2048, { panes: 16, w: 128, d: 4, seed: 14 });
+    const reuseDr = new DecayedReservoir(32, 100000, { seed: 16 });
     globalThis.gc();
     const abBefore = process.memoryUsage().arrayBuffers;
-    let reuseSlT = 0, reuseSdT = 0, reuseScmT = 0;
+    let reuseSlT = 0, reuseSdT = 0, reuseScmT = 0, reuseDrT = 0;
     for (let c = 0; c < 500; c++) {
         for (let k = 0; k < 8192; k++) reuse.add();     // full window -> expire + cascade
         reuse.count();
@@ -1008,6 +1130,9 @@ async function main() {
         for (let k = 0; k < 8192; k++) reuseScm.add(reuseScmT++, ((k * 2654435761) >>> 0) % 5000);  // pane rotate + conservative
         reuseScm.estimate(1234);
         reuseScm.clear();                               // reuse the arrays, no new store
+        for (let k = 0; k < 8192; k++) reuseDr.add(reuseDrT++, (k * 2654435761) % 3000);  // A-Res draw + forest sift + rebase
+        reuseDr.sampleInto(DRSAMP);
+        reuseDr.clear();                                // reuse the columns, no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -1023,6 +1148,7 @@ async function main() {
         ehAdvOk && ehAvfOk && slAdvOk && slAvfOk && sdAdvOk && sdAvfOk && advRetOk &&
         ehBigOk && slBigOk && sdBigOk && hugeOk &&
         scmOk && scmPlainOk && scmRotOk && scmFromOk && scmEstOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
+        drOk && drRebOk && drFromOk && drSampOk && drClearOk && drRetOk &&
         report.ok && abOk;
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -1065,11 +1191,17 @@ async function main() {
         scmAdvBytes + ' B/op (SlidingCountMin advance) ' +
         scmAvfBytes + ' B/op (SlidingCountMin advanceFrom) ' +
         scmClearBytes + ' B/op (SlidingCountMin clear) ' +
-        scmBigBytes + ' B/op (SlidingCountMin big-jump advance)' +
+        scmBigBytes + ' B/op (SlidingCountMin big-jump advance) ' +
+        drBytes + ' B/op (DecayedReservoir add + A-Res draw + forest sift) ' +
+        drRebBytes + ' B/op (DecayedReservoir add rebase-heavy) ' +
+        drFromBytes + ' B/op (DecayedReservoir addFrom fractional) ' +
+        drSampBytes + ' B/op (DecayedReservoir sampleInto) ' +
+        drClearBytes + ' B/op (DecayedReservoir clear)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta +
         ' diag: add-boxed-fractional EH=' + ehBoxedBytes + ' B/op FD=' + fdBoxedBytes +
-        ' B/op HeavyKeeper add-boxed-large-u32=' + hkBoxedBytes + ' B/op)');
+        ' B/op HeavyKeeper add-boxed-large-u32=' + hkBoxedBytes +
+        ' B/op DecayedReservoir add-boxed-fractional=' + drBoxedBytes + ' B/op)');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' (expected > 0)');
@@ -1116,6 +1248,12 @@ async function main() {
         if (!scmClearOk) console.error('  alloc ' + scmClearBytes + ' B/op SlidingCountMin clear (raw ' + scmClearBpc + ')');
         if (!scmBigOk) console.error('  alloc ' + scmBigBytes + ' B/op SlidingCountMin big-jump advance (raw ' + scmBigBpc + ') or not emptied');
         if (!scmRetOk) console.error('  retention: SlidingCountMin bytes/estimate drifted over clear/refill cycles');
+        if (!drOk) console.error('  alloc ' + drBytes + ' B/op DecayedReservoir add (raw ' + drBpc + ')');
+        if (!drRebOk) console.error('  alloc ' + drRebBytes + ' B/op DecayedReservoir add rebase-heavy (raw ' + drRebBpc + ')');
+        if (!drFromOk) console.error('  alloc ' + drFromBytes + ' B/op DecayedReservoir addFrom (raw ' + drFromBpc + ')');
+        if (!drSampOk) console.error('  alloc ' + drSampBytes + ' B/op DecayedReservoir sampleInto (raw ' + drSampBpc + ')');
+        if (!drClearOk) console.error('  alloc ' + drClearBytes + ' B/op DecayedReservoir clear (raw ' + drClearBpc + ')');
+        if (!drRetOk) console.error('  retention: DecayedReservoir bytes/size drifted over clear/refill cycles');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

@@ -8,6 +8,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.6.0] - 2026-09-24
+
+The fifth additive post-1.0 member (`DecayedReservoir`) -- a PURE APPEND. All eight prior classes
+(`ExponentialHistogram`, `ADWIN`, `ForwardDecay`, `HeavyKeeper`, `SlidingHyperLogLog`,
+`DriftDetector`, `SlidingDDSketch`, `SlidingCountMin`) are BYTE-IDENTICAL; only the file header and the
+`VERSION` const change. MINOR bump (new API, no break). This completes the confirmed post-1.0 roadmap.
+
+### Added
+
+- **`DecayedReservoir`** -- a zero-GC, recency-biased fixed-`k` SAMPLE of actual stream values
+  (Efraimidis-Spirakis A-Res weighted reservoir over ForwardDecay weights; ADR 0011). An item's
+  retention probability decays exponentially with its age (halves every `halfLife`), so the `k`
+  retained values are always a decay-weighted sample of the recent stream -- the sampling complement
+  to `ForwardDecay` (which gives decayed *aggregates* exactly). The caller reads the raw sample
+  (`sampleInto` / `forEach`) and computes any statistic over it.
+  - `new DecayedReservoir(k, halfLife, options?)` -- `k` a positive integer, `halfLife` a finite
+    number > 0, `options.seed` a uint32 (default `0x9e3779b1`; `seed = 0` is a valid distinct seed,
+    guarded as `undefined`, not falsy). Throws `[lite-adaptive]` typeof-first, before any allocation.
+  - `add(now?, value?)` / the zero-box stride-2 `addFrom(buf, i)` (`[now, value]`) -- HOT, amortized
+    0 B/op incl. the seeded xorshift32 draw, the min-forest sift, and the order-preserving landmark
+    rebase. EXPLICIT mode (finite non-decreasing `now`) or COUNT mode (`add(undefined, value)`
+    auto-tick); the mode locks at the first add. `value` is ANY finite real (signed OK; default 1). A
+    mode switch, a non-finite / decreasing `now`, or a non-finite value is a byte-identical no-op -- it
+    does NOT advance the PRNG or the landmark.
+  - `sampleInto(buf)` (0-alloc copy of the retained values into a caller `Float64Array` of length
+    `>= k`, returns the count) / `forEach(fn)` (alloc-free `fn(value)` iteration) / `clear()` /
+    getters `k` / `halfLife` / `lambda` / `seed` / `size` / `mode` / `bytes`.
+  - A-Res keys are computed in LOG SPACE (`log(u) * exp(-lambda*(t - L))`), so they underflow to 0
+    gracefully instead of overflowing; the landmark rebase (at `DR_EXP_CAP`) is an order-preserving
+    scalar transform, so it never disturbs the retained set and idle time needs no sweep. It is a
+    SAMPLE, not a hard window, so -- like `ForwardDecay` -- it has NO `advance()`.
+  - The recency-sample witness gates the empirical inclusion rate by item age against the
+    `exp(-lambda*age)` expectation over many seeds; a no-decay (uniform) reservoir and a no-forest
+    ("keep the first `k`") reservoir are both REJECTED by the witness. `add` / `addFrom` /
+    `sampleInto` / `clear` are torture-gated at 0 B/op (incl. a rebase-heavy lane).
+
 ## [1.5.0] - 2026-09-24
 
 The fourth additive post-1.0 member (`SlidingCountMin`), plus a shared fail-closed ctor guard applied
