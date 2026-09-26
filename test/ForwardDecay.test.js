@@ -7,7 +7,7 @@ import { ForwardDecay, VERSION } from '../Adaptive.js';
 const LN2 = Math.LN2;
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '1.6.0');
+    assert.equal(VERSION, '1.7.0');
 });
 
 test('constructor validates halfLife fail-closed BEFORE any field init', () => {
@@ -16,6 +16,22 @@ test('constructor validates halfLife fail-closed BEFORE any field init', () => {
     }
     assert.doesNotThrow(() => new ForwardDecay(1000));
     assert.doesNotThrow(() => new ForwardDecay(1.5));   // fractional half-life is legal
+});
+
+test('F14: a subnormal halfLife that overflows lambda to Infinity throws tagged BEFORE any query', () => {
+    // lambda = ln2 / halfLife = Infinity for a subnormal halfLife (e.g. 1e-320); it must be
+    // rejected at construction (naming halfLife + the floor), not fail late at query time.
+    assert.throws(() => new ForwardDecay(1e-320),
+        /\[lite-adaptive\] ForwardDecay halfLife .* lambda .* is not finite; halfLife must be >=/);
+    // The smallest halfLife that still yields a FINITE lambda is accepted (lambda = Number.MAX_VALUE).
+    const floor = Math.LN2 / Number.MAX_VALUE;
+    assert.ok(Math.LN2 / floor < Infinity);
+    const fd = new ForwardDecay(floor);
+    assert.ok(Number.isFinite(fd.lambda));
+    // A tiny-but-normal halfLife works end to end (no NaN / non-finite accumulator).
+    const fd2 = new ForwardDecay(2.3e-308);
+    fd2.add(0, 1);
+    assert.ok(Number.isFinite(fd2.count()));
 });
 
 test('constructor rejects an unknown option / non-object options', () => {

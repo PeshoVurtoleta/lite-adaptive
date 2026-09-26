@@ -25,8 +25,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // VERSION pin
 // ---------------------------------------------------------------------------
-test('VERSION is 1.6.0', () => {
-    assert.equal(VERSION, '1.6.0');
+test('VERSION is 1.7.0', () => {
+    assert.equal(VERSION, '1.7.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -169,11 +169,11 @@ test('now = -0 is accepted as the anchor time (numeric -0 === 0, no distinct sta
     assert.equal(s.estimate(7), 5);
 });
 
-test('a sub-window w = -0 is rejected identically to w = 0 (estimate returns 0, never throws)', () => {
+test('a sub-window w = -0 is rejected identically to w = 0 (estimate returns NaN, never throws) (F12)', () => {
     const s = new SlidingCountMin(1000, { panes: 4 });
     s.add(1, 7, 4);
-    assert.equal(s.estimate(7, -0), 0);
-    assert.equal(s.estimate(7, 0), s.estimate(7, -0));
+    assert.ok(Number.isNaN(s.estimate(7, -0)));
+    assert.ok(Number.isNaN(s.estimate(7, 0)) && Number.isNaN(s.estimate(7, -0)));
 });
 
 test('advance(now = -0) on a fresh instance anchors at -0 (treated as 0)', () => {
@@ -308,15 +308,15 @@ test('composite key channelIdx*2^32+tag: two channels sharing a tag do not colli
     assert.equal(s.estimate(chan2tag5), 30);
 });
 
-test('a non-safe-integer composite key throws on add; estimate on the SAME bad key never throws (0)', () => {
+test('a non-safe-integer composite key throws on add; estimate on the SAME bad key never throws (NaN, 1.7.0 F12)', () => {
     const s = new SlidingCountMin(1e9, { panes: 4 });
     const tooBig = 9007199254741 * 1e6;   // well past 2^53 - 1 once multiplied out
     assert.throws(() => s.add(1, tooBig, 1), /safe integer/);
-    assert.equal(s.estimate(tooBig), 0);
-    assert.equal(s.estimate(1.5), 0);
-    assert.equal(s.estimate('7'), 0);
-    assert.equal(s.estimate(null), 0);
-    assert.equal(s.estimate(undefined), 0);
+    // an invalid key was never "seen 0 times": NaN, distinguishable from a legitimate miss (0)
+    for (const k of [tooBig, 1.5, '7', null, undefined]) {
+        assert.ok(Number.isNaN(s.estimate(k)), 'estimate(' + String(k) + ') is NaN');
+    }
+    assert.equal(s.estimate(12345), 0, 'an unseen VALID key is still 0');
 });
 
 // ---------------------------------------------------------------------------

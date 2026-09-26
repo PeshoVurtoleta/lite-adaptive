@@ -143,3 +143,79 @@ are each 0 B/op with `gc major = 0`, plus a retention check (bytes constant + co
 controls. This member closes the quantile gap on the recency axis; further windowed members (windowed
 Count-Min, a decayed reservoir, an error-rate DDM/EDDM detector) remain possible post-1.3, each a pure
 append that keeps the frozen classes byte-identical.
+
+## Amendment (1.7.0 F2, settle S8) -- strict semantics, declared range, span-based strict
+
+`SlidingDDSketch` now matches lite-sketch DDSketch's strict/range contract exactly. Two strict
+regimes, both fail-closed (a strict pane NEVER collapses -- `collapsed` stays false):
+
+- **Declared `range: [rmin, rmax]`** DERIVES strict (parity with lite-sketch, where `strict` is
+  derived from `range`, not a standalone flag). It is validated typeof-first BEFORE any allocation:
+  an Array of length 2, both ends finite numbers with `0 < rmin < rmax`, both inside the alpha
+  indexable band, and `nb = keyHi - keyLo + 1 <= SLD_MAX_BINS` (else a tagged throw naming the widest
+  representable `rmax/rmin` at this alpha). The bin offset is PINNED at `rangeKeyLo = ceil(ln(rmin) *
+  mult)` in every pane -- pre-anchored in `_initState` / `_clearPane` (the loops stay keyed off the
+  pane count, so a future B+1 ring inherits it), so `_addKeyPane`'s first-value TOP anchor is never
+  taken and no in-range value can ever slide or collapse. `strict: false` with a declared `range` is
+  a contradiction and throws. Fields `_rangeMin` / `_rangeMax` (NaN when undeclared) + `_rangeKeyLo`
+  / `_rangeKeyHi` back the `rangeMin` / `rangeMax` getters.
+
+- **`strict: true` WITHOUT a `range`** is SPAN-BASED, not a bottom anchor. A bottom anchor (pin the
+  window floor at the first value) merely moves the bug to FALLING values: `add(0, 1); add(1, 0.5)`
+  would then reject the second, smaller value. Instead a strict pane throws only when its OCCUPIED key
+  span `[minKeyPop, maxKeyPop]` including the new key would exceed `SLD_MAX_BINS`; otherwise it
+  RE-ANCHORS the maxBins window LOSSLESSLY -- on a key above the ceiling it shifts the occupied bins
+  DOWN (`copyWithin` + `fill`, O(maxBins), disclosed cold), on a key below the floor it shifts them UP.
+  No occupied bin is ever lost (the span-fits check guarantees it), so strict is exactly "fits or
+  fails", never a silent collapse.
+
+The hot key gate (`k > _maxKey || k < _minKey`) is UNCHANGED in shape: `_minKey` / `_maxKey` are set
+to the ACCEPTED band = the alpha indexable band intersected with any declared range, so an out-of-band
+value is rejected by the SAME two-comparison gate with no new hot branch. The cold thrower names the
+declared range when present, else the indexable band. A new per-pane `_minKeyPop` (Int32Array) tracks
+the low end of the occupied span; it is maintained ONLY where `_maxKeyPop` already is (one extra
+compare in the in-window fast path, read only on the strict cold re-anchor). `minIndexable` /
+`maxIndexable` are ALPHA-ONLY -- computed from the indexable band, NOT the accepted band -- so they are
+Object.is-identical across non-strict / strict / range. NON-STRICT behavior (top anchor +
+collapsing-lowest fold) is BYTE-IDENTICAL to 1.6.0, gated on `_strict` and proven by a 200k-sample
+differential vector (test/differential/sdd-1.6.0-vectors.json). This amendment makes no choice that
+conflicts with a future F7 move of the ring to B+1 panes: the single `bytes` formula and every fill
+loop stay keyed off the pane count.
+
+## Amendment (1.7.0 F7 / F5 / F12) -- B+1 ring, 0-alloc quantileInto, NaN on a bad query
+
+**F7 -- the ring holds B+1 panes; the covered span is `[W, W + W/B]`.** The 1.6.0 ring held only B
+panes (see "Decision" and "The pane rotate-and-clear model" above), so it dropped the oldest
+(straddling) pane up to one pane width `W/B` EARLY -- the retained window was `(E - W, now]`, one pane
+width SHORTER than the ideal `(now - W, now]`, and `count()` UNDER-reported the true count in
+`(now - W, now]` on 29410/29557 witness queries. That is the wrong sign for a windowed count: like
+`SlidingCountMin`'s one-sided bound (ADR 0010), a windowed estimate should over-cover, never
+under-cover. The ring now holds **B+1 panes** (the `panes` option stays B, the user knob). `quantile`
+/ `quantileInto` / `count` merge every live pane with `paneEnd > now - W`, INCLUDING the straddling
+oldest pane, so the covered span is `[W, W + W/B]`: always the FULL window W, over-covered by at most
+one pane width `W/B` and NEVER under-covered. `count() >= true count in (now - W, now]` now holds on
+100% of 29557 witness queries. Line ~31 above ("the oldest live pane straddles the window boundary and
+is counted in full") was true of the PANE -- the straddling pane's contents were always summed whole
+-- but the B-ring dropped that pane out of the live set one pane width before the boundary reached it,
+so the WINDOW still forgot early; the B+1 ring is what keeps the straddling pane live long enough for
+"counted in full" to cover `true(W)`. `bytes` grows by exactly one pane (default `panes: 32`:
+279712 -> 287949 B). Rotation stays bounded: a huge `now` jump clears at most B+1 panes (the while-loop
+cap moves from B to B+1). The witness oracle was the SECOND half of the 1.6.0 bug: it was pane-aligned
+(it replicated the grid-aligned retention exactly), so it AGREED with the early-drop and the edge gate
+passed. The oracle is now the TRUE window `(now - W, now]`: it gates `count() >= true(W)` on 100% and
+quantiles within `alpha` of the covered span `[W, W + W/B]`, and a B-pane control (the 1.6.0 ring) is
+now REJECTED alongside the existing no-expiry and coarse-`panes=2` controls.
+
+**F5 -- `quantileInto` is 0 B/call.** It boxed ~64 B/call by returning a double from the per-quantile
+`_walkInto`. The cut now lands in an instance `Float64Array` scratch slot and `_walkInto` writes
+`out[j]` in place rather than returning a double, so a render path is fully alloc-free. `quantile(q)`
+keeps ONE boxed return (16 B/call) -- the single-value convenience; `quantileInto` is the render path.
+
+**F12 -- a bad query VALUE returns NaN, never throws.** This supersedes line ~128 above ("`quantile`
+throws on `q` outside `[0, 1]` or a sub-window outside `(0, W]`"). A bad query VALUE is not a
+programming error, it is data: `quantile(q)` with `q` outside `[0, 1]` / NaN returns NaN; a bad
+sub-window `w` (`<= 0`, `> W`, NaN, non-number) returns NaN for BOTH `quantile` and `count` (NaN, not
+0 -- null is not zero, an unrepresentable window is not an under-count). An empty window is unchanged
+(`quantile` -> NaN, `count()` -> 0). A wrong CONTAINER type stays a programming error: `quantileInto`
+with a non-Float64Array `qs`/`out` or an `out` shorter than `qs` still THROWS. `SlidingHyperLogLog`
+`count(badW)` and `SlidingCountMin` `estimate(k, badW)` move to the same NaN contract in step 4 (1.7.0).

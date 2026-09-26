@@ -51,22 +51,28 @@ the amortized reshaping (bucket merge / expire), so the bucket store cannot be a
    - REJECTED: a `Map<time, bucket>` or an array of `{ts, size}` objects (both
      allocate per op and churn the heap on merge / expire).
 
-5. **The pool is sized to the theoretical bucket bound at construction and NEVER
-   grows.** For ExponentialHistogram (ADR 0002) with `k = ceil(1/(2*epsilon)) + 1`
-   buckets per level, the pool holds
-   `CAP = (k+1) * (ceil(log2(W/(k+1))) + 2) + 2` buckets: `(k+1)` per level covers
-   the transient `(k+1)`-th bucket before its merge, and the `+2` covers the fresh
-   level-0 bucket opened during a full cascade plus one slack slot. A free-list
-   exhaustion is a fail-closed throw (unreachable if the bound is right; a guard,
-   not a growth path). The bound holds for a stream of O(W) elements per window
-   (the `+2` level slack absorbs a per-tick density up to ~4x). An EXPLICIT-mode
-   stream far denser than that -- more than roughly `4 W` elements inside a single
-   `W`-span -- can exhaust the pool and hits the `_badOverflow` throw. That throw
-   is fail-closed (a `[lite-adaptive]` throw, never a silent overwrite or a hidden
-   allocation), but it is NOT byte-identical: the current add's expire pass and the
-   `_now` advance have already run before the overflow is detected. This is the one
-   documented exception to the "every rejected add is a byte-identical no-op" rule
-   -- and it is a pathological-density edge, not a normal operating point.
+5. **The pool is sized from a declared `maxCount` at construction and NEVER grows.**
+   For ExponentialHistogram (ADR 0002, amended in 1.7.0) with `k = ceil(1/(2*epsilon))
+   + 1` buckets per level, `levels = max(2, ceil(log2(maxCount/(k+1))) + 2)` and the
+   pool holds `CAP = (k+1) * levels + 2` buckets: `(k+1)` per level covers the transient
+   `(k+1)`-th bucket before its merge, and the `+2` covers the fresh level-0 bucket
+   opened during a full cascade plus one slack slot. `maxCount` (default 2^32) is the
+   window population the pool is GUARANTEED to hold (a floor; the exact ceiling is
+   `k * (2^levels - 1)` elements, ~3-6x it); a time-based window holds as many items as the
+   rate allows, so the population bound must be DECLARED, not inferred from `W`.
+
+   An add whose merge cascade would pass the top level throws `_badOverflow`, a
+   fail-closed `[lite-adaptive]` RangeError. As of 1.7.0 this is a BYTE-IDENTICAL no-op:
+   the overflow is PRE-CHECKED before any state write. Because today's `add` expires
+   (and advances `_now`) before inserting, the check `_wouldOverflow(t)` simulates the
+   expiry sweep READ-ONLY and reports overflow iff every level would hold exactly `k`
+   buckets post-expiry (the one configuration where the level-0 insert cascades past the
+   top). The hot body pays only one integer compare (`_count >= _guard`, where
+   `_guard = k * levels`): since pre-expiry `_count >= post-expiry total`, that compare
+   is a necessary condition, and the O(levels) read-only scan runs only on the rare true
+   branch. The free-list-exhaustion throw at the insert site is now unreachable (a
+   defensive guard). The earlier "NOT byte-identical, overflow detected after mutation"
+   exception no longer holds -- there is no state-mutating overflow path.
 
 ## Consequences
 

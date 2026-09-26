@@ -72,21 +72,21 @@ const addFromStream = {
     setup() {
         const eh = new ExponentialHistogram(W, EPS);
         const buf = new Float64Array(2);
-        let t = 0;
-        for (let k = 0; k < 4 * W; k++) { t += 1.5; buf[0] = t; buf[1] = k * 0.5 + 0.25; eh.addFrom(buf, 0); }
-        return { eh, buf, t, i: 4 * W, sink: 0 };
+        const clk = new Float64Array(1);   // F4: the fractional clock lives in a slot, never a JS local
+        for (let k = 0; k < 4 * W; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = k * 0.5 + 0.25; eh.addFrom(buf, 0); }
+        return { eh, buf, clk, i: 4 * W, sink: 0 };
     },
     hot(s, n) {
-        const eh = s.eh, buf = s.buf;
-        let t = s.t, i = s.i | 0, sink = s.sink | 0;
+        const eh = s.eh, buf = s.buf, clk = s.clk;
+        let i = s.i | 0, sink = s.sink | 0;
         for (let j = 0; j < n; j++) {
-            t += 1.5;
-            buf[0] = t; buf[1] = i * 0.5 + 0.25;
+            clk[0] += 1.5;
+            buf[0] = clk[0]; buf[1] = i * 0.5 + 0.25;
             eh.addFrom(buf, 0);
             i = (i + 1) | 0;
             sink = (sink + eh.bucketCount) | 0;      // observe state (defeat DCE)
         }
-        s.t = t; s.i = i | 0; s.sink = sink | 0;
+        s.i = i | 0; s.sink = sink | 0;
     },
     statsOf(s) { return { grows: grows(s) }; },
 };
@@ -160,21 +160,23 @@ const fdAddFromStream = {
     setup() {
         const fd = new ForwardDecay(1e9);
         const buf = new Float64Array(2);
-        let t = 0;
-        for (let k = 0; k < 4000; k++) { t += 1.5; buf[0] = t; buf[1] = k * 0.5 + 0.25; fd.addFrom(buf, 0); }
-        return { fd, buf, t, i: 4000, sink: 0 };
+        const clk = new Float64Array(1);   // F4: the fractional clock lives in a slot, never a JS local
+        for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = k * 0.5 + 0.25; fd.addFrom(buf, 0); }
+        return { fd, buf, clk, i: 4000, sink: 0 };
     },
     hot(s, n) {
-        const fd = s.fd, buf = s.buf;
-        let t = s.t, i = s.i | 0, sink = s.sink | 0;
+        const fd = s.fd, buf = s.buf, clk = s.clk;
+        let i = s.i | 0, sink = s.sink | 0;
         for (let j = 0; j < n; j++) {
-            t += 1.5;
-            buf[0] = t; buf[1] = i * 0.5 + 0.25;
+            clk[0] += 1.5;
+            buf[0] = clk[0]; buf[1] = i * 0.5 + 0.25;
             fd.addFrom(buf, 0);
             i = (i + 1) | 0;
-            sink = (sink + (fd.landmark | 0)) | 0;   // observe state (defeat DCE)
+            // F5: int-derived sink. `fd.landmark` is a double-returning getter that boxes a
+            // 16 B HeapNumber per call; `fd.mode` returns a cached string constant (no box).
+            sink = (sink + (fd.mode === 'explicit' ? 1 : 0)) | 0;   // observe state (defeat DCE)
         }
-        s.t = t; s.i = i | 0; s.sink = sink | 0;
+        s.i = i | 0; s.sink = sink | 0;
     },
     statsOf() { return { grows: 0 }; },
 };
@@ -210,7 +212,8 @@ const hkAddStream = {
 /**
  * HeavyKeeper addFrom on LARGE u32 keys read UNBOXED from a packed [key, weight] Float64Array
  * -- the zero-box entry (a plain-arg add() would box a key >= 2^31). Same d cell touches +
- * decay + forest; must stay flat + 0 old-gen.
+ * decay + forest; must stay flat + 0 old-gen. F3 FIXED: the numeric inputs route through the
+ * HK_KIN slot, so this is a hard gated scenario at maxScavenges 0 (no longer a `todo`).
  */
 const hkAddFromStream = {
     name: 'HeavyKeeper addFrom large-u32 [key,weight] (zero-box hash + decay + forest)',
@@ -408,21 +411,21 @@ const sdAddFromStream = {
     setup() {
         const sd = new SlidingDDSketch(1000, { alpha: 0.01, panes: 8 });
         const buf = new Float64Array(2);
-        let now = 1.75e12;
-        for (let k = 0; k < 4000; k++) { now += 1.5; buf[0] = now; buf[1] = ((k * 40503) % 9973) + 0.5; sd.addFrom(buf, 0); }
-        return { sd, buf, now, i: 0, sink: 0 };
+        const clk = new Float64Array(1); clk[0] = 1.75e12;   // F4: epoch-ms clock in a slot, never a JS local
+        for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((k * 40503) % 9973) + 0.5; sd.addFrom(buf, 0); }
+        return { sd, buf, clk, i: 0, sink: 0 };
     },
     hot(s, n) {
-        const sd = s.sd, buf = s.buf;
-        let now = s.now, i = s.i | 0, sink = s.sink | 0;
+        const sd = s.sd, buf = s.buf, clk = s.clk;
+        let i = s.i | 0, sink = s.sink | 0;
         for (let j = 0; j < n; j++) {
-            now += 1.5;
-            buf[0] = now; buf[1] = ((i * 40503) % 9973) + 0.5;
+            clk[0] += 1.5;
+            buf[0] = clk[0]; buf[1] = ((i * 40503) % 9973) + 0.5;
             sd.addFrom(buf, 0);
             i = (i + 1) | 0;
             sink = (sink + (sd.collapsed ? 1 : 0)) | 0;   // observe state (defeat DCE)
         }
-        s.now = now; s.i = i | 0; s.sink = sink | 0;
+        s.i = i | 0; s.sink = sink | 0;
     },
     statsOf(s) { return { grows: growsSd(s) }; },
 };
@@ -506,6 +509,34 @@ const slMustFailAlloc = {
             sink = (sink + arr[0]) | 0;
         }
         s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+/**
+ * CONTROL (the F3 argument boundary, expected-boxing): HeavyKeeper.add with a LARGE u32 key (>=
+ * 2^31) passed as a PLAIN argument. Unlike addFrom -- which reads the key UNBOXED from a
+ * Float64Array slot (0 B/op) -- a large key crosses the non-inlined add() call boundary as a ~16 B
+ * HeapNumber EACH op. This is exactly why addFrom exists; it MUST trip the gate at maxScavenges 0,
+ * documenting that the argument-boundary box is real (and is NOT what the F3 fix addresses -- the
+ * fix removes the box on addFrom + on every internal call, never on the public add(largeKey) arg).
+ */
+const hkPlainAddLargeKeyControl = {
+    name: 'HeavyKeeper add large-u32 key as a plain argument (CONTROL: MUST box ~16 B at the arg boundary)',
+    setup() {
+        const hk = new HeavyKeeper(4, 512, 16, { seed: 5 });
+        for (let k = 0; k < 40000; k++) hk.add((2 ** 31) + ((k * 2654435761) % 4000), (k & 7) + 1);
+        return { hk, i: 40000, sink: 0 };
+    },
+    hot(s, n) {
+        const hk = s.hk;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            hk.add((2 ** 31) + ((i * 2654435761) % 4000), (i & 7) + 1);   // large key -> boxed arg
+            i = (i + 1) | 0;
+            sink = (sink + hk.size) | 0;   // observe state (defeat DCE)
+        }
+        s.i = i | 0; s.sink = sink | 0;
     },
     statsOf() { return { grows: 0 }; },
 };
@@ -630,21 +661,21 @@ const scmAddFromStream = {
     setup() {
         const scm = new SlidingCountMin(1000, { panes: 8, w: 128, d: 4, seed: 7 });
         const buf = new Float64Array(3);
-        let now = 1.75e12;
-        for (let k = 0; k < 4000; k++) { now += 1.5; buf[0] = now; buf[1] = ((k * 2654435761) >>> 0) % 5000; buf[2] = (k & 7) + 1; scm.addFrom(buf, 0); }
-        return { scm, buf, now, i: 0, sink: 0 };
+        const clk = new Float64Array(1); clk[0] = 1.75e12;   // F4: epoch-ms clock in a slot, never a JS local
+        for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((k * 2654435761) >>> 0) % 5000; buf[2] = (k & 7) + 1; scm.addFrom(buf, 0); }
+        return { scm, buf, clk, i: 0, sink: 0 };
     },
     hot(s, n) {
-        const scm = s.scm, buf = s.buf;
-        let now = s.now, i = s.i | 0, sink = s.sink | 0;
+        const scm = s.scm, buf = s.buf, clk = s.clk;
+        let i = s.i | 0, sink = s.sink | 0;
         for (let j = 0; j < n; j++) {
-            now += 1.5;
-            buf[0] = now; buf[1] = ((i * 2654435761) >>> 0) % 5000; buf[2] = (i & 7) + 1;
+            clk[0] += 1.5;
+            buf[0] = clk[0]; buf[1] = ((i * 2654435761) >>> 0) % 5000; buf[2] = (i & 7) + 1;
             scm.addFrom(buf, 0);
             i = (i + 1) | 0;
             sink = (sink + scm.saturated) | 0;
         }
-        s.now = now; s.i = i | 0; s.sink = sink | 0;
+        s.i = i | 0; s.sink = sink | 0;
     },
     statsOf(s) { return { grows: growsScm(s) }; },
 };
@@ -716,21 +747,21 @@ const drAddFromStream = {
     setup() {
         const dr = new DecayedReservoir(32, 100000, { seed: 7 });
         const buf = new Float64Array(2);
-        let now = 1.75e12;
-        for (let k = 0; k < 4000; k++) { now += 1.5; buf[0] = now; buf[1] = k & 63; dr.addFrom(buf, 0); }
-        return { dr, buf, now, i: 0, sink: 0 };
+        const clk = new Float64Array(1); clk[0] = 1.75e12;   // F4: epoch-ms clock in a slot, never a JS local
+        for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = k & 63; dr.addFrom(buf, 0); }
+        return { dr, buf, clk, i: 0, sink: 0 };
     },
     hot(s, n) {
-        const dr = s.dr, buf = s.buf;
-        let now = s.now, i = s.i | 0, sink = s.sink | 0;
+        const dr = s.dr, buf = s.buf, clk = s.clk;
+        let i = s.i | 0, sink = s.sink | 0;
         for (let j = 0; j < n; j++) {
-            now += 1.5;
-            buf[0] = now; buf[1] = i & 63;
+            clk[0] += 1.5;
+            buf[0] = clk[0]; buf[1] = i & 63;
             dr.addFrom(buf, 0);
             i = (i + 1) | 0;
             sink = (sink + dr.size) | 0;
         }
-        s.now = now; s.i = i | 0; s.sink = sink | 0;
+        s.i = i | 0; s.sink = sink | 0;
     },
     statsOf(s) { return { grows: growsDr(s) }; },
 };
@@ -763,16 +794,45 @@ const drMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
-// maxScavenges: the AUTHORITATIVE 0-B/op proof is test/torture.mjs (measureAllocs = 0 B/op on
-// add count-mode AND explicit-time, gc major 0). This perf gate proves the other invariants
-// strictly -- NO old-gen GC, NO arrayBuffer growth (grows delta 0: the fixed bucket pool never
-// resizes), flat throughput, and the mustFail teeth catch a real allocator -- and allows a small
-// scavenge floor. The EH hot body keeps every quantity a double in a preallocated Float64/Int32
-// column (no boxing), so the floor is comfortably low; a regression trips the teeth immediately.
+/**
+ * N1 (ROADMAP 7 N1): the calibrated must-fail control -- boxes EXACTLY ONE 16 B HeapNumber per op.
+ * A Float64Array-slot clock steps by 1.0 from 0.5, so every value is x.5 (never integral, never a
+ * Smi), and storing it into a PACKED_ELEMENTS array allocates one HeapNumber each op. AllocProbe
+ * reads it at ~16.0 B/op and >= 10 scavenges at 8N; it MUST FAIL the gate at maxScavenges 0. This
+ * replaces the `new Array(64)` teeth as the primary control: at ~16 B/op it is the same order of
+ * magnitude as a single library box (F3), not ~30x it, so the gate's teeth match the signal.
+ */
+const N1_BOXARR = [{}, 0];   // PACKED_ELEMENTS: storing a non-integral double allocates a 16 B HeapNumber
+const n1OneBoxControl = {
+    name: 'N1 one 16 B HeapNumber per op (x.5 slot clock -> PACKED_ELEMENTS store, MUST allocate)',
+    setup() { const v = new Float64Array(1); v[0] = 0.5; return { v, sink: 0 }; },
+    hot(s, n) {
+        const v = s.v;
+        let sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            v[0] += 1.0;               // x.5 every op -> a HeapNumber, never a Smi
+            N1_BOXARR[1] = v[0];       // the one box: a double store into a PACKED_ELEMENTS array
+            sink = (sink + (N1_BOXARR[0] === null ? 0 : 1)) | 0;
+        }
+        s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+// maxScavenges: SETTLE S6 (ROADMAP 7.2) -- gate a TRUE 0 B/op at steady state (the minimum over
+// >= 4 windows) with BOTH semi-space flags pinned (--min-semi-space-size=4 AND
+// --max-semi-space-size=4, wired in package.json test:perf). The first window after warm-up may run
+// Maglev code and box where the Turbofan steady state reads 0; it is printed, never a floor. The
+// AUTHORITATIVE 0-B/op proof remains test/torture.mjs (measureAllocs = 0 B/op, gc major 0). This
+// perf gate proves the other invariants strictly -- NO old-gen GC, NO arrayBuffer growth (grows
+// delta 0: the fixed bucket pool never resizes), flat throughput -- and the mustFail teeth (N1 +
+// per-member + the HK plain-add large-key argument-boundary control) catch a real allocator at
+// maxScavenges 0. hkAddFromStream (HK addFrom large-u32) was F3; the fix routes its numeric inputs
+// through the HK_KIN slot, so it is now a HARD gated scenario here at maxScavenges 0.
 zgcSuite({
     N: 200000,
     k: 8,
-    maxScavenges: 16,
+    maxScavenges: 0,
     maxOldGen: 0,
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
@@ -785,6 +845,7 @@ zgcSuite({
         ddPhStream, ddCusumStream, sdAddStream, sdAddFromStream, scmAddStream, scmAddFromStream,
         drAddStream, drAddFromStream,
     ],
-    mustFail: [mustFailAlloc, fdMustFailAlloc, hkMustFailAlloc, slMustFailAlloc, ddMustFailAlloc,
-        sdMustFailAlloc, scmMustFailAlloc, drMustFailAlloc],
+    mustFail: [n1OneBoxControl, hkPlainAddLargeKeyControl, mustFailAlloc, fdMustFailAlloc,
+        hkMustFailAlloc, slMustFailAlloc, ddMustFailAlloc, sdMustFailAlloc, scmMustFailAlloc,
+        drMustFailAlloc],
 });

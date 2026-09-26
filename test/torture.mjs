@@ -420,6 +420,24 @@ async function main() {
     const slClearBytes = Math.max(0, Math.round(slClearBpc));
     const slClearOk = slClearBytes === 0;
 
+    // SlidingHLL count(): the PURE (F8) windowed distinct query -- it scans every register + folds
+    // the Ertl estimator through the reused `_hist` (no per-call alloc). A full, churning window
+    // (keys cycle over 2W ids) primed first + an interleaved add each step so the ring keeps moving
+    // and the query really re-scans live entries. count() must NOT mutate the ring and must be 0 B/op.
+    const slCount = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 5 });
+    let slcT = 0;
+    for (let k = 0; k < 4000; k++) slCount.add(slcT++, (k * 2654435761) % 2000);
+    let slCountSink = 0;
+    const slCountStep = () => {
+        slCount.add(slcT, (slcT * 2654435761) % 2000);
+        slcT = (slcT + 1) | 0;
+        slCountSink = (slCountSink + slCount.count() + (slcT & 1 ? slCount.count(500) : 0)) | 0;   // full + sub-window
+    };
+    const slCountRes = measureAllocs(slCountStep, { iterations: 100000, batches: 8 });
+    const slCountBpc = slCountRes.bytesPerCall === null ? 0 : slCountRes.bytesPerCall;
+    const slCountBytes = Math.max(0, Math.round(slCountBpc));
+    const slCountOk = slCountBytes === 0;
+
     // ---- phase 2a-sexies: DriftDetector -- add (PH + CUSUM, both mode branches, incl. the reset
     // on a fire) + the ZERO-BOX addFrom on a FRACTIONAL value + clear. Pure scalars, no pool. ----
     // DriftDetector add PH: a drifting stream (mean alternates every 512 items) so every measured add
@@ -527,6 +545,56 @@ async function main() {
     const sdFromBpc = sdFromRes.bytesPerCall === null ? 0 : sdFromRes.bytesPerCall;
     const sdFromBytes = Math.max(0, Math.round(sdFromBpc));
     const sdFromOk = sdFromBytes === 0;
+
+    // SlidingDDSketch STRICT add (F2): span-based re-anchor. A bounded value range (span < maxBins)
+    // never throws; the window re-anchors on a new extreme (copyWithin + fill, 0-alloc). Primed.
+    const sdStrict = new SlidingDDSketch(1000, { alpha: 0.01, strict: true, panes: 32 });
+    let sdsT = 0;
+    for (let k = 0; k < 4000; k++) sdStrict.add(sdsT++, ((k * 2654435761) % 9973) + 1);
+    let sdsSink = 0;
+    const sdStrictStep = () => {
+        sdStrict.add(sdsT, ((sdsT * 2654435761) % 9973) + 1);   // keys span < 2048 -> re-anchor, never throw
+        sdsT = (sdsT + 1) | 0;
+        sdsSink = (sdsSink + (sdStrict.collapsed ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const sdStrictRes = measureAllocs(sdStrictStep, { iterations: 100000, batches: 8 });
+    const sdStrictBpc = sdStrictRes.bytesPerCall === null ? 0 : sdStrictRes.bytesPerCall;
+    const sdStrictBytes = Math.max(0, Math.round(sdStrictBpc));
+    const sdStrictOk = sdStrictBytes === 0;
+
+    // SlidingDDSketch STRICT+RANGE add (F2): a declared range fixes the bin offset -> the fixed-cell
+    // fast path, never anchors / slides / collapses. Values kept inside [1, 1e4]. Primed.
+    const sdRange = new SlidingDDSketch(1000, { alpha: 0.01, range: [1, 1e4], panes: 32 });
+    let sdrT = 0;
+    for (let k = 0; k < 4000; k++) sdRange.add(sdrT++, ((k * 2654435761) % 9973) + 1);
+    let sdrSink = 0;
+    const sdRangeStep = () => {
+        sdRange.add(sdrT, ((sdrT * 2654435761) % 9973) + 1);   // always in [1, 1e4] -> fixed-offset cell
+        sdrT = (sdrT + 1) | 0;
+        sdrSink = (sdrSink + (sdRange.strict ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const sdRangeRes = measureAllocs(sdRangeStep, { iterations: 100000, batches: 8 });
+    const sdRangeBpc = sdRangeRes.bytesPerCall === null ? 0 : sdRangeRes.bytesPerCall;
+    const sdRangeBytes = Math.max(0, Math.round(sdRangeBpc));
+    const sdRangeOk = sdRangeBytes === 0;
+
+    // SlidingDDSketch STRICT re-anchor-heavy add (F2): a rising/falling triangle over a bounded key
+    // span drives the copyWithin + fill re-anchor on almost every add (up on the rise, down on the
+    // wrap), with frequent pane rotation resetting the window -- span stays < maxBins, never throws.
+    const sdReanc = new SlidingDDSketch(1000, { alpha: 0.01, strict: true, panes: 32 });
+    let sdxT = 0, sdxK = 0;
+    const sdxVal = () => Math.exp(((sdxK++ % 100)) * 0.04);   // 1 .. e^3.96 (~52x) ramp, then wrap down
+    for (let k = 0; k < 4000; k++) { sdReanc.add(sdxT, sdxVal()); sdxT = (sdxT + 4) | 0; }
+    let sdxSink = 0;
+    const sdReancStep = () => {
+        sdReanc.add(sdxT, sdxVal());
+        sdxT = (sdxT + 4) | 0;   // ~8 adds per pane -> frequent rotation resets maxKeyPop + re-anchors
+        sdxSink = (sdxSink + (sdReanc.collapsed ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const sdReancRes = measureAllocs(sdReancStep, { iterations: 100000, batches: 8 });
+    const sdReancBpc = sdReancRes.bytesPerCall === null ? 0 : sdReancRes.bytesPerCall;
+    const sdReancBytes = Math.max(0, Math.round(sdReancBpc));
+    const sdReancOk = sdReancBytes === 0;
 
     // SlidingDDSketch quantile: the cold merge-into-scratch + walk must be 0-alloc (never a per-query
     // allocation). Query a full, churning window repeatedly.
@@ -715,16 +783,19 @@ async function main() {
     // re-fills the window near CAPACITY, then advances by many window-widths in ONE call so the
     // bounded hot loop runs to its full bound on every measured call. ----
 
-    // EH big-jump: refill toward capacity (~300 buckets spread across W), then jump 50*W in one
-    // advance -> the expire loop drains up to ~300 live buckets in a single call (vs. 0-1 above).
+    // EH big-jump: refill toward capacity (capacity - 4 items spread across W -- near-full at the
+    // new default maxCount=2^32 pool), then jump 50*W in one advance -> the expire loop drains the
+    // whole live bucket set in a single call (vs. 0-1 above).
     const ehBig = new ExponentialHistogram(1000, 0.01);
+    const ehBigN = ehBig.capacity - 4;       // refill count re-targeted to the new default capacity
+    const ehBigDt = 1000 / ehBigN;
     let ehBigT = 0;
-    for (let k = 0; k < 300; k++) { ehBig.add(ehBigT, 1); ehBigT += 1000 / 300; }
+    for (let k = 0; k < ehBigN; k++) { ehBig.add(ehBigT, 1); ehBigT += ehBigDt; }
     let ehBigSink = 0;
     const ehBigStep = () => {
-        for (let k = 0; k < 300; k++) { ehBig.add(ehBigT, 1); ehBigT += 1000 / 300; }   // re-fill near capacity
+        for (let k = 0; k < ehBigN; k++) { ehBig.add(ehBigT, 1); ehBigT += ehBigDt; }   // re-fill near capacity
         ehBigT += 50 * 1000;                 // BIG jump: 50 window-widths at once
-        ehBig.advance(ehBigT);               // the full-cap expire loop runs to completion
+        ehBig.advance(ehBigT);               // the full expire loop runs to completion
         ehBigSink = (ehBigSink + ehBig.bucketCount) | 0;
     };
     const ehBigRes = measureAllocs(ehBigStep, { iterations: 5000, batches: 4 });
@@ -1142,9 +1213,9 @@ async function main() {
     // ---- verdict + GATE line ----
     const ok = trackedOk && live === 0 && findings.length === 0 &&
         addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk &&
-        hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk &&
+        hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk && slCountOk &&
         ddPhOk && ddCuOk && ddFromOk && ddClearOk &&
-        sdOk && sdFromOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk &&
+        sdOk && sdFromOk && sdStrictOk && sdRangeOk && sdReancOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk &&
         ehAdvOk && ehAvfOk && slAdvOk && slAvfOk && sdAdvOk && sdAvfOk && advRetOk &&
         ehBigOk && slBigOk && sdBigOk && hugeOk &&
         scmOk && scmPlainOk && scmRotOk && scmFromOk && scmEstOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
@@ -1168,12 +1239,16 @@ async function main() {
         slBytes + ' B/op (SlidingHyperLogLog add + LFPM drop) ' +
         slFromBytes + ' B/op (SlidingHyperLogLog addFrom epoch-ms + large key) ' +
         slClearBytes + ' B/op (SlidingHyperLogLog clear) ' +
+        slCountBytes + ' B/op (SlidingHyperLogLog count PURE) ' +
         ddPhBytes + ' B/op (DriftDetector add PH) ' +
         ddCuBytes + ' B/op (DriftDetector add CUSUM) ' +
         ddFromBytes + ' B/op (DriftDetector addFrom fractional) ' +
         ddClearBytes + ' B/op (DriftDetector clear) ' +
         sdBytes + ' B/op (SlidingDDSketch add + pane rotate + collapse) ' +
         sdFromBytes + ' B/op (SlidingDDSketch addFrom fractional) ' +
+        sdStrictBytes + ' B/op (SlidingDDSketch strict add span re-anchor) ' +
+        sdRangeBytes + ' B/op (SlidingDDSketch strict+range add fixed-offset) ' +
+        sdReancBytes + ' B/op (SlidingDDSketch strict re-anchor-heavy add) ' +
         sdQBytes + ' B/op (SlidingDDSketch quantile merge) ' +
         sdIntoBytes + ' B/op (SlidingDDSketch quantileInto) ' +
         sdClearBytes + ' B/op (SlidingDDSketch clear) ' +
@@ -1221,12 +1296,16 @@ async function main() {
         if (!slOk) console.error('  alloc ' + slBytes + ' B/op SlidingHyperLogLog add (raw ' + slBpc + ')');
         if (!slFromOk) console.error('  alloc ' + slFromBytes + ' B/op SlidingHyperLogLog addFrom (raw ' + slFromBpc + ')');
         if (!slClearOk) console.error('  alloc ' + slClearBytes + ' B/op SlidingHyperLogLog clear (raw ' + slClearBpc + ')');
+        if (!slCountOk) console.error('  alloc ' + slCountBytes + ' B/op SlidingHyperLogLog count (raw ' + slCountBpc + ')');
         if (!ddPhOk) console.error('  alloc ' + ddPhBytes + ' B/op DriftDetector add PH (raw ' + ddPhBpc + ')');
         if (!ddCuOk) console.error('  alloc ' + ddCuBytes + ' B/op DriftDetector add CUSUM (raw ' + ddCuBpc + ')');
         if (!ddFromOk) console.error('  alloc ' + ddFromBytes + ' B/op DriftDetector addFrom (raw ' + ddFromBpc + ')');
         if (!ddClearOk) console.error('  alloc ' + ddClearBytes + ' B/op DriftDetector clear (raw ' + ddClearBpc + ')');
         if (!sdOk) console.error('  alloc ' + sdBytes + ' B/op SlidingDDSketch add (raw ' + sdBpc + ')');
         if (!sdFromOk) console.error('  alloc ' + sdFromBytes + ' B/op SlidingDDSketch addFrom (raw ' + sdFromBpc + ')');
+        if (!sdStrictOk) console.error('  alloc ' + sdStrictBytes + ' B/op SlidingDDSketch strict add (raw ' + sdStrictBpc + ')');
+        if (!sdRangeOk) console.error('  alloc ' + sdRangeBytes + ' B/op SlidingDDSketch strict+range add (raw ' + sdRangeBpc + ')');
+        if (!sdReancOk) console.error('  alloc ' + sdReancBytes + ' B/op SlidingDDSketch strict re-anchor-heavy (raw ' + sdReancBpc + ')');
         if (!sdQOk) console.error('  alloc ' + sdQBytes + ' B/op SlidingDDSketch quantile (raw ' + sdQBpc + ')');
         if (!sdIntoOk) console.error('  alloc ' + sdIntoBytes + ' B/op SlidingDDSketch quantileInto (raw ' + sdIntoBpc + ')');
         if (!sdClearOk) console.error('  alloc ' + sdClearBytes + ' B/op SlidingDDSketch clear (raw ' + sdClearBpc + ')');

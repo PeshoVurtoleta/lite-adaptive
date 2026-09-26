@@ -25,6 +25,8 @@ void v;
 // --- ExponentialHistogram --------------------------------------------------
 const eh = new ExponentialHistogram(1000, 0.01);
 const eh2 = new ExponentialHistogram(65536, 0.1, {});
+const eh3 = new ExponentialHistogram(1000, 0.01, { maxCount: 5000 });
+void eh3;
 
 // getters
 const w: number = eh.windowSize;
@@ -33,8 +35,9 @@ const bc: number = eh.bucketCount;
 const cap: number = eh.capacity;
 const k: number = eh.k;
 const lv: number = eh.levels;
+const mc: number = eh.maxCount;
 const mode: ExponentialHistogramMode = eh.mode;
-void w; void e; void bc; void cap; void k; void lv; void mode;
+void w; void e; void bc; void cap; void k; void lv; void mc; void mode;
 
 // add: chainable, both entry shapes
 const chained: ExponentialHistogram = eh.add(1).add(2, 3);
@@ -400,6 +403,9 @@ void ddChain;
 // --- SlidingDDSketch ---------------------------------------------------------
 const sd = new SlidingDDSketch(1000);
 const sd2 = new SlidingDDSketch(4096, { alpha: 0.005, strict: true, panes: 64 });
+const sd3 = new SlidingDDSketch(1000, { alpha: 0.01, range: [1, 1000] });
+const sd4 = new SlidingDDSketch(1000, { range: [1, 1000] as const });
+void sd4;
 
 // getters
 const sdAlpha: number = sd.alpha;
@@ -410,10 +416,12 @@ const sdLast: number = sd.lastNow;
 const sdMode: SlidingDDSketchMode = sd.mode;
 const sdMinIx: number = sd.minIndexable;
 const sdMaxIx: number = sd.maxIndexable;
+const sdRMin: number = sd3.rangeMin;
+const sdRMax: number = sd3.rangeMax;
 const sdColl: boolean = sd.collapsed;
 const sdBytes: number = sd.bytes;
 void sdAlpha; void sdStrict; void sdPanes; void sdW; void sdLast; void sdMode;
-void sdMinIx; void sdMaxIx; void sdColl; void sdBytes;
+void sdMinIx; void sdMaxIx; void sdRMin; void sdRMax; void sdColl; void sdBytes;
 
 // add: chainable, explicit + count mode (count = add(undefined, value))
 const sdChained: SlidingDDSketch = sd.add(1, 42).add(2, 3.5);

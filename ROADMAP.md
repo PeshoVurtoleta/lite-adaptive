@@ -6,7 +6,8 @@ complete at 1.0.0). See `RESEARCH.md` for the identity, the two witnesses (recen
 change response), the roster rationale (incl. the verdict on the inherited backlog), and the
 open questions. ASCII-only (`->`, `<=`, `x`, "epsilon", "alpha", "delta").
 
-> **NEXT (2026-09-24): H1 hardening -- v1.7.0** (section 7; audit record in RESEARCH.md section 13).
+> **NEXT (2026-09-24): H1 hardening -- v1.7.0, MINOR, hardening only** (section 7; audit record in
+> RESEARCH.md section 13; reproduction + session plan in 7.1 / 7.2). Then 1.8.0 = additive API (S1, S2).
 > The 1.6.0 final sweep found 4 High findings the shipped gates pass:
 > - `ExponentialHistogram` goes to `count() = NaN` on a dense explicit stream.
 > - `SlidingDDSketch` strict mode throws on in-range values.
@@ -24,13 +25,13 @@ session (planner -> settle -> coder -> reviewer -> qa); the maintainer commits/p
 
 | # | Member | Version | Headline (space, error, recency model) | Status |
 |---|--------|---------|----------------------------------------|--------|
-| **M0** | Package scaffold + the TIME SOURCE + the fixed bucket-pool substrate + the two-witness chassis | 0.1.0 (with M1) | caller-supplied monotone `now`; preallocated bucket pool; windowed + change-response witnesses | planned (ADR 0001) |
-| **M1** | **ExponentialHistogram** (sliding-window count / sum) | 0.1.0 | `O((1/epsilon) log W)` buckets -> `<= epsilon` windowed error; HARD last-W window | planned (reference member, ADR 0002) |
-| **M2** | **ADWIN** (drift detection + adaptive window) | 0.2.0 | EH-bucket list -> false-alarm `<= delta`; ADAPTIVE data-driven window | planned (the marquee member, ADR 0003) |
-| **M3** | **ForwardDecay** (time-decayed count / sum / mean / rate) | 0.3.0 | landmark + O(1) accumulators -> EXACT decayed aggregate; DECAY half-life model | planned (ADR 0004) |
-| **M4** | **HeavyKeeper** (decayed / windowed heavy hitters, top-k) | 0.4.0 | d x w table + top-k forest -> bounded overestimate, strong on skew; DECAY model | planned (ADR 0005) |
-| -- | **1.0.0** -- API declared STABLE at four members | 1.0.0 | reference + 3, the lite-sketch cadence | planned |
-| M5+ | SlidingHyperLogLog, scalar DriftDetector (Page-Hinkley/CUSUM/DDM), decayed Reservoir, windowed Count-Min / quantiles | post-1.0 | one per release (RESEARCH.md Tier 2) | backlog |
+| **M0** | Package scaffold + the TIME SOURCE + the fixed bucket-pool substrate + the two-witness chassis | 0.1.0 (with M1) | caller-supplied monotone `now`; preallocated bucket pool; windowed + change-response witnesses | SHIPPED 0.1.0 (ADR 0001) |
+| **M1** | **ExponentialHistogram** (sliding-window count / sum) | 0.1.0 | `O((1/epsilon) log W)` buckets -> `<= epsilon` windowed error; HARD last-W window | SHIPPED 0.1.0 (reference member, ADR 0002) |
+| **M2** | **ADWIN** (drift detection + adaptive window) | 0.2.0 | EH-bucket list -> false-alarm `<= delta`; ADAPTIVE data-driven window | SHIPPED 0.2.0 (the marquee member, ADR 0003) |
+| **M3** | **ForwardDecay** (time-decayed count / sum / mean / rate) | 0.3.0 | landmark + O(1) accumulators -> EXACT decayed aggregate; DECAY half-life model | SHIPPED 0.3.0 (ADR 0004) |
+| **M4** | **HeavyKeeper** (decayed / windowed heavy hitters, top-k) | 0.4.0 | d x w table + top-k forest -> bounded overestimate, strong on skew; DECAY model | SHIPPED 0.4.0 (ADR 0005) |
+| -- | **1.0.0** -- API declared STABLE at four members | 1.0.0 | reference + 3, the lite-sketch cadence | SHIPPED 1.0.0 (API freeze) |
+| M5+ | SlidingHyperLogLog (1.1.0), DriftDetector (Page-Hinkley/CUSUM, 1.2.0), SlidingDDSketch (windowed quantiles, 1.3.0), advance()/idle-slide (1.4.0), SlidingCountMin (windowed Count-Min, 1.5.0), DecayedReservoir (1.6.0) | post-1.0 | SHIPPED, one per release (RESEARCH.md Tier 2); DDM/EDDM still deferred | SHIPPED through 1.6.0 |
 
 Re-routed OUT of this package (see RESEARCH.md 4.0): KMV/MinHash + CountSketch -> lite-sketch
 post-1.0 (cumulative, no recency). Exact windowed monoid folds -> lite-o1 (already shipped).
@@ -315,7 +316,7 @@ its later sessions. Each member's planner copies R1-R10 into its brief as gates.
 - Witness (3.2): the stationary false-alarm rate and the step-change detection delay as NUMBERS,
   beside ADWIN on the same streams.
 
-**Decayed Reservoir** and **DDM/EDDM error-rate detector** (unscheduled; NO lite-hud demand)
+**Decayed Reservoir** (SHIPPED as `DecayedReservoir`, 1.6.0) and **DDM/EDDM error-rate detector** (still deferred; NO lite-hud demand)
 - Neither is a lite-hud requirement. The HUD never samples: its panels are aggregates. Its only 0/1
   stream (budget verdicts) is served by ADWIN.
 - If either ships, the shared rules R1-R10 still apply, plus:
@@ -325,7 +326,7 @@ its later sessions. Each member's planner copies R1-R10 into its brief as gates.
   - DDM/EDDM: a tri-state result (none / warning / drift) through a `state` getter. The input is
     strictly 0/1: a 0.5 throws, never a silent round.
 
-**Windowed Count-Min** (IN DEVELOPMENT 2026-09-24; design suggestions from the lite-hud side)
+**Windowed Count-Min** (SHIPPED as `SlidingCountMin`, 1.5.0; design suggestions from the lite-hud side)
 - REJECT an EH per cell. That is the "ECM-sketch" (Papapetrou et al., VLDB 2012), and it costs
   d x w x EH_CAP x 16 B: ~6 MB at d=4, w=1024, eps 0.1, W 1e4. Record it in the ADR as the
   rejected alternative, as ADR 0006 did for panes.
@@ -398,7 +399,7 @@ seeded PRNG, getters, a 0-alloc `clear`, and `merge` optional. **ADWIN.addFrom**
 
 ---
 
-## 7. H1 hardening -- v1.7.0 (final-sweep audit of 1.6.0, 2026-09-24)  [PLANNED]
+## 7. H1 hardening -- v1.7.0 (final-sweep audit of 1.6.0, 2026-09-24)  [IN PROGRESS -- 1.7.0]
 
 Baseline at audit (d37b271): `npm test` 368/368, `test:perf` 28/28, torture `ok` (exit 0), and
 every torture lane prints 0 B/op. Two parallel read-only audits covered (a) allocation + gate
@@ -469,5 +470,168 @@ H1, H2, M1 and A1 were re-run independently and reproduced.
 
 **Exit:** F1-F16 and N1-N5 green, and N1 and the N2 controls FAIL when the fixes are reverted.
 N6 is measured, or recorded as an open item with a browser lane plan.
+
+### 7.1 Independent reproduction (2026-09-24, read-only, Adaptive.js at d37b271)
+
+Baseline re-run: `npm test` 368/368, `test:perf` 28/28, `test:types` clean, `demo:check` 65 pass /
+0 fail, torture `ok` with every lane at 0 B/op (incl. `quantileInto` and HK `addFrom large-u32`),
+witness `ok`. The gates are green on code that has every finding below.
+
+| id | result | measured |
+| --- | --- | --- |
+| F1 | REPRODUCED | `EH(10,.1)` one `now`: NaN at add 43. `EH(1000,.01)` t=i/10: NaN at add 6478. NEW: the README quick-start `EH(60000,.01)` at 8 kHz goes NaN at add 417,742 (t = 52.2 s). |
+| F2 | REPRODUCED | strict `add(0,1); add(1,1.05)` throws. CORRECTED (planner, 2026-09-25): lite-sketch `minIndexable`/`maxIndexable` are alpha-only in BOTH modes, so SDD's getters already match. The real gap: lite-sketch derives `strict` from a declared `range` (bins fixed at the range, `rangeMin`/`rangeMax` getters), while SDD strict has no range, so its accepted band depends on each pane's first value and cannot be pre-checked. |
+| F3 | REPRODUCED | HK `addFrom` 16 B/op for keys 2^31, 2^32-1, 2^53-1 (fresh + warmed, steady state); ~31 B/op for keys <= -2^31. Weight 2^30: fresh only (warmed 0). Small keys and 2^30: 0 (Node has 32-bit Smis). |
+| F4 | REPRODUCED | a 16 B/op control through the shipped `runGate` passes at 16, fails at 0. Gate copy at 0 fails 2/28 every run: FD addFrom (6-14) and HK addFrom (12-25). HK at 25 means the lane is flaky even at 16. DR add passed 3/3, so "DR add 1" was noise. FD's count is HARNESS-only: `t += 1.5` locals (PerfGate lines 83, 171, 419, 641, 727) plus the `fd.landmark \| 0` sink (a getter returning a double). |
+| F5 | REPRODUCED | SDD `quantileInto` (3 qs) 64 B/call, `quantile` 32 B/call. |
+| F6 | NARROWED | SCM `estimate` of a count >= 2^31: 16 B/call, persists. EH `sum()` and HK `estimate` box only in the early JIT tier (steady 0). HK `estimate` of a small count: 0. |
+| F7 | REPRODUCED | W=100, panes=2: `add(10,5); advance(105)` count 0. Own stream (W=1000, panes=8, true `(now-W, now]` oracle): p50 beyond alpha on 260/1068 queries, `count() < true` on 1046/1068. `sldDrive` is pane-aligned (`E - W`, witness.mjs:1276-1282). |
+| F8 | REPRODUCED | same stream, queried vs unqueried: `overflows` 6556 vs 6562. README line 211 says `count()` "lazily expires"; line 628, ADR 0009 and llms.txt:789 say queries are PURE. |
+| F9 | REPRODUCED | ADWIN(.002), 5 seeds x 20k stationary N(0,1): 0 alarms at offsets 0 and 1e6, 98 at 1e9, 144 at 1.7e12. Variance spans [0, 3e10]. +1 step delay 69-112 at 0; 16-338 at 1e9; at 1.7e12, 2 of 5 were not detected within 2000 items. |
+| F10 | REPRODUCED | `add(7, 2^32)` and `add(7, 2^33)`: `estimate` 0 while `topK` reports 2^32 and 2^33. |
+| F11 | REPRODUCED | `HK(64, 2**30, 1)` and `EH(10, 1e-12)` hit V8_Fatal, exit 133, and try/catch cannot catch them. `DR(2**31, 1)` "constructs" with `bytes` 34 GB (lazy on macOS; uncapped). |
+| F12 | REPRODUCED | SDD `quantile(2)` throws (its own `quantileInto` doc says NaN). SCM `estimate(k, -1)` and `estimate(k, 1e9 > W)` return 0. SHLL and SDD `count(-1)` throw. |
+| F13 | REPRODUCED | `{toString:1}` is accepted by HK, HK.withAccuracy, SHLL, DD, SDD, SCM, DR. `[]` is accepted by every ctor door (EH/ADWIN/FD too). No door has a did-you-mean. |
+| F14 | REPRODUCED | `DR(2,1e-320)`: lambda Infinity, the sample freezes at the first k values. `FD(1e-320)`: `count()` throws the misleading "value near Double.MAX" message. |
+| F15 | REPRODUCED | EH `add(0,1e308)` x2: `sum()` Infinity. HK range comment (:1805). CORRECTED in step 5: the audit's "written backwards" was WRONG. HeavyKeeper never overestimates (ADR 0005; the witness gates the worst overestimate at 0), so `[true - err, true]` is right; only the wording was clarified. The "duplicated line :1799/:1800" was a reproduction artifact (overlapping `sed` ranges printed line 1800 twice), and no duplicate exists. The README/llms/witness labels that called it a "bounded overestimate" were fixed. |
+| F16 | REPRODUCED | lockfile `version` 0.1.0; README Testing has no count; the ROADMAP statuses are stale. NEW: the README SDD example `q.quantileInto([0.5, 0.99], out)` (line 266) THROWS (the d.ts requires Float64Array). NEW: the README allocation table covers EH only. |
+| F17 | NEW (H for lite-hud) | EH `sum()` does NOT hold `<= epsilon`. Levels are by POPULATION, so the straddling bucket's VALUE mass is unbounded relative to the window sum. W=1000, eps .1, explicit, 20k items vs an exact oracle: count worst 6.3% on every stream; sum worst 6.5% (uniform), 15.8% (heavy tail), 2504% (a 50-item spike of 1000 among 1s). llms.txt:64 and :259, README line 72 ("count / sum ... `<= epsilon`") and the API table claim the bound. ADR 0002 proves it for count only. The witness sums were near-uniform, so they could not catch it. |
+| F18 | NEW (found by QA, 2026-09-25; pre-existing in 1.6.0, missed by the audit) | ADWIN's range term R = max - min is a running min/max over ALL raw x that never shrinks after a cut. After one large level shift, the Bernstein range term stays inflated for the instance's lifetime. Measured, 5 seeds: a later +1 shift is caught in 87-99 items with no earlier jump, 921-988 items after an earlier jump of 100, and NEVER within 20000 items after an earlier jump of 1e4 or 1e6. A straddling mixed bucket also persists (a window variance of ~2.7e8 instead of 1 after a 1e6 jump). It fails open, and lite-hud M6 uses ADWIN. Identical output on 1.6.0. SETTLED (maintainer): fix in 1.7.0 with per-bucket min/max, so R is the live window's range. |
+| S1 | REPRODUCED | CUSUM(target 0, delta .5, threshold 8) with a +10 step: 5000 alarms in 5000 items. No `lastDriftIndex` / `lastDirection`. |
+| S2/S4/S5 | REPRODUCED | SCM has no `total`. SCM `seed` 2^32+1 reads 1 (HK throws). `lastNow` reads 0 before the first add (SHLL/SDD/SCM). The ADWIN/DD empty `mean` is 0. |
+| N6 | OPEN | this Node (arm64) has 32-bit Smis: `%IsSmi(2**31-1)` true. Every Node 0 on a key in [2^30, 2^31) says nothing about Chrome. |
+
+**Method corrections (these change how the N gates are built):**
+1. **The scavenge-to-bytes ratio is not fixed.** Under `--max-semi-space-size=4`, 16 B/op reads 24
+   scavenges at 8N in a fresh process and 12 after new space has grown. It reads 6 with
+   `--min-semi-space-size=4` as well. Gates pin BOTH flags, and N1 is calibrated in the same process
+   shape as the lane it guards. A direct B/op probe (the new-space used-size delta across K ops with
+   no GC between) reads the controls exactly (16.03 / 8.03 / 0.03) and is the better gate.
+2. **JIT tier.** The first 8N window after warm-up often runs in Maglev code, which does not inline,
+   and boxes. Later windows run in Turbofan code and read 0 (`--no-maglev` removes the gap). A real
+   consumer runs Maglev code too, so settle S6.
+3. **Library vs harness.** HK's box is in the library (a standalone replica stays at 16 B/op).
+   FD's is only in the harness. F4 fixes the harness; F3 fixes the library.
+
+Probe scripts and raw results were kept in the session scratchpad and are not in the repo. They can
+be rebuilt from this table. F1-F15 each need only a few lines.
+
+### 7.2 Next session -- plan (v1.7.0, H1 hardening)
+
+**Settle first (maintainer, before the planner):**
+- S3 (the F1 sizing). In the literature the level count is bounded by the
+  window POPULATION, not by W. DGIM's window is the last N items, so there are ~log N levels. A
+  time-based window holds as many items as the rate allows, so an implementation must either
+  declare a maximum population or grow its lists. A fixed pool cannot grow, so the population bound
+  has to be DECLARED. Memory at `(k+1) * levels + 2` buckets x 36 B:
+
+  | epsilon | 5 s at 1 kHz (5e3) | 5 s at 100 kHz (5e5) | 2^32 | 2^53 |
+  | --- | --- | --- | --- | --- |
+  | 0.01 (k 51) | 16.5 KB | 29.3 KB | 53.1 KB | 91.5 KB |
+  | 0.05 (k 11) | 4.7 KB | 7.7 KB | 13.1 KB | 22.0 KB |
+  | 0.1 (k 6) | 3.0 KB | 4.7 KB | 7.9 KB | 13.1 KB |
+
+  SETTLED (maintainer, 2026-09-25): **an explicit `maxCount` ctor option, default 2^32.** A flat 53
+  levels is REJECTED: it charges every instance the physically unreachable worst case (lite-hud:
+  50 channels x ~99 KB), breaks R10, and hides the domain assumption instead of stating it.
+  Contract for the planner:
+  - `maxCount` is the window population the pool is GUARANTEED to hold (a floor; the exact ceiling is
+    `k * (2^levels - 1)`, ~3-6x maxCount, verified exact on 5 configs), in EITHER mode: a positive integer <= 2^53-1,
+    validated typeof-first before allocation, with a `maxCount` getter (R8). `levels` =
+    `max(2, ceil(log2(maxCount / (k+1))) + 2)`. The pool is allocated at the ctor, before the mode
+    locks, so count-mode instances ALSO get the 2^32 sizing by default (e.g. `EH(1000, .01)` 13 KB ->
+    53 KB). Pass `maxCount: W` in count mode to keep the old size. The CHANGELOG states the new
+    `capacity` / `levels` numbers. This is the one additive API in 1.7.0 (maintainer-approved).
+  - Overflow: an add whose cascade would pass the top level throws a tagged RangeError. The state is
+    BYTE-IDENTICAL: today `add` expires (and advances `_now`) BEFORE inserting (Adaptive.js:385,
+    :514), so the pre-check must predict post-expiry counts with a READ-ONLY scan. The cascade reaches
+    the top iff `lcount[0..top]` are all at `k`, which is an O(levels) read only on that rare path.
+    The `this is a bug` throw at :674 then becomes unreachable, with a test that shows it.
+  - Witness: `EH(1000, .01)` at 10 kHz for 70 s with the default `maxCount` never goes NaN and stays
+    within eps of a deque oracle. With `maxCount` set just below the window population it throws
+    tagged, with a byte-identical snapshot.
+- S6 SETTLED (maintainer, 2026-09-25): **gate 0 B/op.** Every gated lane reads 0 B/op at steady
+  state (the minimum over >= 4 windows, with both semi-space flags pinned). The first window is printed
+  next to it and is never a floor.
+- S7 SETTLED (maintainer, 2026-09-25): **MINOR 1.7.0, hardening only** (plus the S3 `maxCount` option). F7 changes SDD `bytes` (B+1
+  panes) and the covered span. F12 turns throws and silent 0 into NaN. F13 rejects `[]`. Each is a
+  fail-closed or valid-input-preserving change. The CHANGELOG lists every non-byte-identical class,
+  as 1.5.0 did. The new public API in 1.7.0 is EH `maxCount` (S3) and SDD `range` (S8).
+- S8 SETTLED (maintainer, 2026-09-25): **F2 ships lite-sketch's declared `range: [min, max]`** (strict
+  derived from it, plus `rangeMin` / `rangeMax` getters, NaN when undeclared) in 1.7.0. With it,
+  1.7.0 adds two APIs: EH `maxCount` and SDD `range`. `strict` WITHOUT a range is span-based: it
+  throws only when a pane's occupied key span would exceed maxBins, and otherwise re-anchors the
+  pane (both rising AND falling values are accepted). A bottom anchor was rejected because it only
+  moves the bug to falling values (`add(0,1); add(1,0.5)`).
+- S1, S2 SETTLED (maintainer, 2026-09-25): **DEFERRED to 1.8.0**, the additive API release: CUSUM
+  latch + `lastDriftIndex` / `lastDirection`, SCM `total(w?)`, and any F6 `xxxInto` reader (e.g. SCM
+  `estimateInto`). S4, S5: decide at the planner, doc-only for 1.7.0.
+- 1.8.0 candidate from F17 (for lite-hud M4): an exact-per-pane windowed count / sum / mean / min /
+  max (B+1 panes, covered span [W, W+W/B], the SCM/SDD pane substrate, no value-skew error). Or a
+  value-weighted EH (DGIM's sum variant, merge by value mass) if a relative sum bound is required.
+- All settle calls for 1.7.0 are closed (S3, S6, S7; S1/S2 -> 1.8.0; S4/S5 at the planner).
+
+**Order (each step = planner -> coder -> reviewer -> qa; REJECTED goes back to the coder):**
+1. **Gates RED first (test-only, no Adaptive.js change).** N1 (a pinned-semi-space 16 B/op control
+   plus a B/op probe), F4 harness fix (driver clocks/keys in Float64Array slots, a non-double sink),
+   N2 (shared 5-class call site), N3 (key x clock x count x fresh/warm matrix), N4 (query lanes), N5
+   (SCM/FD/DR +1e12 timing). Also the true-window oracle for SDD (F7). Record which lanes FAIL on
+   1.6.0: this is the "has teeth" proof the exit criterion needs.
+2. **Highs, which unblock lite-hud M4 + the HK drop-in:** F1 (EH bound check + S3 sizing), F17 (EH
+   `sum()`: state the true bound, `|err| <= size(oldest straddling bucket) / 2`, which is relative
+   `<= epsilon` only for count or near-constant values; add a skewed-value witness lane that gates the
+   STATED bound and shows the old claim fails), F3 (HK
+   slot-passing, `hkMapHash` returning `| 0`), F2 (SDD strict = declared range, lite-sketch parity getters). The
+   N3 HK row and the F1/F2 gates go green.
+3. **SDD block (one class, one pass):** F7 (B+1 panes), F5 (cut slot + `_walkInto`), the SDD rows of
+   F12. The ADR 0008 amendment is part of this step.
+4. **Remaining Mediums:** F9 (ADWIN per-bucket Chan/Welford), F8 (SHLL non-destructive `count`),
+   F10, F11 (cells caps on HK/EH/DR, subprocess test), F12 (NaN contract table), F13 (null-proto
+   lists, array reject, did-you-mean on all 11 doors).
+5. **Lows + docs:** F6 (doc note: SCM `estimate` >= 2^31 is one boxed return per call, EH `sum` /
+   HK `estimate` box only in the early JIT tier; the `Into` reader is 1.8.0), F14, F15,
+   F16, plus the NEW doc items: the README line-266 example, the strict getter text, and an
+   allocation table row per member.
+6. **Prove + release:** `npm run verify` plus the full N matrix. Revert-check: undo F3/F4 in a
+   scratch copy and confirm N1/N2/N3 FAIL. N6 is recorded as open, with a headless-Chrome lane plan.
+   Then `/release 1.7.0` and a catalog card sync.
+
+**Progress (2026-09-25, uncommitted working tree):**
+- Step 1 DONE (reviewer APPROVED, QA 9/9). New: test/perf/AllocProbe.mjs (B/op probe, steady = min over
+  windows 1..n-1, both semi-space flags pinned and asserted), AllocMatrix.test.mjs (N2/N3/N4),
+  JumpTiming.test.mjs (N5), PerfGate at maxScavenges 0 with harness boxing removed, the SDD true-window
+  oracle, and scripts `test:perf:matrix` + `gates:red`. `todo: '<F-id>'` lanes plus LITE_GATES_STRICT=1.
+- Step 2 DONE: F1 + F17 (EH `maxCount`), F3 (HK slots, bit-identical to 1.6.0), F2 (SDD `range` +
+  span-based strict; non-strict hot body byte-identical to 1.6.0). All reviewer-APPROVED (F2 after one
+  REJECT: a strict-only field was maintained on the non-strict hot path, now moved to the cold path).
+  QA 9/9; npm test 393/393; torture 0 B/op on every lane; test:perf 30/30 strict. `gates:red` fails
+  only on F5 (2 lanes), F6 (1, the 1.8.0 `estimateInto`) and F7.
+- Step 3 DONE: F7 (SDD B+1 ring, covered span [W, W+W/B]; the true-window witness is HARD:
+  count < true(W) on 0/29557, previously 29410; a B-pane control is rejected), F5 (quantileInto
+  0 B/call, previously 64; quantile has one boxed return, 16 B/call), and F12 SDD rows (a bad value
+  returns NaN; a wrong container type still throws). Reviewer APPROVED. The demo oracle moved to the
+  B+1 span. The SDD parity vectors were re-cut to a no-expiry stream; the non-strict rows were
+  re-verified against HEAD 1.6.0. npm test 395/395; `gates:red` fails only on F6 (1.8.0).
+- Steps 4 and 5 DONE (reviewed; QA 8/8 over steps 3-5; npm test 428/428). F18 was found by QA and
+  is being fixed in 1.7.0 (maintainer). Step 4 was split: 4a = F9 (ADWIN centred sums + a re-centre on cut) + F8 (SHLL expiry moves into
+  add); 4b = F10 + F11 + F12 (SHLL/SCM/HK estimate -> NaN) + F13 (shared option door with a
+  did-you-mean hint).
+
+- F18 DONE (reviewer APPROVED): R is the live window's range excluding the oldest bucket (candidate C;
+  A, B and D were measured and rejected in ADR 0003). A later +1 shift after an earlier jump of
+  100 / 1e4 / 1e6 is caught in 78-113 items (no-jump baseline 85-115); variance after a 1e6 jump
+  is 1.00; 0 stationary false alarms on N(0,1) / uniform / heavy-tailed at delta .1 and .002;
+  about +5.6% cost per stationary add.
+- Step 6: `verify` now includes test:perf:matrix and exits 0 (npm test 432/432, perf 30/30, matrix 57
+  pass + the F6 todo, demo 65/65, torture 0 B/op, witness ok). REVERT-CHECK (1.6.0 Adaptive.js in a
+  scratch copy, strict gates): perf fails on HK addFrom (F3); the matrix fails on 9 HK lanes (F3), 2
+  SDD query lanes (F5) and F6; the witness fails on F1 (its 1.6.0 overflow throw), F9 (72 / 3104
+  false alarms at 1e9 / 1.7e12), F18 (misses), F8 (overflows 17487 vs 29842) and F7 (29410/29557
+  undercounts). Every new gate has teeth. Caveat: the SDD quantile half of the witness reads the new
+  `_ring` field, so on 1.6.0 it yields no queries; the count half of F7 is implementation-independent.
+
+**Cut line if time runs short:** steps 1-2 alone are a coherent, releasable 1.7.0 (the four Highs
+plus honest gates). Steps 3-5 then ship as 1.7.1, still hardening only. 1.8.0 stays the additive
+API release (S1, S2, the F6 readers).
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

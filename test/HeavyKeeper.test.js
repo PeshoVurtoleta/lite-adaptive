@@ -2,6 +2,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { HeavyKeeper, ADWIN, VERSION } from '../Adaptive.js';
 
 /** A deterministic mulberry32 PRNG so every assertion is reproducible. */
@@ -33,7 +34,7 @@ function zipfKey(u, n, s, base) {
 }
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '1.6.0');
+    assert.equal(VERSION, '1.7.0');
 });
 
 test('constructor validates d / w / k fail-closed BEFORE allocation', () => {
@@ -126,14 +127,15 @@ test('add accepts safe-integer keys across the full range incl. large u32 and ne
     }
 });
 
-test('estimate returns 0 for an unseen valid key; throws fail-closed on a bad key (T3)', () => {
+test('estimate returns 0 for an unseen valid key; NaN (never a throw) on a bad key (T3, F12)', () => {
     const hk = new HeavyKeeper(4, 256, 8);
     hk.add(7, 5);
     assert.equal(hk.estimate(7), 5);
     assert.equal(hk.estimate(999999), 0, 'unseen but valid key -> 0');
-    // parity with add(): a key that is not a safe integer is rejected, not silently 0
+    // F12: one contract -- queries never throw on a bad value. A non-safe-integer key -> NaN
+    // (an invalid key was never "seen 0 times"), distinct from a legitimate miss (0).
     for (const bad of [1.5, NaN, Infinity, '7', null, undefined, {}, 7n]) {
-        assert.throws(() => hk.estimate(bad), /\[lite-adaptive\]/, 'bad key=' + String(bad));
+        assert.ok(Number.isNaN(hk.estimate(bad)), 'bad key=' + String(bad) + ' -> NaN');
     }
 });
 
@@ -378,11 +380,10 @@ test('ADWIN.addFrom rejects a bad buffer / index / value fail-closed (byte-ident
 
 test('ADWIN.addFrom rejects a FINITE square-overflowing buf[i] -- no silent drift freeze (T7)', () => {
     // Mirrors add()'s T7 guard, but through the zero-box addFrom entry: buf[i] itself is finite
-    // (a real Float64 that survives being STORED in a Float64Array), yet buf[i]*buf[i] would
-    // overflow to Infinity and poison _wsumSq if accepted. Only NaN/Infinity were exercised for
-    // addFrom before this test; the finite-but-overflowing lane was defined in Adaptive.js
-    // (ADWIN_X_MAX check at the addFrom guard) but never actually measured by a node:test.
-    const XMAX = Math.sqrt(Number.MAX_VALUE);   // ~1.34e154
+    // (a real Float64 that survives being STORED in a Float64Array), yet the CENTRED (buf[i] - c)^2
+    // would overflow to Infinity and poison _wsumSq if accepted. Since 1.7.0 (F9) the sums are
+    // centred, so the accepted bound HALVED to sqrt(MAX_VALUE)/2 (|x - c| <= 2*XMAX -> square <= MAX).
+    const XMAX = Math.sqrt(Number.MAX_VALUE) / 2;   // ~6.7e153
     const ad = new ADWIN(0.1);
     ad.add(1); ad.add(2);
     const w = ad.width, bc = ad.bucketCount, m = ad.mean;
@@ -395,9 +396,80 @@ test('ADWIN.addFrom rejects a FINITE square-overflowing buf[i] -- no silent drif
     assert.equal(ad.width, w, 'width unchanged after a rejected addFrom');
     assert.equal(ad.bucketCount, bc, 'bucketCount unchanged after a rejected addFrom');
     assert.equal(ad.mean, m, 'mean unchanged after a rejected addFrom');
-    // the domain edge holds through addFrom too: |x| == sqrt(MAX_VALUE) is accepted, not rejected.
+    // the domain edge holds through addFrom too: |x| == sqrt(MAX_VALUE)/2 is accepted, not rejected.
     buf[0] = XMAX;
-    assert.doesNotThrow(() => ad.addFrom(buf, 0), 'boundary |x| == sqrt(MAX_VALUE) is in-domain via addFrom');
+    assert.doesNotThrow(() => ad.addFrom(buf, 0), 'boundary |x| == sqrt(MAX_VALUE)/2 is in-domain via addFrom');
     buf[0] = -XMAX;
-    assert.doesNotThrow(() => ad.addFrom(buf, 0), 'boundary -sqrt(MAX_VALUE) is in-domain via addFrom');
+    assert.doesNotThrow(() => ad.addFrom(buf, 0), 'boundary -sqrt(MAX_VALUE)/2 is in-domain via addFrom');
+});
+
+// --- 1.7.0 step-2 QA boundary case (F3 shared scratch slots) ---
+
+test('F3 re-entrancy: another instance used inside forEach does not disturb this instance', () => {
+    const keys = [3, 2 ** 31 + 5, -(2 ** 31) - 7, 2 ** 53 - 1, -(2 ** 53 - 1), 2 ** 32 - 1, 12345];
+    const feed = (h) => { for (let i = 0; i < 20000; i++) h.add(keys[(i * 7 + (i >> 3)) % keys.length], 1 + (i % 3)); };
+    const a = new HeavyKeeper(4, 256, 8, { seed: 1 });
+    const ref = new HeavyKeeper(4, 256, 8, { seed: 1 });
+    const b = new HeavyKeeper(4, 256, 8, { seed: 2 });
+    feed(a); feed(ref); feed(b);
+    const buf = new Float64Array([2 ** 31 + 9, 2 ** 30]);
+    a.forEach(() => {                                    // user code runs between A's reads
+        b.add(-(2 ** 53 - 1), 7); b.addFrom(buf, 0); b.estimate(2 ** 32 - 1);
+    });
+    assert.deepEqual(a.topK(), ref.topK(), 'A top-k unchanged by re-entrant B calls');
+    for (const k of keys) assert.ok(Object.is(a.estimate(k), ref.estimate(k)), 'estimate(' + k + ')');
+    a.add(2 ** 31 + 5, 3); ref.add(2 ** 31 + 5, 3);     // and A keeps evolving identically
+    assert.deepEqual(a.topK(), ref.topK());
+});
+
+// --- F10: weight bound [1, 2^32-1] -- a single weight above 2^32-1 is REJECTED (byte-identical
+//     no-op), while an ACCUMULATED cell SATURATES at 2^32-1 (the two rules are distinct). ---
+
+/** A structural snapshot of the HK table + forest (for the byte-identical no-op assertion). */
+function hkSnap(hk) {
+    return JSON.stringify({
+        fp: Array.from(hk._fp), cnt: Array.from(hk._cnt),
+        key: Array.from(hk._hkKey), est: Array.from(hk._hkEst),
+        n: hk._hkN, rng: hk._rng,
+    });
+}
+
+test('F10 add(key, 2^32) / (key, 2^33) throw tagged with a byte-identical table+forest', () => {
+    const hk = new HeavyKeeper(4, 64, 8);
+    for (let i = 0; i < 50; i++) hk.add(i % 10, 3);
+    const before = hkSnap(hk);
+    for (const w of [2 ** 32, 2 ** 33]) {
+        assert.throws(() => hk.add(7, w), /\[lite-adaptive\].*\[1, 4294967295\]/, 'add(7, ' + w + ') throws');
+        assert.equal(hkSnap(hk), before, 'add(7, ' + w + ') left state byte-identical');
+    }
+    // addFrom too (packed [key, weight])
+    const buf = new Float64Array(2);
+    for (const w of [2 ** 32, 2 ** 33]) {
+        buf[0] = 7; buf[1] = w;
+        assert.throws(() => hk.addFrom(buf, 0), /\[lite-adaptive\].*\[1, 4294967295\]/, 'addFrom weight ' + w + ' throws');
+        assert.equal(hkSnap(hk), before, 'addFrom(7, ' + w + ') left state byte-identical');
+    }
+});
+
+test('F10 weight 4294967295 is accepted, then a second add saturates at 4294967295', () => {
+    const hk = new HeavyKeeper(4, 64, 8);
+    hk.add(7, 4294967295);
+    assert.equal(hk.estimate(7), 4294967295, 'estimate == 2^32-1');
+    assert.equal(hk.topK()[0].count, 4294967295, 'topK count == 2^32-1');
+    assert.equal(hk.estimate(7), hk.topK()[0].count, 'estimate === topK()[0].count');
+    hk.add(7, 1);   // an accumulated cell SATURATES (never wraps)
+    assert.equal(hk.estimate(7), 4294967295, 'a second add saturates at 2^32-1');
+});
+
+// --- F11: the ctor cells caps throw a tagged RangeError in-process (1.6.0 aborted with exit 133
+//     via a V8 fatal). Verified in a SUBPROCESS: the child catches the throw and exits 0. ---
+
+test('F11 HeavyKeeper(64, 2^30, 1) throws tagged in a subprocess (no process abort)', () => {
+    const src =
+        "import('" + new URL('../Adaptive.js', import.meta.url).href + "').then(m=>{" +
+        "try{new m.HeavyKeeper(64, 2**30, 1);console.log('NO_THROW');}" +
+        "catch(e){console.log(/\\[lite-adaptive\\]/.test(e.message)&&e instanceof RangeError?'TAGGED':'WRONG:'+e.message);}});";
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', src], { encoding: 'utf8' });
+    assert.equal(r.status, 0, 'child exits 0, stderr=' + r.stderr);
+    assert.match(r.stdout, /TAGGED/, 'child caught a tagged RangeError, got ' + r.stdout);
 });

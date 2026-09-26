@@ -1327,7 +1327,8 @@ export function stepSldOracle(world, allocState) {
         oT[tail] = now; oV[tail] = vals[(start + i) & mask]; tail = (tail + 1) & omask;
         allocState.oracleCount++;                       // a retained sample the sketch refuses to keep
     }
-    const liveCut = sldPaneEnd(now, pw) - W;
+    // 1.7.0 F7: the ring holds B+1 panes, so the covered span is (E - W - pw, E] -- [W, W + W/B].
+    const liveCut = sldPaneEnd(now, pw) - W - pw;
     while (head !== tail && sldPaneEnd(oT[head], pw) <= liveCut) head = (head + 1) & omask;
     world.oHead = head; world.oTail = tail;
     world.n = (world.n + count) | 0;
@@ -1346,7 +1347,7 @@ export function stepSldOracle(world, allocState) {
 export function renderSldPrep(world, allocState) {
     const sd = world.sd, flat = world.flat, pw = world.pw, W = world.W;
     const oT = world.oT, oV = world.oV, omask = world.oMask, sortBuf = world.sortBuf;
-    const liveCut = sldPaneEnd(world.now, pw) - W;
+    const liveCut = sldPaneEnd(world.now, pw) - W - pw;   // B+1 covered span (F7)
     // insertion-sort the live pane content into the preallocated buffer (0 alloc).
     let m = 0, i = world.oHead;
     const tail = world.oTail;

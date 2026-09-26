@@ -20,8 +20,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // version pin (the 8th pin -> 8 VERSION pins total)
 // ---------------------------------------------------------------------------
-test('VERSION is 1.6.0 (DecayedReservoir milestone)', () => {
-    assert.equal(VERSION, '1.6.0');
+test('VERSION is 1.7.0 (DecayedReservoir milestone)', () => {
+    assert.equal(VERSION, '1.7.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -225,16 +225,17 @@ test('a large safe composite key (channelIdx*2^32 + tag) is accepted and estimat
     assert.equal(s.estimate(-key), 0);    // a different (unseen) key
 });
 
-test('estimate NEVER throws: unseen key = 0, empty window = 0, out-of-domain key = 0', () => {
+test('estimate NEVER throws: unseen/empty = 0, out-of-domain key = NaN (F12)', () => {
     const s = new SlidingCountMin(1000, { panes: 4 });
-    assert.equal(s.estimate(42), 0);        // empty window (mode unset)
+    assert.equal(s.estimate(42), 0);        // empty window (mode unset) -> a legitimate 0
     s.add(1, 7, 2);
-    assert.equal(s.estimate(999), 0);       // unseen key
-    assert.equal(s.estimate(1.5), 0);       // out-of-domain (non-integer)
-    assert.equal(s.estimate('7'), 0);       // out-of-domain (non-number)
-    assert.equal(s.estimate(NaN), 0);
-    assert.equal(s.estimate(Infinity), 0);
-    assert.equal(s.estimate(2 ** 53), 0);   // out-of-safe-range
+    assert.equal(s.estimate(999), 0);       // unseen VALID key -> 0 (a legitimate miss)
+    // F12: an out-of-domain key -> NaN, never a silent 0 (0 is a legitimate miss, an invalid key is not)
+    assert.ok(Number.isNaN(s.estimate(1.5)));       // out-of-domain (non-integer)
+    assert.ok(Number.isNaN(s.estimate('7')));       // out-of-domain (non-number)
+    assert.ok(Number.isNaN(s.estimate(NaN)));
+    assert.ok(Number.isNaN(s.estimate(Infinity)));
+    assert.ok(Number.isNaN(s.estimate(2 ** 53)));   // out-of-safe-range
     assert.equal(s.estimate(7), 2);
 });
 
@@ -309,7 +310,7 @@ test('conservative update is never worse than plain add for any key', () => {
 });
 
 // ---------------------------------------------------------------------------
-// sub-window w in (0, W]; a bad w returns 0 (estimate never throws)
+// sub-window w in (0, W]; a bad w returns NaN (estimate never throws) -- F12
 // ---------------------------------------------------------------------------
 test('a sub-window w narrows the counted span; recent keys still show', () => {
     const s = new SlidingCountMin(1000, { panes: 10 });
@@ -323,14 +324,14 @@ test('a sub-window w narrows the counted span; recent keys still show', () => {
     assert.equal(s.estimate(7, 100), 0);      // key 7 is far outside a 100-wide recent window
 });
 
-test('estimate returns 0 (never throws) for a sub-window outside (0, W]', () => {
+test('estimate returns NaN (never throws) for a sub-window outside (0, W] (F12)', () => {
     const s = new SlidingCountMin(1000, { panes: 4 });
     s.add(1, 7, 3);
-    assert.equal(s.estimate(7, 0), 0);
-    assert.equal(s.estimate(7, -5), 0);
-    assert.equal(s.estimate(7, 1001), 0);
-    assert.equal(s.estimate(7, NaN), 0);
-    assert.equal(s.estimate(7, Infinity), 0);
+    assert.ok(Number.isNaN(s.estimate(7, 0)));
+    assert.ok(Number.isNaN(s.estimate(7, -5)));
+    assert.ok(Number.isNaN(s.estimate(7, 1001)));
+    assert.ok(Number.isNaN(s.estimate(7, NaN)));
+    assert.ok(Number.isNaN(s.estimate(7, Infinity)));
     assert.equal(s.estimate(7, 1000), 3);     // w === W is valid
 });
 

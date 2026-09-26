@@ -18,8 +18,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // version pin
 // ---------------------------------------------------------------------------
-test('VERSION is 1.6.0 (DecayedReservoir milestone)', () => {
-    assert.equal(VERSION, '1.6.0');
+test('VERSION is 1.7.0 (DecayedReservoir milestone)', () => {
+    assert.equal(VERSION, '1.7.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -79,6 +79,10 @@ test('getters reflect the defaults (alpha=0.01, strict=false, panes=32)', () => 
     assert.equal(s.mode, 'unset');
     assert.equal(s.lastNow, 0);
     assert.equal(s.collapsed, false);
+    // F7: the ring holds B+1 = 33 panes at defaults (panes=32). Exact byte figure:
+    //   bins 33*2048*4 + 4*Int32(33) + Uint8(33) + 3*Float64(33) + scratch Float64(2048) + cut Float64(1)
+    //   = 270336 + 132*3 + 33 + 264*3 + 16384 + 8 = 287949 (was 279712 at the 1.6.0 B-pane ring).
+    assert.equal(s.bytes, 287949);
     assert.ok(s.bytes > 0);
     // indexable band matches lite-sketch DDSketch at alpha=0.01 (~2.2e-308, ~8.9e307).
     assert.ok(s.minIndexable > 0 && s.minIndexable < 1e-300);
@@ -263,21 +267,39 @@ test('a sub-window quantile(q, w) queries a smaller recent slice; count(w) too',
     assert.ok(recent > full, 'recent p50=' + recent + ' full p50=' + full);
     assert.ok(s.count(2000) < s.count(), 'sub-window count < full');
 });
-test('quantile rejects q outside [0, 1]', () => {
-    const s = new SlidingDDSketch(1000);
-    s.add(1, 5);
-    assert.throws(() => s.quantile(-0.1), /q must be a number in \[0, 1\]/);
-    assert.throws(() => s.quantile(1.1), /q must be a number in \[0, 1\]/);
-    assert.throws(() => s.quantile(NaN), /q must be a number in \[0, 1\]/);
-    assert.throws(() => s.quantile('0.5'), /q must be a number in \[0, 1\]/);
+// F12: a bad VALUE (q / w / count-window) is DATA, not a programming error -> NaN, never a throw, and
+// a BYTE-IDENTICAL no-op (null is not zero: an unrepresentable window is NaN, not an under-count of 0).
+const sddSnap = (s) => ({
+    bins: Array.from(s._bins), offset: Array.from(s._offset), maxKeyPop: Array.from(s._maxKeyPop),
+    binCount: Array.from(s._binCount), paneCollapsed: Array.from(s._paneCollapsed),
+    paneCount: Array.from(s._paneCount), paneZero: Array.from(s._paneZero),
+    paneEnd: Array.from(s._paneEnd), cur: s._cur, now: s._now,
 });
-test('quantile / count reject a sub-window w outside (0, W]', () => {
+test('F12: quantile(q) for q outside [0, 1] / NaN -> NaN, never throws, byte-identical', () => {
     const s = new SlidingDDSketch(1000);
     s.add(1, 5);
-    assert.throws(() => s.quantile(0.5, 0), /sub-window w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.quantile(0.5, 1001), /sub-window w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.count(-5), /sub-window w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.count(NaN), /sub-window w must be a finite number in \(0, W\]/);
+    const before = sddSnap(s);
+    for (const bad of [-1, 2, -0.1, 1.1, NaN, '0.5']) {
+        assert.ok(Number.isNaN(s.quantile(bad)), 'quantile(' + String(bad) + ') must be NaN');
+    }
+    assert.deepEqual(sddSnap(s), before, 'quantile bad-q state must be byte-identical');
+});
+test('F12: a bad sub-window w -> NaN for BOTH quantile and count, byte-identical', () => {
+    const s = new SlidingDDSketch(1000);
+    s.add(1, 5);
+    const before = sddSnap(s);
+    for (const bad of [0, -1, 1001, NaN, Infinity, -Infinity]) {
+        assert.ok(Number.isNaN(s.quantile(0.5, bad)), 'quantile(0.5, ' + String(bad) + ') must be NaN');
+        assert.ok(Number.isNaN(s.count(bad)), 'count(' + String(bad) + ') must be NaN');
+    }
+    assert.deepEqual(sddSnap(s), before, 'bad-window state must be byte-identical');
+});
+test('F12: empty-window quantile -> NaN and count() -> 0 (unchanged, never throws)', () => {
+    const s = new SlidingDDSketch(1000);
+    s.add(1, 5);
+    s.advance(1 + 1000 + 1000 / 32);   // slide the whole window past
+    assert.ok(Number.isNaN(s.quantile(0.5)), 'empty quantile is NaN');
+    assert.equal(s.count(), 0, 'empty count is 0');
 });
 
 // ---------------------------------------------------------------------------
@@ -467,11 +489,11 @@ test('q = -0 is accepted identically to q = 0 (a valid quantile query, not a bou
 test('alpha = -0 is rejected identically to alpha = 0 (-0 > 0 is false)', () => {
     assert.throws(() => new SlidingDDSketch(1000, { alpha: -0 }), /alpha must be a number in \(0, 1\)/);
 });
-test('a sub-window w = -0 is rejected identically to w = 0 (-0 > 0 is false)', () => {
+test('a sub-window w = -0 is rejected identically to w = 0 (-0 > 0 is false) -> NaN (F12)', () => {
     const s = new SlidingDDSketch(1000);
     s.add(1, 5);
-    assert.throws(() => s.quantile(0.5, -0), /sub-window w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.count(-0), /sub-window w must be a finite number in \(0, W\]/);
+    assert.ok(Number.isNaN(s.quantile(0.5, -0)));
+    assert.ok(Number.isNaN(s.count(-0)));
 });
 
 // -- sub-window w exact upper boundary: w === W must behave exactly like the omitted (full) window --
@@ -620,14 +642,14 @@ test('quantileInto tolerates qs and out being the SAME aliased array (read-befor
 });
 
 // -- ADVERSARIAL (not planner-anticipated): quantile()/count() validate q/w BEFORE the empty-window
-//    short-circuit, so a bad w/q THROWS even on a totally fresh (never-added-to) instance -- an empty
-//    window does NOT silently swallow a malformed argument into a NaN/0 "safe" answer. --
-test('ADVERSARIAL: quantile/count validate q/w BEFORE the empty-window short-circuit (bad args still throw)', () => {
+//    short-circuit, so a bad w/q resolves to NaN (F12) even on a totally fresh (never-added-to)
+//    instance -- distinct from a valid q/w which returns the empty-window NaN/0 answer. --
+test('ADVERSARIAL: quantile/count validate q/w BEFORE the empty-window short-circuit (bad args -> NaN, F12)', () => {
     const s = new SlidingDDSketch(1000);   // mode is 'unset', nothing ever added
-    assert.throws(() => s.quantile(0.5, -5), /sub-window w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.quantile(0.5, 2000), /sub-window w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.quantile(1.5), /q must be a number in \[0, 1\]/);
-    assert.throws(() => s.count(-5), /sub-window w must be a finite number in \(0, W\]/);
+    assert.ok(Number.isNaN(s.quantile(0.5, -5)));
+    assert.ok(Number.isNaN(s.quantile(0.5, 2000)));
+    assert.ok(Number.isNaN(s.quantile(1.5)));
+    assert.ok(Number.isNaN(s.count(-5)));
     // a VALID q/w on the same empty instance correctly falls through to NaN / 0, never a throw.
     assert.ok(Number.isNaN(s.quantile(0.5)));
     assert.equal(s.count(500), 0);
@@ -710,4 +732,208 @@ test('advanceFrom rejects a bad buffer / index; COUNT-lock throws', () => {
     const c = new SlidingDDSketch(1000, { alpha: 0.01 });
     c.add(undefined, 5);
     assert.throws(() => c.advanceFrom(new Float64Array([5]), 0), /\[lite-adaptive\]/);
+});
+
+// ---------------------------------------------------------------------------
+// F2 (1.7.0): strict span-based re-anchor + declared range (lite-sketch parity)
+// ---------------------------------------------------------------------------
+
+// A geometric RAMP inside one pane: strict must NEVER throw and NEVER collapse (the span stays well
+// under maxBins), re-anchoring the window up on every rising key. count() == the number of adds.
+test('F2 strict ramp: a rising geometric stream never throws / never collapses (span re-anchor up)', () => {
+    const s = new SlidingDDSketch(1e6, { alpha: 0.01, strict: true });
+    let adds = 0, thrown = 0;
+    for (let v = 1; v < 1e3; v *= 1.05) { try { s.add(adds, v); adds++; } catch (e) { thrown++; } }
+    s.add(adds, 1e3); adds++;
+    assert.equal(thrown, 0, 'no strict throw on a ramp that fits maxBins');
+    assert.equal(s.collapsed, false, 'strict never collapses');
+    assert.equal(s.count(), adds, 'count() == the number of adds');
+});
+
+// A FALLING stream: a bottom anchor would move the bug here (it does not). Strict must not throw --
+// the top-anchor first value leaves the whole window below it for the descending keys to fill.
+test('F2 strict falling: a descending stream never throws (not a bottom anchor)', () => {
+    const s = new SlidingDDSketch(1e6, { alpha: 0.01, strict: true });
+    let adds = 0, thrown = 0, t = 0;
+    for (let v = 1e3; v > 1; v /= 1.05) { try { s.add(t++, v); adds++; } catch (e) { thrown++; } }
+    s.add(t, 1); adds++;
+    assert.equal(thrown, 0, 'no strict throw on a falling stream');
+    assert.equal(s.collapsed, false, 'strict never collapses');
+    assert.equal(s.count(), adds);
+});
+
+// The REAL strict collapse: a key whose occupied span (low end derived lazily .. maxKeyPop) would
+// exceed maxBins throws tagged, and every column of pane state (+ a quantile) is byte-identical.
+test('F2 strict real-collapse: a span > maxBins throws tagged, byte-identical no-op', () => {
+    const s = new SlidingDDSketch(1e6, { alpha: 0.01, strict: true });
+    // seed a tiny value then a huge value: the key span far exceeds 2048 buckets in one pane.
+    s.add(0, 1e-3);
+    s.add(1, 5);
+    const snap = () => ({
+        bins: Array.from(s._bins),
+        paneCount: Array.from(s._paneCount),
+        paneZero: Array.from(s._paneZero),
+        offset: Array.from(s._offset),
+        maxKeyPop: Array.from(s._maxKeyPop),
+        paneCollapsed: Array.from(s._paneCollapsed),
+        q: s.quantile(0.5),
+    });
+    const before = snap();
+    // the tag is anchored at the START of the message (assert.throws matches a RegExp against
+    // String(error), which is "RangeError: ..."-prefixed, so assert on error.message directly).
+    assert.throws(() => s.add(2, 1e15), (e) => /^\[lite-adaptive\]/.test(e.message),
+        'a span-exceeding key fails closed');
+    const after = snap();
+    assert.deepEqual(after.bins, before.bins, '_bins byte-identical across the throw');
+    assert.deepEqual(after.paneCount, before.paneCount, '_paneCount byte-identical');
+    assert.deepEqual(after.paneZero, before.paneZero, '_paneZero byte-identical');
+    assert.deepEqual(after.offset, before.offset, '_offset byte-identical');
+    assert.deepEqual(after.maxKeyPop, before.maxKeyPop, '_maxKeyPop byte-identical');
+    assert.deepEqual(after.paneCollapsed, before.paneCollapsed, '_paneCollapsed byte-identical');
+    assert.ok(Object.is(after.q, before.q), 'quantile(0.5) byte-identical');
+    assert.equal(s.collapsed, false, 'strict never collapses even on the rejected add');
+});
+
+// A DECLARED range [1, 1e3] derives strict, fixes the bin band, and rejects out-of-band values. The
+// boundary values 0.99 / 1001 share the floor / ceiling LOG-BUCKET with 1 / 1000 (lite-sketch
+// key-band parity) and are accepted; a value a full bucket outside is rejected as a byte-identical no-op.
+test('F2 declared range: accepts the band, rejects out-of-band, getters exact', () => {
+    const s = new SlidingDDSketch(1000, { range: [1, 1e3] });
+    assert.equal(s.strict, true, 'a declared range derives strict');
+    assert.equal(s.rangeMin, 1);
+    assert.equal(s.rangeMax, 1e3);
+    assert.equal(s.collapsed, false);
+    let t = 0;
+    for (const v of [1, 1e3, 2, 500, 999.5, 1.5]) s.add(t++, v);   // in-band accepts
+    const n = s.count();
+    for (const bad of [0.5, 2000, 0.001, 5000]) {                  // clearly out-of-band rejects
+        const before = { count: s.count(), q: s.quantile(0.5), collapsed: s.collapsed };
+        assert.throws(() => s.add(t, bad), /outside the declared strict range \[1, 1000\]/, 'value=' + bad);
+        assert.equal(s.count(), before.count, 'count byte-identical after reject on ' + bad);
+        assert.ok(Object.is(s.quantile(0.5), before.q), 'quantile byte-identical after reject on ' + bad);
+        assert.equal(s.collapsed, before.collapsed, 'collapsed byte-identical after reject on ' + bad);
+    }
+    assert.equal(s.count(), n, 'no rejected add mutated the count');
+    assert.equal(s.collapsed, false, 'a declared range never collapses');
+});
+
+// range with strict:false is a contradiction; a range NaN-getter parity on a non-range instance.
+test('F2 declared range: strict:false contradiction throws; non-range rangeMin/Max are NaN', () => {
+    assert.throws(() => new SlidingDDSketch(1000, { range: [1, 1e3], strict: false }),
+        /range implies strict/, 'range + strict:false contradicts');
+    const ns = new SlidingDDSketch(1000, { alpha: 0.01 });
+    assert.ok(Number.isNaN(ns.rangeMin) && Number.isNaN(ns.rangeMax), 'non-range range* is NaN, not 0');
+    const st = new SlidingDDSketch(1000, { alpha: 0.01, strict: true });
+    assert.ok(Number.isNaN(st.rangeMin) && Number.isNaN(st.rangeMax), 'strict-without-range range* is NaN');
+});
+
+// Bad ranges fail closed BEFORE allocation (typeof-first): non-array, wrong length, non-positive min,
+// min >= max, NaN / Infinity ends, and a band too wide for maxBins.
+test('F2 declared range: malformed ranges throw before allocation', () => {
+    const bad = [
+        5, 'x', null, [1], [1, 2, 3], [0, 1], [-1, 1], [2, 1], [1, 1],
+        [NaN, 1], [1, NaN], [Infinity, 2], [1, Infinity], [1, -Infinity],
+        ['1', 2], [1, '2'], [1e-100, 1e100],
+    ];
+    for (const range of bad) {
+        assert.throws(() => new SlidingDDSketch(1000, { range }), /\[lite-adaptive\]/,
+            'range=' + JSON.stringify(range));
+    }
+});
+
+// BAND PARITY: minIndexable / maxIndexable are ALPHA-ONLY -- Object.is-identical across non-strict /
+// strict / range, and equal lite-sketch DDSketch's formula. The expected values below are computed
+// FROM lite-sketch's Sketch.js formula (~933-940, 976-977; lite-sketch is not installed):
+//   gamma=(1+alpha)/(1-alpha); mult=1/ln(gamma); MIN_NORMAL=2**-1022; lnHalf=ln((gamma+1)/2)
+//   maxKey=floor((ln(MAX_VALUE)+lnHalf)/ln(gamma)) then tighten while !finite(2*gamma^maxKey/(gamma+1))
+//   minKey=ceil((ln(MIN_NORMAL)+lnHalf)/ln(gamma)) then tighten while 2*gamma^minKey/(gamma+1)<MIN_NORMAL
+//   minIndexable=gamma^(minKey-1); maxIndexable=gamma^maxKey.
+test('F2 band parity: minIndexable/maxIndexable are alpha-only across modes and equal lite-sketch', () => {
+    const EXPECTED = {
+        0.001: { min: 2.2254797493030344e-308, max: 8.976524795746121e+307, range: [1, 50] },
+        0.01:  { min: 2.2091206902522135e-308, max: 8.935331081551161e+307, range: [1, 1000] },
+        0.1:   { min: 2.290233232818215e-308,  max: 7.972064703069474e+307, range: [1, 1000] },
+    };
+    for (const key of Object.keys(EXPECTED)) {
+        const alpha = Number(key), e = EXPECTED[key];
+        const ns = new SlidingDDSketch(1000, { alpha });
+        const st = new SlidingDDSketch(1000, { alpha, strict: true });
+        const rg = new SlidingDDSketch(1000, { alpha, range: e.range });
+        for (const s of [ns, st, rg]) {
+            assert.ok(Object.is(s.minIndexable, e.min), 'minIndexable alpha=' + alpha);
+            assert.ok(Object.is(s.maxIndexable, e.max), 'maxIndexable alpha=' + alpha);
+        }
+        assert.ok(Object.is(ns.minIndexable, st.minIndexable) && Object.is(st.minIndexable, rg.minIndexable),
+            'minIndexable identical across modes at alpha=' + alpha);
+        assert.ok(Object.is(ns.maxIndexable, st.maxIndexable) && Object.is(st.maxIndexable, rg.maxIndexable),
+            'maxIndexable identical across modes at alpha=' + alpha);
+    }
+});
+
+// --- 1.7.0 step-2 QA boundary case (F2 span-based strict, exact maxBins edge) ---
+
+test('F2 strict span edge: span 2048 accepted (alternating extremes), 2049 throws byte-identically, pane rotation re-admits it', () => {
+    const alpha = 0.01, gamma = (1 + alpha) / (1 - alpha);
+    const v = (key) => Math.pow(gamma, key - 0.5);       // ceil(log_gamma(v)) === key
+    const s = new SlidingDDSketch(100, { alpha, strict: true, panes: 4 });
+    const k0 = 10;
+    for (let i = 0; i < 50; i++) { s.add(0, v(k0)); s.add(0, v(k0 + 2047)); }   // span exactly 2048
+    assert.equal(s.count(), 100);
+    assert.equal(s.collapsed, false);
+    const snap = () => ({ bins: Array.from(s._bins), paneCount: Array.from(s._paneCount),
+        offset: Array.from(s._offset), maxKeyPop: Array.from(s._maxKeyPop), q: s.quantile(0.5) });
+    const before = snap();
+    assert.throws(() => s.add(0, v(k0 + 2048)), (e) => /^\[lite-adaptive\]/.test(e.message));
+    assert.throws(() => s.add(0, v(k0 - 1)), (e) => /^\[lite-adaptive\]/.test(e.message));
+    const after = snap();
+    assert.deepEqual(after.bins, before.bins);
+    assert.deepEqual(after.paneCount, before.paneCount);
+    assert.deepEqual(after.offset, before.offset);
+    assert.deepEqual(after.maxKeyPop, before.maxKeyPop);
+    assert.ok(Object.is(after.q, before.q));
+    s.advance(1000);                                     // the old pane rotates out
+    s.add(1000, v(k0 + 2048));                           // a fresh pane accepts the same key
+    assert.equal(s.count(), 1);
+});
+
+// ---------------------------------------------------------------------------
+// 1.7.0 QA adversarial (a): W not divisible by panes (W=1000, panes=7) with
+// fractional timestamps landing EXACTLY on pane boundaries -- the F7 true-window
+// bound (true(W) <= count() <= true(W + W/B)) must hold at every single step,
+// not just in aggregate over a long run.
+// ---------------------------------------------------------------------------
+test('ADVERSARIAL (a): W=1000 panes=7 (non-divisible) + fractional on-boundary timestamps -- ' +
+    'count() true-window bound holds at EVERY step', () => {
+    const W = 1000, panes = 7, alpha = 0.01;
+    const pw = W / panes;                                // 142.857142857... (fractional pane width)
+    assert.ok(!Number.isInteger(pw), 'sanity: W/panes must be fractional for this adversarial case');
+    const s = new SlidingDDSketch(W, { alpha, panes });
+    const rnd = mulberry32(0xA0A0A0A);
+    const events = [];                                   // true event log: {t, v}
+    let now = 0;
+    let steps = 0;
+    for (let i = 0; i < 5000; i++) {
+        // land exactly on a pane boundary every step (a multiple of the fractional pane width)
+        now = i * pw;
+        // interleave: some steps add 0, 1, or several events at the SAME boundary instant
+        const n = i % 5 === 0 ? 0 : 1 + (i % 3);
+        for (let j = 0; j < n; j++) {
+            const val = Math.exp(rnd() * 6) + 1e-6;
+            s.add(now, val);
+            events.push(now);
+        }
+        if (n === 0) continue;                           // count() only defined meaningfully post-add
+        steps++;
+        let trueW = 0, trueWB = 0;
+        for (const t of events) {
+            if (t > now - W && t <= now) trueW++;
+            if (t > now - W - pw && t <= now) trueWB++;
+        }
+        const c = s.count();
+        assert.ok(c >= trueW,
+            'count() ' + c + ' < true(W) ' + trueW + ' at step ' + i + ' (now=' + now + ')');
+        assert.ok(c <= trueWB,
+            'count() ' + c + ' > true(W+W/B) ' + trueWB + ' at step ' + i + ' (now=' + now + ')');
+    }
+    assert.ok(steps > 100, 'sanity: enough steps exercised (' + steps + ')');
 });

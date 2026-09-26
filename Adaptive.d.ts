@@ -14,24 +14,39 @@ export const VERSION: string;
 /** The locked time mode of an ExponentialHistogram. */
 export type ExponentialHistogramMode = 'unset' | 'explicit' | 'count';
 
-/** Reserved constructor options for ExponentialHistogram (no keys yet; an unknown key throws). */
-export interface ExponentialHistogramOptions {}
+/** Constructor options for ExponentialHistogram; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13). */
+export interface ExponentialHistogramOptions {
+    /**
+     * The window population the pool is GUARANTEED to hold, in EITHER mode -- a positive integer
+     * <= 2^53-1 (default 2^32). It sizes the fixed pool: `levels = max(2, ceil(log2(maxCount/(k+1))) + 2)`.
+     * The exact ceiling is `k * (2^levels - 1)` elements (>= maxCount); the add past it (its merge
+     * cascade would pass the top level) throws a tagged RangeError. Pass
+     * `maxCount: W` in count mode to keep the pre-1.7.0 W-sized pool.
+     */
+    maxCount?: number;
+}
 
 /**
  * ExponentialHistogram -- a zero-GC sliding-window COUNT / SUM summary (Datar-Gionis-
  * Indyk-Motwani, SODA 2002) over a preallocated pool of (timestamp, size) buckets grouped
  * by level, driven by a caller-supplied MONOTONE time source (the member never reads the
  * wall clock). `add` opens a bucket + runs the amortized merge cascade + expires the
- * window edge (0 B/op); `count()` / `sum()` return the windowed estimate within a HARD
- * relative error <= epsilon. DGIM (the 0/1 stream) is the value=1 special case.
+ * window edge (0 B/op); `count()` returns the windowed estimate within a HARD relative
+ * error <= epsilon. `sum()` is bounded absolutely by half the oldest straddling bucket's
+ * value-mass (relative <= epsilon only for count or near-constant values -- see sum()).
+ * DGIM (the 0/1 stream) is the value=1 special case.
  */
 export class ExponentialHistogram {
     /**
      * @param W       window size; a finite number > 0 (items in count mode, or the
      *                `now`-unit span in explicit mode).
-     * @param epsilon relative-error knob in (0, 1); smaller -> more buckets -> tighter error.
-     * @param options reserved; an unknown key throws [lite-adaptive].
-     * Throws [lite-adaptive] on a bad W / epsilon / option BEFORE the pool is allocated.
+     * @param epsilon relative-error knob in (0, 1); smaller -> more buckets -> tighter error. The
+     *                derived bucket-pool cap `(k+1)*levels + 2` is capped at 2^22 buckets (EH_CAP_MAX,
+     *                ~150 MB at 36 B/bucket); a tiny epsilon past it throws a tagged RangeError BEFORE
+     *                allocation (F11), which rejects an epsilon below ~3e-6 at the default maxCount.
+     * @param options `{ maxCount }` (default 2^32); an unknown key throws [lite-adaptive] with a
+     *                did-you-mean hint (F13).
+     * Throws [lite-adaptive] on a bad W / epsilon / maxCount / option BEFORE the pool is allocated.
      */
     constructor(W: number, epsilon: number, options?: ExponentialHistogramOptions);
 
@@ -52,6 +67,9 @@ export class ExponentialHistogram {
 
     /** The number of size-class levels the pool can occupy. O(1). */
     readonly levels: number;
+
+    /** The declared maximum window population that sized the pool (default 2^32). O(1). */
+    readonly maxCount: number;
 
     /** The locked time mode: 'unset' before the first add, then 'explicit' or 'count'. O(1). */
     readonly mode: ExponentialHistogramMode;
@@ -95,7 +113,13 @@ export class ExponentialHistogram {
     /** The windowed COUNT (population) estimate over the last W. COLD, O(levels). Never throws. */
     count(): number;
 
-    /** The windowed SUM (of values) estimate over the last W. COLD, O(buckets). Never throws. */
+    /**
+     * The windowed SUM (of values) estimate over the last W. COLD, O(buckets). Never throws.
+     * ERROR (F17): absolute error <= size(oldest straddling bucket) / 2. That is relative
+     * <= epsilon ONLY for COUNT (value=1) or near-constant values; a heavy-tailed / spiky value
+     * distribution can exceed epsilon (levels are sized by POPULATION, not value mass). Use
+     * count() or keep values near-constant for a relative bound.
+     */
     sum(): number;
 
     /** The primary windowed estimate -- an alias of count(). COLD. Never throws. */
@@ -105,7 +129,7 @@ export class ExponentialHistogram {
     clear(): this;
 }
 
-/** Reserved constructor options for ADWIN (no keys yet; an unknown key throws). */
+/** Reserved constructor options for ADWIN (no keys yet; an unknown key throws [lite-adaptive] with a did-you-mean hint, F13). */
 export interface ADWINOptions {}
 
 /**
@@ -122,7 +146,7 @@ export class ADWIN {
     /**
      * @param delta   confidence knob in (0, 1); the stationary false-alarm rate is bounded by
      *                delta. Smaller -> fewer false alarms, longer detection latency.
-     * @param options reserved; an unknown key throws [lite-adaptive].
+     * @param options reserved; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
      * Throws [lite-adaptive] on a bad delta / option BEFORE the pool is allocated.
      */
     constructor(delta: number, options?: ADWINOptions);
@@ -169,7 +193,7 @@ export class ADWIN {
 /** The locked time mode of a ForwardDecay. */
 export type ForwardDecayMode = 'unset' | 'explicit' | 'count';
 
-/** Reserved constructor options for ForwardDecay (no keys yet; an unknown key throws). */
+/** Reserved constructor options for ForwardDecay (no keys yet; an unknown key throws [lite-adaptive] with a did-you-mean hint, F13). */
 export interface ForwardDecayOptions {}
 
 /**
@@ -185,7 +209,7 @@ export interface ForwardDecayOptions {}
 export class ForwardDecay {
     /**
      * @param halfLife the decay half-life; a finite number > 0 (weight halves over this span).
-     * @param options  reserved; an unknown key throws [lite-adaptive].
+     * @param options  reserved; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
      * Throws [lite-adaptive] on a bad halfLife / option BEFORE any field init.
      */
     constructor(halfLife: number, options?: ForwardDecayOptions);
@@ -242,7 +266,7 @@ export class ForwardDecay {
 
 /**
  * Constructor options for HeavyKeeper. `seed=0` is a valid distinct seed (guarded as
- * `undefined`, not falsy); an unknown key throws [lite-adaptive].
+ * `undefined`, not falsy); an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
  */
 export interface HeavyKeeperOptions {
     /** The uint32 seed for the decay PRNG (default 0x9e3779b1). seed=0 is valid. */
@@ -272,8 +296,10 @@ export class HeavyKeeper {
      * @param d       table depth (rows / independent hashes); an integer in [1, 64]. d ~ 4-8.
      * @param w       table width (cells per row); an integer >= 1. More cells -> fewer collisions.
      * @param k       the top-k size; an integer >= 1.
-     * @param options { seed?, b? }; an unknown key throws [lite-adaptive].
-     * Throws [lite-adaptive] on a bad d / w / k / seed / b / option BEFORE any allocation.
+     * @param options { seed?, b? }; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
+     * Throws [lite-adaptive] on a bad d / w / k / seed / b / option BEFORE any allocation. Memory caps
+     * are checked before allocation and throw a tagged RangeError naming the cap (F11): d*w <= 2^27
+     * cells (HK_CELLS_CAP, ~1 GB at 8 B/cell), w <= 2^30 (HK_W_MAX), k <= 2^24 (HK_K_MAX, ~256 MB).
      */
     constructor(d: number, w: number, k: number, options?: HeavyKeeperOptions);
 
@@ -307,9 +333,11 @@ export class HeavyKeeper {
 
     /**
      * Add `weight` occurrences of `key`. HOT, amortized O(1), 0 B/op incl. the decay draw + the
-     * forest sift. `key` must be a SAFE INTEGER; `weight` a positive integer (default 1 -- rank
-     * by count, or by total time / bytes / any additive weight). Throws [lite-adaptive] on a
-     * non-safe-integer key or a non-positive-integer weight (a byte-identical no-op).
+     * forest sift. `key` must be a SAFE INTEGER; `weight` an integer in [1, 2^32-1] (default 1 --
+     * rank by count, or by total time / bytes / any additive weight). Throws [lite-adaptive] on a
+     * non-safe-integer key or a weight that is not an integer in [1, 2^32-1] (a byte-identical
+     * no-op) -- a single over-range weight throws (F10), while an ACCUMULATED cell SATURATES at
+     * 2^32-1 (parity with SlidingCountMin's count domain).
      */
     add(key: number, weight?: number): this;
 
@@ -324,7 +352,8 @@ export class HeavyKeeper {
 
     /**
      * The estimated total for `key` (the max matching cell; 0 for an unseen but VALID key). COLD.
-     * Fail closed: a non-safe-integer key throws [lite-adaptive] (parity with `add`).
+     * NEVER throws (F12, one query contract): a non-safe-integer key reads NaN (an invalid key was
+     * never seen 0 times), an unseen but VALID key reads 0. null is not zero.
      */
     estimate(key: number): number;
 
@@ -351,7 +380,7 @@ export type SlidingHyperLogLogMode = 'unset' | 'explicit' | 'count';
 
 /**
  * Constructor options for SlidingHyperLogLog. `seed=0` is a valid distinct seed (guarded as
- * `undefined`, not falsy); an unknown key throws [lite-adaptive].
+ * `undefined`, not falsy); an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
  */
 export interface SlidingHyperLogLogOptions {
     /** Precision p; an integer in [4, 16] (default 10). m = 1 << p registers. */
@@ -369,7 +398,8 @@ export interface SlidingHyperLogLogOptions {
  * keeps a small FIXED LFPM ring of `(timestamp, rho)` entries (a monotonic deque, strictly
  * decreasing rho). `add(now, key)` / the zero-box `addFrom(buf, i)` drop dominated tail entries and
  * append (0 B/op incl. the windowed eviction); a full ring bumps `overflows` (the honest-
- * degradation signal `degraded`). `count(w?)` lazily expires the window edge and runs Ertl's
+ * degradation signal `degraded`; expired heads are dropped in add, so only an IN-WINDOW drop counts).
+ * `count(w?)` is PURE (skips expired entries without mutating the rings) and runs Ertl's
  * improved estimator; the standard error is 1.04 / sqrt(m), guaranteed while `degraded === false`.
  * Driven by a caller-supplied MONOTONE `now` (or count mode when omitted); the mode locks at the
  * first add. Fully deterministic given the seed (no PRNG).
@@ -378,7 +408,7 @@ export class SlidingHyperLogLog {
     /**
      * @param W       window size; a finite number > 0 (items in count mode, or the `now`-unit span
      *                in explicit mode).
-     * @param options { p?, ringCap?, seed? }; an unknown key throws [lite-adaptive].
+     * @param options { p?, ringCap?, seed? }; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
      * Throws [lite-adaptive] on a bad W / p / ringCap / seed / option BEFORE any allocation.
      */
     constructor(W: number, options?: SlidingHyperLogLogOptions);
@@ -438,7 +468,7 @@ export class SlidingHyperLogLog {
 
     /**
      * Move the window's reference time forward to `now` WITHOUT adding a key (R11 idle-slide): a
-     * subsequent `count(w?)` then lazily expires `stamp <= now - W` relative to the advanced time,
+     * subsequent `count(w?)` then skips `stamp <= now - W` relative to the advanced time (a pure read),
      * so an idle stream's readout empties instead of freezing on the last burst. HOT, O(1), 0 B/op
      * (clock-only -- the ring is untouched, so `overflows` / `degraded` are unaffected). EXPLICIT-
      * time only (a count-locked instance throws; the first advance locks EXPLICIT). Monotone: a
@@ -456,7 +486,8 @@ export class SlidingHyperLogLog {
     /**
      * The windowed DISTINCT-COUNT estimate over the last W (or a sub-window `w <= W`). COLD, O(m).
      * Standard error 1.04 / sqrt(m) (guaranteed while not degraded). Returns 0 on an empty window.
-     * Throws [lite-adaptive] on a sub-window `w` outside `(0, W]`.
+     * NEVER throws (F12, one query contract): a sub-window `w` outside `(0, W]` reads NaN; `w`
+     * omitted queries the full window W. null is not zero.
      */
     count(w?: number): number;
 
@@ -477,7 +508,7 @@ export type DriftDetectorMode = typeof DRIFT_PH | typeof DRIFT_CUSUM;
 
 /**
  * Constructor options for DriftDetector. `delta = 0` is a valid, meaningful setting (guarded as
- * `undefined`, not falsy); an unknown key throws [lite-adaptive].
+ * `undefined`, not falsy); an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
  */
 export interface DriftDetectorOptions {
     /** The magnitude allowance (Page-Hinkley) / slack (CUSUM); a finite number in [0, 1e150] (default 0.005). */
@@ -508,7 +539,7 @@ export class DriftDetector {
     /**
      * @param mode    DRIFT_PH or DRIFT_CUSUM.
      * @param options { delta?, threshold?, target? }; `target` is REQUIRED for DRIFT_CUSUM and
-     *                FORBIDDEN for DRIFT_PH; an unknown key throws [lite-adaptive].
+     *                FORBIDDEN for DRIFT_PH; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
      * Throws [lite-adaptive] on a bad mode / delta / threshold / target / option BEFORE any field init.
      */
     constructor(mode: DriftDetectorMode, options?: DriftDetectorOptions);
@@ -564,33 +595,45 @@ export type SlidingDDSketchMode = 'unset' | 'explicit' | 'count';
 
 /**
  * Constructor options for SlidingDDSketch. `strict = false` is the default (guarded distinctly from
- * `undefined`); an unknown key throws [lite-adaptive].
+ * `undefined`); an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
  */
 export interface SlidingDDSketchOptions {
     /** The relative-error target alpha; a number in (0, 1) (default 0.01). */
     alpha?: number;
-    /** Fail closed on a collapse instead of collapsing-lowest (default false). */
+    /**
+     * Fail closed instead of collapsing-lowest (default false). A declared `range` DERIVES strict;
+     * `strict: false` together with a `range` is a contradiction and throws [lite-adaptive].
+     */
     strict?: boolean;
     /** The pane-ring size B; an integer in [2, 1024] (default 32). Edge error is W / panes. */
     panes?: number;
+    /**
+     * A declared band `[rmin, rmax]` with finite `0 < rmin < rmax`, both inside the alpha indexable
+     * band and needing <= 2048 bins -> STRICT mode with a FIXED bin offset (lite-sketch DDSketch
+     * parity): no first-value anchor, no slide, no collapse; a value outside the band throws.
+     */
+    range?: readonly [number, number];
 }
 
 /**
  * SlidingDDSketch -- a zero-GC WINDOWED relative-error QUANTILE summary over the LAST W (Masson-Rim-
  * Lee, "DDSketch", VLDB 2019, over a fixed-B pane ring; ADR 0008) -- the recency sibling of
- * lite-sketch's cumulative DDSketch and the quantile complement of SlidingHyperLogLog. A ring of B
- * preallocated DDSketch panes, each covering W/B of the window; `add(now, value)` / the zero-box
- * `addFrom(buf, i)` bin the value on the SAME log scale (gamma = (1+alpha)/(1-alpha),
- * key = ceil(log_gamma value), collapse-lowest default + strict opt-in) and write the current pane,
- * rotating + clearing panes as `now` advances (0 B/op). `quantile(q, w?)` / `quantileInto(qs, out)` /
- * `count(w?)` merge the live panes into an INSTANCE-OWNED preallocated scratch (cold, 0 alloc). The
- * per-query relative error is `<= alpha`, plus a window-edge error of up to one pane width W/panes.
+ * lite-sketch's cumulative DDSketch and the quantile complement of SlidingHyperLogLog. A ring of
+ * B+1 preallocated DDSketch panes (the `panes` option is B, the user knob), each covering W/B of the
+ * window; `add(now, value)` / the zero-box `addFrom(buf, i)` bin the value on the SAME log scale
+ * (gamma = (1+alpha)/(1-alpha), key = ceil(log_gamma value), collapse-lowest default + strict opt-in)
+ * and write the current pane, rotating + clearing panes as `now` advances (0 B/op). `quantile(q, w?)`
+ * / `quantileInto(qs, out)` / `count(w?)` merge the live panes (INCLUDING the straddling oldest pane)
+ * into an INSTANCE-OWNED preallocated scratch (cold, 0 alloc). The per-query relative error is
+ * `<= alpha`; the covered span is [W, W + W/B] -- the FULL window W, over-covered by at most one pane
+ * width W/B and never under-covered (the straddling oldest pane is KEPT, so true(W) is ALWAYS
+ * included). `bytes` includes all B+1 panes.
  */
 export class SlidingDDSketch {
     /**
      * @param W       window size; a finite number > 0 (items in count mode, or the `now`-unit span).
-     * @param options { alpha?, strict?, panes? }; an unknown key throws [lite-adaptive].
-     * Throws [lite-adaptive] on a bad W / alpha / strict / panes / option BEFORE any allocation.
+     * @param options { alpha?, strict?, panes?, range? }; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
+     * Throws [lite-adaptive] on a bad W / alpha / strict / panes / range / option BEFORE any allocation.
      */
     constructor(W: number, options?: SlidingDDSketchOptions);
 
@@ -600,7 +643,7 @@ export class SlidingDDSketch {
     /** Whether strict mode is on (a collapse throws instead of folding). O(1). */
     readonly strict: boolean;
 
-    /** The pane-ring size B (edge error is W / panes). O(1). */
+    /** The pane count B, the user knob (the ring holds B+1 panes; edge over-coverage is W / panes). O(1). */
     readonly panes: number;
 
     /** Window size W. O(1). */
@@ -618,10 +661,16 @@ export class SlidingDDSketch {
     /** The largest x that `add` accepts at this alpha (INCLUSIVE ceiling). O(1). */
     readonly maxIndexable: number;
 
+    /** The declared strict range floor rmin (NaN when no range was declared). O(1). */
+    readonly rangeMin: number;
+
+    /** The declared strict range ceiling rmax (NaN when no range was declared). O(1). */
+    readonly rangeMax: number;
+
     /** Whether any live pane has folded nonzero mass into its collapsed floor. COLD, O(panes). */
     readonly collapsed: boolean;
 
-    /** A fixed memory figure in bytes (all pane columns + the merge scratch). O(1). */
+    /** A fixed memory figure in bytes (all B+1 pane columns + the merge scratch). O(1). */
     readonly bytes: number;
 
     /**
@@ -660,22 +709,26 @@ export class SlidingDDSketch {
     advanceFrom(buf: Float64Array, i: number): this;
 
     /**
-     * Estimate the value at quantile q over the last W (or a sub-window `w <= W`). COLD, 0 alloc.
-     * Returns NaN on an empty window. Throws [lite-adaptive] on q outside [0, 1] or a `w` outside (0, W].
+     * Estimate the value at quantile q over the last W (or a sub-window `w <= W`). COLD, 0 alloc apart
+     * from ONE boxed return (16 B/call -- use `quantileInto` on a render path). NEVER throws on a bad
+     * VALUE: q outside [0, 1] / NaN, or a `w` outside (0, W] / NaN / non-number, returns NaN (null is
+     * not zero). An empty window returns NaN.
      */
     quantile(q: number, w?: number): number;
 
     /**
-     * Render several quantiles into a caller-owned Float64Array, merging the live panes ONCE (0-alloc
-     * render path). Each `qs[j]` in [0, 1] is written to `out[j]` (NaN for a bad q or an empty window).
-     * COLD. Returns the number of quantiles written (= qs.length). Throws [lite-adaptive] on a
-     * non-Float64Array `qs` / `out` or `out.length < qs.length`.
+     * Render several quantiles into a caller-owned Float64Array, merging the live panes ONCE. 0 B/call
+     * (the cut is written to an instance scratch slot; `_walkInto` writes `out[j]` rather than boxing a
+     * return). Each `qs[j]` in [0, 1] is written to `out[j]` (NaN for a bad q or an empty window). COLD.
+     * Returns the number of quantiles written (= qs.length). A wrong CONTAINER type is a programming
+     * error, so this THROWS [lite-adaptive] on a non-Float64Array `qs` / `out` or `out.length < qs.length`.
      */
     quantileInto(qs: Float64Array, out: Float64Array): number;
 
     /**
      * The number of values in the last W (or a sub-window `w <= W`), including zeros. COLD, O(panes).
-     * Returns 0 on an empty window. Throws [lite-adaptive] on a `w` outside (0, W].
+     * An empty window returns 0. NEVER throws on a bad VALUE: a `w` outside (0, W] / NaN / non-number
+     * returns NaN (NaN, not 0 -- null is not zero, an unrepresentable window is not an under-count).
      */
     count(w?: number): number;
 
@@ -720,7 +773,8 @@ export class SlidingCountMin {
      * @param W  the window: a finite number > 0 (a `now`-unit span in explicit mode, or items in
      *           count mode). NOT capped -- ms / epoch-time spans are fine.
      * @param options  see SlidingCountMinOptions. A bad W / epsilon / delta / w / d / panes / seed /
-     *           option throws [lite-adaptive] typeof-first, before any allocation.
+     *           option throws [lite-adaptive] typeof-first, before any allocation (an unknown key gets
+     *           a did-you-mean hint, F13).
      */
     constructor(W: number, options?: SlidingCountMinOptions);
 
@@ -769,9 +823,10 @@ export class SlidingCountMin {
     /**
      * The estimated windowed frequency of `key` over the last W (or a sub-window `w <= W`). COLD,
      * O(d * (B+1)); sums the key's cell across the live panes per row then takes the min over rows.
-     * Returns a DOUBLE (a window sum can exceed 2^32). NEVER throws -- returns 0 for an unseen or
-     * out-of-domain key or an empty window (parity with lite-sketch, so it can be swapped in). `w` an
-     * optional sub-window in (0, W].
+     * Returns a DOUBLE (a window sum can exceed 2^32). NEVER throws (F12, one query contract): 0 for
+     * an unseen but VALID key or an empty window, NaN for an out-of-domain key or a bad sub-window `w`
+     * (0 was a fail-open under-count on an upper-bound sketch; an invalid key was never seen 0 times).
+     * `w` an optional sub-window in (0, W]. null is not zero.
      */
     estimate(key: number, w?: number): number;
 
@@ -826,11 +881,13 @@ export interface DecayedReservoirOptions {
  */
 export class DecayedReservoir {
     /**
-     * @param k         the sample size; a positive integer. The reservoir retains at most k values.
+     * @param k         the sample size; a positive integer <= 2^24 (DR_K_MAX, ~256 MB at 16 B/slot --
+     *                  a bigger k throws a tagged RangeError before allocation, F11). Retains at most k.
      * @param halfLife  the decay half-life; a finite number > 0 (a retained item's weight halves over
      *                  this span, in `now`-units in explicit mode or items in count mode).
      * @param options   see DecayedReservoirOptions. A bad k / halfLife / seed / option throws
-     *                  [lite-adaptive] typeof-first, before any allocation.
+     *                  [lite-adaptive] typeof-first, before any allocation (an unknown key gets a
+     *                  did-you-mean hint, F13).
      */
     constructor(k: number, halfLife: number, options?: DecayedReservoirOptions);
 

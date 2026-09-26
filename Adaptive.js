@@ -61,8 +61,9 @@
  * register bank where each register keeps a small FIXED "List of Future Possible Maxima" ring of
  * `(timestamp, rho)` entries (a per-register monotonic deque); `add(now, key)` / the zero-box
  * `addFrom(buf, i)` drop dominated tail entries and append (0 B/op incl. any windowed eviction),
- * a full ring bumps `overflows` (the honest-degradation signal, `degraded`); `count(w?)` lazily
- * expires `stamp <= now - W`, takes each register's live-max rho, and runs Ertl's improved
+ * expired heads (`stamp <= now - W`) are dropped in add (1.7.0 F8) and a full ring of IN-WINDOW
+ * entries bumps `overflows` (the honest-degradation signal, `degraded`); `count(w?)` is PURE --
+ * it skips expired entries while reading, takes each register's live-max rho, and runs Ertl's improved
  * estimator (design-parity with lite-sketch, inline -- never an import). The FIRST additive
  * post-1.0 member: it is a PURE APPEND -- the four frozen core classes (ExponentialHistogram,
  * ADWIN, ForwardDecay, HeavyKeeper) stay BYTE-IDENTICAL; only this header + VERSION change above
@@ -106,7 +107,7 @@
  * (parity with addFrom): a COUNT-locked instance throws, an UNSET instance locks EXPLICIT +
  * anchors, monotone `now` >= lastNow; a rejected advance is a byte-identical no-op; 0 B/op.
  * EH runs add()'s expire loop VERBATIM (opens no bucket); SlidingHyperLogLog is CLOCK-ONLY (count
- * already lazily expires off `now` -- eager expiry would perturb overflows/degraded);
+ * skips entries expired off `now` without mutating; the next add drops them -- 1.7.0 F8);
  * SlidingDDSketch rotates+clears stale panes via the private _advance. ForwardDecay / ADWIN /
  * HeavyKeeper / DriftDetector are EXCLUDED (FD satisfies R11 via its existing now? query args;
  * ADWIN/HeavyKeeper/DriftDetector are item-indexed, not time-windowed). A PURE method ADD: every
@@ -139,14 +140,22 @@
  * lambda = ln2/halfLife), and keeps the k HIGHEST keys in an INLINE size-k min-forest (design-parity
  * with HeavyKeeper / lite-o1 FreqO1, never a dep); an item's retention probability decays as
  * exp(-lambda*age). The landmark rebase is an ORDER-PRESERVING common-factor multiply (proven not to
- * disturb membership) capped (DR_EXP_CAP=40 / DR_F_CAP=700) so a key never underflows to -0 or
- * overflows to -Inf across a long idle gap. Raw-sample-only surface: add(now?, value?) / the zero-box
+ * disturb membership) capped (DR_EXP_CAP=40 / DR_F_CAP=700) so a key never underflows to -0 within a
+ * single rebase; across MULTIPLE back-to-back capped rebases (epoch-long idle gaps) a stored key CAN
+ * reach -Infinity, which is HARMLESS -- the common factor preserves order, the value column stays
+ * finite, there is no NaN, and those keys sink and evict first (ADR 0011). Raw-sample-only surface: add(now?, value?) / the zero-box
  * addFrom(buf, i) (0 B/op incl. the rebase), sampleInto(buf) / forEach(fn) / clear / getters -- NO
  * mean()/quantile() aggregates, NO advance() (a sample, not a hard window). The FIFTH additive
  * post-1.0 member: a PURE APPEND -- the eight prior classes (ExponentialHistogram, ADWIN,
  * ForwardDecay, HeavyKeeper, SlidingHyperLogLog, DriftDetector, SlidingDDSketch, SlidingCountMin) stay
  * BYTE-IDENTICAL; only this header + VERSION change above the append point plus the appended
  * DecayedReservoir class (and its DR_* consts).
+ *
+ * v1.7.0 is the H1 HARDENING release (ROADMAP section 7): NOT a pure append -- it fixes the 1.6.0
+ * final-sweep findings in place across the members (EH maxCount sizing + overflow pre-check; HK
+ * zero-box hot path + weight bound; SDD declared range, B+1 pane ring, 0-alloc quantileInto; ADWIN
+ * centred sums + live-window range; SHLL pure count; ctor memory caps; one NaN query contract; one
+ * shared option door). Every change is listed per class in CHANGELOG 1.7.0.
  *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
@@ -155,7 +164,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.6.0';
+export const VERSION = '1.7.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -178,8 +187,107 @@ const MODE_UNSET = 0;
 const MODE_EXPLICIT = 1;
 const MODE_COUNT = 2;
 
+/**
+ * The smallest halfLife that yields a FINITE decay rate lambda = ln2 / halfLife (F14).
+ * A subnormal halfLife (e.g. 1e-320) makes lambda overflow to Infinity, which then poisons
+ * every weight to NaN -- ForwardDecay / DecayedReservoir must fail closed at construction,
+ * BEFORE allocation, rather than fail open (NaN priorities) or fail late (a misleading query
+ * error). halfLife >= this floor keeps lambda < Infinity.
+ */
+const LAMBDA_HALFLIFE_MIN = Math.LN2 / Number.MAX_VALUE;
+
+/**
+ * A module-level scratch row for the option-door Levenshtein distance (F13). One preallocated
+ * Int32Array reused across every did-you-mean probe -- the door is COLD (ctor path only), never hot,
+ * and it fully drains this row before it returns, so no two calls observe each other's scratch.
+ * Sized 64: known option keys and the probed key are both bounded at 63 chars (longer keys skip the
+ * hint entirely), so `lb + 1 <= 64` always.
+ */
+const OPT_LEV_ROW = new Int32Array(64);
+
+/**
+ * @private Levenshtein edit distance between two <= 63-char strings, via a single preallocated row
+ * (OPT_LEV_ROW). COLD -- only reached for an unknown option key on a throwing ctor path.
+ */
+function optLev(a, b) {
+    const la = a.length, lb = b.length;
+    const row = OPT_LEV_ROW;
+    for (let j = 0; j <= lb; j++) row[j] = j;
+    for (let i = 1; i <= la; i++) {
+        let prev = row[0];
+        row[0] = i;
+        const ca = a.charCodeAt(i - 1);
+        for (let j = 1; j <= lb; j++) {
+            const tmp = row[j];
+            const sub = prev + (ca === b.charCodeAt(j - 1) ? 0 : 1);
+            const del = row[j] + 1;
+            const ins = row[j - 1] + 1;
+            let m = sub;
+            if (del < m) m = del;
+            if (ins < m) m = ins;
+            row[j] = m;
+            prev = tmp;
+        }
+    }
+    return row[lb];
+}
+
+/**
+ * The shared COLD option door (F13). `undefined` is OK (no options). null, a non-object, an Array, or
+ * an ArrayBuffer view (typed array / DataView) is a hard TypeError -- none is a valid options bag.
+ * Each OWN enumerable key must be present in the null-proto `known` set (a plain-literal set would
+ * inherit `constructor` / `toString`, so `{constructor: 1}` would slip through -- the F13 bug). An
+ * unknown key throws a tagged RangeError with a Levenshtein <= 2 did-you-mean hint (skipped for keys
+ * over 63 chars). Never allocates on the accept path; the reject path is a throw, so its allocation
+ * is irrelevant. Called by all 9 ctors and the two `withAccuracy` factories (R6: every door is the
+ * same door).
+ * @param {object|undefined} options
+ * @param {object} known    a null-proto set of the legal keys (`key in known`).
+ * @param {string} label    the class or factory label, e.g. 'HeavyKeeper' or 'HeavyKeeper.withAccuracy'.
+ */
+function optDoor(options, known, label) {
+    if (options === undefined) return;
+    if (options === null || typeof options !== 'object' ||
+        Array.isArray(options) || ArrayBuffer.isView(options)) {
+        throw new TypeError('[lite-adaptive] ' + label + ' options must be an object');
+    }
+    // A PLAIN object only: the ctors read `options.X` through the prototype chain, so an inherited
+    // key would skip this door yet still configure the instance (fail-open). Symbol keys can never
+    // name an option -- reject them rather than silently ignore (review 4b).
+    const proto = Object.getPrototypeOf(options);
+    if ((proto !== Object.prototype && proto !== null) || Object.getOwnPropertySymbols(options).length !== 0) {
+        throw new TypeError('[lite-adaptive] ' + label + ' options must be a plain object (no prototype keys, no Symbol keys)');
+    }
+    for (const key in options) {
+        if (!Object.prototype.hasOwnProperty.call(options, key)) continue;
+        if (!(key in known)) {
+            let msg = '[lite-adaptive] ' + label + ' unknown option "' + key + '"';
+            if (key.length <= 63) {
+                let best = null, bestD = 3;   // accept only a distance <= 2 (bestD starts at 3)
+                for (const k in known) {
+                    const dst = optLev(key, k);
+                    if (dst < bestD) { bestD = dst; best = k; }
+                }
+                if (best !== null) msg += ' -- did you mean "' + best + '"?';
+            }
+            throw new RangeError(msg);
+        }
+    }
+}
+
 /** Frozen marker of the known ctor option keys -- an unknown key is a throw with a did-you-mean. */
-const EH_KNOWN_OPTS = Object.freeze(Object.create(null));
+const EH_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { maxCount: true }));
+
+/** The default `maxCount` (max window population): 2^32. Declares the pool sizing when omitted. */
+const EH_DEFAULT_MAXCOUNT = 4294967296;
+/** The largest safe-integer `maxCount` (2^53 - 1). Above this, integer counts stop being exact. */
+const EH_MAXCOUNT_MAX = 9007199254740991;
+/**
+ * Hard ceiling on the bucket-pool capacity `cap = (k+1)*levels + 2` (F11). 2^22 buckets x 36 B
+ * (6 SoA columns) = ~150 MB, the memory ceiling; above it the ctor throws a tagged RangeError BEFORE
+ * allocation instead of aborting the process on a V8 fatal (e.g. `EH(10, 1e-12)` in 1.6.0).
+ */
+const EH_CAP_MAX = 2 ** 22;
 
 // ===========================================================================
 // ExponentialHistogram (ADR 0002) -- the reference member (sliding-window count / sum)
@@ -196,10 +304,15 @@ const EH_KNOWN_OPTS = Object.freeze(Object.create(null));
  *
  * Headline (space, error, recency model) -- the family TRIPLE:
  *   - SPACE: O((1/epsilon) log(epsilon W)) buckets -- a FIXED pool, never grows.
- *   - ERROR: windowed count/sum relative error <= epsilon (HARD), by the merge rule
+ *   - ERROR: windowed COUNT relative error <= epsilon (HARD), by the merge rule
  *     `k = ceil(1/(2 epsilon)) + 1`: the oldest (straddling) bucket, the only source
- *     of error, holds at most ~ (1/(2k)) of the window, so estimating half of it is
- *     within epsilon.
+ *     of error, holds at most ~ (1/(2k)) of the window POPULATION, so estimating half
+ *     of it is within epsilon. The windowed SUM error is bounded in ABSOLUTE terms by
+ *     `size(oldest straddling bucket) / 2` (half the value-mass of the one uncertain
+ *     bucket); that is relative `<= epsilon` for COUNT or near-constant values, but a
+ *     heavy-tailed or spiky value distribution can exceed epsilon (levels are sized by
+ *     POPULATION, not value mass -- measured 15.8% heavy-tail, 2504% for a lone spike
+ *     at eps .1). See sum() for the exact bound (F17).
  *   - RECENCY: a HARD last-W window (EH forgets EXACTLY at the window edge -- vs
  *     ForwardDecay's smooth decay or ADWIN's adaptive window).
  *
@@ -224,7 +337,12 @@ export class ExponentialHistogram {
      *                          or the `now`-unit span in explicit mode).
      * @param {number} epsilon  relative-error knob; a number in (0, 1). Smaller ->
      *                          more buckets -> tighter windowed error.
-     * @param {object} [options] reserved; an unknown key throws [lite-adaptive].
+     * @param {object} [options] `{ maxCount }`; an unknown key throws [lite-adaptive].
+     * @param {number} [options.maxCount] the window population the pool is GUARANTEED to
+     *   hold, in EITHER mode -- a positive integer <= 2^53-1 (default 2^32). It sizes the fixed
+     *   pool; the exact ceiling is `k * (2^levels - 1)` elements (>= maxCount, ~3-6x it): the
+     *   add past it (its merge cascade would pass the top level) throws a tagged RangeError. Pass
+     *   `maxCount: W` in count mode to keep the pre-1.7.0 W-sized pool.
      */
     constructor(W, epsilon, options) {
         // typeof guard FIRST, BEFORE any allocation.
@@ -237,32 +355,54 @@ export class ExponentialHistogram {
                 '[lite-adaptive] ExponentialHistogram epsilon must be a number in (0, 1), got ' + String(epsilon));
         }
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null) {
-                throw new TypeError('[lite-adaptive] ExponentialHistogram options must be an object');
+            optDoor(options, EH_KNOWN_OPTS, 'ExponentialHistogram');
+        }
+        // maxCount -- typeof-first, BEFORE any allocation. `undefined` (not null) takes the
+        // 2^32 default; a supplied value must be a finite integer in [1, 2^53-1]. null is NOT
+        // a default -- it fails typeof, fail-closed. The pool is sized from maxCount, before
+        // the mode locks, so a count-mode instance ALSO gets the default sizing.
+        let maxCount = EH_DEFAULT_MAXCOUNT;
+        if (options !== undefined && options.maxCount !== undefined) {
+            const mc = options.maxCount;
+            if (typeof mc !== 'number' || mc !== mc || mc === Infinity || !Number.isInteger(mc) ||
+                mc <= 0 || mc > EH_MAXCOUNT_MAX) {
+                throw new RangeError(
+                    '[lite-adaptive] ExponentialHistogram maxCount must be an integer in [1, 2^53-1], got ' +
+                    String(mc));
             }
-            for (const key in options) {
-                if (!(key in EH_KNOWN_OPTS)) {
-                    throw new RangeError('[lite-adaptive] ExponentialHistogram unknown option "' + key + '"');
-                }
-            }
+            maxCount = mc;
         }
         // k = ceil(1/(2 epsilon)) + 1 -- at most k buckets per level; the two oldest
         // merge on the (k+1)-th, so each level below the top stays in [k-1, k+1].
         const k = Math.ceil(1 / (2 * epsilon)) + 1;
-        // LEVELS = ceil(log2(W / (k+1))) + 2 -- the number of size classes the pool can
-        // ever occupy (a level-L bucket holds 2^L elements; the top level is reached
-        // when the lower levels are full). Floored at 2 so the first cascade always fits.
-        const levels = Math.max(2, Math.ceil(Math.log2(W / (k + 1))) + 2);
+        // LEVELS = ceil(log2(maxCount / (k+1))) + 2 -- the number of size classes the pool
+        // can ever occupy for a window of up to `maxCount` elements (a level-L bucket holds
+        // 2^L elements; the top level is reached when the lower levels are full). Floored at
+        // 2 so the first cascade always fits.
+        const levels = Math.max(2, Math.ceil(Math.log2(maxCount / (k + 1))) + 2);
         // CAP = (k+1)*LEVELS + 2 -- (k+1) per level covers the transient (k+1)-th bucket
         // before its merge; the +2 covers the freshly-opened level-0 bucket during a
         // full cascade plus one slack slot. The pool never grows past CAP.
         const cap = (k + 1) * levels + 2;
+        // Cells cap BEFORE allocation (F11): a tiny epsilon (huge k) or huge maxCount (huge levels)
+        // pushes cap past 2^22 and aborted the process on a V8 fatal in 1.6.0 (e.g. EH(10, 1e-12)).
+        if (!(cap <= EH_CAP_MAX)) {           // NaN-safe: a non-finite cap lands on the rejecting side
+            throw new RangeError(
+                '[lite-adaptive] ExponentialHistogram bucket pool cap=' + cap + ' exceeds cap ' +
+                EH_CAP_MAX + ' (epsilon=' + epsilon + ', maxCount=' + maxCount + ')');
+        }
 
         this._W = W;
         this._epsilon = epsilon;
         this._k = k;
         this._levels = levels;
         this._cap = cap;
+        this._maxCount = maxCount;
+        // _guard = k * levels -- the post-expiry total bucket count an overflowing insert
+        // requires (every level at exactly k). Since _count (pre-expiry) >= post-expiry
+        // total, `_count >= _guard` is a NECESSARY condition for overflow: the hot body
+        // pays one integer compare and only the rare true branch runs the cold read-only scan.
+        this._guard = k * levels;
 
         // SoA columns (parallel, index 0..cap-1):
         this._ts = new Float64Array(cap);     // bucket timestamp = most-recent element time
@@ -318,6 +458,8 @@ export class ExponentialHistogram {
     get k() { return this._k; }
     /** The number of size-class levels the pool can occupy. O(1). */
     get levels() { return this._levels; }
+    /** The declared maximum window population that sized the pool. O(1). */
+    get maxCount() { return this._maxCount; }
     /** The locked time mode: 'unset' | 'explicit' | 'count'. O(1). */
     get mode() {
         return this._mode === MODE_EXPLICIT ? 'explicit' : this._mode === MODE_COUNT ? 'count' : 'unset';
@@ -357,7 +499,12 @@ export class ExponentialHistogram {
         const mode = this._mode;
         if (mode === MODE_COUNT) {
             if (now !== undefined) return this._badMode('count', 'explicit');
-            t = ++this._tick;
+            t = this._tick + 1;
+            // OVERFLOW PRE-CHECK -- hot body: ONE integer compare; the read-only scan is cold
+            // + rare. Placed BEFORE any state write (_tick, _now, the expiry loop) so an
+            // overflow throw is a BYTE-IDENTICAL no-op.
+            if (this._count >= this._guard && this._wouldOverflow(t)) return this._badOverflow();
+            this._tick = t;
         } else if (mode === MODE_EXPLICIT) {
             if (now === undefined) return this._badMode('explicit', 'count');
             if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
@@ -365,9 +512,10 @@ export class ExponentialHistogram {
             }
             if (now < this._lastNow) return this._badMonotone(now);
             t = now;
+            if (this._count >= this._guard && this._wouldOverflow(t)) return this._badOverflow();
             this._lastNow = now;
         } else {
-            // first add: lock the mode
+            // first add: the pool is empty, so the insert cannot overflow -- lock the mode.
             if (now === undefined) {
                 this._mode = MODE_COUNT;
                 t = ++this._tick;
@@ -502,8 +650,12 @@ export class ExponentialHistogram {
             if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
             if (now < this._lastNow) return this._badMonotone(now);
             t = now;
+            // OVERFLOW PRE-CHECK -- one hot integer compare, cold read-only scan; BEFORE any
+            // state write so the throw is a BYTE-IDENTICAL no-op (see add()).
+            if (this._count >= this._guard && this._wouldOverflow(t)) return this._badOverflow();
             this._lastNow = now;
         } else {
+            // first addFrom: the pool is empty, so the insert cannot overflow -- lock EXPLICIT.
             if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
             this._mode = MODE_EXPLICIT;
             t = now;
@@ -583,8 +735,9 @@ export class ExponentialHistogram {
      * The windowed COUNT (population) estimate: the number of elements in the last W.
      * The standard EH estimate -- every live bucket's population (a level-L bucket
      * holds 2^L) minus HALF the oldest (straddling) bucket, whose in-window portion is
-     * unknown. COLD, O(numLevels). Windowed relative error <= epsilon. NEVER throws;
-     * returns 0 on an empty window.
+     * unknown. COLD, O(numLevels). Windowed relative error <= epsilon (HARD -- the
+     * merge rule bounds the straddling bucket's population). NEVER throws; returns 0
+     * on an empty window.
      * @returns {number}
      */
     count() {
@@ -607,8 +760,22 @@ export class ExponentialHistogram {
     /**
      * The windowed SUM estimate: the sum of the VALUES of the elements in the last W
      * (= count() when every add used value=1). Every live bucket's `size` minus HALF
-     * the oldest straddling bucket's size. COLD, O(buckets). Windowed relative error
-     * <= epsilon. NEVER throws; returns 0 on an empty window.
+     * the oldest straddling bucket's size. COLD, O(buckets). NEVER throws; returns 0 on
+     * an empty window.
+     *
+     * ERROR (F17): the absolute error is bounded by `size(oldest straddling bucket) / 2`
+     * -- half the value-mass of the single uncertain bucket. That is relative <= epsilon
+     * ONLY for COUNT (value=1) or near-constant values. Levels are sized by POPULATION,
+     * not by value mass, so a heavy-tailed or spiky value distribution can push a large
+     * value into the straddling bucket and the relative sum error can EXCEED epsilon
+     * (measured 15.8% on a heavy tail, 2504% for a lone spike, at eps .1). For a relative
+     * SUM bound, keep values near-constant or use count(). count()'s bound is unaffected.
+     *
+     * OVERFLOW (F15): sum() is an IEEE double. It overflows to +Infinity ONLY if the windowed
+     * value sum exceeds Number.MAX_VALUE (~1.8e308) -- e.g. two adds of 1e308. This is the honest
+     * IEEE result, not a bug: it is a query on a VALUE, so it returns the representable answer
+     * (+Infinity) rather than throwing, consistent with the package's query contract (a query
+     * never throws on a bad value). count()'s bound is a POPULATION bound, so count() is unaffected.
      * @returns {number}
      */
     sum() {
@@ -667,11 +834,52 @@ export class ExponentialHistogram {
             '[lite-adaptive] ExponentialHistogram add value must be a finite number > 0, got ' + String(v));
     }
 
-    /** @private Cold thrower for a pool overflow (should be unreachable if CAP is correct). */
+    /**
+     * @private COLD. Would the pending insert at time `t` overflow the fixed pool? Simulates
+     * the expiry sweep for `t` READ-ONLY (no writes), then reports true iff EVERY level
+     * 0..levels-1 would hold exactly k buckets post-expiry -- the one configuration in which
+     * the level-0 insert cascades all the way past the top level. Called only on the rare
+     * `_count >= _guard` branch (a necessary condition, since _count pre-expiry >= the
+     * post-expiry total). O(levels) reads, no allocation, no mutation.
+     * @param {number} t the would-be timestamp (explicit `now` or the next count tick).
+     * @returns {boolean}
+     */
+    _wouldOverflow(t) {
+        const levels = this._levels;
+        const maxL = this._maxLevel;
+        // Overflow needs all `levels` levels at exactly k; if the top level is unoccupied the
+        // structure cannot be saturated, so no cascade can reach it.
+        if (maxL !== levels - 1) return false;
+        const k = this._k;
+        const cutoff = t - this._W;
+        const ts = this._ts;
+        const next = this._next;
+        const head = this._head;
+        const lcount = this._lcount;
+        // The expiry sweep drops the age-ordered oldest prefix: from the top (oldest) level
+        // downward, stopping at the first bucket still inside the window. Walk each level's
+        // list read-only, subtracting the buckets it would expire, and require every level to
+        // survive at exactly k.
+        let expiring = true;
+        for (let L = maxL; L >= 0; L--) {
+            let surviving = lcount[L];
+            if (expiring) {
+                let node = head[L];
+                while (node !== -1 && ts[node] <= cutoff) { surviving--; node = next[node]; }
+                if (node !== -1) expiring = false; // hit an in-window bucket -> nothing older-than survives to expire below
+            }
+            if (surviving !== k) return false;
+        }
+        return true;
+    }
+
+    /** @private Cold thrower for a pool overflow: the window would pass the pool's exact ceiling. */
     _badOverflow() {
         throw new RangeError(
-            '[lite-adaptive] ExponentialHistogram bucket pool overflow (cap=' + this._cap +
-            '); this is a bug -- please report the W/epsilon used');
+            '[lite-adaptive] ExponentialHistogram bucket pool overflow: the window would exceed ' +
+            'the pool ceiling k*(2^levels-1)=' + (this._k * (this._pow[this._levels - 1] * 2 - 1)) +
+            ' elements (sized from maxCount=' + this._maxCount + ', capacity=' + this._cap + ' buckets). ' +
+            'Raise maxCount to size the pool for a larger window population.');
     }
 
     /** @private Cold thrower for a bad addFrom buffer/index. */
@@ -833,7 +1041,7 @@ export class ExponentialHistogram {
 //
 // The cut test is ADWIN2's VARIANCE-AWARE (Bernstein) bound. For every boundary split
 // of the window into W0 (older) | W1 (newer), with counts n0 / n1 and the whole-window
-// variance sigmaHat^2 and running range R = max - min (over ALL x seen), a cut fires when
+// variance sigmaHat^2 and window range R = max - min (over the LIVE buckets, excluding the oldest -- 1.7.0 F18), a cut fires when
 //   |mean(W0) - mean(W1)| > epsCut
 //   m       = 1 / (1/n0 + 1/n1)                 -- the harmonic-mean of the sub-window counts
 //   deltaP  = delta / ln(width)                 -- Bifet-Gavalda multiple-testing correction
@@ -848,14 +1056,19 @@ const ADWIN_M = 5;
 /** LEVELS -- the fixed number of size classes (a level-L bucket holds 2^L items). */
 const ADWIN_LEVELS = 64;
 /**
- * ADWIN_X_MAX -- the largest |x| whose SQUARE is still finite (sqrt(Number.MAX_VALUE) ~= 1.34e154).
- * A finite |x| above this makes x*x overflow to Infinity, which poisons _sumSq / _wsumSq: variance
- * then reads Inf - Inf = NaN (clamped to 0) while mean stays finite, so every epsCut is Inf/NaN and
- * drift detection freezes to false SILENTLY. |x| > ADWIN_X_MAX is therefore rejected fail-closed via
- * the existing _badValue thrower (one extra comparison on the COLD reject branch -- 0 hot-path bytes).
- * Astronomically above any real telemetry value.
+ * ADWIN_X_MAX -- the largest |x| whose CENTRED square is still finite. Since 1.7.0 (F9) every
+ * sum / sum-of-squares accumulates the CENTRED value xc = x - c (c = the window's first value; see
+ * `add`), so the quantity that must not overflow is xc*xc, not x*x. With |x| <= ADWIN_X_MAX AND
+ * |c| <= ADWIN_X_MAX (c is always a value that passed this gate), |xc| <= 2*ADWIN_X_MAX, so xc*xc
+ * stays finite iff 2*ADWIN_X_MAX <= sqrt(Number.MAX_VALUE) -- i.e. ADWIN_X_MAX = sqrt(MAX)/2 ~=
+ * 6.7e153 (HALVED from the pre-F9 sqrt(MAX) ~= 1.34e154 exactly to keep the centred square finite).
+ * A finite |x| above this makes xc*xc overflow to Infinity, which poisons _sumSq / _wsumSq:
+ * variance then reads Inf - Inf = NaN (clamped to 0) while mean stays finite, so every epsCut is
+ * Inf/NaN and drift detection freezes to false SILENTLY. |x| > ADWIN_X_MAX is therefore rejected
+ * fail-closed via the existing _badValue thrower (one extra comparison on the COLD reject branch --
+ * 0 hot-path bytes). Astronomically above any real telemetry value.
  */
-const ADWIN_X_MAX = Math.sqrt(Number.MAX_VALUE);
+const ADWIN_X_MAX = Math.sqrt(Number.MAX_VALUE) / 2;
 
 /**
  * ADWIN -- ADaptive WINdowing (Bifet-Gavalda, SDM 2007): concept-drift detection with NO
@@ -879,7 +1092,7 @@ const ADWIN_X_MAX = Math.sqrt(Number.MAX_VALUE);
  * manipulation on the preallocated columns (no objects, no closures, no array literals).
  *
  * Fail closed: a bad delta / option throws `[lite-adaptive]` at the ctor door BEFORE any
- * allocation; `add(x)` validates `x` (a finite number with |x| <= sqrt(Number.MAX_VALUE), so its
+ * allocation; `add(x)` validates `x` (a finite number with |x| <= sqrt(Number.MAX_VALUE)/2, so its
  * square never overflows and poisons the variance) typeof-first, BEFORE any state mutation -- a
  * rejected add is a BYTE-IDENTICAL no-op; the mean / variance getters throw `[lite-adaptive]` if
  * the whole-window accumulator ever reaches a non-finite value (fail-closed, never a silent 0).
@@ -898,14 +1111,7 @@ export class ADWIN {
                 '[lite-adaptive] ADWIN delta must be a number in (0, 1), got ' + String(delta));
         }
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null) {
-                throw new TypeError('[lite-adaptive] ADWIN options must be an object');
-            }
-            for (const key in options) {
-                if (!(key in ADWIN_KNOWN_OPTS)) {
-                    throw new RangeError('[lite-adaptive] ADWIN unknown option "' + key + '"');
-                }
-            }
+            optDoor(options, ADWIN_KNOWN_OPTS, 'ADWIN');
         }
         const M = ADWIN_M;
         const levels = ADWIN_LEVELS;
@@ -922,6 +1128,8 @@ export class ADWIN {
         // ADWIN's OWN variance-carrying SoA columns (design-parity with EH, a SEPARATE pool):
         this._sum = new Float64Array(cap);    // sum of the values in the bucket
         this._sumSq = new Float64Array(cap);  // sum of squares of the values in the bucket
+        this._bmin = new Float64Array(cap);   // F18: min RAW x in the bucket (offset-invariant; window range R)
+        this._bmax = new Float64Array(cap);   // F18: max RAW x in the bucket (offset-invariant; window range R)
         this._bcount = new Int32Array(cap);   // number of items in the bucket (= 2^level)
         this._next = new Int32Array(cap);     // intra-level next (toward newer) OR free-list link
         this._prev = new Int32Array(cap);     // intra-level prev (toward older)
@@ -951,10 +1159,16 @@ export class ADWIN {
         this._maxLevel = -1;    // highest occupied level, -1 when empty
         this._count = 0;        // live bucket count
         this._total = 0;        // window item count (= width)
-        this._wsum = 0;         // running sum over the whole window
-        this._wsumSq = 0;       // running sum of squares over the whole window
-        this._min = Infinity;   // running min over ALL x seen (for the range R -- widens only)
-        this._max = -Infinity;  // running max over ALL x seen (for the range R -- widens only)
+        this._c = -0;           // centring offset (F9): every sum / sumSq holds x - c, not raw x.
+                                // -0 (not 0) so the field starts in DOUBLE representation: no
+                                // Smi->Double transition on the first fractional add.
+        this._wsum = 0;         // running CENTRED sum over the whole window (sum of x - c)
+        this._wsumSq = 0;       // running CENTRED sum of squares over the whole window (sum of (x-c)^2)
+        // F18: the range R in the ADWIN2 bound is the range of the CURRENT WINDOW (ADWIN reference
+        // semantics), NOT a running global min/max over all x ever seen. It is derived on demand in
+        // `_scanCut` from the per-bucket _bmin/_bmax columns, EXCLUDING the globally-oldest bucket
+        // (see `_scanCut`) -- no whole-window range scalar is carried, so `add`'s hot body is free of
+        // any range bookkeeping (the range walk lives in the cut scan that already iterates buckets).
     }
 
     /** The confidence knob delta. O(1). */
@@ -969,15 +1183,18 @@ export class ADWIN {
     get mean() {
         if (this._total <= 0) return 0;
         this._guardFinite();
-        return this._wsum / this._total;
+        // sums are CENTRED (F9): the true mean re-adds the centring offset c.
+        return this._c + this._wsum / this._total;
     }
     /** The variance over the current window (0 on an empty window, FP-clamped >= 0). O(1). Throws if overflowed. */
     get variance() {
         const n = this._total;
         if (n <= 0) return 0;
         this._guardFinite();
-        const mean = this._wsum / n;
-        const v = this._wsumSq / n - mean * mean;
+        // variance is OFFSET-INVARIANT: on the centred sums it is the same formula, and c cancels
+        // (Var[x - c] = Var[x]) -- this is exactly the F9 fix: no E[x^2] - mean^2 cancellation at scale.
+        const cmean = this._wsum / n;
+        const v = this._wsumSq / n - cmean * cmean;
         return v > 0 ? v : 0;
     }
 
@@ -987,10 +1204,10 @@ export class ADWIN {
      * bounded merge cascade, then scans every boundary split with the ADWIN2 variance-aware
      * epsCut and drops the oldest bucket(s) while a cut remains.
      *
-     * Fail closed: a non-number / NaN / +-Infinity `x`, or a finite |x| > sqrt(Number.MAX_VALUE)
-     * (~1.34e154, whose square would overflow to Infinity and silently poison the variance / drift
+     * Fail closed: a non-number / NaN / +-Infinity `x`, or a finite |x| > sqrt(Number.MAX_VALUE)/2
+     * (~6.7e153, whose CENTRED square would overflow to Infinity and silently poison the variance / drift
      * test), throws [lite-adaptive] (typeof-first, a BYTE-IDENTICAL no-op -- nothing is opened).
-     * @param {number} x  a finite real value with |x| <= sqrt(Number.MAX_VALUE).
+     * @param {number} x  a finite real value with |x| <= sqrt(Number.MAX_VALUE)/2.
      * @returns {boolean} true iff a cut fired (drift detected) this add.
      */
     add(x) {
@@ -999,16 +1216,20 @@ export class ADWIN {
             x > ADWIN_X_MAX || x < -ADWIN_X_MAX) {   // reject a finite x whose square would overflow
             return this._badValue(x);
         }
-        // running range over ALL x seen (widens monotonically; NOT rolled back on a shrink).
-        if (x < this._min) this._min = x;
-        if (x > this._max) this._max = x;
+        // CENTRING (F9): anchor c at the first value of a (re)started window, then accumulate the
+        // CENTRED xc = x - c into every sum / sum-of-squares. This keeps the variance out of the
+        // E[x^2] - mean^2 catastrophic-cancellation regime at a large offset (the whole F9 fix).
+        if (this._total === 0) this._c = x;
+        const xc = x - this._c;
 
-        // --- open a fresh level-0 bucket (count 1, sum x, sumSq x*x) at the newest end ---
+        // --- open a fresh level-0 bucket (count 1, sum xc, sumSq xc*xc) at the newest end ---
         const node = this._freeHead;
         if (node === -1) return this._badOverflow();
         this._freeHead = this._next[node];
-        this._sum[node] = x;
-        this._sumSq[node] = x * x;
+        this._sum[node] = xc;
+        this._sumSq[node] = xc * xc;
+        this._bmin[node] = x;   // F18: a size-1 bucket's range is [x, x] (RAW)
+        this._bmax[node] = x;
         this._bcount[node] = 1;
         this._lvl[node] = 0;
         const tail0 = this._tail[0];
@@ -1019,10 +1240,10 @@ export class ADWIN {
         this._lcount[0]++;
         this._count++;
         if (this._maxLevel < 0) this._maxLevel = 0;
-        // whole-window aggregates
+        // whole-window aggregates (CENTRED)
         this._total += 1;
-        this._wsum += x;
-        this._wsumSq += x * x;
+        this._wsum += xc;
+        this._wsumSq += xc * xc;
 
         // --- the bounded merge cascade: while a level has > M buckets, merge its two OLDEST
         //     into one bucket of the next level (reuse a slot, free the other) ---
@@ -1039,6 +1260,9 @@ export class ADWIN {
             this._sum[a] += this._sum[b2];
             this._sumSq[a] += this._sumSq[b2];
             this._bcount[a] += this._bcount[b2];
+            // F18: the merged bucket's range is the union of the two ranges (window range unchanged).
+            if (this._bmin[b2] < this._bmin[a]) this._bmin[a] = this._bmin[b2];
+            if (this._bmax[b2] > this._bmax[a]) this._bmax[a] = this._bmax[b2];
             const nl = L + 1;
             this._lvl[a] = nl;
             this._next[b2] = this._freeHead;
@@ -1061,6 +1285,9 @@ export class ADWIN {
             this._dropOldest();
             changed = true;
         }
+        // F9: after a cut FIRES (never inside the loop), re-anchor c to the surviving window's mean
+        // so centring stays close to the data across a regime change (cold, 0 alloc, O(live buckets)).
+        if (changed) this._recentre();
         return changed;
     }
 
@@ -1077,9 +1304,9 @@ export class ADWIN {
      *
      * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer /
      * negative / out-of-range `i` (needs `i < buf.length`) throws [lite-adaptive]. A NaN /
-     * +-Infinity `buf[i]`, or a finite |buf[i]| > sqrt(Number.MAX_VALUE) (square would overflow),
+     * +-Infinity `buf[i]`, or a finite |buf[i]| > sqrt(Number.MAX_VALUE)/2 (centred square would overflow),
      * throws (a byte-identical no-op).
-     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = the value (|x| <= sqrt(MAX)).
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = the value (|x| <= sqrt(MAX)/2).
      * @param {number} i the index of the value to read.
      * @returns {boolean} true iff a cut fired (drift detected) this add.
      */
@@ -1091,18 +1318,20 @@ export class ADWIN {
         // --- validate x FIRST (mirror add(); a Float64Array read is always a number, so add()'s
         // typeof branch is unreachable here and omitted). BYTE-IDENTICAL no-op on reject. ---
         if (x !== x || x === Infinity || x === -Infinity ||
-            x > ADWIN_X_MAX || x < -ADWIN_X_MAX) return this._badValue(x);   // square would overflow
-        // running range over ALL x seen (widens monotonically; NOT rolled back on a shrink).
-        if (x < this._min) this._min = x;
-        if (x > this._max) this._max = x;
+            x > ADWIN_X_MAX || x < -ADWIN_X_MAX) return this._badValue(x);   // centred square would overflow
+        // CENTRING (F9) -- DUPLICATED from add(): anchor c on a (re)started window, accumulate x - c.
+        if (this._total === 0) this._c = x;
+        const xc = x - this._c;
 
-        // --- open a fresh level-0 bucket (count 1, sum x, sumSq x*x) at the newest end --
+        // --- open a fresh level-0 bucket (count 1, sum xc, sumSq xc*xc) at the newest end --
         //     DUPLICATED from add() to keep add()'s hot body byte-identical. ---
         const node = this._freeHead;
         if (node === -1) return this._badOverflow();
         this._freeHead = this._next[node];
-        this._sum[node] = x;
-        this._sumSq[node] = x * x;
+        this._sum[node] = xc;
+        this._sumSq[node] = xc * xc;
+        this._bmin[node] = x;   // F18 -- DUPLICATED from add(): a size-1 bucket's range is [x, x] (RAW)
+        this._bmax[node] = x;
         this._bcount[node] = 1;
         this._lvl[node] = 0;
         const tail0 = this._tail[0];
@@ -1114,8 +1343,8 @@ export class ADWIN {
         this._count++;
         if (this._maxLevel < 0) this._maxLevel = 0;
         this._total += 1;
-        this._wsum += x;
-        this._wsumSq += x * x;
+        this._wsum += xc;
+        this._wsumSq += xc * xc;
 
         // --- the bounded merge cascade (see add() for the full commentary) ---
         const M = this._M;
@@ -1130,6 +1359,9 @@ export class ADWIN {
             this._sum[a] += this._sum[b2];
             this._sumSq[a] += this._sumSq[b2];
             this._bcount[a] += this._bcount[b2];
+            // F18 -- DUPLICATED from add(): the merged bucket's range is the union of both.
+            if (this._bmin[b2] < this._bmin[a]) this._bmin[a] = this._bmin[b2];
+            if (this._bmax[b2] > this._bmax[a]) this._bmax[a] = this._bmax[b2];
             const nl = L + 1;
             this._lvl[a] = nl;
             this._next[b2] = this._freeHead;
@@ -1151,6 +1383,7 @@ export class ADWIN {
             this._dropOldest();
             changed = true;
         }
+        if (changed) this._recentre();   // F9: re-anchor c after a cut (see add()).
         return changed;
     }
 
@@ -1170,11 +1403,33 @@ export class ADWIN {
         const mean = wsum / total;
         let variance = this._wsumSq / total - mean * mean;
         if (variance < 0) variance = 0;          // FP guard (sqrt of a tiny negative)
-        const R = this._max - this._min;         // running observed range (widens as data arrives)
         const head = this._head;
         const next = this._next;
         const bc = this._bcount;
         const sum = this._sum;
+        // F18: R is the range of the CURRENT window, taken over the live buckets' RAW min/max
+        // (_bmin/_bmax) but EXCLUDING the globally-oldest bucket (head of the highest level). After a
+        // level shift a single "straddling" bucket at the oldest end carries one stale value from the
+        // prior regime; a whole-window range would let that lone value pin R at the old shift height
+        // forever (the range term (2/3)(R/m)ln(2/deltaP) then dominates and ADWIN goes deaf -- the F18
+        // bug). Excluding the oldest bucket is exactly the range of the window ADWIN would RETAIN when
+        // it cuts there, so the straddle's stale extreme cannot protect it, yet on a stationary stream
+        // the (large, well-sampled) oldest bucket's exclusion barely moves R -> the false-alarm rate
+        // stays <= delta. One O(live buckets) pass, 0 alloc (cold relative to add's per-item work).
+        const bmin = this._bmin, bmax = this._bmax;
+        const oldest = head[this._maxLevel];     // the globally-oldest bucket, excluded from R
+        let rlo = Infinity, rhi = -Infinity;
+        for (let L = this._maxLevel; L >= 0; L--) {
+            let rn = head[L];
+            while (rn !== -1) {
+                if (rn !== oldest) {
+                    if (bmin[rn] < rlo) rlo = bmin[rn];
+                    if (bmax[rn] > rhi) rhi = bmax[rn];
+                }
+                rn = next[rn];
+            }
+        }
+        const R = rhi >= rlo ? rhi - rlo : 0;     // 0 when the window is a single (excluded) bucket
         // walk oldest -> newest: higher levels are older, head -> tail within each level.
         let n0 = 0, sum0 = 0;
         for (let L = this._maxLevel; L >= 0; L--) {
@@ -1218,6 +1473,42 @@ export class ADWIN {
             while (m >= 0 && this._head[m] === -1) m--;
             this._maxLevel = m;
         }
+        // F18: nothing to do for the range -- it is derived fresh from the live buckets in `_scanCut`
+        // (a freed bucket's _bmin/_bmax slot is dead and never read).
+    }
+
+    /**
+     * @private F9 -- re-anchor the centring offset c to the current window MEAN after a cut has
+     * fired (called from `add` / `addFrom` AFTER the cut loop exits, never inside it). Every live
+     * bucket's CENTRED sum / sum-of-squares, and the window totals, are shifted from offset c to
+     * c' = c + wsum/n (the current window mean) via
+     *     sum'   = sum   - n*d
+     *     sumSq' = sumSq - 2*d*sum + n*d^2        (d = c' - c = wsum/n; n = bucket count)
+     * so the stored quantities keep their meaning (sum of x - c') while c tracks the DATA after a
+     * regime change -- otherwise a shift plus a large absolute offset would slowly re-inflate the
+     * centred magnitudes. COLD (once per fired cut), 0 alloc, O(live buckets). A slow drift WITHOUT
+     * a cut is NOT re-centred here: c then lags the data, but the centred error grows only with the
+     * DRIFT magnitude (|mean - c|), never with the absolute offset -- see ADR 0003 amendment.
+     */
+    _recentre() {
+        const n = this._total;
+        if (n <= 0) return;               // empty window -> the next add re-anchors c to x (fail-safe)
+        const d = this._wsum / n;         // c' - c = the current centred window mean
+        if (d === 0) return;              // already centred on the mean -> no work, keeps FP exact
+        const sum = this._sum, sumSq = this._sumSq, bc = this._bcount;
+        const head = this._head, next = this._next;
+        for (let L = this._maxLevel; L >= 0; L--) {
+            let node = head[L];
+            while (node !== -1) {
+                const s = sum[node], nb = bc[node];
+                sumSq[node] = sumSq[node] - 2 * d * s + nb * d * d;
+                sum[node] = s - nb * d;
+                node = next[node];
+            }
+        }
+        this._wsumSq = this._wsumSq - 2 * d * this._wsum + n * d * d;
+        this._wsum = this._wsum - n * d;   // ~= 0 (modulo FP): the window is now centred on its mean
+        this._c = this._c + d;
     }
 
     /** Reset to the empty window; reuse the pool. O(cap). @returns {ADWIN} this */
@@ -1229,8 +1520,8 @@ export class ADWIN {
     /** @private Cold thrower for a bad value. */
     _badValue(x) {
         throw new TypeError(
-            '[lite-adaptive] ADWIN add x must be a finite number with |x| <= sqrt(Number.MAX_VALUE) ' +
-            '(~1.34e154, so x*x stays finite), got ' + String(x));
+            '[lite-adaptive] ADWIN add x must be a finite number with |x| <= sqrt(Number.MAX_VALUE)/2 ' +
+            '(~6.7e153, so the centred square (x - c)*(x - c) stays finite), got ' + String(x));
     }
 
     /**
@@ -1350,18 +1641,20 @@ export class ForwardDecay {
             throw new RangeError(
                 '[lite-adaptive] ForwardDecay halfLife must be a finite number > 0, got ' + String(halfLife));
         }
+        // A subnormal halfLife makes lambda = ln2/halfLife overflow to Infinity, which poisons
+        // every weight to NaN. Reject it here, BEFORE any field init, NaN-safe (F14).
+        const lambda = Math.LN2 / halfLife;
+        if (!(lambda < Infinity)) {
+            throw new RangeError(
+                '[lite-adaptive] ForwardDecay halfLife ' + String(halfLife) +
+                ' is too small: lambda = ln2/halfLife = ' + String(lambda) +
+                ' is not finite; halfLife must be >= ' + LAMBDA_HALFLIFE_MIN);
+        }
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null) {
-                throw new TypeError('[lite-adaptive] ForwardDecay options must be an object');
-            }
-            for (const key in options) {
-                if (!(key in FD_KNOWN_OPTS)) {
-                    throw new RangeError('[lite-adaptive] ForwardDecay unknown option "' + key + '"');
-                }
-            }
+            optDoor(options, FD_KNOWN_OPTS, 'ForwardDecay');
         }
         this._halfLife = halfLife;
-        this._lambda = Math.LN2 / halfLife;   // g(x) = exp(lambda * x); halves every halfLife
+        this._lambda = lambda;   // g(x) = exp(lambda * x); halves every halfLife
         this._initState();
     }
 
@@ -1707,6 +2000,16 @@ const HK_DEFAULT_SEED = 0x9e3779b1;
 const HK_LUT_SIZE = 256;
 /** Max simultaneous rows d (a sane ceiling; the paper uses d ~ 4-8). */
 const HK_D_MAX = 64;
+/**
+ * Hard ceiling on the flat table cell count d*w (F11). 2^27 cells x 8 B (fp + count) = ~1 GB of
+ * table, the memory ceiling; above it the ctor throws a tagged RangeError BEFORE allocation instead
+ * of aborting the process on a V8 fatal (the pre-1.7.0 failure).
+ */
+const HK_CELLS_CAP = 2 ** 27;
+/** Max table width w (F11): 2^30 keeps `hkPos`'s `% w` in Smi range on a 31-bit-Smi runtime. */
+const HK_W_MAX = 2 ** 30;
+/** Max top-k size k (F11): 2^24 heap slots x 16 B (key + est) = ~256 MB, the heap memory ceiling. */
+const HK_K_MAX = 2 ** 24;
 
 /** MurmurHash3 mixing constants (SMIs) -- mirrored INLINE from lite-sketch Sketch.js (ADR 0001 there). */
 const HK_C1 = 0xcc9e2d51 | 0;
@@ -1721,16 +2024,26 @@ const HK_MAP_SALT = 0x27d4eb2f | 0;
 const HK_RNG_SALT = 0x165667b1 | 0;
 
 /** Frozen marker of the known HeavyKeeper ctor option keys -- an unknown key is a throw. */
-const HK_KNOWN_OPTS = Object.freeze({ seed: true, b: true });
+const HK_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { seed: true, b: true }));
 
 /**
- * The two hash lanes of the last hkHash call: HK_H1 = fingerprint lane, HK_H2 = position base
- * lane. Written by hkHash, read by the caller on the immediately following synchronous line
- * -- the alloc-free "return two uint32s" trick. Held as SIGNED int32 so a lane >= 2^31 never
- * boxes a HeapNumber into a module slot; readers recover the unsigned value with `>>> 0`.
+ * Module scratch for the HeavyKeeper hot path -- the alloc-free "pass values without an argument
+ * boundary" trick (ROADMAP N6). A safe-integer KEY or a uint32 SEED >= 2^30 held in a `let` or
+ * crossed as a call argument boxes a 31-bit-Smi Chrome HeapNumber; a Float64Array / Int32Array
+ * slot never does. So the caller writes the numeric inputs into HK_KIN and each helper reads them
+ * from the slot -- no numeric argument crosses hkHash / hkPos / hkMapHash / _promote / the map ops.
+ *
+ * HK_KIN (Float64Array(4)) inputs: [0] = key, [1] = seed, [2] = map-key, [3] = estimate.
+ * HK_HS  (Int32Array(3)) hash out: [0] = h1 (fingerprint lane), [1] = h2 (position base lane),
+ *                                  [2] = map-index hash. Int32 slots so a lane >= 2^31 never boxes
+ *                                  a HeapNumber into a module let; readers recover unsigned via `>>> 0`.
+ *
+ * CONTRACT: a slot lives only inside ONE synchronous add / addFrom / estimate call. No user code
+ * runs inside that body (forEach callbacks fire OUTSIDE add), so interleaved HeavyKeeper instances
+ * never observe each other's scratch -- each fully drains HK_KIN before the next call touches it.
  */
-let HK_H1 = 0;
-let HK_H2 = 0;
+const HK_KIN = new Float64Array(4);
+const HK_HS = new Int32Array(3);
 
 /** One MurmurHash3 body round (pure int32, zero-alloc). */
 function hkRound(h, k) {
@@ -1754,44 +2067,53 @@ function hkFinal(h) {
 }
 
 /**
- * Hash a numeric (safe-integer) key with a uint32 seed into HK_H1 (fingerprint lane) and
- * HK_H2 (position base lane): the key's low + high words folded through TWO independently
- * seeded murmur3 bodies. Zero allocation, no BigInt, no ref retained.
+ * Hash the scratch key HK_KIN[0] with the scratch seed HK_KIN[1] into HK_HS[0] (fingerprint lane)
+ * and HK_HS[1] (position base lane): the key's low + high words folded through TWO independently
+ * seeded murmur3 bodies. NO numeric argument (the key / seed live in Float64Array slots), so a
+ * large key / seed never boxes at this call boundary. Zero allocation, no BigInt, no ref retained.
  */
-function hkHash(key, seed) {
-    let a = key, neg = 0;
+function hkHash() {
+    let a = HK_KIN[0], neg = 0;
     if (a < 0) { a = -a; neg = 1; }
     const lo = a >>> 0;                        // low 32 bits (ToUint32)
     const hi = ((a - lo) / 4294967296) >>> 0;  // high word (exact for safe integers)
-    const s = seed >>> 0;
+    const s = HK_KIN[1] >>> 0;
     let h = s | 0;
     h = hkRound(h, lo);
     h = hkRound(h, hi ^ neg);
     h = h ^ 8;
-    HK_H1 = hkFinal(h) | 0;
+    HK_HS[0] = hkFinal(h) | 0;
     let g = (s ^ HK_LANE_SALT) | 0;
     g = hkRound(g, lo);
     g = hkRound(g, hi ^ neg);
     g = g ^ 8;
-    HK_H2 = hkFinal(g) | 0;
+    HK_HS[1] = hkFinal(g) | 0;
 }
 
-/** Column position of row r: a per-row salt of the position base lane, mod w. Zero-alloc. */
-function hkPos(base, r, w) {
-    return (hkFinal((base ^ Math.imul(r, HK_ODD)) | 0) >>> 0) % w;
+/**
+ * Column position of row r: a per-row salt of the position base lane HK_HS[1], mod w. Zero-alloc.
+ * KEEP `>>> 0` before `% w`: a negative `int|0 % w` would change positions. `(...>>> 0) % w` is an
+ * int in [0, w) (a Smi for any legal w), so the return never boxes.
+ */
+function hkPos(r, w) {
+    return (hkFinal((HK_HS[1] ^ Math.imul(r, HK_ODD)) | 0) >>> 0) % w;
 }
 
-/** A standalone map-index hash of a key (does NOT touch HK_H1 / HK_H2). Zero-alloc uint32. */
-function hkMapHash(key, seed) {
-    let a = key, neg = 0;
+/**
+ * A standalone map-index hash of the scratch map-key HK_KIN[2] with seed HK_KIN[1], written to
+ * HK_HS[2] (does NOT touch HK_HS[0] / HK_HS[1]). Returns void. The caller masks HK_HS[2]: index
+ * bit-identical because `(x >>> 0) & mask === (x | 0) & mask` for any power-of-two mask < 2^31.
+ */
+function hkMapHash() {
+    let a = HK_KIN[2], neg = 0;
     if (a < 0) { a = -a; neg = 1; }
     const lo = a >>> 0;
     const hi = ((a - lo) / 4294967296) >>> 0;
-    let h = (seed ^ HK_MAP_SALT) | 0;
+    let h = ((HK_KIN[1] | 0) ^ HK_MAP_SALT) | 0;
     h = hkRound(h, lo);
     h = hkRound(h, hi ^ neg);
     h = h ^ 8;
-    return hkFinal(h) >>> 0;
+    HK_HS[2] = hkFinal(h) | 0;
 }
 
 /**
@@ -1805,8 +2127,9 @@ function hkMapHash(key, seed) {
  *
  * Headline (the recency TRIPLE):
  *   - SPACE: a FIXED d x w Uint32 table + a k-slot heap + a 2k-ish map. Never grows.
- *   - ERROR: bounded OVERESTIMATE (a reported count is in [true - err, true] for the current
- *     leaders); recall of the true heavy hitters is high on skew (witnessed vs Space-Saving).
+ *   - ERROR: a bounded, ONE-SIDED estimate that NEVER overestimates -- a reported count is in
+ *     [true - err, true] for the current leaders (ADR 0005; the witness gates worst-overestimate 0);
+ *     recall of the true heavy hitters is high on skew (witnessed vs Space-Saving).
  *   - RECENCY: a DECAY model -- a counter for a key that stops arriving is probabilistically
  *     eroded by other keys' misses, so the top-k tracks the CURRENT distribution.
  *
@@ -1835,25 +2158,23 @@ export class HeavyKeeper {
             throw new RangeError(
                 '[lite-adaptive] HeavyKeeper d must be an integer in [1, ' + HK_D_MAX + '], got ' + String(d));
         }
-        if (typeof w !== 'number' || !Number.isInteger(w) || w < 1) {
+        if (typeof w !== 'number' || !Number.isInteger(w) || w < 1 || w > HK_W_MAX) {
             throw new RangeError(
-                '[lite-adaptive] HeavyKeeper w must be an integer >= 1, got ' + String(w));
+                '[lite-adaptive] HeavyKeeper w must be an integer in [1, ' + HK_W_MAX + '], got ' + String(w));
         }
-        if (typeof k !== 'number' || !Number.isInteger(k) || k < 1) {
+        if (typeof k !== 'number' || !Number.isInteger(k) || k < 1 || k > HK_K_MAX) {
             throw new RangeError(
-                '[lite-adaptive] HeavyKeeper k must be an integer >= 1, got ' + String(k));
+                '[lite-adaptive] HeavyKeeper k must be an integer in [1, ' + HK_K_MAX + '], got ' + String(k));
+        }
+        // Cells cap BEFORE allocation (F11): d*w past 2^27 aborted the process on a V8 fatal in 1.6.0.
+        if (d * w > HK_CELLS_CAP) {
+            throw new RangeError(
+                '[lite-adaptive] HeavyKeeper table d*w=' + (d * w) + ' exceeds cap ' + HK_CELLS_CAP);
         }
         let seed = HK_DEFAULT_SEED;
         let b = HK_DEFAULT_B;
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null) {
-                throw new TypeError('[lite-adaptive] HeavyKeeper options must be an object');
-            }
-            for (const key in options) {
-                if (!(key in HK_KNOWN_OPTS)) {
-                    throw new RangeError('[lite-adaptive] HeavyKeeper unknown option "' + key + '"');
-                }
-            }
+            optDoor(options, HK_KNOWN_OPTS, 'HeavyKeeper');
             // seed=0 is a VALID distinct seed -- guard `undefined`, not falsy (null is not zero).
             if (options.seed !== undefined) {
                 const s = options.seed;
@@ -1931,6 +2252,8 @@ export class HeavyKeeper {
                 '[lite-adaptive] HeavyKeeper.withAccuracy targetError must be a number in (0, 1), got ' +
                 String(targetError));
         }
+        // Same door as the ctor (R6), with the factory label, BEFORE forwarding options.
+        optDoor(options, HK_KNOWN_OPTS, 'HeavyKeeper.withAccuracy');
         const d = 4;
         const w = Math.max(2 * k, Math.ceil(1 / targetError));
         return new HeavyKeeper(d, w, k, options);
@@ -1967,26 +2290,31 @@ export class HeavyKeeper {
         let wt = weight;
         if (wt === undefined) {
             wt = 1;
-        } else if (typeof wt !== 'number' || !Number.isSafeInteger(wt) || wt <= 0) {
+        } else if (typeof wt !== 'number' || !Number.isSafeInteger(wt) || wt <= 0 || wt > 4294967295) {
+            // A single weight above 2^32-1 is REJECTED (an accumulated cell SATURATES at 2^32-1
+            // in the body below; the two rules are distinct -- F10). Byte-identical no-op on reject.
             return this._badWeight(wt);
         }
 
         // --- the accumulate body (DUPLICATED in addFrom to keep this hot body byte-identical). ---
-        hkHash(key, this._seed);
-        const fp = HK_H1 >>> 0;
-        const base = HK_H2;
+        // key + seed into Float64Array slots so no numeric argument crosses hkHash / _promote (a
+        // large key >= 2^31 boxes as a plain `add` argument -- that is F3; here it never boxes).
+        HK_KIN[0] = key;
+        HK_KIN[1] = this._seed;
+        hkHash();
+        const fp = HK_HS[0] | 0;                  // signed int32: `(fps[cell]|0) === fp` never boxes
         const d = this._d, w = this._w;
         const fps = this._fp, cnt = this._cnt;
         const lut = this._decayLut, b = this._b;
         let best = 0;
         for (let r = 0; r < d; r++) {
-            const cell = r * w + hkPos(base, r, w);
+            const cell = r * w + hkPos(r, w);
             const c = cnt[cell];
             if (c === 0) {
-                fps[cell] = fp;
+                fps[cell] = fp;                   // ToUint32 store: bit-identical to the old fp
                 cnt[cell] = wt;
                 if (wt > best) best = wt;
-            } else if (fps[cell] === fp) {
+            } else if ((fps[cell] | 0) === fp) {
                 let nc = c + wt;
                 if (nc > 4294967295) nc = 4294967295;   // clamp at uint32 max (no wrap on store)
                 cnt[cell] = nc;
@@ -2004,7 +2332,8 @@ export class HeavyKeeper {
                 }
             }
         }
-        this._promote(key, best);
+        HK_KIN[3] = best;                         // est into a slot: no boxed arg into _promote
+        this._promote();
         return this;
     }
 
@@ -2029,24 +2358,27 @@ export class HeavyKeeper {
         const key = buf[i];         // UNBOXED Float64Array reads -- the whole point (no arg box).
         const wt = buf[i + 1];      // packed [key, weight]
         if (!Number.isSafeInteger(key)) return this._badKey(key);
-        if (!Number.isSafeInteger(wt) || wt <= 0) return this._badWeight(wt);
+        if (!Number.isSafeInteger(wt) || wt <= 0 || wt > 4294967295) return this._badWeight(wt);
 
         // --- the accumulate body -- DUPLICATED from add() to keep add()'s hot body byte-identical. ---
-        hkHash(key, this._seed);
-        const fp = HK_H1 >>> 0;
-        const base = HK_H2;
+        // key (buf[i]) + seed into slots so no numeric argument crosses hkHash / _promote: the whole
+        // point -- a key / weight >= 2^31 read UNBOXED here never boxes (F3 zero-box for addFrom).
+        HK_KIN[0] = key;
+        HK_KIN[1] = this._seed;
+        hkHash();
+        const fp = HK_HS[0] | 0;
         const d = this._d, w = this._w;
         const fps = this._fp, cnt = this._cnt;
         const lut = this._decayLut, b = this._b;
         let best = 0;
         for (let r = 0; r < d; r++) {
-            const cell = r * w + hkPos(base, r, w);
+            const cell = r * w + hkPos(r, w);
             const c = cnt[cell];
             if (c === 0) {
                 fps[cell] = fp;
                 cnt[cell] = wt;
                 if (wt > best) best = wt;
-            } else if (fps[cell] === fp) {
+            } else if ((fps[cell] | 0) === fp) {
                 let nc = c + wt;
                 if (nc > 4294967295) nc = 4294967295;
                 cnt[cell] = nc;
@@ -2063,34 +2395,37 @@ export class HeavyKeeper {
                 }
             }
         }
-        this._promote(key, best);
+        HK_KIN[3] = best;
+        this._promote();
         return this;
     }
 
     /**
      * The estimated count of `key` -- the max count over the d cells whose fingerprint matches
-     * (0 if none match). COLD, O(d). Fail closed: a non-safe-integer key throws [lite-adaptive]
-     * (the SAME guard `add` applies -- an invalid key is never silently 0). An unseen but VALID
-     * key reads 0 (null is not zero).
+     * (0 if none match). COLD, O(d). NEVER throws (F12): a non-safe-integer / non-number key reads
+     * NaN (an invalid key was never seen 0 times), an unseen but VALID key reads 0. null is not zero.
      * @param {number} key a safe integer.
      * @returns {number}
      */
     estimate(key) {
-        if (typeof key !== 'number' || !Number.isSafeInteger(key)) return this._badKey(key);
-        hkHash(key, this._seed);
-        const fp = HK_H1 >>> 0;
-        const base = HK_H2;
+        // F12: a bad key is NaN, never a throw (one contract -- queries never throw on a bad value).
+        // An UNSEEN valid key still reads 0 (null is not zero).
+        if (typeof key !== 'number' || !Number.isSafeInteger(key)) return NaN;
+        HK_KIN[0] = key;
+        HK_KIN[1] = this._seed;
+        hkHash();
+        const fp = HK_HS[0] | 0;
         const d = this._d, w = this._w;
         const fps = this._fp, cnt = this._cnt;
         let best = 0;
         for (let r = 0; r < d; r++) {
-            const cell = r * w + hkPos(base, r, w);
-            if (fps[cell] === fp) {
+            const cell = r * w + hkPos(r, w);
+            if ((fps[cell] | 0) === fp) {
                 const c = cnt[cell];
                 if (c > best) best = c;
             }
         }
-        return best;
+        return best;   // COLD: the single boxed return (a uint32 >= 2^31) is F6, out of scope here.
     }
 
     /**
@@ -2164,8 +2499,11 @@ export class HeavyKeeper {
      * already a leader, update its estimate + re-heapify; else if the heap has room, insert it;
      * else if `est` beats the current minimum leader, evict the min and insert `key`. 0-alloc.
      */
-    _promote(key, est) {
-        const pos = this._mapFind(key);
+    _promote() {
+        // key + est read from slots (never a boxed argument): HK_KIN[0] = key, HK_KIN[3] = est.
+        const key = HK_KIN[0], est = HK_KIN[3];
+        HK_KIN[2] = key;                          // map-key slot for _mapFind
+        const pos = this._mapFind();
         if (pos >= 0) {
             this._hkEst[pos] = est;
             // est may have risen (fp hit) or fallen (a cell it relied on was decayed by another
@@ -2180,25 +2518,32 @@ export class HeavyKeeper {
         if (n < this._k) {
             this._hkKey[n] = key;
             this._hkEst[n] = est;
-            this._mapSet(key, n);
+            HK_KIN[2] = key;                      // map-key slot for _mapSet
+            this._mapSet(n);
             this._hkN = n + 1;
             this._siftUp(n);
         } else if (est > this._hkEst[0]) {
-            this._mapDel(this._hkKey[0]);
+            HK_KIN[2] = this._hkKey[0];           // map-key slot for _mapDel (the evicted min)
+            this._mapDel();
             this._hkKey[0] = key;
             this._hkEst[0] = est;
-            this._mapSet(key, 0);
+            HK_KIN[2] = key;                      // map-key slot for _mapSet
+            this._mapSet(0);
             this._siftDown(0);
         }
     }
 
-    /** @private Swap heap slots a, b and keep the map positions in sync. 0-alloc. */
+    /**
+     * @private Swap heap slots a, b and keep the map positions in sync. 0-alloc. Writes HK_KIN[2]
+     * (the map-key) before each _mapSet; NEVER touches HK_KIN[0] / HK_KIN[3], so the key / est that
+     * the calling _promote still needs are undisturbed by a sift.
+     */
     _hswap(a, b) {
         const hk = this._hkKey, he = this._hkEst;
         const ka = hk[a], ea = he[a], kb = hk[b], eb = he[b];
         hk[a] = kb; he[a] = eb; hk[b] = ka; he[b] = ea;
-        this._mapSet(kb, a);
-        this._mapSet(ka, b);
+        HK_KIN[2] = kb; this._mapSet(a);
+        HK_KIN[2] = ka; this._mapSet(b);
     }
 
     /** @private Sift heap slot i toward the root while it is smaller than its parent. Returns its final index. */
@@ -2227,11 +2572,13 @@ export class HeavyKeeper {
         }
     }
 
-    /** @private Find `key`'s heap slot in the map, or -1. Linear probing. 0-alloc. */
-    _mapFind(key) {
+    /** @private Find the map-key HK_KIN[2]'s heap slot, or -1. Linear probing. 0-alloc, no arg. */
+    _mapFind() {
         const mask = this._mapCap - 1;
         const mk = this._mapKey, mp = this._mapPos;
-        let i = hkMapHash(key, this._seed) & mask;
+        const key = HK_KIN[2];
+        hkMapHash();
+        let i = HK_HS[2] & mask;
         while (mk[i] === mk[i]) {           // occupied (a NaN slot fails self-equality)
             if (mk[i] === key) return mp[i];
             i = (i + 1) & mask;
@@ -2239,25 +2586,29 @@ export class HeavyKeeper {
         return -1;
     }
 
-    /** @private Insert `key` -> `pos`, or update its stored pos if already present. 0-alloc. */
-    _mapSet(key, pos) {
+    /** @private Insert HK_KIN[2] -> `pos`, or update its stored pos if already present. 0-alloc. */
+    _mapSet(pos) {
         const mask = this._mapCap - 1;
         const mk = this._mapKey, mp = this._mapPos;
-        let i = hkMapHash(key, this._seed) & mask;
+        const key = HK_KIN[2];
+        hkMapHash();
+        let i = HK_HS[2] & mask;
         while (mk[i] === mk[i]) {
             if (mk[i] === key) { mp[i] = pos; return; }
             i = (i + 1) & mask;
         }
         mk[i] = key;
-        mp[i] = pos;
+        mp[i] = pos;                        // pos is a Smi heap slot
         this._mapSize++;
     }
 
-    /** @private Delete `key` with Knuth backward-shift so the probe chains stay contiguous. 0-alloc. */
-    _mapDel(key) {
+    /** @private Delete HK_KIN[2] with Knuth backward-shift so the probe chains stay contiguous. 0-alloc. */
+    _mapDel() {
         const mask = this._mapCap - 1;
         const mk = this._mapKey, mp = this._mapPos;
-        let i = hkMapHash(key, this._seed) & mask;
+        const key = HK_KIN[2];
+        hkMapHash();
+        let i = HK_HS[2] & mask;
         while (mk[i] === mk[i]) {
             if (mk[i] === key) break;
             i = (i + 1) & mask;
@@ -2270,7 +2621,9 @@ export class HeavyKeeper {
             do {
                 j = (j + 1) & mask;
                 if (mk[j] !== mk[j]) return;         // hit an empty slot -> chain closed
-                const home = hkMapHash(mk[j], this._seed) & mask;
+                HK_KIN[2] = mk[j];                   // probe key into the slot for its home hash
+                hkMapHash();
+                const home = HK_HS[2] & mask;
                 // keep mk[j] iff its home does NOT lie cyclically in (i, j] (it must not shift back).
                 if (i <= j ? (home <= i || home > j) : (home <= i && home > j)) break;
             } while (true);
@@ -2284,10 +2637,10 @@ export class HeavyKeeper {
             '[lite-adaptive] HeavyKeeper key must be a safe integer, got ' + String(key));
     }
 
-    /** @private Cold thrower for a bad weight. */
+    /** @private Cold thrower for a bad weight (closed domain [1, 2^32-1], SCM count parity). */
     _badWeight(w) {
         throw new TypeError(
-            '[lite-adaptive] HeavyKeeper weight must be a positive integer, got ' + String(w));
+            '[lite-adaptive] HeavyKeeper weight must be an integer in [1, 4294967295], got ' + String(w));
     }
 
     /** @private Cold thrower for a bad addFrom buffer/index. */
@@ -2325,14 +2678,18 @@ export class HeavyKeeper {
 //
 // HOT add(now, key) / addFrom(buf, i): the two-lane murmur (mirrored INLINE from lite-sketch
 // Sketch.js, ADR 0001 there -- pure int32 locals, never an import) derives register j + rho;
-// pop every tail entry with rho <= the new rho (now dominated), then append (now, rho). A full
-// ring drops its OLDEST (head) entry -- it expires soonest -- and bumps `_overflows` (the honest
-// degradation signal; `degraded` flips true). 0 B/op incl. that windowed eviction.
+// pop every tail entry with rho <= the new rho (now dominated), then DROP expired head entries
+// (stamp <= now - W) so the ring holds only in-window entries, then append (now, rho). If the ring
+// is STILL full after that expiry, the drop is an IN-WINDOW eviction: bump `_overflows` (the honest
+// degradation signal; `degraded` flips true). 0 B/op incl. that windowed eviction. Since expiry is
+// done here (F8, 1.7.0), `_overflows` counts only genuine capacity pressure -- it is independent of
+// how often you query, and each entry is dropped exactly once (amortized O(1)).
 //
-// COLD count(w?): lazily drop head entries with stamp <= now - W (expired), then take each
-// register's windowed max = the rho of the OLDEST non-expired entry (or the first with stamp >
-// now - w for a sub-window w <= W), fold the register multiplicity vector through Ertl's improved
-// estimator (sigma / tau, alpha_inf; design-parity with lite-sketch, inline). The register value
+// COLD count(w?): PURE -- it NEVER mutates the rings (F8). It scans each register for the rho of
+// the OLDEST in-window entry (the first with stamp > now - w for a sub-window w <= W, else > now - W),
+// folding the register multiplicity vector through Ertl's improved estimator (sigma / tau,
+// alpha_inf; design-parity with lite-sketch, inline). Expired-by-W entries are skipped by the same
+// stamp test, so the estimate is bit-identical to the old destructive path. The register value
 // equals the HLL register of the in-window DISTINCT key set (a duplicate never lowers a max), so
 // accuracy is the standard 1.04 / sqrt(m) standard error (no extra bias) when not degraded.
 //
@@ -2358,7 +2715,7 @@ const SL_ALPHA_INF = 0.5 / Math.LN2;
 /** MurmurHash3 lane-decorrelation salt (SMI) -- mirrored INLINE from lite-sketch Sketch.js. */
 const SL_LANE_SALT = 0x85ebca6b | 0;
 /** Frozen marker of the known ctor option keys -- an unknown key is a throw with a did-you-mean. */
-const SL_KNOWN_OPTS = Object.freeze({ p: true, ringCap: true, seed: true });
+const SL_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { p: true, ringCap: true, seed: true }));
 
 /** One MurmurHash3 body round (pure int32, zero-alloc) -- design-parity with lite-sketch. */
 function slRound(h, k) {
@@ -2442,7 +2799,7 @@ function slTau(x) {
  * manipulation on preallocated columns. A full ring drops its oldest (head) entry and bumps
  * `overflows` (`degraded`) -- honest degradation, never an allocation or a silent wrong answer.
  *
- * Cold path: `count(w?)` is O(m) (a disclosed co-headline, NOT per-add) -- lazily expire, then
+ * Cold path: `count(w?)` is O(m) (a disclosed co-headline, NOT per-add) and PURE -- skip expired, then
  * Ertl's improved estimator (2017), a single table-free formula accurate across the whole range;
  * `clear()` reuses the arrays.
  *
@@ -2472,14 +2829,7 @@ export class SlidingHyperLogLog {
         let ringCap = SL_DEFAULT_RINGCAP;
         let seed = SL_DEFAULT_SEED;
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null) {
-                throw new TypeError('[lite-adaptive] SlidingHyperLogLog options must be an object');
-            }
-            for (const key in options) {
-                if (!(key in SL_KNOWN_OPTS)) {
-                    throw new RangeError('[lite-adaptive] SlidingHyperLogLog unknown option "' + key + '"');
-                }
-            }
+            optDoor(options, SL_KNOWN_OPTS, 'SlidingHyperLogLog');
             if (options.p !== undefined) {
                 const pp = options.p;
                 if (typeof pp !== 'number' || (pp | 0) !== pp || pp < SL_P_MIN || pp > SL_P_MAX) {
@@ -2658,6 +3008,11 @@ export class SlidingHyperLogLog {
             const tailCell = base + ((head + len - 1) & mask);
             if (rhos[tailCell] <= rho) len--; else break;
         }
+        // F8: drop expired heads (stamp <= this add's t - W) BEFORE the ring-full check, so a full
+        // ring is a genuine IN-WINDOW drop -> overflows++ that does NOT depend on query cadence.
+        // Amortized O(1): every entry is dropped exactly once, here in add(), never in count().
+        const exp = t - this._W;
+        while (len > 0 && stamps[base + (head & mask)] <= exp) { head = (head + 1) & mask; len--; }
         if (len === cap) { head = (head + 1) & mask; len--; this._overflows++; }
         const at = base + ((head + len) & mask);
         stamps[at] = t;
@@ -2741,6 +3096,11 @@ export class SlidingHyperLogLog {
             const tailCell = base + ((head + len - 1) & mask);
             if (rhos[tailCell] <= rho) len--; else break;
         }
+        // F8: drop expired heads (stamp <= this add's t - W) BEFORE the ring-full check, so a full
+        // ring is a genuine IN-WINDOW drop -> overflows++ that does NOT depend on query cadence.
+        // Amortized O(1): every entry is dropped exactly once, here in add(), never in count().
+        const exp = t - this._W;
+        while (len > 0 && stamps[base + (head & mask)] <= exp) { head = (head + 1) & mask; len--; }
         if (len === cap) { head = (head + 1) & mask; len--; this._overflows++; }
         const at = base + ((head + len) & mask);
         stamps[at] = t;
@@ -2751,29 +3111,33 @@ export class SlidingHyperLogLog {
     }
 
     /**
-     * The windowed DISTINCT-COUNT estimate over the last W (or a sub-window `w <= W`). Lazily
-     * expires ring entries with `stamp <= now - W`, takes each register's windowed max rho, and
-     * runs Ertl's improved estimator (2017). COLD, O(m + total entries) (a disclosed co-headline,
-     * NOT per-add): 0 alloc (the multiplicity vector is the reused `_hist`). Standard error
-     * 1.04 / sqrt(m), guaranteed only while `degraded === false`. Returns 0 on an empty window.
+     * The windowed DISTINCT-COUNT estimate over the last W (or a sub-window `w <= W`). PURE (F8):
+     * it NEVER mutates the rings -- expiry happens in `add` / `addFrom`, so `overflows` / `degraded`
+     * and the ring state are independent of how often you query. It scans each register for the
+     * OLDEST entry still inside the window (its highest windowed rho), then runs Ertl's improved
+     * estimator (2017). COLD, O(m + total entries) (a disclosed co-headline, NOT per-add): 0 alloc
+     * (the multiplicity vector is the reused `_hist`). Standard error 1.04 / sqrt(m), guaranteed
+     * only while `degraded === false`. Returns 0 on an empty window.
      *
-     * Fail closed: a sub-window `w` outside `(0, W]` (non-finite, <= 0, or > W) throws
-     * [lite-adaptive]; `w` omitted queries the full window W.
+     * NEVER throws (F12): a sub-window `w` outside `(0, W]` (non-finite, <= 0, or > W) reads NaN,
+     * never a throw; `w` omitted queries the full window W. An empty window reads 0. null is not zero.
      * @param {number} [w] an optional sub-window in `(0, W]` (omit for the full window W).
      * @returns {number}
      */
     count(w) {
         let effW = this._W;
         if (w !== undefined) {
+            // F12: a bad sub-window is NaN, never a throw (one contract -- queries never throw on a
+            // bad value). An unseen/empty window still reads 0. null is not zero.
             if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
-                return this._badWindow(w);
+                return NaN;
             }
             effW = w;
         }
         if (this._mode === MODE_UNSET) return 0;
         const now = this._now;
-        const fullCut = now - this._W;   // permanent expiry cutoff (entries this old can never return)
-        const subCut = now - effW;       // sub-window cutoff (>= fullCut)
+        const subCut = now - effW;       // sub-window cutoff (full-W entries with stamp <= now - W
+                                         // are already skipped by this scan, since subCut >= now - W)
         const m = this._m, cap = this._ringCap, mask = this._mask;
         const stamps = this._stamps, rhos = this._rho;
         const heads = this._head, lens = this._len;
@@ -2782,13 +3146,14 @@ export class SlidingHyperLogLog {
         C.fill(0);
         for (let jj = 0; jj < m; jj++) {
             const base = jj * cap;
-            let head = heads[jj];
-            let len = lens[jj];
-            // destructive full-W expiry from the head (oldest first).
-            while (len > 0 && stamps[base + (head & mask)] <= fullCut) { head = (head + 1) & mask; len--; }
-            heads[jj] = head; lens[jj] = len;
-            // non-destructive sub-window scan: the first entry with stamp > subCut is the OLDEST
-            // in-window entry, which carries the HIGHEST rho (rho decreases head -> tail).
+            // F8: count() is PURE -- it NEVER expires ring entries (that now happens in add()). The
+            // read-only sub-window scan skips every stamp <= subCut, and subCut >= now - W, so an
+            // expired-by-W entry is skipped here anyway -> the estimate is bit-identical to the old
+            // destructive path, but `overflows` / the ring state no longer depend on query cadence.
+            const head = heads[jj];
+            const len = lens[jj];
+            // the first entry with stamp > subCut is the OLDEST in-window entry, which carries the
+            // HIGHEST rho (rho decreases head -> tail).
             let maxRho = 0;
             let idx = head, rem = len;
             while (rem > 0) {
@@ -2844,13 +3209,6 @@ export class SlidingHyperLogLog {
             ' after ' + String(this._lastNow));
     }
 
-    /** @private Cold thrower for a bad sub-window `w`. */
-    _badWindow(w) {
-        throw new RangeError(
-            '[lite-adaptive] SlidingHyperLogLog count sub-window w must be a finite number in (0, W] (W=' +
-            this._W + '), got ' + String(w));
-    }
-
     /** @private Cold thrower for a bad addFrom buffer/index. */
     _badBuf(buf, i) {
         throw new TypeError(
@@ -2860,11 +3218,12 @@ export class SlidingHyperLogLog {
 
     /**
      * Advance the reference clock to `now` WITHOUT adding a key (the R11 idle slide). CLOCK-ONLY:
-     * it moves `_now` / `_lastNow` forward and touches NOTHING else. The ring is NOT eagerly
-     * expired -- `count()` already lazily drops `stamp <= now - W` off `_now` at query time, so a
-     * pure clock bump is enough for an idle stream to slide to 0; eager expiry would perturb the
-     * `overflows` / `degraded` degradation signal (an entry evicted by an idle slide never
-     * happened as far as capacity accounting is concerned). O(1), 0 B/op.
+     * it moves `_now` / `_lastNow` forward and touches NOTHING else -- it must NOT expire the rings.
+     * The pure `count()` self-filters by `_now` (it skips `stamp <= now - W` at read time), so a
+     * bare clock bump is enough for an idle stream to slide to 0. Leaving the rings untouched keeps
+     * `overflows` / `degraded` independent of advance frequency too (F8): an entry that only leaves
+     * because time moved on, with no new add competing for its slot, never counted as an overflow.
+     * Ring expiry is the sole job of `add` / `addFrom`. O(1), 0 B/op.
      *
      * EXPLICIT-time ONLY (parity with addFrom): a COUNT-locked instance throws; an UNSET instance
      * locks EXPLICIT (and sets the reference time). Monotone: `now` finite and >= lastNow (a
@@ -2892,7 +3251,7 @@ export class SlidingHyperLogLog {
             t = now;
             this._lastNow = now;
         }
-        this._now = t;   // clock-only: count() lazily expires stamp <= now - W off this.
+        this._now = t;   // clock-only: count() skips stamp <= now - W off this (pure read; F8).
         return this;
     }
 
@@ -2989,7 +3348,7 @@ export const DRIFT_PH = 0;
 export const DRIFT_CUSUM = 1;
 
 /** Frozen marker of the known ctor option keys -- an unknown key is a throw with a did-you-mean. */
-const DD_KNOWN_OPTS = Object.freeze({ delta: true, threshold: true, target: true });
+const DD_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { delta: true, threshold: true, target: true }));
 
 /** Default magnitude allowance (PH) / slack (CUSUM): 0 is a valid, meaningful setting (null is not zero). */
 const DD_DEFAULT_DELTA = 0.005;
@@ -3062,14 +3421,7 @@ export class DriftDetector {
         let threshold = DD_DEFAULT_THRESHOLD;
         let target;   // undefined = no fixed reference (PH); a finite mu0 is REQUIRED for CUSUM.
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null) {
-                throw new TypeError('[lite-adaptive] DriftDetector options must be an object');
-            }
-            for (const key in options) {
-                if (!(key in DD_KNOWN_OPTS)) {
-                    throw new RangeError('[lite-adaptive] DriftDetector unknown option "' + key + '"');
-                }
-            }
+            optDoor(options, DD_KNOWN_OPTS, 'DriftDetector');
             // delta = 0 is VALID -- guard `undefined`, not falsy (null is not zero). delta is capped at
             // DD_X_MAX (like x) so the accumulators cannot be driven non-finite by a pathological delta
             // (each add moves gP/gN by ~delta; an uncapped delta near Double.MAX would overflow them in a
@@ -3334,14 +3686,16 @@ export class DriftDetector {
 // of SlidingHyperLogLog (windowed distinct-count) -- both keep a hard last-W window over a
 // caller-supplied MONOTONE `now`, never the wall clock.
 //
-// WINDOW MODEL (ADR 0008, model A -- fixed-B pane ring): B preallocated DDSketch PANES, each
-// covering W/B of the window, held in a ring. add() writes the CURRENT pane; when `now` crosses a
-// pane boundary the ring rotates to the next pane and CLEARS it (fill(0), 0-alloc). A `now` jump of
-// many pane-widths expires multiple panes in a bounded while-loop capped at B iterations (skipping
-// >= B panes clears them ALL, then re-anchors the ring around `now`). quantile / quantileInto /
-// count MERGE the live panes into an INSTANCE-OWNED preallocated scratch (cold, 0-alloc -- never a
-// per-query allocation). The edge error is up to one pane width (W/B), disclosed: the oldest live
-// pane straddles the window boundary and is counted in full. Each pane collapses its lowest bins
+// WINDOW MODEL (ADR 0008, model A -- fixed-(B+1) pane ring, F7): B+1 preallocated DDSketch PANES,
+// each covering W/B of the window, held in a ring. add() writes the CURRENT pane; when `now` crosses
+// a pane boundary the ring rotates to the next pane and CLEARS it (fill(0), 0-alloc). A `now` jump of
+// many pane-widths expires multiple panes in a bounded while-loop capped at B+1 iterations (skipping
+// >= B+1 panes clears the WHOLE ring, then re-anchors it around `now`). quantile / quantileInto /
+// count MERGE the live panes (paneEnd > now - W, INCLUDING the straddling oldest pane) into an
+// INSTANCE-OWNED preallocated scratch (cold, 0-alloc -- never a per-query allocation). The window is
+// therefore OVER-covered by up to one pane width: the covered span is [W, W + W/B] and the straddling
+// oldest pane is KEPT (never dropped), so true(W) is ALWAYS included -- forgetting is at the far edge
+// [W, W + W/B], never before W. Dropping the oldest pane would under-count. Each pane collapses its lowest bins
 // INDEPENDENTLY, so the merged min-key across the B panes can differ from a single sketch's -- the
 // accuracy/edge bound is therefore WITNESSED, not assumed.
 //
@@ -3356,7 +3710,7 @@ export class DriftDetector {
 // scratch is `Float64Array` so summing B near-saturated panes stays exact to 2^53.
 
 /** Frozen marker of the known SlidingDDSketch option keys -- an unknown key throws with a hint. */
-const SLD_KNOWN_OPTS = Object.freeze({ alpha: true, strict: true, panes: true });
+const SLD_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { alpha: true, strict: true, panes: true, range: true }));
 /** Default relative-error target alpha (a common DDSketch setting; the option is tunable). */
 const SLD_DEFAULT_ALPHA = 0.01;
 /** Default pane count B (edge error W/32). */
@@ -3388,13 +3742,14 @@ const SLD_KEY_MAX = 1 << 30;
  * SlidingHyperLogLog.
  *
  * Headline (the family TRIPLE):
- *   - SPACE: a FIXED ring of B panes, each a dense `Uint32Array(SLD_MAX_BINS)` log-bucket store
+ *   - SPACE: a FIXED ring of B+1 panes, each a dense `Uint32Array(SLD_MAX_BINS)` log-bucket store
  *     (+ per-pane offset / max-key / count bookkeeping) + one instance-owned Float64 merge scratch;
- *     never grows (panes=32 -> ~256 KB at 2048 bins).
+ *     never grows (panes=32 -> ~281 KB at 2048 bins).
  *   - ERROR: a HARD per-query relative bound `|q_est - q_true| <= alpha * q_true` on the merged live
- *     window, PLUS a window-edge error of up to one pane width W/B (the straddling oldest pane).
- *   - RECENCY: a HARD last-W window (forgets at the window edge, +/- one pane width) with a
- *     sub-window query `quantile(q, w)` / `count(w)` for any `w <= W`.
+ *     window, PLUS a window over-coverage of up to one pane width W/B (the straddling oldest pane is
+ *     KEPT, never dropped) -- the covered span is [W, W + W/B], so true(W) is ALWAYS included.
+ *   - RECENCY: a HARD last-W window (forgets in [W, W + W/B], never before W) with a sub-window query
+ *     `quantile(q, w)` / `count(w)` for any `w <= W`.
  *
  * Hot path (`add` / `addFrom`, 0 B/op INCLUDING pane rotation): validate value + time, compute the
  * ONE log-bucket key, rotate + clear panes if `now` crossed a boundary (a bounded, alloc-free
@@ -3411,18 +3766,25 @@ const SLD_KEY_MAX = 1 << 30;
  * non-finite / decreasing `now` -- typeof-first, and every value-domain / indexable / time rejection
  * is a BYTE-IDENTICAL no-op (validated before any state write); a STRICT collapse rejection throws
  * before any bin write (the time model has legitimately advanced -- time is monotone and
- * value-independent; the quantile/count state is intact). `quantile` throws on q outside [0, 1] or a
- * sub-window outside (0, W], and returns NaN on an empty window; `count` returns 0 on empty. null is
- * not zero (strict = false and value = 0 are guarded distinctly).
+ * value-independent; the quantile/count state is intact). F12: `quantile` / `count` NEVER throw on a
+ * bad VALUE -- q outside [0, 1] / NaN, or a sub-window `w` outside (0, W] / NaN, returns NaN (null is
+ * not zero -- an unrepresentable window is NaN, not an under-count of 0); an empty-window quantile is
+ * NaN and count is 0. A wrong CONTAINER type is a programming error, so `quantileInto` still throws on
+ * a non-Float64Array `qs`/`out`. null is not zero (strict = false and value = 0 are guarded distinctly).
  */
 export class SlidingDDSketch {
     /**
      * @param {number} W        window size; a finite number > 0 (items in count mode, or the
      *                          `now`-unit span in explicit mode).
-     * @param {{alpha?: number, strict?: boolean, panes?: number}} [options]
+     * @param {{alpha?: number, strict?: boolean, panes?: number, range?: readonly [number, number]}} [options]
      *   alpha:  relative-error target; a number in (0, 1) (default 0.01).
-     *   strict: fail closed on a collapse instead of collapsing-lowest (default false).
+     *   strict: fail closed on a collapse instead of collapsing-lowest (default false). A declared
+     *           `range` DERIVES strict; `strict: false` with a `range` is a contradiction and throws.
      *   panes:  pane-ring size B; an integer in [2, 1024] (default 32). Edge error is W / panes.
+     *   range:  a declared band `[rmin, rmax]` with finite `0 < rmin < rmax`, both inside the alpha
+     *           indexable band and needing <= SLD_MAX_BINS bins -> STRICT mode with a FIXED bin offset
+     *           (lite-sketch DDSketch parity): no first-value anchor, no slide, no collapse; a value
+     *           outside the band throws.
      */
     constructor(W, options) {
         // typeof guard FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
@@ -3432,16 +3794,11 @@ export class SlidingDDSketch {
         }
         let alpha = SLD_DEFAULT_ALPHA;
         let strict = false;
+        let strictSet = false;   // whether strict was passed EXPLICITLY (a declared range + strict:false contradicts)
         let panes = SLD_DEFAULT_PANES;
+        let range;               // a declared [rmin, rmax] band -> DERIVES strict (lite-sketch DDSketch parity)
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null) {
-                throw new TypeError('[lite-adaptive] SlidingDDSketch options must be an object');
-            }
-            for (const key in options) {
-                if (!(key in SLD_KNOWN_OPTS)) {
-                    throw new RangeError('[lite-adaptive] SlidingDDSketch unknown option "' + key + '"');
-                }
-            }
+            optDoor(options, SLD_KNOWN_OPTS, 'SlidingDDSketch');
             if (options.alpha !== undefined) {
                 const a = options.alpha;
                 if (typeof a !== 'number' || !(a > 0 && a < 1)) {
@@ -3458,7 +3815,9 @@ export class SlidingDDSketch {
                         '[lite-adaptive] SlidingDDSketch strict must be a boolean, got ' + String(st));
                 }
                 strict = st;
+                strictSet = true;
             }
+            if (options.range !== undefined) range = options.range;
             if (options.panes !== undefined) {
                 const p = options.panes;
                 if (typeof p !== 'number' || (p | 0) !== p || p < SLD_PANES_MIN || p > SLD_PANES_MAX) {
@@ -3469,6 +3828,14 @@ export class SlidingDDSketch {
                 panes = p;
             }
         }
+
+        // A declared `range` DERIVES strict (lite-sketch DDSketch parity); `strict: false` with a
+        // declared range is a contradiction -- fail closed BEFORE any allocation.
+        if (range !== undefined && strictSet && strict === false) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingDDSketch range implies strict; strict:false contradicts a declared range');
+        }
+        strict = strict === true || range !== undefined;
 
         const gamma = (1 + alpha) / (1 - alpha);
         const multiplier = 1 / Math.log(gamma);
@@ -3486,6 +3853,37 @@ export class SlidingDDSketch {
         if (maxKey > SLD_KEY_MAX) maxKey = SLD_KEY_MAX;
         if (minKey < -SLD_KEY_MAX) minKey = -SLD_KEY_MAX;
 
+        // A declared `range` fixes the strict band to [rmin, rmax] (lite-sketch DDSketch parity): the
+        // bin offset is anchored at `_rangeKeyLo = ceil(ln(rmin) * mult)`, nb = keyHi - keyLo + 1 bins,
+        // never anchored to a first value, never collapsed. Validate typeof-first, BEFORE any allocation.
+        let rangeMin = NaN, rangeMax = NaN, rangeKeyLo = 0, rangeKeyHi = 0;
+        // ACCEPTED key band for the hot two-comparison gate = the indexable band, tightened to the
+        // declared range when present (an out-of-range value is then rejected by the SAME gate).
+        let acceptLo = minKey, acceptHi = maxKey;
+        if (range !== undefined) {
+            if (!Array.isArray(range) || range.length !== 2) this._badRange(range);
+            const rmin = range[0], rmax = range[1];
+            if (typeof rmin !== 'number' || typeof rmax !== 'number' ||
+                rmin !== rmin || rmax !== rmax ||
+                rmin === Infinity || rmin === -Infinity || rmax === Infinity || rmax === -Infinity ||
+                !(rmin > 0) || !(rmin < rmax)) {
+                this._badRange(range);
+            }
+            const keyLo = Math.ceil(Math.log(rmin) * multiplier);   // offset = minKey (lite-sketch parity)
+            const keyHi = Math.ceil(Math.log(rmax) * multiplier);
+            // Both ends must lie inside the alpha indexable band (else the representative over/underflows).
+            if (keyLo < minKey || keyHi > maxKey) this._badRange(range);
+            const nb = keyHi - keyLo + 1;
+            if (nb > SLD_MAX_BINS) {
+                throw new RangeError(
+                    '[lite-adaptive] SlidingDDSketch range [' + rmin + ', ' + rmax + '] needs ' + nb +
+                    ' bins, exceeds SLD_MAX_BINS=' + SLD_MAX_BINS + ' (the widest representable rmax/rmin at ' +
+                    'alpha=' + alpha + ' is ' + Math.pow(gamma, SLD_MAX_BINS - 1) + ')');
+            }
+            rangeMin = rmin; rangeMax = rmax; rangeKeyLo = keyLo; rangeKeyHi = keyHi;
+            acceptLo = keyLo; acceptHi = keyHi;
+        }
+
         // Fail closed BEFORE alloc: a SUBNORMAL W underflows W/panes to 0 (or a non-finite value), which
         // would make the pane-boundary arithmetic non-finite -> no pane ever live -> add() never throws yet
         // quantile()/count() silently read empty for a just-added value. Guard the derived pane width.
@@ -3496,35 +3894,53 @@ export class SlidingDDSketch {
                 ' (W / panes underflowed to ' + paneW + '); use a larger W or fewer panes');
         }
 
+        // F7: the ring holds B+1 panes so the covered span is [W, W + W/B] -- the straddling oldest
+        // pane is INCLUDED (kept, never dropped) and the true window is ALWAYS fully covered. `_panes`
+        // stays the user knob B (the getter + edge-error W/B); every per-pane column is allocated at
+        // `ring` (one extra pane -- disclosed in `bytes`).
+        const ring = panes + 1;
+
         this._W = W;
         this._alpha = alpha;
         this._strict = strict;
-        this._panes = panes;
+        this._panes = panes;         // B (getter returns this; edge error is W / B); the ring holds B+1 panes
+        this._ring = ring;           // B + 1
         this._maxBins = SLD_MAX_BINS;
         this._paneW = paneW;              // per-pane time width (the disclosed edge error); guarded > 0 above
         this._gamma = gamma;
         this._multiplier = multiplier;
-        this._maxKey = maxKey;
-        this._minKey = minKey;
+        // Hot key gate reads the ACCEPTED band (indexable, tightened to any declared range).
+        this._maxKey = acceptHi;
+        this._minKey = acceptLo;
+        // minIndexable / maxIndexable are ALPHA-ONLY (identical strict / non-strict / range) -- keyed off
+        // the INDEXABLE band, NOT the accepted band, so the getters mean the same thing in every mode.
         this._minIndexable = Math.pow(gamma, minKey - 1);  // EXCLUSIVE floor: add accepts x > this
         this._maxIndexable = Math.pow(gamma, maxKey);      // INCLUSIVE ceiling: add accepts x <= this
+        this._rangeMin = rangeMin;      // declared strict band (NaN when undeclared)
+        this._rangeMax = rangeMax;
+        this._rangeKeyLo = rangeKeyLo;  // fixed bin offset for a declared range (0 when undeclared)
+        this._rangeKeyHi = rangeKeyHi;
 
-        const cells = panes * SLD_MAX_BINS;
+        const cells = ring * SLD_MAX_BINS;
         // per-pane dense log-bucket store (pane p occupies cells [p*maxBins, p*maxBins+maxBins)):
         this._bins = new Uint32Array(cells);         // bin counts (saturate at 0xFFFFFFFF)
-        this._offset = new Int32Array(panes);        // per-pane key at physical bin 0
-        this._maxKeyPop = new Int32Array(panes);     // per-pane highest populated key
-        this._binCount = new Int32Array(panes);      // per-pane anchored flag (0 = fresh)
-        this._paneCollapsed = new Uint8Array(panes); // per-pane collapse flag (low-end precision lost)
-        this._paneCount = new Float64Array(panes);   // per-pane total adds (incl. zeros), exact to 2^53
-        this._paneZero = new Float64Array(panes);    // per-pane zero adds
-        this._paneEnd = new Float64Array(panes);     // per-pane EXCLUSIVE upper time bound
+        this._offset = new Int32Array(ring);         // per-pane key at physical bin 0
+        this._maxKeyPop = new Int32Array(ring);      // per-pane highest populated key
+        this._binCount = new Int32Array(ring);       // per-pane anchored flag (0 = fresh)
+        this._paneCollapsed = new Uint8Array(ring);  // per-pane collapse flag (low-end precision lost)
+        this._paneCount = new Float64Array(ring);    // per-pane total adds (incl. zeros), exact to 2^53
+        this._paneZero = new Float64Array(ring);     // per-pane zero adds
+        this._paneEnd = new Float64Array(ring);      // per-pane EXCLUSIVE upper time bound
         // instance-owned merge scratch (Float64 so B near-saturated panes sum exactly):
         this._scratch = new Float64Array(SLD_MAX_BINS);
+        // F5: the merge cutoff lives in a preallocated slot; callers write `_cut[0] = now - effW` and
+        // `_merge()` reads `_cut[0]` -- no computed double passed as an argument (0-box query path).
+        this._cut = new Float64Array(1);
 
         this._bytes = this._bins.byteLength + this._offset.byteLength + this._maxKeyPop.byteLength +
-            this._binCount.byteLength + this._paneCollapsed.byteLength + this._paneCount.byteLength +
-            this._paneZero.byteLength + this._paneEnd.byteLength + this._scratch.byteLength;
+            this._binCount.byteLength + this._paneCollapsed.byteLength +
+            this._paneCount.byteLength + this._paneZero.byteLength + this._paneEnd.byteLength +
+            this._scratch.byteLength + this._cut.byteLength;
 
         this._initState();
     }
@@ -3532,7 +3948,10 @@ export class SlidingDDSketch {
     /** @private Reset all pane state + time mode + scratch. Reused by clear(). 0 alloc. */
     _initState() {
         this._bins.fill(0);
-        this._offset.fill(0);
+        // Declared range: PRE-ANCHOR every pane's offset at the fixed _rangeKeyLo (0 when undeclared, so
+        // byte-identical to the old fill(0)), so _addKeyPane's first-value TOP anchor is never taken and no
+        // in-range value can slide or collapse. The fill covers all panes (keyed off length -> F7 B+1 safe).
+        this._offset.fill(this._rangeKeyLo);
         this._maxKeyPop.fill(0);
         this._binCount.fill(0);
         this._paneCollapsed.fill(0);
@@ -3573,13 +3992,17 @@ export class SlidingDDSketch {
     get minIndexable() { return this._minIndexable; }
     /** The largest x that `add` accepts at this alpha (INCLUSIVE; above it the representative overflows). O(1). */
     get maxIndexable() { return this._maxIndexable; }
+    /** The declared strict range floor rmin (NaN when no range was declared). O(1). null is not zero. */
+    get rangeMin() { return this._rangeMin; }
+    /** The declared strict range ceiling rmax (NaN when no range was declared). O(1). null is not zero. */
+    get rangeMax() { return this._rangeMax; }
     /** Whether any live pane has folded nonzero mass into its collapsed floor. COLD, O(panes). */
     get collapsed() {
-        const c = this._paneCollapsed, B = this._panes;
+        const c = this._paneCollapsed, B = this._ring;
         for (let p = 0; p < B; p++) if (c[p] !== 0) return true;
         return false;
     }
-    /** A fixed memory figure in bytes (all pane columns + the merge scratch). O(1). */
+    /** A fixed memory figure in bytes (all B+1 pane columns + the merge scratch + the cut slot). O(1). */
     get bytes() { return this._bytes; }
 
     /**
@@ -3732,7 +4155,7 @@ export class SlidingDDSketch {
      * width each. Cold (once per lifecycle / clear). 0 alloc.
      */
     _anchor(now) {
-        const B = this._panes, pw = this._paneW;
+        const B = this._ring, pw = this._paneW;
         const E = (Math.floor(now / pw) + 1) * pw;   // EXCLUSIVE upper bound of the current pane
         this._cur = 0;
         this._paneEnd[0] = E;
@@ -3742,11 +4165,11 @@ export class SlidingDDSketch {
 
     /**
      * @private Rotate the ring forward so the current pane covers time `t`, clearing each pane it
-     * rotates onto. Capped at B rotations (rotating >= B panes clears them ALL, then re-anchors the
-     * ring around `t`). 0 alloc. Called only when `t` crossed the current pane boundary.
+     * rotates onto. Capped at B+1 rotations (rotating >= B+1 panes clears the WHOLE ring, then
+     * re-anchors it around `t`). 0 alloc. Called only when `t` crossed the current pane boundary.
      */
     _advance(t) {
-        const pw = this._paneW, B = this._panes;
+        const pw = this._paneW, B = this._ring;
         let cur = this._cur;
         let E = this._paneEnd[cur];
         let rot = 0;
@@ -3771,7 +4194,7 @@ export class SlidingDDSketch {
     _clearPane(p) {
         const base = p * this._maxBins;
         this._bins.fill(0, base, base + this._maxBins);
-        this._offset[p] = 0;
+        this._offset[p] = this._rangeKeyLo;   // pre-anchor (0 when undeclared -> byte-identical to before)
         this._maxKeyPop[p] = 0;
         this._binCount[p] = 0;
         this._paneCollapsed[p] = 0;
@@ -3780,11 +4203,20 @@ export class SlidingDDSketch {
     }
 
     /**
-     * @private The cold window math for one pane (out-of-window key), mirroring lite-sketch DDSketch's
-     * collapsing-lowest _addKey on a Uint32 store: anchor the first key at the TOP (fill downward), fold a
-     * below-floor key into bin 0, or slide the window up folding the vacated low cells. STRICT mode throws
-     * on ANY collapse (below-floor OR slide-up) at the HEAD of that branch, before any bin mutation. Uint32
-     * bin counts saturate at 0xFFFFFFFF (never wrap); the per-pane count is gated on the same
+     * @private The cold window math for one pane (out-of-window key). Three regimes, gated so the
+     * NON-STRICT path stays BYTE-IDENTICAL to 1.6.0 (top anchor + collapsing-lowest fold):
+     *   - DECLARED RANGE (`_rangeMin` finite): the offset is pre-anchored at `_rangeKeyLo` (in
+     *     `_initState` / `_clearPane`) and the hot key gate guarantees k in [_rangeKeyLo, _rangeKeyHi],
+     *     so the key drops straight into its FIXED cell -- no anchor, no slide, no collapse EVER.
+     *   - STRICT WITHOUT a range (span-based): NEVER collapses. The occupied key span plus the new key
+     *     must fit maxBins; if it would exceed, fail closed; otherwise RE-ANCHOR the window losslessly by
+     *     shifting the occupied bins (up for a below-floor key, down for an above-ceiling key). The high
+     *     end is `_maxKeyPop`; the low end is derived LAZILY here by scanning for the first nonzero bin
+     *     (cold, O(maxBins) -- the re-anchor already does an O(maxBins) copyWithin). A bottom anchor would
+     *     only move the bug to falling values.
+     *   - NON-STRICT (default): anchor the first key at the TOP (fill downward), fold a below-floor key
+     *     into bin 0, or slide the window up folding the vacated low cells (collapsing-lowest).
+     * Uint32 bin counts saturate at 0xFFFFFFFF (never wrap); the per-pane count is gated on the same
      * non-saturation check so the tracked total never exceeds the histogram mass. 0 alloc.
      * @param {number} pane pane index
      * @param {number} k    bucket key
@@ -3794,6 +4226,17 @@ export class SlidingDDSketch {
         const maxBins = this._maxBins;
         const bins = this._bins;
         const base = pane * maxBins;
+        // DECLARED RANGE: fixed offset (_rangeKeyLo), k pre-validated in [_rangeKeyLo, _rangeKeyHi] by the
+        // hot gate -> idx in [0, nb - 1] always; never anchors / slides / collapses. (_rangeMin is NaN
+        // when undeclared, so `_rangeMin === _rangeMin` is FALSE and this whole branch is skipped.)
+        if (this._rangeMin === this._rangeMin) {
+            const idx = k - this._offset[pane];   // _offset[pane] == _rangeKeyLo
+            const c = bins[base + idx];
+            if (c !== 4294967295) { bins[base + idx] = c + 1; this._paneCount[pane] += 1; }
+            if (this._binCount[pane] === 0) this._binCount[pane] = 1;
+            if (k > this._maxKeyPop[pane]) this._maxKeyPop[pane] = k;
+            return this;
+        }
         if (this._binCount[pane] === 0) {
             const off = k - (maxBins - 1);      // anchor at the TOP, fill downward
             this._offset[pane] = off;
@@ -3814,8 +4257,36 @@ export class SlidingDDSketch {
             if (k > this._maxKeyPop[pane]) this._maxKeyPop[pane] = k;
             return this;
         }
-        if (idx < 0) {                          // below the floor: collapsing-lowest fold (or strict throw)
-            if (this._strict) return this._badStrict(k);   // strict: NO collapse ever -- throw before any write
+        // STRICT WITHOUT a range: SPAN-BASED, never collapses -- either the extended span fits (lossless
+        // re-anchor) or it fails closed. Gated here so the non-strict fold below stays byte-identical.
+        if (this._strict) {
+            const maxPop = this._maxKeyPop[pane];
+            if (idx < 0) {                      // key BELOW the floor: new span [k, maxPop], shift bins UP
+                if (maxPop - k + 1 > maxBins) return this._badStrict(k);
+                const delta = off - k;          // > 0; new offset = k anchors the new key at bin 0
+                bins.copyWithin(base + delta, base, base + maxBins - delta);
+                bins.fill(0, base, base + delta);
+                bins[base] += 1;                // the new key sits at the bottom (fresh after the shift)
+                this._offset[pane] = k;
+            } else {                            // idx >= maxBins: key ABOVE the ceiling, shift bins DOWN
+                // Derive the low end of the occupied span LAZILY: the first nonzero cell's key
+                // (off + firstNonzeroIndex). binCount != 0 here, so strict panes always hold >= 1 cell.
+                let lo = 0;
+                while (lo < maxBins && bins[base + lo] === 0) lo++;
+                const minPop = off + lo;
+                if (k - minPop + 1 > maxBins) return this._badStrict(k);
+                const newOff = k - (maxBins - 1);
+                const delta = newOff - off;     // > 0
+                bins.copyWithin(base, base + delta, base + maxBins);
+                bins.fill(0, base + maxBins - delta, base + maxBins);
+                bins[base + (maxBins - 1)] += 1;   // the new key sits at the top (fresh after the shift)
+                this._offset[pane] = newOff;
+                this._maxKeyPop[pane] = k;
+            }
+            this._paneCount[pane] += 1;
+            return this;
+        }
+        if (idx < 0) {                          // below the floor: collapsing-lowest fold
             const c = bins[base];
             if (c !== 4294967295) {             // saturate; gate the count so the total never exceeds the mass
                 bins[base] = c + 1;
@@ -3824,10 +4295,7 @@ export class SlidingDDSketch {
             this._paneCollapsed[pane] = 1;
             return this;
         }
-        // idx > maxBins - 1: the value sits ABOVE the window ceiling -> a slide-up that WOULD collapse the
-        // low end. STRICT: no collapse ever -- throw at the HEAD, before any bin mutation (symmetric with
-        // the below-floor strict throw; both too-small and too-large fail closed, DDSketch-strict parity).
-        if (this._strict) return this._badStrict(k);
+        // idx > maxBins - 1: the value sits ABOVE the window ceiling -> a slide-up that collapses the low end.
         const newOff = k - (maxBins - 1);
         const delta = newOff - off;             // > 0
         if (delta >= maxBins) {                 // everything folds into bin 0
@@ -3855,16 +4323,18 @@ export class SlidingDDSketch {
      * @private Merge the live panes (paneEnd > cut) into the instance-owned Float64 scratch. Each pane
      * collapses INDEPENDENTLY, so keys are re-folded through the same collapsing-lowest logic on the
      * scratch (the merged min-key may differ from a single pane's -- ADR 0008). Also accumulates the
-     * merged zero count + total. COLD, O(panes * maxBins), 0 alloc.
+     * merged zero count + total. COLD, O(ring * maxBins), 0 alloc. F5: reads the cutoff from the
+     * preallocated `_cut[0]` slot (callers write it) -- no computed double passed as an argument.
      */
-    _merge(cut) {
+    _merge() {
+        const cut = this._cut[0];
         const s = this._scratch;
         s.fill(0);
         this._sBinCount = 0;
         this._sOffset = 0;
         this._sMaxKeyPop = 0;
         let zeros = 0, total = 0;
-        const B = this._panes, maxBins = this._maxBins, bins = this._bins;
+        const B = this._ring, maxBins = this._maxBins, bins = this._bins;
         for (let p = 0; p < B; p++) {
             if (!(this._paneEnd[p] > cut)) continue;   // pane fully expired (its newest edge <= cut)
             zeros += this._paneZero[p];
@@ -3919,7 +4389,11 @@ export class SlidingDDSketch {
         this._sMaxKeyPop = k;
     }
 
-    /** @private Walk the merged scratch for quantile q in [0, 1]; NaN for a bad q or an empty merge. */
+    /**
+     * @private Walk the merged scratch for quantile q in [0, 1]; NaN for a bad q or an empty merge.
+     * Used ONLY by quantile()'s single boxed return (~16 B HeapNumber). The batch render path uses
+     * `_walkInto` (writes a Float64Array cell, no boxed return).
+     */
     _walk(q) {
         if (typeof q !== 'number' || q !== q || q < 0 || q > 1) return NaN;
         const N = this._mTotal;
@@ -3941,52 +4415,85 @@ export class SlidingDDSketch {
     }
 
     /**
+     * @private F5: walk the merged scratch for qs[j] and WRITE out[j] (returns void -- no boxed
+     * return, so the batch render stays 0-alloc). NaN for a bad q or an empty merge. `qs` is a
+     * Float64Array so `qs[j]` is always a number (no typeof branch; a NaN q still writes NaN).
+     */
+    _walkInto(qs, out, j) {
+        const q = qs[j];
+        if (q !== q || q < 0 || q > 1) { out[j] = NaN; return; }
+        const N = this._mTotal;
+        if (N === 0) { out[j] = NaN; return; }
+        const rank = Math.floor(q * (N - 1));   // 0-indexed target rank
+        let cum = this._mZeros;
+        if (rank < cum) { out[j] = 0; return; } // the target falls in the zero bucket
+        const s = this._scratch, off = this._sOffset, gamma = this._gamma;
+        const top = this._sBinCount === 0 ? -1 : this._sMaxKeyPop - off;
+        for (let i = 0; i <= top; i++) {
+            cum += s[i];
+            if (cum > rank) { out[j] = 2 * Math.pow(gamma, i + off) / (gamma + 1); return; }
+        }
+        out[j] = top >= 0 ? 2 * Math.pow(gamma, this._sMaxKeyPop) / (gamma + 1) : NaN;
+    }
+
+    /**
      * Estimate the value at quantile q over the last W (or a sub-window `w <= W`). COLD, 0 alloc
-     * (merges the live panes into the instance scratch, never per-query). Returns NaN on an empty
-     * window. Throws [lite-adaptive] on q outside [0, 1] or a sub-window `w` outside (0, W].
+     * (merges the live panes into the instance scratch, never per-query; one ~16 B HeapNumber for the
+     * boxed return). NEVER throws (F12): a bad VALUE -- q outside [0, 1] or NaN, or a sub-window `w`
+     * outside (0, W] -- returns NaN (null is not zero). An empty window also returns NaN. A wrong
+     * argument TYPE is not validated here (q / w are read as numbers); `quantileInto` still throws on a
+     * non-Float64Array container (a container is a programming error, a bad number is a data value).
      * @param {number} q a number in [0, 1].
      * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
      * @returns {number}
      */
     quantile(q, w) {
-        if (typeof q !== 'number' || q !== q || q < 0 || q > 1) return this._badQ(q);
+        if (typeof q !== 'number' || q !== q || q < 0 || q > 1) return NaN;   // F12: bad VALUE -> NaN
         let effW = this._W;
         if (w !== undefined) {
             if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
-                return this._badWindow(w);
+                return NaN;   // F12: a bad sub-window -> NaN (same contract as count)
             }
             effW = w;
         }
         if (this._mode === MODE_UNSET) return NaN;
-        this._merge(this._now - effW);
+        this._cut[0] = this._now - effW;   // F5: write the cutoff slot, no computed double argument
+        this._merge();
         return this._walk(q);
     }
 
     /**
      * Render several quantiles at once into a caller-owned Float64Array, merging the live panes ONCE
-     * (0-alloc render path). Each `qs[j]` in [0, 1] is written to `out[j]` (NaN for a q outside [0, 1]
-     * or an empty window). COLD. Returns the number of quantiles written (= qs.length).
+     * (0-alloc render path -- no boxed return per q, F5 `_walkInto` writes each cell directly). Each
+     * `qs[j]` in [0, 1] is written to `out[j]` (NaN for a q outside [0, 1] / NaN, or an empty window).
+     * COLD. Returns the number of quantiles written (= qs.length). Argument-TYPE validation still
+     * throws: a non-Float64Array `qs`/`out` (or `out` too short) is a PROGRAMMING error (a wrong
+     * container), distinct from a bad VALUE inside `qs` (which is data -> NaN, never a throw).
      * @param {Float64Array} qs the quantiles to render (each in [0, 1]).
      * @param {Float64Array} out the receiving buffer (length must be >= qs.length).
      * @returns {number} the count of quantiles written.
      */
     quantileInto(qs, out) {
         if (!(qs instanceof Float64Array) || !(out instanceof Float64Array) || out.length < qs.length) {
-            return this._badInto(qs, out);
+            return this._badInto(qs, out);   // argument-TYPE guard (a wrong container is a programming error)
         }
         const n = qs.length;
         if (this._mode === MODE_UNSET) {
             for (let j = 0; j < n; j++) out[j] = NaN;
             return n;
         }
-        this._merge(this._now - this._W);
-        for (let j = 0; j < n; j++) out[j] = this._walk(qs[j]);
+        this._cut[0] = this._now - this._W;   // F5: write the cutoff slot, no computed double argument
+        this._merge();
+        for (let j = 0; j < n; j++) this._walkInto(qs, out, j);   // F5: void write, no boxed return
         return n;
     }
 
     /**
-     * The number of values in the last W (or a sub-window `w <= W`), including zeros. COLD, O(panes),
-     * 0 alloc. Returns 0 on an empty window. Throws [lite-adaptive] on a sub-window `w` outside (0, W].
+     * The number of values in the last W (or a sub-window `w <= W`), including zeros. COLD, O(ring),
+     * 0 alloc. Covers the LIVE panes (paneEnd > now - W, INCLUDING the straddling oldest pane), so the
+     * covered span is [W, W + W/B]. NEVER throws (F12): a bad sub-window `w` outside (0, W] / NaN
+     * returns NaN (null is not zero -- an unrepresentable window is NaN, not an under-count of 0). An
+     * empty window returns 0.
      * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
      * @returns {number}
      */
@@ -3994,13 +4501,13 @@ export class SlidingDDSketch {
         let effW = this._W;
         if (w !== undefined) {
             if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
-                return this._badWindow(w);
+                return NaN;   // F12: a bad sub-window -> NaN (null is not zero; same contract as quantile)
             }
             effW = w;
         }
         if (this._mode === MODE_UNSET) return 0;
         const cut = this._now - effW;
-        const B = this._panes;
+        const B = this._ring;
         let total = 0;
         for (let p = 0; p < B; p++) if (this._paneEnd[p] > cut) total += this._paneCount[p];
         return total;
@@ -4018,10 +4525,25 @@ export class SlidingDDSketch {
             '[lite-adaptive] SlidingDDSketch value must be a finite number >= 0, got ' + String(value));
     }
 
-    /** @private Cold thrower for a value outside the indexable range (representative would over/underflow). */
+    /**
+     * @private Cold thrower for a value the hot key gate rejected. With a declared range the gate is the
+     * range band, so name it; otherwise it is the alpha indexable band (representative would over/underflow).
+     */
     _badIndexable(value) {
+        if (this._rangeMin === this._rangeMin) {   // a range was declared (NaN when not)
+            throw new RangeError(
+                '[lite-adaptive] SlidingDDSketch value ' + String(value) +
+                ' is outside the declared strict range [' + this._rangeMin + ', ' + this._rangeMax + ']');
+        }
         throw new RangeError(
             '[lite-adaptive] SlidingDDSketch value ' + String(value) + ' is outside the sketch\'s indexable range');
+    }
+
+    /** @private Cold thrower for a malformed `range` option (before any allocation). */
+    _badRange(range) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingDDSketch range must be [rmin, rmax] with finite 0 < rmin < rmax, both ' +
+            'inside the alpha indexable band, got ' + String(range));
     }
 
     /** @private Cold thrower for a strict-mode collapse rejection (below the floor OR above the ceiling). */
@@ -4049,19 +4571,6 @@ export class SlidingDDSketch {
         throw new RangeError(
             '[lite-adaptive] SlidingDDSketch add now must be non-decreasing: got ' + String(now) +
             ' after ' + String(this._lastNow));
-    }
-
-    /** @private Cold thrower for a bad quantile q. */
-    _badQ(q) {
-        throw new RangeError(
-            '[lite-adaptive] SlidingDDSketch quantile q must be a number in [0, 1], got ' + String(q));
-    }
-
-    /** @private Cold thrower for a bad sub-window `w`. */
-    _badWindow(w) {
-        throw new RangeError(
-            '[lite-adaptive] SlidingDDSketch sub-window w must be a finite number in (0, W] (W=' +
-            this._W + '), got ' + String(w));
     }
 
     /** @private Cold thrower for a bad quantileInto(qs, out). */
@@ -4212,8 +4721,8 @@ export class SlidingDDSketch {
 // parity with lite-sketch CMS.
 
 /** Frozen marker of the known SlidingCountMin option keys -- an unknown key throws with a hint. */
-const SCM_KNOWN_OPTS = Object.freeze({
-    epsilon: true, delta: true, w: true, d: true, panes: true, seed: true, conservative: true });
+const SCM_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), {
+    epsilon: true, delta: true, w: true, d: true, panes: true, seed: true, conservative: true }));
 /** Default pane count B (edge error W/32); the ring holds B+1 panes. */
 const SCM_DEFAULT_PANES = 32;
 /** Fewest panes: at least 2 so the window is meaningfully sub-divided. */
@@ -4299,14 +4808,7 @@ export class SlidingCountMin {
         let seed = SCM_DEFAULT_SEED;
         let conservative = true;
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null) {
-                throw new TypeError('[lite-adaptive] SlidingCountMin options must be an object');
-            }
-            for (const key in options) {
-                if (!(key in SCM_KNOWN_OPTS)) {
-                    throw new RangeError('[lite-adaptive] SlidingCountMin unknown option "' + key + '"');
-                }
-            }
+            optDoor(options, SCM_KNOWN_OPTS, 'SlidingCountMin');
             if (options.epsilon !== undefined) {
                 epsilon = options.epsilon;
                 if (typeof epsilon !== 'number' || !(epsilon > 0 && epsilon < 1)) {
@@ -4445,9 +4947,8 @@ export class SlidingCountMin {
             throw new RangeError(
                 '[lite-adaptive] SlidingCountMin.withAccuracy delta must be a number in (0, 1), got ' + String(delta));
         }
-        if (options !== undefined && (typeof options !== 'object' || options === null)) {
-            throw new TypeError('[lite-adaptive] SlidingCountMin.withAccuracy options must be an object');
-        }
+        // Same door as the ctor (R6), with the factory label, BEFORE copying options.
+        optDoor(options, SCM_KNOWN_OPTS, 'SlidingCountMin.withAccuracy');
         const opts = {};
         if (options !== undefined) for (const key in options) opts[key] = options[key];
         opts.epsilon = epsilon;
@@ -4742,20 +5243,24 @@ export class SlidingCountMin {
      * Estimate `key`'s frequency over the last W (or a sub-window `w <= W`): for each row SUM the key's
      * cell across the LIVE panes (paneEnd > now - W, INCLUDING the straddling oldest pane -- the one-sided
      * upper bound), then take the MINIMUM over rows (sum-then-min). COLD, O(d x (B+1)), 0 alloc. Returns a
-     * DOUBLE (a window sum can exceed 2^32). NEVER throws -- an unseen / out-of-domain key or an empty
-     * window returns 0 (lite-sketch CMS parity). A bad sub-window `w` also returns 0 (fail-closed, no throw).
+     * DOUBLE (a window sum can exceed 2^32). NEVER throws (F12): an UNSEEN valid key or an empty window
+     * returns 0, but an OUT-OF-DOMAIN key or a bad sub-window `w` returns NaN (an invalid key was never
+     * "seen 0 times", and 0 is indistinguishable from a legitimate miss). null is not zero.
      * @param {number} key
      * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
      * @returns {number} the estimated windowed frequency (>= the true windowed count).
      */
     estimate(key, w) {
+        // F12: an out-of-domain KEY or a bad sub-window `w` is NaN, never a throw and never a silent 0
+        // (an invalid key was never "seen 0 times", and 0 is indistinguishable from a legitimate miss
+        // for an upper-bound sketch). An UNSEEN valid key / empty window still reads 0. null is not zero.
         if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
-            key > 9007199254740991 || key < -9007199254740991) return 0;
+            key > 9007199254740991 || key < -9007199254740991) return NaN;
         if (this._mode === MODE_UNSET) return 0;
         let effW = this._W;
         if (w !== undefined) {
             if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
-                return 0;
+                return NaN;
             }
             effW = w;
         }
@@ -4947,13 +5452,21 @@ export class SlidingCountMin {
 // and the k HIGHEST keys kept in an INLINE size-k binary MIN-HEAP (root = smallest key =
 // the eviction candidate; design-parity with HeavyKeeper / lite-o1 FreqO1, never a dep).
 // The landmark rebase is an ORDER-PRESERVING common-factor multiply (proven not to disturb
-// membership), capped so a key never underflows to -0 or overflows to -Inf. Raw-sample-only:
+// membership), capped so a key never underflows to -0 within a single rebase; across multiple
+// back-to-back capped rebases a stored key CAN reach -Infinity, which is HARMLESS (order preserved,
+// values finite, no NaN, oldest items evict first -- ADR 0011). Raw-sample-only:
 // sampleInto / forEach / clear / getters -- NO aggregates, NO advance (a sample, not a window).
 
 /** Frozen marker of the known DecayedReservoir ctor option keys -- an unknown key is a throw. */
-const DR_KNOWN_OPTS = Object.freeze({ seed: true });
+const DR_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { seed: true }));
 /** Default per-instance seed (a uint32, nonzero). Two default-seeded reservoirs behave identically. */
 const DR_DEFAULT_SEED = 0x9e3779b1;
+/**
+ * Max reservoir size k (F11): 2^24 slots x 16 B (value + priority) = ~256 MB, the memory ceiling.
+ * Above it the ctor throws a tagged RangeError BEFORE allocation instead of a lazy multi-GB
+ * over-commit (e.g. `DR(2^31, 1)` reported ~34 GB of `bytes` in 1.6.0).
+ */
+const DR_K_MAX = 2 ** 24;
 /**
  * DR_EXP_CAP -- the exp() argument ceiling that triggers a landmark rebase (mirrors FD_EXP_CAP=40).
  * The hot path rebases the landmark to `t` BEFORE lambda*(t - L) exceeds this, so a freshly computed
@@ -5017,24 +5530,27 @@ export class DecayedReservoir {
      */
     constructor(k, halfLife, options) {
         // typeof guards FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
-        if (typeof k !== 'number' || !Number.isInteger(k) || k < 1) {
+        if (typeof k !== 'number' || !Number.isInteger(k) || k < 1 || k > DR_K_MAX) {
             throw new RangeError(
-                '[lite-adaptive] DecayedReservoir k must be an integer >= 1, got ' + String(k));
+                '[lite-adaptive] DecayedReservoir k must be an integer in [1, ' + DR_K_MAX + '], got ' + String(k));
         }
         if (typeof halfLife !== 'number' || halfLife !== halfLife || halfLife === Infinity || halfLife <= 0) {
             throw new RangeError(
                 '[lite-adaptive] DecayedReservoir halfLife must be a finite number > 0, got ' + String(halfLife));
         }
+        // A subnormal halfLife makes lambda = ln2/halfLife overflow to Infinity, which poisons
+        // the A-Res priorities to NaN and freezes the sample at the first k values. Reject it here,
+        // BEFORE any allocation, NaN-safe (F14).
+        const lambda = Math.LN2 / halfLife;
+        if (!(lambda < Infinity)) {
+            throw new RangeError(
+                '[lite-adaptive] DecayedReservoir halfLife ' + String(halfLife) +
+                ' is too small: lambda = ln2/halfLife = ' + String(lambda) +
+                ' is not finite; halfLife must be >= ' + LAMBDA_HALFLIFE_MIN);
+        }
         let seed = DR_DEFAULT_SEED;
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null) {
-                throw new TypeError('[lite-adaptive] DecayedReservoir options must be an object');
-            }
-            for (const key in options) {
-                if (!(key in DR_KNOWN_OPTS)) {
-                    throw new RangeError('[lite-adaptive] DecayedReservoir unknown option "' + key + '"');
-                }
-            }
+            optDoor(options, DR_KNOWN_OPTS, 'DecayedReservoir');
             // seed=0 is a VALID distinct seed -- guard `undefined`, not falsy (null is not zero).
             if (options.seed !== undefined) {
                 const s = options.seed;
@@ -5048,7 +5564,7 @@ export class DecayedReservoir {
 
         this._k = k;
         this._halfLife = halfLife;
-        this._lambda = Math.LN2 / halfLife;   // g(x) = exp(lambda * x); retention halves every halfLife
+        this._lambda = lambda;   // g(x) = exp(lambda * x); retention halves every halfLife
         this._seed = seed >>> 0;
 
         // the k-slot min-forest columns (heap slot -> value / A-Res key). SoA, parallel.

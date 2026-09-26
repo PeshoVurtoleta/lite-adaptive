@@ -18,8 +18,8 @@ function mulberry32(seed) {
 // ---------------------------------------------------------------------------
 // version pin
 // ---------------------------------------------------------------------------
-test('VERSION is 1.6.0 (DecayedReservoir milestone)', () => {
-    assert.equal(VERSION, '1.6.0');
+test('VERSION is 1.7.0 (DecayedReservoir milestone)', () => {
+    assert.equal(VERSION, '1.7.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -307,14 +307,13 @@ test('a sub-window count(w) tracks a smaller recent slice', () => {
     assert.ok(Math.abs(half - 5000) / 5000 <= 3 * s.standardError, 'half=' + half);
     assert.ok(half < full);
 });
-test('count rejects a sub-window w outside (0, W]', () => {
+test('count returns NaN (never throws) for a sub-window w outside (0, W] (1.7.0 F12)', () => {
     const s = new SlidingHyperLogLog(1000);
     s.add(1, 1);
-    assert.throws(() => s.count(0), /w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.count(-5), /w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.count(1001), /w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.count(NaN), /w must be a finite number in \(0, W\]/);
-    assert.throws(() => s.count('500'), /w must be a finite number in \(0, W\]/);
+    for (const w of [0, -5, 1001, NaN, Infinity, '500', null]) {
+        assert.ok(Number.isNaN(s.count(w)), 'count(' + String(w) + ') is NaN');
+    }
+    assert.equal(s.count(), 1, 'state untouched by the bad queries');
 });
 test('count(W) equals count() (the full window)', () => {
     const s = new SlidingHyperLogLog(5000, { p: 12 });
@@ -521,4 +520,46 @@ test('advanceFrom rejects a bad buffer / index; COUNT-lock throws', () => {
     const c = new SlidingHyperLogLog(1000, { p: 8 });
     c.add(undefined, 1);
     assert.throws(() => c.advanceFrom(new Float64Array([5]), 0), /\[lite-adaptive\]/);
+});
+
+// ---------------------------------------------------------------------------
+// 1.7.0 QA adversarial (c): interleave advance(), count(w) with RANDOM w, and add() on one twin;
+// the other twin only ever add()s. advance() is CLOCK-ONLY, so both twins must end with identical
+// `overflows` and identical estimates at the same query times.
+// ---------------------------------------------------------------------------
+test('ADVERSARIAL (c): a twin that interleaves advance() + count(random w) alongside add() ends ' +
+    'with the SAME overflows and the SAME estimates at shared query times as an add-only twin', () => {
+    const W = 2000, P = 4, RING = 2;           // small ringCap so overflows actually fire
+    const rnd = mulberry32(0xC0FFEE);
+    const events = [];                          // {now, key} in monotone-now explicit mode
+    let now = 0;
+    for (let i = 0; i < 20000; i++) {
+        now += rnd() < 0.5 ? 0 : 1 + Math.floor(rnd() * 3);   // monotone, sometimes same-tick bursts
+        events.push({ now, key: (i * 2654435761) >>> 0 });
+    }
+    const queryAt = new Set();                 // shared query checkpoints (every 500th event's `now`)
+    for (let i = 0; i < events.length; i += 500) queryAt.add(events[i].now);
+
+    const busy = new SlidingHyperLogLog(W, { p: P, ringCap: RING, seed: 1 });
+    const quiet = new SlidingHyperLogLog(W, { p: P, ringCap: RING, seed: 1 });
+    const estimatesAtQuery = [];
+    for (const { now: t, key } of events) {
+        // the busy twin interleaves advance() + count(w) with a RANDOM w BEFORE each add
+        busy.advance(t);
+        const w = 1 + Math.floor(rnd() * W);   // random sub-window in (0, W]
+        busy.count(w);                          // pure read, must not perturb state
+        busy.add(t, key);
+        quiet.add(t, key);
+        if (queryAt.has(t)) {
+            estimatesAtQuery.push({ t, busy: busy.count(), quiet: quiet.count() });
+        }
+    }
+    assert.ok(estimatesAtQuery.length > 10, 'sanity: enough shared query checkpoints hit');
+    for (const q of estimatesAtQuery) {
+        assert.equal(q.busy, q.quiet, 'estimate() differs at shared query time now=' + q.t);
+    }
+    assert.equal(busy.overflows, quiet.overflows,
+        'overflows differ: busy=' + busy.overflows + ' quiet=' + quiet.overflows +
+        ' (advance()/count() must be clock-only / pure, never perturbing overflow accounting)');
+    assert.equal(busy.degraded, quiet.degraded, 'degraded flag must also agree');
 });

@@ -4,6 +4,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { DecayedReservoir, VERSION } from '../Adaptive.js';
 
 /** A deterministic mulberry32 PRNG so every assertion is reproducible (matches sibling suites). */
@@ -43,21 +44,21 @@ function feedFrom(r, t, v) {
 // ---------------------------------------------------------------------------
 // 1. VERSION pin (the 9th pin)
 // ---------------------------------------------------------------------------
-test('VERSION is 1.6.0', () => {
-    assert.equal(VERSION, '1.6.0');
+test('VERSION is 1.7.0', () => {
+    assert.equal(VERSION, '1.7.0');
 });
 
 // ---------------------------------------------------------------------------
 // 2. ctor: fail-closed BEFORE allocation (typeof-first)
 // ---------------------------------------------------------------------------
 test('ctor rejects a non-integer / non-positive / non-finite k (typeof-first, before allocation)', () => {
-    assert.throws(() => new DecayedReservoir(0, 100), /k must be an integer >= 1/);
-    assert.throws(() => new DecayedReservoir(-1, 100), /k must be an integer >= 1/);
-    assert.throws(() => new DecayedReservoir(1.5, 100), /k must be an integer >= 1/);
-    assert.throws(() => new DecayedReservoir(NaN, 100), /k must be an integer >= 1/);
-    assert.throws(() => new DecayedReservoir('4', 100), /k must be an integer >= 1/);
-    assert.throws(() => new DecayedReservoir(Infinity, 100), /k must be an integer >= 1/);
-    assert.throws(() => new DecayedReservoir(-0, 100), /k must be an integer >= 1/);   // -0 < 1 -> rejected like 0
+    assert.throws(() => new DecayedReservoir(0, 100), /k must be an integer/);
+    assert.throws(() => new DecayedReservoir(-1, 100), /k must be an integer/);
+    assert.throws(() => new DecayedReservoir(1.5, 100), /k must be an integer/);
+    assert.throws(() => new DecayedReservoir(NaN, 100), /k must be an integer/);
+    assert.throws(() => new DecayedReservoir('4', 100), /k must be an integer/);
+    assert.throws(() => new DecayedReservoir(Infinity, 100), /k must be an integer/);
+    assert.throws(() => new DecayedReservoir(-0, 100), /k must be an integer/);   // -0 < 1 -> rejected like 0
 });
 
 test('ctor rejects a non-finite / non-positive halfLife', () => {
@@ -66,6 +67,24 @@ test('ctor rejects a non-finite / non-positive halfLife', () => {
     assert.throws(() => new DecayedReservoir(8, NaN), /halfLife must be a finite number > 0/);
     assert.throws(() => new DecayedReservoir(8, Infinity), /halfLife must be a finite number > 0/);
     assert.throws(() => new DecayedReservoir(8, '100'), /halfLife must be a finite number > 0/);
+});
+
+test('F14: a subnormal halfLife that overflows lambda to Infinity throws tagged BEFORE allocation', () => {
+    // lambda = ln2 / halfLife = Infinity for a subnormal halfLife (1e-320) -> NaN priorities,
+    // the sample freezes at the first k values. Reject it at construction, naming the floor.
+    assert.throws(() => new DecayedReservoir(2, 1e-320),
+        /\[lite-adaptive\] DecayedReservoir halfLife .* lambda .* is not finite; halfLife must be >=/);
+    // The smallest halfLife that still yields a FINITE lambda is accepted.
+    const floor = Math.LN2 / Number.MAX_VALUE;
+    const dr = new DecayedReservoir(2, floor);
+    assert.ok(Number.isFinite(dr.lambda));
+    // A tiny-but-normal halfLife samples finite values (no NaN-frozen sample).
+    const dr2 = new DecayedReservoir(2, 2.3e-308);
+    dr2.add(0, 1);
+    dr2.add(1, 2);
+    const out = new Float64Array(2);
+    const n = dr2.sampleInto(out);
+    for (let i = 0; i < n; i++) assert.ok(Number.isFinite(out[i]));
 });
 
 test('ctor rejects a bad seed / a non-object options / an unknown option key', () => {
@@ -510,4 +529,16 @@ test('ADVERSARIAL: a re-entrant add() from inside forEach does not crash and sta
     const buf = new Float64Array(r.k);
     const n = r.sampleInto(buf);
     for (let i = 0; i < n; i++) assert.ok(Number.isFinite(buf[i]), 'every sampled value stays finite after a re-entrant write');
+});
+
+// --- F11: the ctor k cap throws a tagged RangeError before allocation (1.6.0 lazily over-committed
+//     ~34 GB of `bytes` for DR(2^31, 1)). Verified in a SUBPROCESS: the child catches, exits 0. ---
+test('F11 DecayedReservoir(2^31, 1) throws tagged in a subprocess (no over-commit)', () => {
+    const src =
+        "import('" + new URL('../Adaptive.js', import.meta.url).href + "').then(m=>{" +
+        "try{new m.DecayedReservoir(2**31, 1);console.log('NO_THROW');}" +
+        "catch(e){console.log(/\\[lite-adaptive\\]/.test(e.message)&&e instanceof RangeError?'TAGGED':'WRONG:'+e.message);}});";
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', src], { encoding: 'utf8' });
+    assert.equal(r.status, 0, 'child exits 0, stderr=' + r.stderr);
+    assert.match(r.stdout, /TAGGED/, 'child caught a tagged RangeError, got ' + r.stdout);
 });

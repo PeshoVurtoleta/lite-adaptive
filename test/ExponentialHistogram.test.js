@@ -2,10 +2,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { ExponentialHistogram, VERSION } from '../Adaptive.js';
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '1.6.0');
+    assert.equal(VERSION, '1.7.0');
 });
 
 test('constructor validates W fail-closed BEFORE allocation', () => {
@@ -33,18 +34,39 @@ test('constructor rejects an unknown option with a message, non-object options',
     assert.doesNotThrow(() => new ExponentialHistogram(1000, 0.1, undefined));
 });
 
-test('CAP / k / levels match the settled formulas', () => {
+test('CAP / k / levels match the settled formulas (maxCount: W reproduces the pre-1.7.0 W-sized pool)', () => {
+    // levels = max(2, ceil(log2(maxCount/(k+1))) + 2); cap = (k+1)*levels + 2. With
+    // maxCount = W these reproduce the exact pre-1.7.0 numbers (23/44/158/35/72/366/53/114/678).
     const cases = [
         [64, 0.5, 2, 7, 23], [64, 0.1, 6, 6, 44], [64, 0.01, 51, 3, 158],
         [1000, 0.5, 2, 11, 35], [1000, 0.1, 6, 10, 72], [1000, 0.01, 51, 7, 366],
         [65536, 0.5, 2, 17, 53], [65536, 0.1, 6, 16, 114], [65536, 0.01, 51, 13, 678],
     ];
     for (const [W, eps, k, levels, cap] of cases) {
-        const eh = new ExponentialHistogram(W, eps);
+        const eh = new ExponentialHistogram(W, eps, { maxCount: W });
         assert.equal(eh.k, k, 'k for W=' + W + ' eps=' + eps);
         assert.equal(eh.levels, levels, 'levels for W=' + W + ' eps=' + eps);
         assert.equal(eh.capacity, cap, 'cap for W=' + W + ' eps=' + eps);
+        assert.equal(eh.maxCount, W, 'maxCount for W=' + W + ' eps=' + eps);
     }
+});
+
+test('default maxCount (2^32) sizes the pool by epsilon alone (W-independent)', () => {
+    // maxCount defaults to 2^32, so levels/cap depend only on k (= epsilon), not on W.
+    const cases = [
+        [0.5, 2, 33, 101], [0.1, 6, 32, 226], [0.05, 11, 31, 374], [0.01, 51, 29, 1510],
+    ];
+    for (const [eps, k, levels, cap] of cases) {
+        for (const W of [64, 1000, 65536]) {
+            const eh = new ExponentialHistogram(W, eps);
+            assert.equal(eh.maxCount, 4294967296, 'default maxCount');
+            assert.equal(eh.k, k, 'k for eps=' + eps);
+            assert.equal(eh.levels, levels, 'default levels for eps=' + eps + ' W=' + W);
+            assert.equal(eh.capacity, cap, 'default cap for eps=' + eps + ' W=' + W);
+        }
+    }
+    // eps 0.01 default pool: 1510 buckets x 36 B = 54,360 B (the CHANGELOG figure).
+    assert.equal(new ExponentialHistogram(1000, 0.01).capacity * 36, 54360);
 });
 
 test('getters read back the shape', () => {
@@ -186,6 +208,18 @@ test('count() === sum() when every add uses value=1', () => {
     const eh = new ExponentialHistogram(200, 0.05);
     for (let i = 1; i <= 1000; i++) eh.add(i);   // value defaults to 1
     assert.equal(eh.count(), eh.sum());
+});
+
+test('F15: sum() overflows to +Infinity (honest IEEE) for values near Double.MAX; count() unaffected', () => {
+    // sum() is an IEEE double. It never throws on a big value; it returns the representable
+    // answer (+Infinity) when the windowed value sum exceeds Number.MAX_VALUE. This pins that
+    // decision (query contract: a query never throws on a bad VALUE). count() is a POPULATION
+    // bound, so it stays exact.
+    const eh = new ExponentialHistogram(1000, 0.1);
+    eh.add(0, 1e308);
+    eh.add(0, 1e308);   // 2e308 > Number.MAX_VALUE ~ 1.8e308
+    assert.equal(eh.sum(), Infinity);
+    assert.equal(eh.count(), 2);
 });
 
 // --- addFrom: the zero-box packed [now, value] entry -------------------------------------
@@ -403,4 +437,217 @@ test('advanceFrom on a COUNT-locked instance throws', () => {
     const eh = new ExponentialHistogram(100, 0.01);
     eh.add();
     assert.throws(() => eh.advanceFrom(new Float64Array([5]), 0), /\[lite-adaptive\]/);
+});
+
+// --- 1.7.0 S3: maxCount sizing + overflow pre-check (F1) ----------------------
+
+test('maxCount is validated typeof-first, BEFORE any allocation', () => {
+    for (const bad of [0, -1, 1.5, 9007199254740992 /* 2^53 */, NaN, Infinity, '10', null, {}, 10n]) {
+        assert.throws(() => new ExponentialHistogram(1000, 0.1, { maxCount: bad }),
+            /\[lite-adaptive\].*maxCount/, 'maxCount=' + String(bad));
+    }
+    // valid values do not throw; undefined (not null) takes the 2^32 default.
+    assert.doesNotThrow(() => new ExponentialHistogram(1000, 0.1, { maxCount: 1 }));
+    assert.doesNotThrow(() => new ExponentialHistogram(1000, 0.1, { maxCount: 9007199254740991 }));
+    assert.equal(new ExponentialHistogram(1000, 0.1, { maxCount: undefined }).maxCount, 4294967296);
+});
+
+test('maxCount getter reads back the declared population', () => {
+    assert.equal(new ExponentialHistogram(1000, 0.1).maxCount, 4294967296);
+    assert.equal(new ExponentialHistogram(1000, 0.1, { maxCount: 5000 }).maxCount, 5000);
+    assert.equal(new ExponentialHistogram(1000, 0.01, { maxCount: 1000 }).maxCount, 1000);
+});
+
+// Snapshot every internal field the overflow throw must leave byte-identical.
+function ehSnapshot(eh) {
+    return {
+        ts: Array.from(eh._ts), start: Array.from(eh._start), size: Array.from(eh._size),
+        next: Array.from(eh._next), prev: Array.from(eh._prev), lvl: Array.from(eh._lvl),
+        head: Array.from(eh._head), tail: Array.from(eh._tail), lcount: Array.from(eh._lcount),
+        freeHead: eh._freeHead, count: eh._count, maxLevel: eh._maxLevel,
+        now: eh._now, lastNow: eh._lastNow, tick: eh._tick, mode: eh._mode,
+    };
+}
+
+test('overflow throws a tagged RangeError, BYTE-IDENTICAL no-op (add, explicit)', () => {
+    // small maxCount, W large so nothing expires -> a growing window overflows the pool.
+    const eh = new ExponentialHistogram(1e9, 0.1, { maxCount: 8 });
+    let threw = false;
+    for (let i = 1; i <= 100000; i++) {
+        const before = ehSnapshot(eh);
+        try {
+            eh.add(i, 1);
+        } catch (e) {
+            threw = true;
+            assert.ok(e instanceof RangeError, 'RangeError');
+            assert.match(e.message, /\[lite-adaptive\].*maxCount/);
+            assert.doesNotMatch(e.message, /this is a bug/);
+            assert.deepEqual(ehSnapshot(eh), before, 'state byte-identical after throw');
+            break;
+        }
+    }
+    assert.ok(threw, 'expected an overflow throw');
+});
+
+test('overflow throws BYTE-IDENTICAL (add, count mode)', () => {
+    const eh = new ExponentialHistogram(1e9, 0.1, { maxCount: 8 });
+    let threw = false;
+    for (let i = 1; i <= 100000; i++) {
+        const before = ehSnapshot(eh);
+        try {
+            eh.add();   // count mode
+        } catch (e) {
+            threw = true;
+            assert.match(e.message, /\[lite-adaptive\].*maxCount/);
+            assert.deepEqual(ehSnapshot(eh), before, 'state byte-identical after throw');
+            break;
+        }
+    }
+    assert.ok(threw, 'expected an overflow throw');
+});
+
+test('overflow throws BYTE-IDENTICAL (addFrom, explicit)', () => {
+    const eh = new ExponentialHistogram(1e9, 0.1, { maxCount: 8 });
+    const buf = new Float64Array(2);
+    let threw = false;
+    for (let i = 1; i <= 100000; i++) {
+        buf[0] = i; buf[1] = 1;
+        const before = ehSnapshot(eh);
+        try {
+            eh.addFrom(buf, 0);
+        } catch (e) {
+            threw = true;
+            assert.match(e.message, /\[lite-adaptive\].*maxCount/);
+            assert.deepEqual(ehSnapshot(eh), before, 'state byte-identical after throw');
+            break;
+        }
+    }
+    assert.ok(threw, 'expected an overflow throw');
+});
+
+test('advance / advanceFrom never throw overflow (they insert nothing)', () => {
+    // Fill toward capacity, then advance far past the window -- an idle slide only expires.
+    const eh = new ExponentialHistogram(1000, 0.1);
+    for (let i = 1; i <= 5000; i++) eh.add(i, 1);
+    assert.doesNotThrow(() => eh.advance(1e15));
+    assert.equal(eh.count(), 0, 'idle slide empties the window');
+    const eh2 = new ExponentialHistogram(1000, 0.1);
+    for (let i = 1; i <= 5000; i++) eh2.add(i, 1);
+    assert.doesNotThrow(() => eh2.advanceFrom(new Float64Array([1e15]), 0));
+    assert.equal(eh2.count(), 0);
+});
+
+// Independent oracle: does the pending insert at `t` really cascade past the top level?
+// Simulates the expiry sweep + the insert cascade on a COPY of the per-level counts.
+function refWouldOverflow(eh, t) {
+    const levels = eh._levels, k = eh._k, maxL = eh._maxLevel;
+    const cutoff = t - eh._W, ts = eh._ts, next = eh._next, head = eh._head, lcount = eh._lcount;
+    const lc = new Array(levels);
+    for (let L = 0; L < levels; L++) lc[L] = lcount[L];
+    let expiring = true;
+    for (let L = maxL; L >= 0 && expiring; L--) {
+        let node = head[L];
+        while (node !== -1 && ts[node] <= cutoff) { lc[L]--; node = next[node]; }
+        if (node !== -1) expiring = false;
+    }
+    lc[0]++;
+    let L = 0;
+    while (lc[L] > k) {
+        lc[L] -= 2;
+        const nl = L + 1;
+        if (nl >= levels) return true;   // cascade passes the top -> real overflow
+        lc[nl]++;
+        L = nl;
+    }
+    return false;
+}
+
+test('_wouldOverflow soundness: true <=> the cascade would really pass the top (eps .5)', () => {
+    // A tiny deterministic LCG so the random streams are reproducible.
+    let seed = 0x9e3779b9 >>> 0;
+    const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+    let overflows = 0, falsePositives = 0, checks = 0;
+    for (const maxCount of [16, 40]) {
+        for (let stream = 0; stream < 40; stream++) {
+            const eh = new ExponentialHistogram(100, 0.5, { maxCount });
+            let t = 0;
+            for (let step = 0; step < 4000; step++) {
+                t += rnd() * 2;                       // fractional, sometimes expires
+                const ref = refWouldOverflow(eh, t);
+                const got = eh._wouldOverflow(t);
+                checks++;
+                // no false negatives: the real cascade overflowing MUST be predicted.
+                assert.equal(got, ref, 'mismatch maxCount=' + maxCount + ' step=' + step +
+                    ' ref=' + ref + ' got=' + got);
+                if (got) { falsePositives += ref ? 0 : 1; }
+                if (ref) {
+                    overflows++;
+                    assert.throws(() => eh.add(t, 1), /\[lite-adaptive\].*maxCount/);
+                    eh.clear();
+                    t = 0;
+                } else {
+                    eh.add(t, 1);   // the real add must NOT throw when ref says no overflow
+                }
+            }
+        }
+    }
+    assert.equal(falsePositives, 0, 'no false positives');
+    assert.ok(overflows > 0, 'the true branch was exercised (' + overflows + ' overflows / ' + checks + ' checks)');
+});
+
+// --- 1.7.0 step-2 QA boundary cases (promoted from the QA reproduction scripts) ---
+
+test('maxCount -0 is rejected (not a positive integer) before allocation', () => {
+    assert.throws(() => new ExponentialHistogram(10, 0.1, { maxCount: -0 }), /\[lite-adaptive\]/);
+});
+
+test('exact pool ceiling k*(2^levels-1): holds exactly that many, the next add throws byte-identically (add + addFrom)', () => {
+    const pairs = [[0.01, 5000], [0.5, 16], [0.1, 40], [0.5, 1], [0.01, 1]];
+    for (const [eps, mc] of pairs) {
+        for (const viaFrom of [false, true]) {
+            const eh = new ExponentialHistogram(1e12, eps, { maxCount: mc });
+            const ceil = eh.k * (2 ** eh.levels - 1);
+            assert.ok(ceil >= mc, 'ceiling ' + ceil + ' >= maxCount ' + mc);
+            const buf = new Float64Array([0, 1]);
+            for (let i = 0; i < ceil; i++) { if (viaFrom) eh.addFrom(buf, 0); else eh.add(0); }
+            assert.equal(eh.count(), ceil, 'eps ' + eps + ' maxCount ' + mc + ' holds exactly ' + ceil);
+            const before = ehSnapshot(eh);
+            assert.throws(() => (viaFrom ? eh.addFrom(buf, 0) : eh.add(0)),
+                (e) => e instanceof RangeError && /^\[lite-adaptive\]/.test(e.message));
+            assert.deepEqual(ehSnapshot(eh), before, 'byte-identical across the overflow throw');
+        }
+    }
+});
+
+test('exact pool ceiling in COUNT mode (auto-tick, nothing expires)', () => {
+    const eh = new ExponentialHistogram(1e12, 0.1, { maxCount: 40 });
+    const ceil = eh.k * (2 ** eh.levels - 1);
+    for (let i = 0; i < ceil; i++) eh.add();
+    const before = ehSnapshot(eh);
+    assert.throws(() => eh.add(), /\[lite-adaptive\]/);
+    assert.deepEqual(ehSnapshot(eh), before);
+});
+
+test('adversarial: overflow at the ceiling, then the window slides and the pool recovers', () => {
+    const eh = new ExponentialHistogram(10, 0.5, { maxCount: 1 });   // k 2, levels 2, ceiling 6
+    const ceil = eh.k * (2 ** eh.levels - 1);
+    for (let i = 0; i < ceil; i++) eh.add(0);
+    assert.throws(() => eh.add(0), /\[lite-adaptive\]/);
+    eh.advance(11);                                                   // the whole burst expires
+    assert.equal(eh.count(), 0);
+    for (let i = 0; i < ceil; i++) eh.add(11);                        // a fresh burst fits again
+    assert.equal(eh.count(), ceil);
+    assert.throws(() => eh.add(11), /\[lite-adaptive\]/);
+});
+
+// --- F11: the ctor bucket-pool cap throws a tagged RangeError in-process (1.6.0 aborted with exit
+//     133 via a V8 fatal). Verified in a SUBPROCESS: the child catches the throw and exits 0. ---
+test('F11 ExponentialHistogram(10, 1e-12) throws tagged in a subprocess (no process abort)', () => {
+    const src =
+        "import('" + new URL('../Adaptive.js', import.meta.url).href + "').then(m=>{" +
+        "try{new m.ExponentialHistogram(10, 1e-12);console.log('NO_THROW');}" +
+        "catch(e){console.log(/\\[lite-adaptive\\]/.test(e.message)&&e instanceof RangeError?'TAGGED':'WRONG:'+e.message);}});";
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', src], { encoding: 'utf8' });
+    assert.equal(r.status, 0, 'child exits 0, stderr=' + r.stderr);
+    assert.match(r.stdout, /TAGGED/, 'child caught a tagged RangeError, got ' + r.stdout);
 });

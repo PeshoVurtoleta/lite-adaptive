@@ -8,6 +8,207 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.7.0] - 2026-09-26
+
+The H1 HARDENING release: fixes the 1.6.0 final-sweep audit findings (ROADMAP section 7; evidence in
+RESEARCH.md 13 and ROADMAP 7.1) plus one finding QA added during the cycle (F18). NOT a pure append:
+classes change in place. MINOR bump: two additive options (`ExponentialHistogram` `maxCount`,
+`SlidingDDSketch` `range`), and behavior changes limited to invalid or out-of-range inputs (a bad query
+value now returns NaN instead of throwing or returning 0; the `ADWIN` input bound narrows from ~1.34e154
+to ~6.7e153; over-range weights and oversized constructor configs now throw) plus the documented window
+and memory changes (`SlidingDDSketch` B+1 panes; `ExponentialHistogram` default pool sized from
+`maxCount`). Gates: npm test 439/439; torture 0 B/op on all 49 lanes; test:perf 30/30 at
+maxScavenges 0; test:perf:matrix 57 pass + 1 todo (F6: `SlidingCountMin.estimate` of a count >= 2^31
+boxes 16 B/call; the `estimateInto` reader is 1.8.0).
+
+### Added
+
+- **`ExponentialHistogram` `maxCount` option + getter (F1, settle S3).** `new
+  ExponentialHistogram(W, epsilon, { maxCount })` declares the window population the pool is
+  GUARANTEED to hold, in EITHER mode (a floor: the exact ceiling is `k * (2^levels - 1)`
+  elements, ~3-6x `maxCount`) -- a positive integer `<= 2^53-1`, default `2^32`, validated
+  typeof-first before allocation. It sizes the fixed pool from the population, not from `W`:
+  `levels = max(2, ceil(log2(maxCount/(k+1))) + 2)`, `capacity = (k+1) * levels + 2`. The
+  pool is allocated before the mode locks, so a COUNT-mode instance also gets the default
+  sizing -- the new default `capacity` / `levels` grow (e.g. `EH(1000, 0.01)`: 366 -> 1510
+  buckets, 7 -> 29 levels, ~13 KB -> ~53 KB). Pass `maxCount: W` to keep the pre-1.7.0
+  W-sized pool. A `maxCount` O(1) getter reports it.
+- **`SlidingDDSketch` `range` option + `rangeMin` / `rangeMax` getters + span-based strict (F2,
+  settle S8 -- lite-sketch DDSketch parity).** `new SlidingDDSketch(W, { range: [rmin, rmax] })`
+  DERIVES strict from a declared band (finite `0 < rmin < rmax`, both inside the alpha indexable
+  band, needing `<= SLD_MAX_BINS` bins) and pins the bin offset at `rangeKeyLo = ceil(ln(rmin) *
+  mult)`, `nb = keyHi - keyLo + 1` bins -- never anchored to a first value, never slid, never
+  collapsed; an out-of-band value throws "outside the declared strict range [rmin, rmax]" (a
+  key-band check, so a value in `rmin`'s / `rmax`'s log bucket is accepted, identical to
+  lite-sketch). Validated typeof-first BEFORE any allocation; a declared `range` with `strict:
+  false` is a contradiction and throws. `strict: true` WITHOUT a `range` is now SPAN-BASED: a pane
+  throws only when its occupied key span `[minKeyPop, maxKeyPop]` plus the new key would exceed
+  `SLD_MAX_BINS`, otherwise it RE-ANCHORS the window losslessly (shift the occupied bins down on a
+  key above the ceiling, up on a key below the floor) -- span-based, NOT a bottom anchor (which
+  would only move the bug to falling values). `rangeMin` / `rangeMax` O(1) getters report the
+  declared band (NaN when undeclared); `minIndexable` / `maxIndexable` are ALPHA-ONLY (identical
+  across non-strict / strict / range). Non-strict behavior is byte-identical to 1.6.0 (proven by a
+  200k-sample differential vector). The gap this closes was the missing `range` option -- the
+  getters were already lite-sketch-shaped.
+
+### Changed
+
+- **One query contract across the whole package: a bad query VALUE returns NaN and never throws; a
+  wrong container TYPE throws (F12).** A bad query value no longer throws on any member; only a wrong
+  CONTAINER type (a programming error) does.
+  - `SlidingDDSketch.quantile(q)` with `q` outside `[0, 1]` / NaN returns NaN; a bad sub-window `w`
+    (`<= 0`, `> W`, NaN, non-number) returns NaN for BOTH `quantile` and `count` (NaN, not 0 -- null
+    is not zero, an unrepresentable window is not an under-count). An empty window is unchanged
+    (`quantile` -> NaN, `count()` -> 0).
+  - `SlidingHyperLogLog.count(w)` with `w` outside `(0, W]` returns NaN (was a throw); `w` omitted
+    queries the full window W; an empty window still reads 0.
+  - `SlidingCountMin.estimate(key, w)` returns NaN on a bad sub-window `w` (was `0` -- a fail-open
+    under-count on an upper-bound sketch) and NaN on an out-of-domain `key` (was `0`); an UNSEEN but
+    VALID key is still `0` (an invalid key was never "seen 0 times", and `0` is indistinguishable
+    from a legitimate miss). null is not zero.
+  - `HeavyKeeper.estimate(key)` with a non-safe-integer key returns NaN (was a throw); an unseen but
+    VALID key still reads 0.
+  - A wrong CONTAINER type stays a programming error: an Into reader (`quantileInto`, `topKInto`,
+    `sampleInto`, ...) with a non-`Float64Array` container or one too short still THROWS.
+
+### Fixed
+
+- **`ADWIN` range term `R` is now the CURRENT window's range, not a running global (F18).** The
+  ADWIN2 Bernstein cut threshold has a range term `(2/3)(R/m)ln(2/deltaP)`. Pre-1.7.0 `R = max - min`
+  was a running min/max over ALL raw `x` ever seen (`_min` / `_max`), which never shrank after a cut.
+  After one large level shift `R` stayed inflated for the instance's life, so the range term dominated
+  and ADWIN went DEAF to later shifts (it failed OPEN; lite-hud M6 uses ADWIN). Measured, ADWIN(.002),
+  5 seeds, N(0,1) noise: a later `+1` shift was caught in **87-99** items with no prior jump, **921-988**
+  after a prior jump of 100, and **NEVER within 20000** items after a prior jump of `1e4` / `1e6`; a
+  straddling mixed bucket also survived, leaving the window variance at **~2.7e8** instead of `~1` after a
+  `1e6` jump. FIX: two per-bucket `Float64Array` columns `_bmin` / `_bmax` (RAW `x`, offset-invariant) are
+  set when a bucket opens and unioned on a merge, and `_scanCut` derives `R` from the live buckets'
+  min/max EXCLUDING the globally-oldest bucket -- the range of the window ADWIN would RETAIN when it cuts
+  there, so the lone straddle carrying a stale prior-regime value can no longer pin `R` at the old shift
+  height. After the fix the later `+1` shift is caught in **96 / 82 / 113 / 78 / 83** items for J in
+  `{100, 1e4, 1e6}` (within 1.5x + 10 of the **91 / 85 / 115 / 89 / 88** no-prior-jump baseline on the same
+  seeds), and the settled `0 -> 1e6` window reads variance **~1.0** with `|mean - 1e6| < 0.01`. Stationary
+  false alarms stay at 0 (offsets 0 / 1e9 / 1.7e12) and `<= delta` -- the (large, well-sampled) oldest
+  bucket's exclusion barely moves `R` on a stationary stream. `_min` / `_max` are removed; no public getter
+  exposed them. The ADWIN bucket pool grows by two `Float64Array(CAP)` columns, `2 x 8 x 386 = +6176 B`
+  (13120 -> 19296 B; no `bytes` getter). `add` / `addFrom` stay 0 B/op (the range walk lives in the
+  existing cut scan, not `add`'s hot body); stationary per-add cost +5.6%.
+- **`ForwardDecay` / `DecayedReservoir` reject a subnormal `halfLife` that overflows `lambda` (F14).**
+  A subnormal `halfLife` (e.g. `1e-320`) makes `lambda = ln2 / halfLife = Infinity`, which then poisons
+  every weight to `NaN`: `DecayedReservoir` failed OPEN (NaN A-Res priorities, the sample froze at the
+  first `k` values) and `ForwardDecay` failed only at query time with a misleading "value near Double.MAX
+  was added" message. Both constructors now compute `lambda` and reject `!(lambda < Infinity)` (NaN-safe)
+  with a tagged `[lite-adaptive]` RangeError BEFORE any allocation, naming `halfLife` and the smallest
+  accepted value (`ln2 / Number.MAX_VALUE ~ 3.86e-309`). A normal `halfLife` that yields a finite lambda
+  is accepted unchanged.
+- **`ExponentialHistogram.sum()` finiteness stated; two class-comment texts corrected (F15).** `sum()` is
+  an IEEE double: it overflows to `+Infinity` ONLY if the windowed value sum exceeds `Number.MAX_VALUE`
+  (e.g. `add(0, 1e308)` twice). This is now DOCUMENTED as the honest IEEE result -- a query never throws on
+  a bad VALUE (query contract, consistent with F12), and `+Infinity` is the representable answer;
+  `count()`'s POPULATION bound is unaffected. A unit test pins the behavior. Also: the `DecayedReservoir`
+  idle-gap class comment now matches the truth (a key CAN reach `-Infinity` across multiple back-to-back
+  capped rebases -- harmless: order preserved, values finite, no NaN, per ADR 0011), and the `HeavyKeeper`
+  class comment's estimate range is clarified to state HeavyKeeper NEVER overestimates (a reported count is
+  in `[true - err, true]`, verified against ADR 0005 and the witness's worst-overestimate-0 gate).
+- **`ADWIN` false alarms at large offsets (F9).** Variance was computed as `E[x^2] - mean^2`, which
+  cancels catastrophically at a large absolute offset: 5 seeds x 20k stationary N(0,1) raised 0 false
+  alarms at offset 0 but 98 at 1e9 and 144 at 1.7e12, and a +1 step went undetected on 2 of 5 seeds at
+  1.7e12. The sums are now CENTRED on an offset `c` (the first value, re-centred on the window mean
+  after every fired cut), so behavior is offset-invariant: 0 false alarms at 0 / 1e9 / 1.7e12, and the
+  step-detection delay is IDENTICAL across offsets on every seed (witness gate). Columns and `bytes`
+  unchanged; offset-0 results are statistically equivalent, not bit-identical (FP rounding). **Behavior change (frozen-core domain narrowing):** the
+  accepted `|x|` bound drops from `sqrt(Number.MAX_VALUE)` (~1.34e154) to `sqrt(Number.MAX_VALUE) / 2`
+  (~6.7e153), because a centred `|x - c|` can reach twice `|x|` and must still square finitely; a
+  finite `x` in between now throws `[lite-adaptive]` (a byte-identical no-op) instead of being accepted.
+- **`SlidingHyperLogLog.count()` is now PURE (F8).** It used to expire ring entries destructively, so
+  `overflows` / `degraded` depended on how often you queried (6556 vs 6562 on one stream; 2694 vs 162
+  in the audit). Expired heads are now dropped in `add` / `addFrom` before appending, an overflow is
+  counted only for an IN-WINDOW drop, and `count()` skips expired entries without writing. A queried
+  and a never-queried twin now end with identical `overflows` (17294 = 17294) and byte-identical rings;
+  the estimate is bit-identical to 1.6.0 (differential vectors).
+
+- **`HeavyKeeper.addFrom` boxed a large key / weight / the default seed (F3, hot path).** A
+  safe-integer key or weight `>= 2^31`, or the default uint32 seed `0x9e3779b1`, crossed the
+  internal `hkHash` / `hkPos` / `hkMapHash` / `_promote` / map call boundaries as arguments and
+  boxed a ~16 B HeapNumber per op (a 31-bit-Smi V8 boxes any int32 outside +-2^30 held in a `let`
+  or passed as an argument). The hot-path numeric inputs now live in fixed module scratch slots
+  (a `Float64Array` for key / seed / map-key / estimate, an `Int32Array` for the hash lanes) that
+  every helper reads directly, so no numeric value crosses a call boundary. `addFrom` is now
+  0 B/op for EVERY safe-integer key and weight (large, negative, and the default seed) -- proven
+  fresh AND warmed at maxScavenges 0. Output is bit-identical to 1.6.0 (a differential replays a
+  200k-op stream and compares `topKInto` order + 512 estimate probes exactly, for the default seed
+  and `seed: 0`). Plain `add(largeKey)` still boxes the key at its own public argument boundary --
+  use `addFrom` (a packed `[key, weight]` Float64Array) for keys `>= 2^31`.
+- **`ExponentialHistogram` explicit/count overflow -> `count()`/`sum()` = NaN (F1, High).**
+  A stream denser than the old `W`-sized pool cascaded past the top level and wrote out of
+  bounds on the typed columns (silently), orphaning buckets so queries returned NaN (e.g.
+  `EH(1000, .01)` at 10 kHz went NaN mid-stream). `add` / `addFrom` now PRE-CHECK the pending
+  insert with a read-only expiry scan and throw a tagged `[lite-adaptive]` RangeError (naming
+  `maxCount` and the capacity) BEFORE any state write -- a BYTE-IDENTICAL no-op. The hot path
+  adds one integer compare; the scan is a separate cold method. Under the default `maxCount`
+  the dense 10 kHz / 70 s witness never goes NaN.
+- **`ExponentialHistogram.sum()` did not hold `<= epsilon` (F17, doc).** Levels are sized by
+  POPULATION, not value mass, so the `sum()` error is bounded ABSOLUTELY by
+  `size(oldest straddling bucket) / 2` -- relative `<= epsilon` only for count or
+  near-constant values. Heavy-tailed / spiky value streams can exceed epsilon (measured
+  15.8% heavy tail, ~2504% spike at eps .1). The docs, d.ts, ADR 0002 and a new witness lane
+  now state the true bound; `count()`'s `<= epsilon` bound is unchanged.
+- **`SlidingDDSketch` under-counted the window edge -- ring now holds B+1 panes (F7, behavior
+  change).** The ring stored only B panes, so it dropped the oldest (straddling) pane up to one pane
+  width EARLY and `count()` under-reported the true count on 29410/29557 witness queries. The ring
+  now holds B+1 panes (the `panes` option stays B, the user knob) and queries cover every live pane
+  `paneEnd > now - W`, INCLUDING the straddling oldest pane. The covered span is therefore
+  `[W, W + W/B]`: always the FULL window W, over-covered by at most one pane width W/B and NEVER
+  under-covered. `count() >= true count in (now - W, now]` now holds on 100% of 29557 witness queries.
+  `bytes` grows by one pane (default `panes: 32` -> 279712 -> 287949 B). Rotation stays bounded: a huge
+  `now` jump clears at most B+1 panes.
+- **`SlidingDDSketch.quantileInto(qs, out)` is now 0 B/call (F5, render path).** It boxed ~64 B/call
+  by returning a double from `_walkInto`; the cut now lives in an instance `Float64Array` slot and
+  `_walkInto` writes `out[j]` in place, so a render path is fully alloc-free. `quantile(q)` keeps ONE
+  boxed return (16 B/call) -- use `quantileInto` on a hot render path.
+- **`HeavyKeeper` single weight above `2^32-1` now throws (F10).** A single `add` / `addFrom` weight
+  must be an integer in `[1, 2^32-1]`; above `2^32-1` it throws `[lite-adaptive] HeavyKeeper weight
+  must be an integer in [1, 4294967295], got <w>` (a byte-identical no-op). In 1.6.0 an over-range
+  single weight was stored UNCLAMPED into the `Uint32` cell and wrapped, so `add(7, 2^32)` then
+  `estimate(7)` read `0` while `topK` reported `2^32`. An ACCUMULATED cell still SATURATES at
+  `2^32-1` (unchanged) -- the two rules are distinct. This is parity with `SlidingCountMin`'s
+  `[1, 2^32-1]` count domain.
+- **Constructor memory caps -- a tagged `RangeError` BEFORE allocation (F11).** In 1.6.0 an oversized
+  table aborted the PROCESS on an uncatchable V8 fatal (exit 133) or lazily over-committed multiple
+  GB: `new HeavyKeeper(64, 2**30, 1)` and `new ExponentialHistogram(10, 1e-12)` crashed, and
+  `new DecayedReservoir(2**31, 1)` reserved ~34 GB. Each ctor now checks a hard cell ceiling BEFORE
+  allocation and throws a tagged `[lite-adaptive]` `RangeError` naming the cap: `HeavyKeeper` `d*w
+  <= 2^27` cells (`HK_CELLS_CAP`, ~1 GB at 8 B/cell), `w <= 2^30` (`HK_W_MAX`), `k <= 2^24`
+  (`HK_K_MAX`, ~256 MB at 16 B/slot); `ExponentialHistogram` bucket-pool `cap <= 2^22` buckets
+  (`EH_CAP_MAX`, ~150 MB at 36 B/bucket -- which rejects an epsilon below ~3e-6 at the default
+  `maxCount`); `DecayedReservoir` `k <= 2^24` (`DR_K_MAX`, ~256 MB at 16 B/slot).
+- **Option-bag door is now prototype-safe with a did-you-mean hint (F13).** Every constructor (all 9)
+  and both static factories (`HeavyKeeper.withAccuracy`, `SlidingCountMin.withAccuracy`) validate
+  `options` through ONE shared door (R6: every door is the same door): `undefined` is OK; `null`, a
+  non-object, an `Array`, or a typed array / `DataView` is a `TypeError`; an unknown OWN enumerable
+  key is a `RangeError` with a Levenshtein `<= 2` did-you-mean hint for a known key (e.g. `{sede: 1}`
+  -> `unknown option "sede" -- did you mean "seed"?`, `{maxcount: 1}` -> `"maxCount"`). The known-key
+  sets are now null-proto, so inherited keys like `toString` / `constructor` are no longer accepted
+  as options -- in 1.6.0 six classes used plain object-literal key sets and accepted them. Only OWN
+  enumerable keys are validated; inherited enumerable keys are ignored (not part of the bag contract).
+
+### Documentation
+
+- **The query allocation rule is now stated (F6).** A query that RETURNS a fractional or large double
+  boxes ONE ~16 B HeapNumber per call at a non-inlined call site; the `Into` / `forEach` readers are the
+  0-alloc render path. Measured (steady state): `SlidingCountMin.estimate` of a windowed count `>= 2^31`
+  boxes 16 B/call (the 1.8.0 `estimateInto` fixes it); `SlidingDDSketch.quantile` boxes 16 B/call (use
+  `quantileInto`, 0 B/call); `ExponentialHistogram.sum()` and `HeavyKeeper.estimate` box only in the
+  early JIT tier (steady 0). `llms.txt` previously claimed `SlidingCountMin.estimate` was 0-alloc -- that
+  claim is corrected, and the one rule is added to `README.md` (allocation table + Design decisions) and
+  `llms.txt`.
+- **Docs / metadata sweep (F16).** The `package-lock.json` `version` fields now read the package version
+  (were stale at `0.1.0`). The README Testing section now states the test counts (`npm test` 420,
+  `test:perf` 30, `test:perf:matrix` 58) and mentions `gates:red`, `witness`, `torture`, and the
+  `test/differential` parity suites. The ROADMAP milestone table and section 6.2 status words are updated
+  from "planned" / "IN DEVELOPMENT" / "unscheduled" to SHIPPED with versions (M0-M4 -> 0.1.0-0.4.0, 1.0.0,
+  and the post-1.0 members through 1.6.0), and section 7 (H1 hardening) is marked IN PROGRESS for 1.7.0.
+
 ## [1.6.0] - 2026-09-24
 
 The fifth additive post-1.0 member (`DecayedReservoir`) -- a PURE APPEND. All eight prior classes

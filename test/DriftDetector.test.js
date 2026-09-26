@@ -29,7 +29,7 @@ function newDD(mode, opts) {
 }
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '1.6.0');
+    assert.equal(VERSION, '1.7.0');
 });
 
 test('the mode consts are the documented numeric values', () => {

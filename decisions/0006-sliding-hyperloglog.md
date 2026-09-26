@@ -128,3 +128,33 @@ caller can assert the sketch stayed within its accuracy contract. The witness ga
 `degraded === false` on the measured workload; a caller sizing `ringCap` too small for an
 adversarial stream will see `degraded` flip and must widen `ringCap` (never a silent wrong
 answer).
+
+## Amendment (1.7.0, F8) -- queries are PURE; expiry moved into `add`
+
+1.6.0 `count()` was DESTRUCTIVE: it dropped expired ring heads (`stamp <= now - W`) and wrote
+the new head/len back. So `overflows` / `degraded` depended on HOW OFTEN you queried -- a
+never-queried instance and an every-add-queried instance saw DIFFERENT overflow counts on the
+SAME stream (measured 6556 vs 6562; the audit's adversarial case 2694 vs 162). llms.txt and
+this ADR promised queries are pure (R7), so this was a contract violation.
+
+FIX -- expire in the WRITE, read-only in the query:
+- `add` / `addFrom`: after popping dominated tail entries and BEFORE the ring-full check, drop
+  expired heads off THIS add's clock (`stamp <= t - W`). A ring that is STILL full after that
+  expiry means a genuine IN-WINDOW eviction -> `_overflows++`. Amortized O(1): each entry is
+  dropped exactly once, in the write path. `_overflows` now counts only real capacity pressure
+  and is independent of query cadence.
+- `count(w?)` is PURE -- it NEVER mutates the rings. Its read scan already skipped every
+  `stamp <= subCut`, and `subCut = now - w >= now - W`, so an expired-by-W entry is skipped
+  anyway. The estimate is therefore BIT-IDENTICAL to the 1.6.0 destructive path on any stream
+  (the dead `fullCut` and both write-backs were removed).
+- `advance` / `advanceFrom` stay CLOCK-ONLY and must NOT expire the rings. Leaving them
+  untouched keeps `overflows` independent of advance frequency too (an entry that only leaves
+  because time moved on, with no new add competing for its slot, is not capacity pressure). The
+  pure `count()` self-filters by `_now`, so a bare clock bump still slides an idle stream to 0.
+
+GATE (HARD, `test/witness.mjs` F8 purity lane + `test/differential/SHLLParity.test.mjs`): two
+twins fed the same 200k-op stream (p4/ringCap2 so overflows fire), one queried after every add
+and one never -- `overflows` EQUAL (measured 17294 == 17294) and `_stamps`/`_rho`/`_head`/`_len`
+BYTE-IDENTICAL; a ring snapshot byte-identical across 100 consecutive `count()` calls;
+`count()` bit-identical to the frozen 1.6.0 golden at every query point on a non-overflowing
+stream (full + sub-window). The windowed-distinct witness still passes.

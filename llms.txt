@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.6.0
+Version: 1.7.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -36,7 +36,7 @@ zero-box `addFrom(buf, i)` for callers whose inputs are read from a Float64Array
 tree-shakeable named exports; prior members stay byte-identical on append (only the header +
 VERSION change). v1.2.0 adds DriftDetector (scalar Page-Hinkley / CUSUM change detection). v1.3.0 adds
 SlidingDDSketch (windowed relative-error QUANTILES over the last W; Masson-Rim-Lee, VLDB 2019, over a
-fixed-B pane ring) -- the recency sibling of lite-sketch's cumulative DDSketch and the quantile
+fixed-(B+1) pane ring) -- the recency sibling of lite-sketch's cumulative DDSketch and the quantile
 complement of SlidingHyperLogLog. Each post-1.0 member is a PURE APPEND: the prior classes stay
 BYTE-IDENTICAL (only the file header + VERSION change). v1.4.0 adds advance(now) / advanceFrom(buf, i)
 to the three TIME-windowed members (ExponentialHistogram, SlidingHyperLogLog, SlidingDDSketch) -- the
@@ -61,14 +61,16 @@ change). This completes the confirmed post-1.0 roadmap.
   opens a level-0 bucket, merges the two oldest at any level that exceeds
   `k = ceil(1/(2*epsilon)) + 1` (a bounded cascade), and expires buckets older than
   `now - W`. Driven by a caller-supplied MONOTONE time source; the member never reads
-  the wall clock. `count()` / `sum()` / `query()` are COLD windowed estimates within a
-  HARD relative error `<= epsilon`. DGIM (the 0/1 count stream) is the `value = 1`
+  the wall clock. `count()` / `query()` are COLD windowed estimates within a HARD
+  relative error `<= epsilon`; `sum()` error is bounded absolutely by half the oldest
+  straddling bucket's value-mass (relative `<= epsilon` only for count / near-constant
+  values -- F17). DGIM (the 0/1 count stream) is the `value = 1`
   special case. Fail closed on a bad W / epsilon (throws before allocation), a mode
   switch, a non-finite / decreasing `now`, or a non-positive value; queries never throw.
 - `ADWIN` -- class. A zero-GC concept-drift detector with NO fixed window size (Bifet-
   Gavalda, SDM 2007). It keeps the most-recent values in an EH-style bucket list over its
   OWN variance-carrying `(sum, sumSq, count)` columns (design-parity with EH, a SEPARATE
-  fixed pool). `add(x) -> boolean` appends a finite real (|x| <= sqrt(MAX_VALUE)), compresses buckets (at most 5 per
+  fixed pool). `add(x) -> boolean` appends a finite real (|x| <= sqrt(MAX_VALUE)/2, 1.7.0 F9), compresses buckets (at most 5 per
   level), scans every bucket-boundary split of the window into an older `W0` and a newer
   `W1` with the ADWIN2 variance-aware (Bernstein) cut, and on a detected mean shift DROPS
   the older sub-window -- returning `true` on the detecting item. Amortized O(1), 0 B/op
@@ -101,13 +103,15 @@ change). This completes the confirmed post-1.0 roadmap.
   (a seeded xorshift32 draw) and evicted at count 0 -- so cold keys erode and the top-k tracks
   the CURRENT concept. Amortized O(1), 0 B/op incl. the decay draw + the forest sift.
   `estimate(key)` is the max matching cell (0 for an unseen but VALID key; a non-safe-integer key
-  throws, parity with add); `forEach(fn)` iterates the current top-k allocation-free; `topKInto(buf)`
+  -> NaN, never throws -- F12); `forEach(fn)` iterates the current top-k allocation-free; `topKInto(buf)`
   packs the current top-k into a caller Float64Array as [key, estimate] pairs (2 floats per entry)
   and returns the entry count, 0-alloc (buf length must be >= 2*k, else it throws);
   `topK()` is a COLD convenience that may allocate. `addFrom(buf, i)` is the zero-box entry
   (`key = buf[i]`, `weight = buf[i+1]` -- a large u32 key would box as a plain argument). Weight
-  is a positive integer (rank by count, total time, bytes, ...). Keys are safe integers; a bad
-  key/weight/buffer throws [lite-adaptive] typeof-first (byte-identical no-op). Far lower error
+  is an integer in [1, 2^32-1] (rank by count, total time, bytes, ...; a single over-range weight
+  throws -- F10 -- while an ACCUMULATED cell SATURATES at 2^32-1, parity with SlidingCountMin).
+  Keys are safe integers; on add/addFrom a bad key/weight/buffer throws [lite-adaptive] typeof-first
+  (byte-identical no-op), while the estimate query never throws (bad key -> NaN). Far lower error
   than Space-Saving on skewed / evolving streams. No `merge` (it decays natively). Getters:
   `d` / `w` / `k` / `b` / `seed` / `bytes` / `size`.
 - `SlidingHyperLogLog` -- class. A zero-GC WINDOWED distinct-count (how many DISTINCT keys in the
@@ -115,14 +119,17 @@ change). This completes the confirmed post-1.0 roadmap.
   An `m = 2^p` register bank where each register keeps a small FIXED LFPM ring of `(timestamp, rho)`
   entries (a monotonic deque, strictly decreasing rho). `add(now, key) -> this` (count mode via
   `add(undefined, key)`) derives register + rho from an inline two-lane hash, pops dominated tail
-  entries, and appends -- 0 B/op incl. the windowed eviction; a full ring drops its oldest entry and
-  bumps `overflows` (`degraded` flips true -- the honest degradation signal). `addFrom(buf, i)` is
+  entries, then drops expired heads (`stamp <= now - W`), and appends -- 0 B/op incl. the windowed
+  eviction; a ring still full AFTER expiry drops its oldest entry and bumps `overflows` (`degraded`
+  flips true -- the honest degradation signal, query-independent since expiry lives in add). Since
+  1.7.0 (F8) expiry happens in add/addFrom, not the query. `addFrom(buf, i)` is
   the zero-box entry (`now = buf[i]`, `key = buf[i+1]` -- a fractional / epoch-ms `now` and a large
-  key would box as plain arguments). `count(w?) -> number` lazily expires `stamp <= now - W`, takes
-  each register's live-max rho, and runs Ertl's improved estimator (design-parity with lite-sketch,
+  key would box as plain arguments). `count(w?) -> number` is PURE (never mutates the rings; it only
+  reads the oldest in-window entry per register), and runs Ertl's improved estimator (design-parity with lite-sketch,
   inline) -- standard error `1.04 / sqrt(m)` (guaranteed while `degraded === false`); `w` is an
-  optional sub-window in `(0, W]`. `query()` aliases `count()`. Keys are safe integers; a bad key /
-  now / w / option throws [lite-adaptive] typeof-first (byte-identical no-op). Fully deterministic
+  optional sub-window in `(0, W]` (outside that range -> NaN, never throws -- F12). `query()` aliases
+  `count()`. Keys are safe integers; on add a bad key / now / option throws [lite-adaptive] typeof-first
+  (byte-identical no-op), while count(w) with a bad `w` reads NaN. Fully deterministic
   (no PRNG). Getters: `W` / `p` / `m` / `ringCap` / `seed` / `standardError` / `lastNow` / `mode` /
   `overflows` / `degraded` / `bytes`.
 - `DriftDetector` -- class. A zero-GC, O(1)-STATE scalar streaming DRIFT DETECTOR over a
@@ -154,18 +161,23 @@ change). This completes the confirmed post-1.0 roadmap.
   no-op). DDM / EDDM (Bernoulli error-bit + tri-state output) are deliberately OUT of this class -- a
   future member.
 - `SlidingDDSketch` -- class. A zero-GC WINDOWED relative-error QUANTILE summary over the LAST W
-  (Masson-Rim-Lee, "DDSketch", VLDB 2019, over a fixed-B pane ring; ADR 0008) -- the recency sibling of
-  lite-sketch's cumulative DDSketch and the quantile complement of SlidingHyperLogLog. A ring of B
-  preallocated DDSketch panes, each covering W/B of the window; `add(now, value) -> this` (count mode via
+  (Masson-Rim-Lee, "DDSketch", VLDB 2019, over a fixed-(B+1) pane ring; ADR 0008) -- the recency sibling of
+  lite-sketch's cumulative DDSketch and the quantile complement of SlidingHyperLogLog. A ring of B+1
+  preallocated DDSketch panes (the `panes` option is B, the user knob), each covering W/B of the window;
+  `add(now, value) -> this` (count mode via
   `add(undefined, value)`) bins the value on the SAME log scale (gamma = (1+alpha)/(1-alpha),
   key = ceil(log_gamma value), collapse-lowest default + strict opt-in) and writes the current pane,
   rotating + clearing panes as `now` advances -- 0 B/op incl. rotation. `addFrom(buf, i)` is the zero-box
   entry (`now = buf[i]`, `value = buf[i+1]` read UNBOXED). `quantile(q, w?) -> number` /
-  `quantileInto(qs, out) -> count` / `count(w?) -> number` merge the live panes into an INSTANCE-OWNED
-  preallocated scratch (cold, 0 alloc) -- per-query relative error `<= alpha`, plus a window-edge error of
-  up to one pane width W/panes (disclosed + WITNESSED, since each pane collapses INDEPENDENTLY). Value
-  domain is positive + zero (negatives / out-of-indexable throw); a bad value / now / q / w / option throws
-  [lite-adaptive] typeof-first (byte-identical no-op). Empty window -> NaN quantile / 0 count. Getters:
+  `quantileInto(qs, out) -> count` / `count(w?) -> number` merge the live panes (INCLUDING the straddling
+  oldest pane) into an INSTANCE-OWNED preallocated scratch (cold, 0 alloc) -- per-query relative error
+  `<= alpha`; the covered span is [W, W + W/B]: the FULL window W, over-covered by at most one pane width
+  W/B and never under-covered (disclosed + WITNESSED, since each pane collapses INDEPENDENTLY). `quantile`
+  keeps ONE boxed return (16 B/call); `quantileInto` is 0 B/call (a render path). Value domain is positive
+  + zero (negatives / out-of-indexable throw); a bad value / now / option throws [lite-adaptive]
+  typeof-first (byte-identical no-op), but a bad query VALUE (q outside [0, 1] / NaN, or a `w` outside
+  (0, W] / NaN) returns NaN, NEVER throws (null is not zero). Empty window -> NaN quantile / 0 count.
+  Getters:
   `alpha` / `strict` / `panes` / `W` / `mode` / `lastNow` / `minIndexable` / `maxIndexable` / `collapsed`
   / `bytes`.
 - `SlidingCountMin` -- class. A zero-GC WINDOWED per-label FREQUENCY summary over the LAST W
@@ -179,12 +191,14 @@ change). This completes the confirmed post-1.0 roadmap.
   0 B/op incl. rotation. `addFrom(buf, i)` is the zero-box stride-3 entry (`now = buf[i]`, `key = buf[i+1]`,
   `count = buf[i+2]` read UNBOXED). `estimate(key, w?) -> number` SUMS each row's cell across the live panes
   then MINs over rows (sum-then-min); it returns a DOUBLE (a window sum can exceed 2^32) and NEVER throws
-  (0 for an unseen / out-of-domain key or an empty window -- lite-sketch CMS parity). The query covers the
+  (0 for an unseen but VALID key or an empty window; NaN for an out-of-domain key or a bad sub-window `w`
+  -- F12: 0 was a fail-open under-count on an upper-bound sketch, and an invalid key was never seen 0
+  times). The query covers the
   live panes so the span is [W, W+W/B]: the straddling oldest pane is KEPT, giving a ONE-SIDED upper bound
   true(W) <= est <= true(W+W/B) + epsilon*N. `advance(now)` / `advanceFrom(buf, i)` slide an idle window.
   Key domain: every SAFE INTEGER |key| <= 2^53 - 1 (so a composite channelIdx*2^32 + tag works for one
   shared instance); a bad key / count / now / option throws [lite-adaptive] typeof-first on add / addFrom
-  (byte-identical no-op), estimate never throws. Ctor `new SlidingCountMin(W, options?)` with
+  (byte-identical no-op), while estimate never throws (bad key / bad w -> NaN). Ctor `new SlidingCountMin(W, options?)` with
   `{ epsilon?, delta?, w?, d?, panes?, seed?, conservative? }` (epsilon -> w = ceil(e/epsilon) power-of-two,
   delta -> d = ceil(ln(1/delta)); explicit w / d override; defaults epsilon=delta=0.01 -> d=5, w=512,
   panes=32). No `merge` in 1.5.0. Getters: `d` / `w` / `panes` / `W` / `seed` / `conservative` / `saturated`
@@ -208,7 +222,7 @@ change). This completes the confirmed post-1.0 roadmap.
   the PRNG or the landmark). Deterministic given the seed. Getters: `k` / `halfLife` / `lambda` /
   `seed` / `size` / `mode` / `bytes`.
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.6.0'.
+- `VERSION` -- string, '1.7.0'.
 
 ## ExponentialHistogram
 
@@ -217,11 +231,21 @@ change). This completes the confirmed post-1.0 roadmap.
 - W: window size; a finite number > 0 (items in count mode, or the `now`-unit span in
   explicit mode).
 - epsilon: relative-error knob in (0, 1). Smaller -> more buckets -> tighter windowed
-  error. `k = ceil(1/(2*epsilon)) + 1` buckets per level;
-  `CAP = (k+1) * (ceil(log2(W/(k+1))) + 2) + 2` buckets (a fixed pool, never grows).
-- options: reserved object; an unknown key throws [lite-adaptive].
-- Constructor throws [lite-adaptive] typeof-first on a bad W / epsilon / option BEFORE
-  the pool is allocated (nothing half-built escapes).
+  error. `k = ceil(1/(2*epsilon)) + 1` buckets per level. The derived bucket-pool cap
+  `(k+1)*levels + 2` is capped at 2^22 buckets (EH_CAP_MAX, ~150 MB at 36 B/bucket); a tiny
+  epsilon past it throws a tagged RangeError BEFORE allocation instead of a V8 fatal (F11 --
+  this rejects an epsilon below ~3e-6 at the default maxCount).
+- options: `{ maxCount }`; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
+- maxCount: the window population the pool is GUARANTEED to hold, in EITHER mode -- a
+  positive integer <= 2^53-1 (default 2^32). It sizes the fixed pool:
+  `levels = max(2, ceil(log2(maxCount/(k+1))) + 2)`;
+  `CAP = (k+1) * levels + 2` buckets (a fixed pool, never grows). The exact ceiling is
+  `k * (2^levels - 1)` elements (>= maxCount, ~3-6x it; eps .01 + maxCount 5000 -> 26,061):
+  the add past it (its merge cascade would pass the top level) throws a tagged RangeError
+  (a byte-identical no-op).
+  Pass `maxCount: W` in count mode to keep the pre-1.7.0 W-sized pool.
+- Constructor throws [lite-adaptive] typeof-first on a bad W / epsilon / maxCount /
+  option BEFORE the pool is allocated (nothing half-built escapes).
 
 Time modes (LOCKED at the first add, a switch throws [lite-adaptive]):
 
@@ -256,20 +280,28 @@ Hot surface (add is amortized O(1), zero allocation incl. the merge / expire res
 - count() -> number           The windowed COUNT (population) over the last W. COLD,
                               O(levels). Relative error <= epsilon. Never throws (0 on empty).
 - sum() -> number             The windowed SUM (of values) over the last W. COLD,
-                              O(buckets). Relative error <= epsilon. Never throws.
+                              O(buckets). Never throws. ERROR (F17): absolute error
+                              <= size(oldest straddling bucket)/2; relative <= epsilon
+                              only for count / near-constant values (heavy-tailed / spiky
+                              values can exceed it -- levels are sized by POPULATION, not
+                              value mass). Use count() for a relative bound.
 - query() -> number           The primary windowed estimate -- an alias of count(). COLD.
 - clear() -> this             Reset to the empty window; reuse the pool (unlocks the mode).
 - windowSize / epsilon        Getters: the window; the error knob.
 - bucketCount / capacity      Getters: the live bucket count; the fixed pool capacity.
 - k / levels                  Getters: the per-level bound; the number of size classes.
+- maxCount (getter)           The declared (guaranteed) window population that sized the pool.
 - mode (getter)               'unset' | 'explicit' | 'count' -- the locked time mode.
 
 Recency contract (the honesty anchor): the witness drives an evolving stream against an
-exact ring-of-the-last-W oracle, measures the windowed relative error, and GATES it
-`<= epsilon` on EVERY query across the W x epsilon sweep, plus a shifting-rate stream;
-a broken EH (no straddle half-correction) is REJECTED by the same gate. Space
-co-headline: the fixed bucket pool vs the exact ring's O(W). The window is HARD (EH
-forgets EXACTLY at the edge); the error is relative and hard (not statistical).
+exact ring-of-the-last-W oracle, measures the windowed COUNT relative error, and GATES it
+`<= epsilon` on EVERY query across the W x epsilon sweep, plus a shifting-rate stream and
+a dense 10 kHz / 70 s stream (F1: count() never NaN under the default maxCount); a broken
+EH (no straddle half-correction) is REJECTED by the same gate. A separate SUM lane gates
+the F17 bound `|sum_est - sum_true| <= size(straddling bucket)/2` on 100% of queries over
+uniform / heavy-tail / spike streams and shows the old `sum <= epsilon` claim fails on
+skew. Space co-headline: the fixed bucket pool vs the exact ring's O(W). The window is
+HARD (EH forgets EXACTLY at the edge); the COUNT error is relative and hard (not statistical).
 
 ## ADWIN (ADR 0003)
 
@@ -277,14 +309,15 @@ forgets EXACTLY at the edge); the error is relative and hard (not statistical).
 
 - delta: confidence knob in (0, 1). The stationary false-alarm rate is bounded by delta.
   Smaller -> fewer false alarms, longer detection latency.
-- options: reserved object; an unknown key throws [lite-adaptive].
+- options: reserved object; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
 - Constructor throws [lite-adaptive] typeof-first on a bad delta / option BEFORE the pool
   is allocated. The pool is FIXED at CAP = (M+1)*LEVELS + 2 = 386 buckets (M = 5, LEVELS =
   64) and never grows.
 
 Item-indexed (NO clock): the adaptive window is measured in ITEMS, not time. `add(x)` takes
-one finite real value per item (|x| <= sqrt(Number.MAX_VALUE) ~= 1.34e154, so x*x never overflows
-the variance -- a larger finite x throws) and returns true iff a cut fired (drift detected) this add.
+one finite real value per item (|x| <= sqrt(Number.MAX_VALUE)/2 ~= 6.7e153 since 1.7.0 -- the sums
+are CENTRED on an offset c, and |x - c| <= 2*|x|max must still square finitely; a larger finite x
+throws) and returns true iff a cut fired (drift detected) this add.
 
 The ADWIN2 variance-aware cut: after the insert + merge cascade, every boundary split of
 the window into W0 (older, n0 items) | W1 (newer, n1 items) is tested; a cut fires when
@@ -294,13 +327,16 @@ the window into W0 (older, n0 items) | W1 (newer, n1 items) is tested; a cut fir
     deltaP  = delta / ln(width)                          (Bifet-Gavalda multiple-testing correction)
     epsCut  = sqrt( (2/m) * sigmaHat^2 * ln(2/deltaP) ) + (2/3) * (R/m) * ln(2/deltaP)
 
-sigmaHat^2 is the whole-window variance and R = max - min is the running observed range
-(over ALL x seen). On a detected cut the oldest bucket(s) are DROPPED (shrink W0 away) and
-the scan repeats until no cut remains -- amortized O(1), 0 B/op incl. the cut-scan + shrink.
+sigmaHat^2 is the whole-window variance and R = max - min is the CURRENT window's range
+(over the live buckets' per-bucket min/max, EXCLUDING the globally-oldest bucket -- since
+1.7.0 F18; pre-1.7.0 R was a running global range over ALL x seen that never shrank, so ADWIN
+went deaf to later shifts after one large level shift -- a straddling bucket pinned R). On a
+detected cut the oldest bucket(s) are DROPPED (shrink W0 away) and the scan repeats until no
+cut remains -- amortized O(1), 0 B/op incl. the cut-scan + shrink.
 
 Hot surface:
 
-- add(x) -> boolean           Append a finite real (|x| <= sqrt(Number.MAX_VALUE)), run the merge
+- add(x) -> boolean           Append a finite real (|x| <= sqrt(Number.MAX_VALUE)/2), run the merge
                               cascade + the cut-scan, drop the older sub-window on a cut. Returns
                               true on the detecting item. Fail closed: a non-finite / non-number x,
                               or a finite |x| whose square would overflow, throws [lite-adaptive]
@@ -323,7 +359,7 @@ must false-alarm; a no-shrink ADWIN must fail to adapt -- both rejected by the s
 
 - halfLife: the decay half-life; a finite number > 0 (an element's weight halves over this
   span). lambda = ln2 / halfLife (getter `lambda`).
-- options: reserved object; an unknown key throws [lite-adaptive].
+- options: reserved object; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
 - Constructor throws [lite-adaptive] typeof-first on a bad halfLife / option BEFORE any
   field init. O(1) SPACE: two scalar accumulators C, Sv -- there is NO pool.
 
@@ -392,22 +428,31 @@ Negative controls: fdNoRescale (rebase without the C,Sv rescale -> diverges) and
 - d: number of hash rows (~4-8). w: cells per row. k: the top-k size. options:
   `{ seed, b }` -- `seed` a Uint32 for the decay PRNG (default a fixed nonzero constant;
   seed=0 is valid), `b` the decay base (default ~1.08). A bad d / w / k / seed / b / option
-  throws [lite-adaptive] typeof-first BEFORE any allocation.
+  throws [lite-adaptive] typeof-first BEFORE any allocation. Memory caps are checked before
+  allocation and throw a tagged RangeError naming the cap (F11): d*w <= 2^27 cells (HK_CELLS_CAP,
+  ~1 GB at 8 B/cell), w <= 2^30 (HK_W_MAX), k <= 2^24 (HK_K_MAX, ~256 MB at 16 B/slot) -- an
+  oversized table used to abort the process on a V8 fatal.
 - add(key, weight = 1) -> this   HOT, amortized O(1), 0 B/op incl. the decay draw + the forest
-                                 sift. `key` a SAFE INTEGER; `weight` a positive integer
+                                 sift. `key` a SAFE INTEGER; `weight` an integer in [1, 2^32-1]
                                  (rank by count when 1, or by total time / bytes / any additive
-                                 weight). Hashes key to d cells (inline two-lane hash); a matching
+                                 weight; a single over-range weight throws -- F10 -- while an
+                                 ACCUMULATED cell SATURATES at 2^32-1, parity with SlidingCountMin).
+                                 Hashes key to d cells (inline two-lane hash); a matching
                                  fingerprint += weight; a colliding one is DECAYED once with prob
                                  b^(-count) (seeded xorshift32), count -= weight (clamped), and
                                  the fingerprint is replaced when count hits 0. Fail closed: a
-                                 non-safe-integer key / non-positive-integer weight throws
-                                 [lite-adaptive] (byte-identical no-op).
-- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX entry: key = buf[i], weight = buf[i+1] read
-                                 UNBOXED from a packed [key, weight] Float64Array (a large u32 key
-                                 >= 2^31 would box as a plain argument). Same validation + inline
+                                 non-safe-integer key, or a weight that is not an integer in
+                                 [1, 2^32-1], throws [lite-adaptive] (byte-identical no-op).
+- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX entry (F3 fixed): key = buf[i], weight =
+                                 buf[i+1] read UNBOXED from a packed [key, weight] Float64Array.
+                                 0 B/op for ALL safe-integer keys AND weights (incl. >= 2^31 and
+                                 the default seed): the numeric inputs route through fixed module
+                                 scratch slots, so nothing boxes at any call boundary. Plain
+                                 add(largeKey) still boxes the key at the argument boundary (a ~16 B
+                                 HeapNumber) -- use addFrom for large keys. Same validation + inline
                                  accumulate as add().
 - estimate(key) -> number        COLD; the max matching cell count (0 for an unseen but VALID key;
-                                 a non-safe-integer key throws, parity with add).
+                                 a non-safe-integer key -> NaN, never throws -- F12).
 - forEach(fn) -> void            ALLOC-FREE iteration over the current top-k: fn(key, estimate).
                                  The render path (topK() may allocate; forEach never does).
 - topKInto(buf) -> number        Pack the current top-k into a caller Float64Array as [key, estimate]
@@ -419,7 +464,7 @@ Negative controls: fdNoRescale (rebase without the C,Sv rescale -> diverges) and
                                  fixed memory figure (bytes), and the live top-k size.
 
 Top-k contract (the honesty anchor): the witness gates 100% RECALL of the true current top-k
-above N/k vs an exact Map oracle (weighted AND unit streams), a BOUNDED overestimate (each
+above N/k vs an exact Map oracle (weighted AND unit streams), a BOUNDED ONE-SIDED error (each
 reported total in [true - ~N/w, true], never over the truth), and the marquee claim -- MEASURED
 mean rel-error over the true top-k LOWER than a faithful Space-Saving baseline (Metwally et al.
 Stream-Summary) on a Zipfian + DRIFTING stream (measured 0.001% vs 36.75%). Negative controls
@@ -460,15 +505,18 @@ door BEFORE any allocation.
                                  as add().
 - advance(now) -> this           Move the reference clock to `now` WITHOUT adding a key (the R11
                                  idle slide, ADR 0009). CLOCK-ONLY: set `_now`, touch NOTHING else --
-                                 count() already lazily expires stamp <= now - W off `_now`, and
-                                 eager expiry would perturb overflows/degraded. EXPLICIT-time ONLY
+                                 the PURE count() self-filters stamp <= now - W off `_now`, and
+                                 expiring the ring here would perturb overflows/degraded (F8: the
+                                 ring is only expired by add). EXPLICIT-time ONLY
                                  (count-locked throws, unset locks EXPLICIT), monotone; O(1), 0 B/op.
 - advanceFrom(buf, i) -> this    The ZERO-BOX sibling of advance(now): `now = buf[i]` read UNBOXED
                                  (needs `i < buf.length`), same clock-only body, EXPLICIT-only.
-- count(w?) -> number            COLD, O(m). Lazily expire stamp <= now - W, take each register's
-                                 live-max rho, run Ertl's improved estimator (sigma / tau,
+- count(w?) -> number            COLD, O(m). PURE (F8): NEVER mutates the rings (expiry lives in
+                                 add). Read the oldest in-window entry per register (skips
+                                 stamp <= now - w), run Ertl's improved estimator (sigma / tau,
                                  alpha_inf; inline). Returns 0 on an empty window. `w` is an
-                                 optional sub-window in (0, W] (outside that range throws).
+                                 optional sub-window in (0, W] (outside that range -> NaN, never
+                                 throws -- F12).
 - query() -> number              COLD; an alias of count() over the full window W.
 - clear() -> this                0-alloc reset (reuse the arrays; unlocks the mode).
 - W / p / m / ringCap / seed / standardError / lastNow / mode / overflows / degraded / bytes
@@ -566,30 +614,47 @@ preallocated space with the SAME per-query bound as lite-sketch's cumulative DDS
 "DDSketch", VLDB 2019): `|q_est - q_true| <= alpha * q_true`. The recency sibling of cumulative DDSketch
 and the quantile complement of SlidingHyperLogLog. It is the QUANTILE corner on the time axis.
 
-Window model (ADR 0008, model A -- a fixed-B pane ring): B preallocated DDSketch panes, each covering
-W/B of the window, held in a ring. add() writes the CURRENT pane; when `now` crosses a pane boundary the
-ring rotates to the next pane and CLEARS it (fill(0), 0-alloc). A `now` jump of many pane-widths expires
-multiple panes in a bounded while-loop CAPPED at B iterations (skipping >= B panes clears them ALL, then
-re-anchors around `now`). quantile / quantileInto / count MERGE the live panes into an INSTANCE-OWNED
-preallocated scratch (cold, 0-alloc -- NEVER a per-query allocation). The window is grid-aligned to the
-current pane end, so the retained window is up to one pane width (W/B) SHORTER than the ideal
-(now-W, now] -- the disclosed EDGE error. Rejected alternatives: B (an EH/DGIM-style histogram OF
-DDSketches -- merge-on-add allocates, not 0 B/op) and C (Arasu-Manku -- unbounded per-item state, not
-zero-GC). Default panes B = 32 (edge error W/32; `panes` is a caller-tunable integer in [2, 1024]).
+Window model (ADR 0008, model A -- a fixed-(B+1) pane ring, F7): B+1 preallocated DDSketch panes (the
+`panes` option is B, the user knob), each covering W/B of the window, held in a ring. add() writes the
+CURRENT pane; when `now` crosses a pane boundary the ring rotates to the next pane and CLEARS it (fill(0),
+0-alloc). A `now` jump of many pane-widths expires multiple panes in a bounded while-loop CAPPED at B+1
+iterations (skipping >= B+1 panes clears the WHOLE ring, then re-anchors around `now`). quantile /
+quantileInto / count MERGE the live panes (paneEnd > now - W, INCLUDING the straddling oldest pane) into
+an INSTANCE-OWNED preallocated scratch (cold, 0-alloc -- NEVER a per-query allocation). The straddling
+oldest pane is KEPT (never dropped), so the covered span is [W, W + W/B]: always the FULL window W,
+over-covered by at most one pane width W/B and NEVER under-covered -- forgetting is at the far edge
+[W, W + W/B], never before W. Dropping the oldest pane would under-count (the 1.6.0 B-pane ring did, and
+under-reported the true count on 29410/29557 witness queries). Rejected alternatives: B (an EH/DGIM-style
+histogram OF DDSketches -- merge-on-add allocates, not 0 B/op) and C (Arasu-Manku -- unbounded per-item
+state, not zero-GC). Default panes B = 32 (edge over-coverage W/32; `panes` is a caller-tunable integer
+in [2, 1024], and the ring holds B+1).
 
 DDSketch mapping (INLINED, never an import -- a consumer like lite-hud pre-checks a value identically to
 lite-sketch DDSketch, so a shared dependency's divergence would be a breaking surprise): gamma =
 (1+alpha)/(1-alpha), key(x) = ceil(ln(x) * multiplier); x > 0 bins on the log scale, x === 0 routes to a
 per-pane zero counter, x < 0 fails closed. Collapse-lowest by default (protects the p90/p99 tail);
-`strict` opts into a throw on a collapse instead. The indexable band is computed with DDSketch's exact
+`strict` opts into a fail-closed throw instead. The indexable band is computed with DDSketch's exact
 ctor-time loop, so the ACCEPTED VALUE BAND is identical to lite-sketch DDSketch at every practical alpha.
 SLD_KEY_MAX = 2^30 caps |key| fail-closed (per-pane offsets live in Int32Array; the ADWIN/DriftDetector
 overflow lesson). SLD_MAX_BINS = 2048 (parity with lite-sketch DDSketch's default maxBins).
 
+Strict mode (lite-sketch DDSketch parity, F2): `strict` never collapses. WITHOUT a `range` it is
+SPAN-BASED -- a pane throws only when its OCCUPIED key span [minKeyPop, maxKeyPop] plus the new key would
+exceed SLD_MAX_BINS; otherwise it RE-ANCHORS the window losslessly (shift the occupied bins down on a
+key above the ceiling, up on a key below the floor). Span-based, NOT a bottom anchor -- a bottom anchor
+would only move the bug to falling values (e.g. add(0,1); add(1,0.5)). WITH a declared `range` it is
+DERIVED and FIXED: the bin offset is pinned at `rangeKeyLo = ceil(ln(rmin) * mult)`, nb = keyHi-keyLo+1
+bins, never anchored to a first value, never slid, never collapsed; a value outside the band throws
+"outside the declared strict range [rmin, rmax]" (a key-band check -- a value in rmin's / rmax's log
+bucket is accepted, identical to lite-sketch). minIndexable / maxIndexable are ALPHA-ONLY: identical
+across non-strict / strict / range.
+
 Constructor: `new SlidingDDSketch(W, options?)` where options = { alpha (a number in (0, 1), default
 0.01), strict (a boolean, default false -- null is not false), panes (an integer in [2, 1024], default
-32) }. A bad W / alpha / strict / panes / option throws [lite-adaptive] at the ctor door BEFORE any
-allocation.
+32), range ([rmin, rmax] with finite 0 < rmin < rmax, both inside the alpha indexable band and needing
+<= SLD_MAX_BINS bins -> DERIVES strict) }. A declared `range` with `strict: false` is a contradiction and
+throws. A bad W / alpha / strict / panes / range / option throws [lite-adaptive] at the ctor door BEFORE
+any allocation.
 
 - add(now, value) -> this        HOT, 0 B/op incl. pane rotate + clear. EXPLICIT mode: a finite,
                                  non-decreasing `now`. COUNT mode: add(undefined, value) auto-ticks (W in
@@ -606,28 +671,36 @@ allocation.
                                  anchors), monotone; bounded (<= panes clears), 0 B/op.
 - advanceFrom(buf, i) -> this    The ZERO-BOX sibling of advance(now): `now = buf[i]` read UNBOXED
                                  (needs `i < buf.length`), same rotate body, EXPLICIT-only.
-- quantile(q, w?) -> number      COLD, 0 alloc. Merge the live panes into the scratch, walk it. q in
-                                 [0, 1] (outside throws). `w` an optional sub-window in (0, W] (outside
-                                 throws). NaN on an empty window. rel error <= alpha (+ edge W/panes).
-- quantileInto(qs, out) -> count COLD, 0 alloc render: merge ONCE, write each qs[j] -> out[j] (NaN for a
-                                 bad q / empty window). Returns qs.length. Rejects non-Float64Array args
-                                 or out.length < qs.length.
+- quantile(q, w?) -> number      COLD, 0 alloc apart from ONE boxed return (16 B/call -- use quantileInto
+                                 on a render path). Merge the live panes into the scratch, walk it. NEVER
+                                 throws on a bad VALUE: q outside [0, 1] / NaN, or `w` outside (0, W] /
+                                 NaN / non-number -> NaN (null is not zero). NaN on an empty window. rel
+                                 error <= alpha over the covered span [W, W + W/B].
+- quantileInto(qs, out) -> count COLD, 0 B/call render (the cut lands in an instance scratch slot;
+                                 _walkInto writes out[j] in place). merge ONCE, write each qs[j] -> out[j]
+                                 (NaN for a bad q / empty window). Returns qs.length. A wrong CONTAINER
+                                 type is a programming error: THROWS on non-Float64Array args or
+                                 out.length < qs.length.
 - count(w?) -> number            COLD, O(panes). Items in the last W (or sub-window w), incl. zeros. 0 on
-                                 empty. `w` outside (0, W] throws.
+                                 an empty window. NEVER throws on a bad VALUE: `w` outside (0, W] / NaN /
+                                 non-number -> NaN (NaN, not 0 -- null is not zero).
 - clear() -> this                0-alloc reset (reuse the arrays; unlocks the mode).
-- alpha / strict / panes / W / mode / lastNow / minIndexable / maxIndexable / collapsed / bytes
-                                 Getters: the knobs, the locked mode, the last applied time, the DDSketch
-                                 indexable band, whether any live pane collapsed, the fixed memory figure.
+- alpha / strict / panes / W / mode / lastNow / minIndexable / maxIndexable / rangeMin / rangeMax /
+  collapsed / bytes             Getters: the knobs, the locked mode, the last applied time, the DDSketch
+                                 indexable band, the declared strict range (NaN when undeclared), whether
+                                 any live pane collapsed, the fixed memory figure.
 
 Windowed-quantile contract (the honesty anchor): the witness drives against an EXACT sorted-array oracle
 over the sketch's LIVE pane content and gates rel error <= alpha on 100% of >= 2000 queries across 3 W x
-3 alpha + a distribution SHIFT + a post-burst edge, AND asserts the window-edge error <= one pane width
-W/panes. Negative controls rejected by the same gates: a NO-EXPIRY variant (clear-on-rotate disabled ->
-stale values linger -> rel >> alpha) and a COARSE panes=2 variant (edge ~W/2, above the fine W/32 bound).
-Bin counts are Uint32Array (saturate at 0xFFFFFFFF, never wrap -- the CountMinSketch precedent; the one
-recorded deviation from lite-sketch DDSketch's Float64 bins), the merge scratch is Float64Array so B
-near-saturated panes sum exactly to 2^53. Memory ~ panes * 2048 * 4 B + scratch; panes=32 -> ~256 KB,
-never grows. ADR 0008 records the pane-ring choice (vs the rejected histogram-of-sketches / Arasu-Manku),
+3 alpha + a distribution SHIFT + a post-burst edge, AND asserts the TRUE-window gate: count >= true count
+in (now - W, now] on 100% of the queries, with quantiles within alpha of the covered span [W, W + W/B].
+Negative controls rejected by the same gates: a NO-EXPIRY variant (clear-on-rotate disabled -> stale
+values linger -> rel >> alpha), a COARSE panes=2 variant (edge ~W/2, above the fine W/32 bound), and a
+B-pane control (the 1.6.0 ring -- drops the straddling pane one pane width early and under-counts). Bin
+counts are Uint32Array (saturate at 0xFFFFFFFF, never wrap -- the CountMinSketch precedent; the one
+recorded deviation from lite-sketch DDSketch's Float64 bins), the merge scratch is Float64Array so B+1
+near-saturated panes sum exactly to 2^53. Memory ~ (B+1) * 2048 * 4 B + scratch; panes=32 -> ~281 KB
+(287949 B), never grows. ADR 0008 records the pane-ring choice (vs the rejected histogram-of-sketches / Arasu-Manku),
 the rotate-and-clear model, the edge-error disclosure, the merge-into-instance-scratch 0-alloc argument,
 the DDSketch mapping/collapse parity (and why inlined), the SLD_KEY_MAX overflow cap, and the
 independent-pane-collapse subtlety (why the bound is witnessed, not assumed).
@@ -683,10 +756,15 @@ throws [lite-adaptive] at the ctor door BEFORE any allocation. No `merge` in 1.5
 - addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX stride-3: now = buf[i], key = buf[i+1],
                                  count = buf[i+2] read UNBOXED. EXPLICIT-time only. Same validation + body
                                  (duplicated) as add().
-- estimate(key, w?) -> number    COLD, O(d x (B+1)), 0 alloc. SUM each row's cell across the live panes,
+- estimate(key, w?) -> number    COLD, O(d x (B+1)). SUM each row's cell across the live panes,
                                  then MIN over rows. Returns a DOUBLE (a window sum can exceed 2^32). NEVER
-                                 throws: 0 for an unseen / out-of-domain key, an empty window, or a bad
-                                 sub-window w (fail-closed). `w` an optional sub-window in (0, W].
+                                 throws: 0 for an unseen but VALID key or an empty window; NaN for an
+                                 out-of-domain key or a bad sub-window w (F12: 0 was a fail-open under-count
+                                 on an upper-bound sketch, and an invalid key was never seen 0 times). `w` an
+                                 optional sub-window in (0, W]. ALLOC (F6): a windowed count >= 2^31 boxes ONE
+                                 ~16 B HeapNumber per call at a non-inlined call site (the honest return of a
+                                 large double); a count < 2^31 is a Smi, 0 B/call. The 1.8.0 `estimateInto`
+                                 slot reader is the 0-alloc render path.
 - advance(now) -> this           Move the window's reference time to `now` WITHOUT adding (the R11 idle
                                  slide, ADR 0009): rotate + clear stale panes via the private _advance so
                                  an idle stream slides to empty (estimate 0). EXPLICIT-time ONLY (count-
@@ -741,9 +819,11 @@ and membership is fixed thereafter, an idle stream correctly HOLDS its last deca
 nothing to "slide to empty", so (like `ForwardDecay`) DecayedReservoir has NO `advance()`.
 
 Constructor: `new DecayedReservoir(k, halfLife, options?)` where `k` is a positive integer (the sample
-size), `halfLife` a finite number > 0 (`lambda = ln2 / halfLife`), options = { seed (uint32, default
-0x9e3779b1; seed=0 valid, guarded as `undefined`) }. A bad k / halfLife / seed / option throws
-[lite-adaptive] at the ctor door BEFORE any allocation.
+size, a positive integer <= 2^24 -- DR_K_MAX, ~256 MB at 16 B/slot; a bigger k throws a tagged
+RangeError BEFORE allocation instead of a lazy multi-GB over-commit, F11), `halfLife` a finite number
+> 0 (`lambda = ln2 / halfLife`), options = { seed (uint32, default 0x9e3779b1; seed=0 valid, guarded
+as `undefined`) }. A bad k / halfLife / seed / option throws [lite-adaptive] at the ctor door BEFORE
+any allocation.
 
 - add(now?, value?) -> this      HOT, amortized 0 B/op incl. the PRNG draw + forest sift + rebase.
                                  EXPLICIT mode: a finite, non-decreasing `now`. COUNT mode:
@@ -789,8 +869,9 @@ move the window forward with no traffic.
   add would, WITHOUT inserting a value. Queries stay PURE (they never mutate); advance() is the
   only op that moves the clock without a value.
 - Per-member body: ExponentialHistogram runs add()'s expire loop VERBATIM (opens no bucket).
-  SlidingHyperLogLog is CLOCK-ONLY (set `_now`; count() already lazily expires stamp <= now - W,
-  and EAGER expiry would perturb the overflows/degraded degradation signal). SlidingDDSketch
+  SlidingHyperLogLog is CLOCK-ONLY (set `_now`; count() skips stamp <= now - W as a PURE read,
+  and the next add drops expired heads -- 1.7.0 F8 -- so overflows/degraded never depend on how
+  often count() or advance() is called). SlidingDDSketch
   rotates + clears stale panes via the private `_advance` (bounded, <= panes clears).
 - Mode rule (all 3, parity with addFrom): EXPLICIT-time ONLY. A COUNT-locked instance throws; an
   UNSET instance locks EXPLICIT (and anchors, for SlidingDDSketch). Monotone: `now` finite and
@@ -801,6 +882,16 @@ move the window forward with no traffic.
   to advance).
 - Every existing method + hot body of the three touched classes is BYTE-IDENTICAL; advance /
   advanceFrom are pure additions.
+
+## Query allocation -- the render path (F6)
+
+One rule: a query that RETURNS a fractional or large double boxes ONE ~16 B HeapNumber per call
+at a non-inlined call site; the `xxxInto` / `forEach` readers are the 0-alloc render path. So on a
+10-15 Hz render loop use `SlidingDDSketch.quantileInto` (0 B/call) not `quantile` (16 B/call), and
+`HeavyKeeper.forEach` / `topKInto` (0 B/call) not `topK`. `SlidingCountMin.estimate` boxes 16 B/call
+only when the windowed count is >= 2^31 (a Smi-range count returns 0 B/call; the 1.8.0 `estimateInto`
+is the slot reader that fixes it). `ExponentialHistogram.sum()` and `HeavyKeeper.estimate` box only in
+the early JIT tier (steady state 0). `count()` and integer-count returns are Smis, 0 B/call.
 
 ## The time source + the bucket pool (ADR 0001)
 
@@ -836,7 +927,9 @@ PURE APPEND) -> 1.4.0 (the R11 advance() / advanceFrom() idle-slide sweep on the
 members -- ExponentialHistogram, SlidingHyperLogLog, SlidingDDSketch; additive, existing methods
 byte-identical) -> 1.5.0 (SlidingCountMin -- windowed per-label frequency; the FOURTH additive post-1.0
 member, a PURE APPEND) -> 1.6.0 (DecayedReservoir -- recency-biased fixed-k sample; the FIFTH additive
-post-1.0 member, a PURE APPEND). This COMPLETES the confirmed post-1.0 roadmap. The one remaining
+post-1.0 member, a PURE APPEND) -> 1.7.0 (the H1 HARDENING release: in-place fixes across members
+from the 1.6.0 final-sweep audit -- NOT a pure append; see CHANGELOG 1.7.0). The 1.6.0 member
+COMPLETES the confirmed post-1.0 roadmap. The one remaining
 optional / unscheduled tail member is an error-rate DDM / EDDM detector (Bernoulli error-bit stream ->
 stable / warning / drift) -- built on demand if a consumer asks; it would be a pure append that keeps
 the frozen core byte-identical.

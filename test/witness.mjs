@@ -132,9 +132,113 @@ console.log('');
     // per bucket: ts + start + size (Float64 x3) + next/prev/lvl (Int32 x3) = 36 bytes; pool = cap * 36.
     const ehBytes = eh.capacity * 36;
     const ringBytes = W * 8;   // an exact ring of the last W timestamps, 8 B each
-    console.log('  space co-headline @ W=' + nStr(W) + ', eps=' + eps + ':  ExponentialHistogram = ' +
+    console.log('  space co-headline @ W=' + nStr(W) + ', eps=' + eps + ', maxCount=' + eh.maxCount +
+        ' (default 2^32):  ExponentialHistogram = ' +
         (ehBytes / 1024).toFixed(1) + ' KB (fixed, ' + eh.capacity + ' buckets)  vs  exact ring = ' +
         (ringBytes / 1024).toFixed(1) + ' KB (grows O(W))  |  count=' + eh.count() + ' (true ' + W + ')');
+}
+
+// ---------------------------------------------------------------------------
+// F1: a DENSE explicit stream (10 kHz for 70 s = 700,000 adds, t = i/10). With the
+// DEFAULT maxCount (2^32) count() NEVER goes NaN and stays within eps of an exact deque
+// oracle; a W-sized maxCount (the pre-1.7.0 pool) OVERFLOWS this stream -> a tagged throw.
+// ---------------------------------------------------------------------------
+console.log('');
+{
+    const W = 1000, eps = 0.01, adds = 700000;
+    const eh = new ExponentialHistogram(W, eps);   // default maxCount 2^32
+    const CAPQ = 1 << 15;                            // > the ~10,000 in-window items
+    const q = new Float64Array(CAPQ);
+    let qh = 0, qt = 0, nan = 0, maxRel = 0, sampled = 0;
+    for (let i = 1; i <= adds; i++) {
+        const t = i / 10;
+        eh.add(t, 1);
+        q[qt] = t; qt = (qt + 1) & (CAPQ - 1);
+        while (qh !== qt && q[qh] <= t - W) qh = (qh + 1) & (CAPQ - 1);
+        if ((i % 10) === 0) {
+            const est = eh.count();
+            if (est !== est) nan++;
+            const exact = (qt - qh) & (CAPQ - 1);
+            if (exact > 0) { const rel = Math.abs(est - exact) / exact; if (rel > maxRel) maxRel = rel; }
+            sampled++;
+        }
+    }
+    const f1ok = nan === 0 && maxRel <= eps && sampled >= 70000;
+    if (!f1ok) ok = false;
+    // A W-sized maxCount reproduces the pre-1.7.0 pool -> the F1 overflow, now a tagged throw
+    // (a byte-identical no-op; the 12-field snapshot equality is gated in the unit suite).
+    const ehSmall = new ExponentialHistogram(W, eps, { maxCount: W });
+    let threw = false;
+    try { for (let i = 1; i <= adds; i++) ehSmall.add(i / 10, 1); }
+    catch (e) { threw = e instanceof RangeError && /\[lite-adaptive\].*maxCount/.test(e.message); }
+    if (!threw) ok = false;
+    console.log('  F1 dense 10 kHz x 70 s (' + nStr(adds) + ' adds, default maxCount ' + eh.maxCount + '): NaN ' +
+        nan + '/' + nStr(adds) + ', maxRel ' + pct(maxRel) + ' over ' + nStr(sampled) +
+        ' queries vs eps ' + pct(eps) + ' -> ' + (f1ok ? 'ok' : 'FAIL') +
+        ';  maxCount=W pool -> ' + (threw ? 'tagged throw (ok)' : 'NO throw (FAIL)'));
+}
+
+// ---------------------------------------------------------------------------
+// F17: the SUM bound. count() stays <= epsilon, but sum()'s error is bounded ABSOLUTELY
+// by size(oldest straddling bucket)/2 -- relative <= epsilon only for count / near-constant
+// values. A witness-local EhProbe reads the internal columns to compute the straddling
+// bucket size; the STATED bound holds on 100% of queries while the OLD "<= eps" sum claim
+// fails hard on a spike stream (informational print). (F17.)
+// ---------------------------------------------------------------------------
+class EhProbe extends ExponentialHistogram {
+    straddleSize() {
+        if (this._count === 0) return 0;
+        const oldest = this._head[this._maxLevel];
+        return this._start[oldest] <= this._now - this._W ? this._size[oldest] : 0;
+    }
+}
+function f17Stream(valueFn, W, eps, n) {
+    const eh = new EhProbe(W, eps);
+    const CAPQ = 1 << 15;
+    const qt_ = new Float64Array(CAPQ), qv = new Float64Array(CAPQ);
+    let qh = 0, qtl = 0, trueSum = 0;
+    let sumWorstRel = 0, cntWorstRel = 0, sumBoundViol = 0, queries = 0;
+    for (let i = 1; i <= n; i++) {
+        const t = i, v = valueFn(i);
+        eh.add(t, v);
+        qt_[qtl] = t; qv[qtl] = v; qtl = (qtl + 1) & (CAPQ - 1); trueSum += v;
+        while (qh !== qtl && qt_[qh] <= t - W) { trueSum -= qv[qh]; qh = (qh + 1) & (CAPQ - 1); }
+        if (t > W) {
+            const trueCnt = (qtl - qh) & (CAPQ - 1);
+            const estSum = eh.sum(), estCnt = eh.count();
+            const sumErr = Math.abs(estSum - trueSum);
+            const bound = eh.straddleSize() / 2 + 1e-6 * Math.max(1, trueSum);
+            if (sumErr > bound) sumBoundViol++;
+            if (trueSum > 0) { const r = sumErr / trueSum; if (r > sumWorstRel) sumWorstRel = r; }
+            if (trueCnt > 0) { const rc = Math.abs(estCnt - trueCnt) / trueCnt; if (rc > cntWorstRel) cntWorstRel = rc; }
+            queries++;
+        }
+    }
+    return { sumWorstRel, cntWorstRel, sumBoundViol, queries };
+}
+console.log('');
+console.log('  F17 windowed SUM bound (eps 0.1): |sum_est - sum_true| <= size(straddling bucket)/2 on 100% of' +
+    ' queries; count stays <= eps; the OLD sum <= eps claim FAILS on skew (informational):');
+{
+    let seed = 0x1234567 >>> 0;
+    const rng = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const streams = [
+        ['uniform  ', (i) => 1 + (rng() * 9 | 0)],
+        ['heavy-tail', () => rng() < 0.01 ? 1000 : 1],
+        ['spike     ', (i) => (i % 1500 === 0) ? 1e6 : 1],
+    ];
+    let f17ok = true;
+    for (const [name, fn] of streams) {
+        const r = f17Stream(fn, 1000, 0.1, 20000);
+        const boundOk = r.sumBoundViol === 0 && r.queries >= 2000;
+        const cntOk = r.cntWorstRel <= 0.1;
+        if (!boundOk || !cntOk) f17ok = false;
+        console.log('    ' + name + ' (' + nStr(r.queries) + ' q): sum bound viol ' + r.sumBoundViol +
+            ' -> ' + (boundOk ? 'ok' : 'FAIL') + ';  count worstRel ' + pct(r.cntWorstRel) +
+            ' <= eps -> ' + (cntOk ? 'ok' : 'FAIL') + ';  OLD sum<=eps: worstRel ' + pct(r.sumWorstRel) +
+            (r.sumWorstRel > 0.1 ? ' (EXCEEDS eps -- old claim false)' : ''));
+    }
+    if (!f17ok) ok = false;
 }
 
 console.log('');
@@ -355,6 +459,202 @@ let adControlsOk = true;
 }
 console.log('');
 console.log('WITNESS ADWIN negative controls (broken bound + broken shrink rejected) ' + (adControlsOk ? 'ok' : 'FAIL'));
+
+// ===========================================================================
+// F9 (1.7.0) HARD GATE -- ADWIN at a LARGE absolute OFFSET must behave like offset 0.
+// Pre-F9 variance was E[x^2] - mean^2, which cancels catastrophically once |mean| is large
+// (measured: 0 false alarms at offset 0, 98 at 1e9, 144 at 1.7e12; variance read ~0). With
+// CENTRED sums the variance is offset-invariant. GATE (HARD): ADWIN(0.002), seeds 1..5 x 20k
+// stationary N(0,1) -- false alarms at 1e9 and 1.7e12 each <= (offset-0 count + 1); a +1 step at
+// item 10000 detected 5/5 within 2000 items with delay within +-2 items of the offset-0 delay on
+// the same seed; the stationary false-alarm rate <= delta at every offset.
+// ===========================================================================
+
+/** Box-Muller N(0,1) from a mulberry32 stream (shared by the offset lanes). */
+function gaussFrom(rnd) {
+    let u = 0, v = 0;
+    while (u === 0) u = rnd();
+    while (v === 0) v = rnd();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+let adOffsetOk = true;
+console.log('');
+console.log('F9 OFFSET GATE -- ADWIN(0.002), 5 seeds x 20k stationary N(0,1) at a large absolute offset');
+console.log('  (theoretical: an additive offset shifts the mean, NOT the variance -> behavior is offset-invariant)');
+console.log('');
+{
+    const DELTA = 0.002, SEEDS = [1, 2, 3, 4, 5], N = 20000, STEP_AT = 10000, STEP = 1, LIMIT = 2000;
+    const OFFSETS = [0, 1e9, 1.7e12];
+
+    // stationary false alarms per offset per seed.
+    const faByOffset = new Map();      // offset -> total false alarms across seeds
+    const faSeed = new Map();          // offset -> [per-seed counts]
+    for (const off of OFFSETS) {
+        let total = 0; const per = [];
+        for (const seed of SEEDS) {
+            const ad = new ADWIN(DELTA);
+            const r = mulberry32(seed);
+            let flags = 0;
+            for (let i = 0; i < N; i++) if (ad.add(off + gaussFrom(r))) flags++;
+            total += flags; per.push(flags);
+        }
+        faByOffset.set(off, total); faSeed.set(off, per);
+    }
+    const fa0 = faByOffset.get(0);
+    console.log('  stationary false alarms (summed over 5 seeds; theoretical rate <= delta = ' + DELTA + '):');
+    console.log('  offset        false alarms   rate         gate (<= off0+1 = ' + (fa0 + 1) + ')  status');
+    console.log('  ------------  -------------  -----------  ----------------------  ------');
+    for (const off of OFFSETS) {
+        const fa = faByOffset.get(off);
+        const rate = fa / (SEEDS.length * N);
+        const rateOk = rate <= DELTA;
+        const cntOk = off === 0 ? true : fa <= fa0 + 1;
+        if (!rateOk || !cntOk) adOffsetOk = false;
+        console.log('  ' + off.toExponential(1).padEnd(12) + '  ' + String(fa).padStart(13) + '  ' +
+            pct(rate).padStart(11) + '  ' + String(fa).padStart(22) + '  ' + (rateOk && cntOk ? 'ok' : 'FAIL'));
+    }
+
+    // +1 step at item 10000: detection delay per seed per offset, within +-2 of offset-0 delay, 5/5 <2000.
+    console.log('');
+    console.log('  +1 step at item 10000: detection delay per seed (gate: 5/5 detected < ' + LIMIT +
+        ', |delay - offset0 delay| <= 2):');
+    console.log('  seed   off 0    off 1e9  off 1.7e12  delta(1e9)  delta(1.7e12)  status');
+    console.log('  -----  -------  -------  ----------  ----------  -------------  ------');
+    function stepDelay(offset, seed) {
+        const ad = new ADWIN(DELTA);
+        const r = mulberry32(seed + 1000);
+        for (let i = 0; i < STEP_AT; i++) ad.add(offset + gaussFrom(r));
+        for (let j = 0; j < LIMIT; j++) if (ad.add(offset + STEP + gaussFrom(r))) return j;
+        return Infinity;
+    }
+    for (const seed of SEEDS) {
+        const d0 = stepDelay(0, seed), d9 = stepDelay(1e9, seed), d12 = stepDelay(1.7e12, seed);
+        const all3 = Number.isFinite(d0) && Number.isFinite(d9) && Number.isFinite(d12);
+        const near9 = Number.isFinite(d9) && Number.isFinite(d0) && Math.abs(d9 - d0) <= 2;
+        const near12 = Number.isFinite(d12) && Number.isFinite(d0) && Math.abs(d12 - d0) <= 2;
+        const cellOk = all3 && near9 && near12;
+        if (!cellOk) adOffsetOk = false;
+        const fmt = (d) => (Number.isFinite(d) ? String(d) : 'MISS');
+        console.log('  ' + String(seed).padEnd(5) + '  ' + fmt(d0).padStart(7) + '  ' + fmt(d9).padStart(7) + '  ' +
+            fmt(d12).padStart(10) + '  ' + (Number.isFinite(d9 - d0) ? String(d9 - d0) : '--').padStart(10) + '  ' +
+            (Number.isFinite(d12 - d0) ? String(d12 - d0) : '--').padStart(13) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+    }
+}
+console.log('');
+console.log('WITNESS ADWIN F9 offset invariance (false alarms + step delay offset-invariant) ' +
+    (adOffsetOk ? 'ok' : 'FAIL'));
+
+// ===========================================================================
+// F18 (1.7.0) HARD GATE -- ADWIN recovers its sensitivity after a large level shift.
+// Pre-F18 the Bernstein range term used R = max - min over ALL raw x ever seen, a running global
+// min/max that never shrinks after a cut. After one large shift R stayed inflated for the instance's
+// life, so the range term (2/3)(R/m)ln(2/deltaP) dominated and ADWIN went DEAF: a later +1 shift was
+// caught in 87-99 items with no prior jump, 921-988 after a prior jump of 100, and NEVER within 20000
+// items after a prior jump of 1e4 / 1e6; a straddling mixed bucket also survived (window variance
+// ~2.7e8 instead of ~1 after a 1e6 jump). FIX: R is the range of the CURRENT window, taken over the
+// live buckets' per-bucket min/max EXCLUDING the globally-oldest bucket (the lone straddle that
+// carries a stale prior-regime value) -- so R tracks the retained window, not ancient history.
+// GATES: G1 recovery (later +1 delay within 1.5x + 10 of the no-prior-jump delay for J in {100,1e4,
+// 1e6}); G2 clean window (variance in [0.8,1.25], |mean - 1e6| < 1 after a 1e6 jump + 30k settled);
+// G4 negative control (an ADWIN kept on the OLD running-global R must FAIL G1 -- proves the teeth).
+// ===========================================================================
+
+/** An ADWIN pinned to the OLD (pre-F18) running-GLOBAL R = max - min over ALL raw x ever seen. */
+class GlobalRADWIN extends ADWIN {
+    constructor(delta, options) { super(delta, options); this._gmin = Infinity; this._gmax = -Infinity; }
+    add(x) { if (typeof x === 'number') { if (x < this._gmin) this._gmin = x; if (x > this._gmax) this._gmax = x; } return super.add(x); }
+    // reproduce the pre-F18 bound: whole-history range, never shrunk, used for every split.
+    _scanCut() {
+        const total = this._total; if (total <= 1) return false;
+        const wsum = this._wsum, lnw = Math.log(total), deltaP = this._delta / lnw, ln2dp = Math.log(2 / deltaP);
+        const mean = wsum / total; let variance = this._wsumSq / total - mean * mean; if (variance < 0) variance = 0;
+        const R = this._gmax - this._gmin;                 // OLD BUG: running-global range
+        const head = this._head, next = this._next, bc = this._bcount, sum = this._sum;
+        let n0 = 0, sum0 = 0;
+        for (let L = this._maxLevel; L >= 0; L--) {
+            let node = head[L];
+            while (node !== -1) {
+                n0 += bc[node]; sum0 += sum[node]; const n1 = total - n0;
+                if (n1 > 0) {
+                    const m = 1 / (1 / n0 + 1 / n1), mean0 = sum0 / n0, mean1 = (wsum - sum0) / n1;
+                    let diff = mean0 - mean1; if (diff < 0) diff = -diff;
+                    if (diff > Math.sqrt((2 / m) * variance * ln2dp) + (2 / 3) * (R / m) * ln2dp) return true;
+                }
+                node = next[node];
+            }
+        }
+        return false;
+    }
+}
+
+let adRecoverOk = true;
+let adControlHasTeeth = false;
+console.log('');
+console.log('F18 RECOVERY GATE -- ADWIN(0.002): a later +1 shift after a settled prior level shift J');
+console.log('  (3000 items N(0,1) at 0, then 20000 at J + N(0,1), then a +1 shift; 5 seeds)');
+console.log('');
+{
+    const DELTA = 0.002, SEEDS = [1, 2, 3, 4, 5], JS = [100, 1e4, 1e6], TOLK = 1.5, TOLADD = 10;
+    function baselineDelay(Ctor, seed) {   // no prior jump: 23000 N(0,1) at 0, then +1
+        const ad = new Ctor(DELTA), r = mulberry32(seed + 7000);
+        for (let i = 0; i < 3000; i++) ad.add(gaussFrom(r));
+        for (let i = 0; i < 20000; i++) ad.add(gaussFrom(r));
+        for (let j = 0; j < 20000; j++) if (ad.add(1 + gaussFrom(r))) return j;
+        return Infinity;
+    }
+    function priorDelay(Ctor, J, seed) {   // prior jump to J settled, then +1 more
+        const ad = new Ctor(DELTA), r = mulberry32(seed + 7000);
+        for (let i = 0; i < 3000; i++) ad.add(gaussFrom(r));
+        for (let i = 0; i < 20000; i++) ad.add(J + gaussFrom(r));
+        for (let j = 0; j < 20000; j++) if (ad.add(J + 1 + gaussFrom(r))) return j;
+        return Infinity;
+    }
+    console.log('  seed   base(no jump)  J=100      J=1e4      J=1e6      status (each <= 1.5x base + 10)');
+    console.log('  -----  -------------  ---------  ---------  ---------  ------');
+    for (const seed of SEEDS) {
+        const base = baselineDelay(ADWIN, seed);
+        const budget = Number.isFinite(base) ? base * TOLK + TOLADD : Infinity;
+        const per = JS.map((J) => priorDelay(ADWIN, J, seed));
+        const cellOk = Number.isFinite(base) && per.every((d) => Number.isFinite(d) && d <= budget);
+        if (!cellOk) adRecoverOk = false;
+        const fmt = (d) => (Number.isFinite(d) ? String(d) : 'MISS');
+        console.log('  ' + String(seed).padEnd(5) + '  ' + fmt(base).padStart(13) + '  ' +
+            fmt(per[0]).padStart(9) + '  ' + fmt(per[1]).padStart(9) + '  ' + fmt(per[2]).padStart(9) +
+            '  ' + (cellOk ? 'ok' : 'FAIL'));
+    }
+    // G4 negative control: the OLD running-global R must FAIL the same recovery gate.
+    let controlFails = false;
+    for (const seed of SEEDS) {
+        const base = baselineDelay(GlobalRADWIN, seed);
+        const budget = Number.isFinite(base) ? base * TOLK + TOLADD : Infinity;
+        const per = JS.map((J) => priorDelay(GlobalRADWIN, J, seed));
+        if (!(Number.isFinite(base) && per.every((d) => Number.isFinite(d) && d <= budget))) controlFails = true;
+    }
+    adControlHasTeeth = controlFails;
+    if (!controlFails) adRecoverOk = false;
+    console.log('  negative control (OLD running-global R) recovers within budget: ' +
+        (controlFails ? 'NO -> REJECTED (gate has teeth, ok)' : 'YES -> gate has NO teeth (FAIL)'));
+
+    // G2 clean window: variance ~1 and |mean - 1e6| < 1 after a 1e6 jump + 30000 settled items.
+    console.log('');
+    console.log('  G2 clean window after 0 -> 1e6 jump + 30000 settled items (variance in [0.8, 1.25], |mean - 1e6| < 1):');
+    console.log('  seed   variance    mean - 1e6   width    status');
+    console.log('  -----  ----------  -----------  -------  ------');
+    for (const seed of SEEDS) {
+        const ad = new ADWIN(DELTA), r = mulberry32(seed + 123);
+        for (let i = 0; i < 3000; i++) ad.add(gaussFrom(r));
+        for (let i = 0; i < 30000; i++) ad.add(1e6 + gaussFrom(r));
+        const v = ad.variance, md = ad.mean - 1e6;
+        const cellOk = v >= 0.8 && v <= 1.25 && Math.abs(md) < 1;
+        if (!cellOk) adRecoverOk = false;
+        console.log('  ' + String(seed).padEnd(5) + '  ' + v.toFixed(4).padStart(10) + '  ' +
+            md.toFixed(4).padStart(11) + '  ' + String(ad.width).padStart(7) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+    }
+}
+console.log('');
+console.log('WITNESS ADWIN F18 recovery (post-shift sensitivity restored; old-global-R control rejected) ' +
+    (adRecoverOk && adControlHasTeeth ? 'ok' : 'FAIL'));
 
 // ===========================================================================
 // EXACT-AGGREGATE Witness -- ForwardDecay (Cormode-Shkapenyuk-Srivastava-Xu, ICDE 2009).
@@ -740,7 +1040,7 @@ function driftStream(feed, K, seed) {
 }
 
 console.log('');
-console.log('WITNESS HeavyKeeper (recall + bounded overestimate + beats Space-Saving on drift) ' +
+console.log('WITNESS HeavyKeeper (recall + bounded one-sided error, never over + beats Space-Saving on drift) ' +
     (hkOk ? 'ok' : 'FAIL'));
 
 // --- HeavyKeeper NEGATIVE CONTROLS (N4): decay + the forest must be load-bearing ---
@@ -1053,6 +1353,59 @@ console.log('WITNESS SlidingHyperLogLog negative controls (no-expiry + no-domina
     (slControlsOk ? 'ok' : 'FAIL'));
 
 // ===========================================================================
+// F8 (1.7.0) HARD GATE -- count() is PURE: overflows / degraded / ring state are query-independent.
+// Pre-F8 count() destructively expired ring heads, so `overflows` depended on query cadence (6556
+// vs 6562 on the same stream). Expiry now lives in add(); count() only reads. GATE (HARD): two
+// twins fed the SAME 200k-op stream (small ringCap so overflows happen), one queried after every
+// add and one never -- `overflows` EQUAL and _stamps/_rho/_head/_len byte-identical at the end; and
+// a ring snapshot byte-identical across 100 consecutive count() calls.
+// ===========================================================================
+let slPureOk = true;
+console.log('');
+console.log('F8 PURITY GATE -- SlidingHyperLogLog count() is non-destructive (query-independent overflows):');
+{
+    function ringEqual(a, b) {
+        const sa = new Uint8Array(a._stamps.buffer), sb = new Uint8Array(b._stamps.buffer);
+        if (sa.length !== sb.length) return false;
+        for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) return false;
+        for (let i = 0; i < a._rho.length; i++) if (a._rho[i] !== b._rho[i]) return false;
+        for (let i = 0; i < a._head.length; i++) if (a._head[i] !== b._head[i]) return false;
+        for (let i = 0; i < a._len.length; i++) if (a._len[i] !== b._len[i]) return false;
+        return true;
+    }
+    function run(queryEveryAdd) {
+        const s = new SlidingHyperLogLog(50, { p: 4, ringCap: 2, seed: 1 });
+        for (let t = 0; t < 200000; t++) { s.add(t, (t * 2654435761 >>> 0) % 500); if (queryEveryAdd) s.count(); }
+        return s;
+    }
+    const q = run(true), u = run(false);
+    const ovEq = q.overflows === u.overflows;
+    const stateEq = ringEqual(q, u);
+    if (!ovEq || !stateEq) slPureOk = false;
+    console.log('  queried-every-add vs never-queried twins (200k ops, p4/ringCap2 -> overflows fire):');
+    console.log('    overflows: queried=' + q.overflows + '  unqueried=' + u.overflows +
+        ' -> ' + (ovEq ? 'EQUAL (ok)' : 'DIFFER (FAIL)'));
+    console.log('    ring state (_stamps/_rho/_head/_len) byte-identical: ' + (stateEq ? 'ok' : 'FAIL'));
+
+    // 100 consecutive count() calls: value stable AND ring snapshot unchanged.
+    const s = run(false);
+    const first = s.count();
+    const snap = new Uint8Array(s._stamps.buffer).slice();
+    let stable = true, snapOk = true;
+    for (let i = 0; i < 100; i++) {
+        if (s.count() !== first) stable = false;
+        const cur = new Uint8Array(s._stamps.buffer);
+        for (let k = 0; k < snap.length; k++) if (cur[k] !== snap[k]) { snapOk = false; break; }
+    }
+    if (!stable || !snapOk) slPureOk = false;
+    console.log('    100 consecutive count(): value stable=' + stable + ', ring snapshot unchanged=' + snapOk +
+        ' -> ' + (stable && snapOk ? 'ok' : 'FAIL'));
+}
+console.log('');
+console.log('WITNESS SlidingHyperLogLog F8 purity (count() non-destructive; overflows query-independent) ' +
+    (slPureOk ? 'ok' : 'FAIL'));
+
+// ===========================================================================
 // CHANGE-RESPONSE Witness -- DriftDetector (ADR 0007; Page 1954, Mouss et al. 2004). The scalar
 // drift anchor: inject a KNOWN changepoint into a real-valued signal and MEASURE, against ground
 // truth, for BOTH modes (DRIFT_PH online-mean-referenced, DRIFT_CUSUM fixed-target-referenced):
@@ -1255,52 +1608,79 @@ class NoExpirySDS extends SlidingDDSketch {
 /** The grid-aligned exclusive upper bound of the pane holding time `tv` (mirrors the shipped class). */
 function sldPaneEnd(tv, pw) { return (Math.floor(tv / pw) + 1) * pw; }
 
+/** A B-PANE (old ring) SlidingDDSketch: shrink the ring back to B panes so the covered span is only W
+ *  (not W + W/B). This UNDER-covers the true (now - W, now] window by up to one pane -> count() < true
+ *  on some queries -> the F7 true-window lower-bound gate MUST reject it. The load-bearing proof that
+ *  the +1 pane is what buys `count() >= true(W)`. */
+class BPaneSDS extends SlidingDDSketch {
+    constructor(W, opts) { super(W, opts); this._ring = this._panes; }   // old ring size / cut
+}
+
 /**
- * Drive `Ctor` on a positive explicit-time stream (one item per tick) against an EXACT sorted-array
- * oracle over the sketch's LIVE pane content (values whose pane is live: paneEnd(tv) > now - W --
- * replicated exactly, so rel-error is purely the DDSketch bucket error). Gate rel <= alpha on q in
- * {0.5, 0.9, 0.99}; also measure the window-edge error (|liveCount - exactWindowCount|). Returns
- * { maxRel, maxEdge, queries, countMatch }.
+ * Drive `Ctor` on a positive explicit-time stream (one item per tick) against EXACT sorted-array
+ * oracles. F7 (B+1 ring): the code covers the pane span (E - (B+1)*pw, E], so gate the per-query
+ * quantile rel <= alpha against the EXACT multiset of THAT covered span (computed from pane geometry),
+ * and gate count() against the TRUE (now - W, now] window as a HARD one-sided bound:
+ *   true(W) <= count() <= true(W + W/B)   on 100% of queries (0 misses either side).
+ * Also measure the over-coverage edge = count() - true(W) (<= one pane width). Returns
+ * { maxRel, maxEdge, queries, countMiss, countOver, countTotal, coveredMatch, pw }.
  */
-function sldDrive(Ctor, shape, W, alpha, panes, N, warm, gen, gateOk) {
+function sldDrive(Ctor, shape, W, alpha, panes, N, warm, gen, onBeyond) {
     const sd = new Ctor(W, { alpha, panes });
     const pw = W / panes;
     const tv = new Float64Array(N), val = new Float64Array(N);
-    let maxRel = 0, maxEdge = 0, queries = 0, countMatch = true;
+    let maxRel = 0, maxEdge = 0, queries = 0, coveredMatch = true;
+    let countMiss = 0, countOver = 0, countTotal = 0, p50Beyond = 0, p50Total = 0;
     for (let t = 1; t <= N; t++) {
         const v = gen(t);
         sd.add(t, v);
         tv[t - 1] = t; val[t - 1] = v;
         if (t >= warm && (t % 7) === 0) {
             const now = t;
-            // The sketch's window is the B physically-retained panes = grid range (E - W, E], where
-            // E = the current pane's grid end. A value is live iff its grid pane end > E - W. This
-            // mirrors the sketch's actual content EXACTLY, so rel-error is purely the bucket error.
             const E = sldPaneEnd(now, pw);
-            const liveCut = E - W;
-            const live = [];
-            for (let i = 0; i < t; i++) if (sldPaneEnd(tv[i], pw) > liveCut) live.push(val[i]);
-            live.sort((a, b) => a - b);
-            const liveCount = live.length;
-            const exactWin = Math.min(t, W);            // ideal (now - W, now] item count (one per tick)
-            const edge = Math.abs(liveCount - exactWin);
+            // COVERED span the code physically retains: the B+1 grid cells ending at E -> (E-(B+1)pw, E].
+            // (The ring holds B+1 panes; all are live since E - B*pw = E - W > now - W.) The quantile
+            // oracle is the EXACT multiset of this span, so rel-error is purely the DDSketch bucket error.
+            const ring = sd._ring;                 // B+1 for the shipped class, B for the BPane control
+            const coveredCut = E - ring * pw;
+            // Grid-aligned retention: a value at tv lives in the pane whose EXCLUSIVE end is
+            // sldPaneEnd(tv); it is retained iff that pane end is one of the `ring` cells ending at E,
+            // i.e. sldPaneEnd(tv) > E - ring*pw. This is EXACTLY the sketch's paneEnd > now - W rule
+            // (no grid cell lies strictly between now - W and E - B*pw), so the multiset matches the
+            // merged pane content bit-for-bit -> the rel-error is purely the DDSketch bucket error.
+            const covered = [];
+            for (let i = 0; i < t; i++) if (sldPaneEnd(tv[i], pw) > coveredCut) covered.push(val[i]);
+            covered.sort((a, b) => a - b);
+            const coveredCount = covered.length;
+            // TRUE (now - W, now] window and the WIDE (now - W - W/B, now] window -- the honest one-sided
+            // bounds. One item per tick, so true = min(t, W), wide = min(t, W + pw).
+            const trueCut = now - W, wideCut = now - W - pw;
+            let trueCount = 0, wideCount = 0;
+            for (let i = 0; i < t; i++) { if (tv[i] > trueCut) trueCount++; if (tv[i] > wideCut) wideCount++; }
+            const cnt = sd.count();
+            countTotal++;
+            if (cnt < trueCount) { countMiss++; if (onBeyond) onBeyond(); }   // F7 LOWER bound: count >= true(W)
+            if (cnt > wideCount) { countOver++; if (onBeyond) onBeyond(); }   // F7 UPPER bound: count <= true(W+W/B)
+            if (cnt !== coveredCount) coveredMatch = false;                   // count() == covered-span oracle
+            const edge = cnt - trueCount;                                     // over-coverage (>= 0), <= one pane
             if (edge > maxEdge) maxEdge = edge;
-            if (sd.count() !== liveCount) countMatch = false;   // count() must mirror the live set exactly
-            if (liveCount > 0) {
+            if (coveredCount > 0) {
                 for (const q of [0.5, 0.9, 0.99]) {
-                    const trueV = live[Math.floor(q * (liveCount - 1))];
+                    const trueV = covered[Math.floor(q * (coveredCount - 1))];
                     const est = sd.quantile(q);
                     if (trueV > 0) {
                         const rel = Math.abs(est - trueV) / trueV;
                         if (!(rel <= maxRel)) maxRel = rel;
-                        if (rel > alpha + 1e-9 && gateOk) gateOk();
+                        const beyond = rel > alpha + 1e-9;
+                        if (q === 0.5) { p50Total++; if (beyond) p50Beyond++; }
+                        if (beyond && onBeyond) onBeyond();
                         queries++;
                     }
                 }
             }
         }
     }
-    return { maxRel, maxEdge, queries, countMatch, pw };
+    return { maxRel, maxEdge, queries, coveredMatch, pw, countMiss, countOver, countTotal, p50Beyond, p50Total };
 }
 
 console.log('');
@@ -1308,13 +1688,28 @@ console.log('WINDOWED-QUANTILE Witness -- SlidingDDSketch v' + VERSION + ' (Mass
     'pane ring): windowed quantile vs an EXACT sorted-array oracle (theoretical: rel <= alpha per query)');
 console.log('');
 
-let sdOk = true;
+// F7 (B+1 ring) is now a HARD gate (no LITE_GATES_STRICT plumbing for it): count() >= true(W) on 100%
+// of queries AND count() <= true(W + W/B) on 100%; quantile rel <= alpha vs the EXACT covered-span
+// multiset; over-coverage edge <= one pane width; enough queries; empty window NaN/0. The windowed
+// correctness of SlidingDDSketch now lives HERE (the retired long-stream differential vectors defer to
+// this gate). LITE_GATES_STRICT still governs the OTHER family todos elsewhere in this witness.
+let sdOk = true;               // ALL SDD gates are hard (F7 among them)
 let sdQueries = 0;
-const sdFail = () => { sdOk = false; };
+let sdCountMiss = 0, sdCountOver = 0, sdCountTotal = 0, sdP50Beyond = 0, sdP50Total = 0;
+function sdAccum(r, alpha) {
+    sdQueries += r.queries;
+    sdCountMiss += r.countMiss; sdCountOver += r.countOver; sdCountTotal += r.countTotal;
+    sdP50Beyond += r.p50Beyond; sdP50Total += r.p50Total;
+    if (r.maxRel > alpha + 1e-9) sdOk = false;                   // covered-span quantile accuracy
+    if (r.countMiss > 0 || r.countOver > 0) sdOk = false;        // F7 one-sided count bound (both sides)
+    if (!r.coveredMatch) sdOk = false;                           // count() == covered-span oracle exactly
+    if (r.maxEdge > r.pw + 1) sdOk = false;                      // over-coverage <= one pane width (hard)
+}
 
-// --- fairness self-check: a panes=32 sketch mirrors the oracle within alpha + edge within one pane ---
-console.log('  W        alpha   panes  shape              queries  maxRel err   theo (alpha)  maxEdge  edge<=W/p  status');
-console.log('  -------  ------  -----  -----------------  -------  -----------  ------------  -------  ---------  ------');
+// --- fairness self-check: a panes=32 sketch vs the TRUE (now - W, now] one-sided count bound + the
+//     EXACT covered-span (E - (B+1)*pw, E] quantile oracle (F7 HARD) ---
+console.log('  W        alpha   panes  shape              queries  maxRel err   theo (alpha)  edge(over)  miss/over  status');
+console.log('  -------  ------  -----  -----------------  -------  -----------  ------------  ----------  ---------  ------');
 
 /** A lognormal-ish deterministic positive value stream (i.i.d. per tick, stationary distribution). */
 function sldLognormal(seed) {
@@ -1322,20 +1717,27 @@ function sldLognormal(seed) {
     return () => Math.exp(r() * 10) + 1e-6;   // positive, ~5 orders of magnitude spread
 }
 
+/** Print one SDD lane row + fold its gate result into sdOk. */
+function sdLaneRow(r, W, alpha, panes, shape) {
+    sdAccum(r, alpha);
+    const relOk = r.maxRel <= alpha + 1e-9;
+    const countOk = r.countMiss === 0 && r.countOver === 0 && r.coveredMatch;
+    const edgeOk = r.maxEdge <= r.pw + 1;
+    const laneOk = relOk && countOk && edgeOk;
+    console.log('  ' + nStr(W).padEnd(7) + '  ' + String(alpha).padEnd(6) + '  ' +
+        String(panes).padEnd(5) + '  ' + shape.padEnd(17) + '  ' +
+        String(r.queries).padEnd(7) + '  ' + pct(r.maxRel).padStart(11) + '  ' +
+        pct(alpha).padStart(12) + '  ' + String(r.maxEdge).padStart(10) + '  ' +
+        (String(r.countMiss) + '/' + String(r.countOver)).padStart(9) + '  ' +
+        (laneOk ? 'ok' : 'FAIL'));
+}
+
 for (const W of [1000, 4000, 16000]) {
     for (const alpha of [0.05, 0.01, 0.005]) {
         const panes = 32;
         const gen = sldLognormal(1234 + W + Math.round(alpha * 1000));
-        const r = sldDrive(SlidingDDSketch, 'lognormal', W, alpha, panes, 4 * W, W, gen, sdFail);
-        sdQueries += r.queries;
-        const relOk = r.maxRel <= alpha + 1e-9;
-        const edgeOk = r.maxEdge <= r.pw + 1;
-        if (!relOk || !edgeOk || !r.countMatch) sdOk = false;
-        console.log('  ' + nStr(W).padEnd(7) + '  ' + String(alpha).padEnd(6) + '  ' +
-            String(panes).padEnd(5) + '  ' + 'lognormal'.padEnd(17) + '  ' +
-            String(r.queries).padEnd(7) + '  ' + pct(r.maxRel).padStart(11) + '  ' +
-            pct(alpha).padStart(12) + '  ' + String(r.maxEdge).padStart(7) + '  ' +
-            (edgeOk ? 'ok' : 'FAIL').padStart(9) + '  ' + (relOk && edgeOk && r.countMatch ? 'ok' : 'FAIL'));
+        const r = sldDrive(SlidingDDSketch, 'lognormal', W, alpha, panes, 4 * W, W, gen, null);
+        sdLaneRow(r, W, alpha, panes, 'lognormal');
     }
 }
 
@@ -1344,16 +1746,8 @@ for (const W of [1000, 4000, 16000]) {
 {
     const W = 4000, alpha = 0.01, panes = 32, N = 5 * W;
     const gen = (t) => (t < N / 2 ? 100 + ((t * 7) % 20) : 100000 + ((t * 7) % 20));   // ~100 -> ~100000
-    // query only in the post-shift SETTLED tail (old regime long gone).
-    const r = sldDrive(SlidingDDSketch, 'dist-shift', W, alpha, panes, N, N / 2 + W + 100, gen, sdFail);
-    sdQueries += r.queries;
-    const relOk = r.maxRel <= alpha + 1e-9;
-    const edgeOk = r.maxEdge <= r.pw + 1;
-    if (!relOk || !edgeOk || !r.countMatch) sdOk = false;
-    console.log('  ' + nStr(W).padEnd(7) + '  ' + String(alpha).padEnd(6) + '  ' + String(panes).padEnd(5) +
-        '  ' + 'dist-shift'.padEnd(17) + '  ' + String(r.queries).padEnd(7) + '  ' + pct(r.maxRel).padStart(11) +
-        '  ' + pct(alpha).padStart(12) + '  ' + String(r.maxEdge).padStart(7) + '  ' +
-        (edgeOk ? 'ok' : 'FAIL').padStart(9) + '  ' + (relOk && edgeOk && r.countMatch ? 'ok' : 'FAIL'));
+    const r = sldDrive(SlidingDDSketch, 'dist-shift', W, alpha, panes, N, N / 2 + W + 100, gen, null);
+    sdLaneRow(r, W, alpha, panes, 'dist-shift');
 }
 
 // --- post-BURST edge: a dense burst of large-spread values, then a quiet tail of one repeated value;
@@ -1362,15 +1756,8 @@ for (const W of [1000, 4000, 16000]) {
     const W = 4000, alpha = 0.01, panes = 32, N = 4 * W;
     const burstGen = sldLognormal(555);
     const gen = (t) => (t % (3 * W) < W) ? burstGen() : 42;   // burst third, then value 42 repeated
-    const r = sldDrive(SlidingDDSketch, 'post-burst-edge', W, alpha, panes, N, W, gen, sdFail);
-    sdQueries += r.queries;
-    const relOk = r.maxRel <= alpha + 1e-9;
-    const edgeOk = r.maxEdge <= r.pw + 1;
-    if (!relOk || !edgeOk || !r.countMatch) sdOk = false;
-    console.log('  ' + nStr(W).padEnd(7) + '  ' + String(alpha).padEnd(6) + '  ' + String(panes).padEnd(5) +
-        '  ' + 'post-burst-edge'.padEnd(17) + '  ' + String(r.queries).padEnd(7) + '  ' + pct(r.maxRel).padStart(11) +
-        '  ' + pct(alpha).padStart(12) + '  ' + String(r.maxEdge).padStart(7) + '  ' +
-        (edgeOk ? 'ok' : 'FAIL').padStart(9) + '  ' + (relOk && edgeOk && r.countMatch ? 'ok' : 'FAIL'));
+    const r = sldDrive(SlidingDDSketch, 'post-burst-edge', W, alpha, panes, N, W, gen, null);
+    sdLaneRow(r, W, alpha, panes, 'post-burst-edge');
 }
 
 // --- empty-window read: NaN quantile + count 0, never a throw ---
@@ -1385,12 +1772,18 @@ for (const W of [1000, 4000, 16000]) {
 
 const sdEnough = sdQueries >= 2000;
 if (!sdEnough) sdOk = false;
-console.log('  total queries=' + sdQueries + ' (>= 2000 required: ' + (sdEnough ? 'ok' : 'FAIL') +
-    '); all within alpha + edge within one pane width: ' + (sdOk ? 'ok' : 'FAIL'));
+console.log('  total queries=' + sdQueries + ' (>= 2000 required: ' + (sdEnough ? 'ok' : 'FAIL') + ')');
+// F7 measured counts against the TRUE (now - W, now] one-sided bound (now HARD-GREEN on 1.7.0).
+console.log('  F7 true-window: count() < true(W) on ' + sdCountMiss + '/' + sdCountTotal +
+    ' queries; count() > true(W+W/B) on ' + sdCountOver + '/' + sdCountTotal +
+    ' queries; p50 beyond alpha on ' + sdP50Beyond + '/' + sdP50Total + ' -> ' +
+    ((sdCountMiss === 0 && sdCountOver === 0 && sdP50Beyond === 0) ? 'ok (HARD)' : 'FAIL'));
 console.log('');
-console.log('WITNESS SlidingDDSketch (windowed quantile within alpha, edge within W/panes) ' + (sdOk ? 'ok' : 'FAIL'));
+console.log('WITNESS SlidingDDSketch (F7 HARD: count bound + covered-span accuracy + empty window) ' +
+    (sdOk ? 'ok' : 'FAIL'));
 
-// --- SlidingDDSketch NEGATIVE CONTROLS: expiry (clear-on-rotate) + the pane count must be load-bearing ---
+// --- SlidingDDSketch NEGATIVE CONTROLS: expiry (clear-on-rotate), the pane count, and the B+1 ring
+//     must each be load-bearing ---
 console.log('');
 console.log('NEGATIVE CONTROLS -- a broken SlidingDDSketch MUST be rejected by the same gates:');
 let sdControlsOk = true;
@@ -1417,8 +1810,20 @@ let sdControlsOk = true;
     console.log('  coarse panes=2 SlidingDDSketch maxEdge=' + r.maxEdge + ' (> fine W/32 bound ' +
         fineBound + ') -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
 }
+// (3) B-PANE ring (F7 negative control): the OLD B-pane ring (not B+1) covers only span W, so it
+//     UNDER-covers (now - W, now] by up to one pane -> count() < true(W) on some queries. The F7
+//     lower-bound gate MUST reject it (the +1 pane is load-bearing for `count() >= true(W)`).
+{
+    const W = 4000, alpha = 0.01, panes = 32, N = 4 * W;
+    const gen = sldLognormal(777);
+    const r = sldDrive(BPaneSDS, 'b-pane-ring', W, alpha, panes, N, W, gen, null);
+    const rejected = r.countMiss > 0;   // count() dips below true(W) -> the lower-bound gate fires
+    if (!rejected) sdControlsOk = false;
+    console.log('  B-pane ring SlidingDDSketch (ring=B, not B+1) count()<true(W) on ' + r.countMiss +
+        '/' + r.countTotal + ' -> ' + (rejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+}
 console.log('');
-console.log('WITNESS SlidingDDSketch negative controls (no-expiry + coarse-panes rejected) ' +
+console.log('WITNESS SlidingDDSketch negative controls (no-expiry + coarse-panes + B-pane ring rejected) ' +
     (sdControlsOk ? 'ok' : 'FAIL'));
 
 // ===========================================================================
@@ -1963,8 +2368,8 @@ console.log('');
 console.log('WITNESS DecayedReservoir negative controls (no-decay + no-forest rejected) ' +
     (drControlsOk ? 'ok' : 'FAIL'));
 
-const all = ok && controlsOk && adOk && adControlsOk && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
-    slOk && slControlsOk && ddOk && ddControlsOk && sdOk && sdControlsOk && isOk && isControlsOk &&
+const all = ok && controlsOk && adOk && adControlsOk && adOffsetOk && (adRecoverOk && adControlHasTeeth) && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
+    slOk && slControlsOk && slPureOk && ddOk && ddControlsOk && sdOk && sdControlsOk && isOk && isControlsOk &&
     scmOk && scmControlsOk && drOk && drControlsOk;
 console.log('');
 console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper + ' +

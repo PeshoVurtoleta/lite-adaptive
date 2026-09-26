@@ -113,3 +113,16 @@ SPACE: unchanged -- `advance` allocates nothing and adds no field. This member c
 gap on the recency axis; the three time-windowed summaries now report an honest window whether or not
 data is flowing. Further windowed members remain possible post-1.4, each a pure append that keeps the
 frozen classes byte-identical.
+
+## Amendment (1.7.0, F8) -- SlidingHyperLogLog `advance` stays PURE w.r.t. the rings
+
+F8 (ADR 0006 amendment) moved SlidingHyperLogLog's windowed expiry OUT of `count()` (now pure)
+and INTO `add`/`addFrom`. That makes it explicit that `advance`/`advanceFrom` must remain
+CLOCK-ONLY: they move `_now`/`_lastNow` and touch NOTHING else -- in particular they do NOT
+expire ring entries. `advance` is an EXPLICIT mutation of the clock, but leaving the rings
+untouched keeps `overflows`/`degraded` independent of advance frequency, just as F8 made them
+independent of query frequency (an entry that leaves only because time advanced, with no new
+add competing for its slot, is not capacity pressure and never counts as an overflow). The pure
+`count()` self-filters by `_now`, so a bare `advance` still slides an idle stream to 0 -- the
+`SHLLFrozen` negative control (an advance that never updates `_now`) is still REJECTED by the
+idle-slide gate, so advancing the clock is still the load-bearing part.
