@@ -6,15 +6,10 @@ complete at 1.0.0). See `RESEARCH.md` for the identity, the two witnesses (recen
 change response), the roster rationale (incl. the verdict on the inherited backlog), and the
 open questions. ASCII-only (`->`, `<=`, `x`, "epsilon", "alpha", "delta").
 
-> **NEXT (2026-09-26): the last session -- v1.8.0 additive API + the demo for 1.7.0 / 1.8.0 (section 8).**
-> 1.7.0 H1 hardening SHIPPED 2026-09-26. Previously: **H1 hardening -- v1.7.0, MINOR, hardening only** (section 7; audit record in
-> RESEARCH.md section 13; reproduction + session plan in 7.1 / 7.2). Then 1.8.0 = additive API (S1, S2).
-> The 1.6.0 final sweep found 4 High findings the shipped gates pass:
-> - `ExponentialHistogram` goes to `count() = NaN` on a dense explicit stream.
-> - `SlidingDDSketch` strict mode throws on in-range values.
-> - `HeavyKeeper.addFrom` boxes large keys.
-> - The perf gate's `maxScavenges: 16` cannot see a 16 B/op box.
-> lite-hud M4 (EH) and the HeavyKeeper drop-in wait for this release.
+> **NEXT: v1.9.0 -- SlidingAggregate ONLY (section 9).** 1.8.0 (additive API) released 2026-09-27;
+> 1.7.0 H1 hardening shipped 2026-09-26. After 1.9.0: section 10 (v1.10.0, the zero-alloc readers +
+> the latched-PH fix, from the 1.8.0 doc-truth findings) and section 11 (the demo session, repo-only,
+> no npm release). One feature per minor (maintainer, 2026-09-26).
 
 Status (historical; the roster SHIPPED through 1.6.0): PRE-CODE / PROPOSED (2026-09-23). Two calls to SETTLE before M1: the scope/theme (is
 this the sliding-window + decay + drift package, with Exponential Histogram as reference?) and
@@ -635,7 +630,7 @@ be rebuilt from this table. F1-F15 each need only a few lines.
 plus honest gates). Steps 3-5 then ship as 1.7.1, still hardening only. 1.8.0 stays the additive
 API release (S1, S2, the F6 readers).
 
-## 8. The last session -- v1.8.0 (additive API) + the demo for 1.7.0 / 1.8.0  [PLANNED]
+## 8. v1.8.0 (additive API) + the demo for 1.7.0 / 1.8.0  [SHIPPED -- 1.8.0, 2026-09-27; demo P3-P5 -> section 11]
 
 1.7.0 shipped the hardening. 1.8.0 ships the settled additive API, and the demo is brought up to
 date so that every 1.7.0 / 1.8.0 capability is VISIBLE and re-derived live (DEMO.md section 0: no
@@ -775,10 +770,37 @@ is DONE (planner, 2026-09-26) and is the brief for that session:
   next to the EH sum() skew failure (F17); torture incl. rotate-every-add; AllocMatrix N3 / N4;
   JumpTiming +1e12 with a per-pane-loop control; perf gate at maxScavenges 0; QueryContract +
   OptionDoors rows; a mutation test of every reader's `w`.
-- Demo: a SlidingAggregate scene (formerly D9) -- a lite-hud-shaped latency panel, the windowed
-  mean / min / max vs the exact oracle, next to the EH sum() skew failure.
+- Demo: the SlidingAggregate scene (formerly D9) moves to the demo session (section 11).
 
-**Carried from the 1.8.0 doc-truth pass (findings decided in 1.8.0, fixed here):**
+**Session plan (v1.9.0, SlidingAggregate ONLY -- nothing else ships in this minor):**
+1. Planner: re-read the brief above against the 1.8.0 tree (the pane-ring code it copies is
+   SlidingCountMin's, which gained `_paneTotal` in 1.8.0 -- confirm the copy, not a shared helper).
+   Output ADR 0012 + atomic tasks + falsifiable assertions. Read-only.
+2. Coder: Adaptive.js PURE APPEND (the nine prior classes byte-identical -- a sha256 over each class
+   body before/after is the proof) + Adaptive.d.ts + test/SlidingAggregate.test.js + QueryContract /
+   OptionDoors rows + witness lanes + torture lanes + AllocMatrix lanes.
+3. Reviewer (mutation-testing): every reader's `w`, the B-pane and no-clear-on-rotate controls, Kahan
+   removed, the Neumaier merge removed -- each must turn a gate RED.
+4. QA: boundary suite (empty window -> NaN not 0, one item, W exactly on a pane edge, +1e12 jump,
+   count mode vs explicit, subnormal W, 2^53 counts, -0 values, +-Infinity / NaN values rejected).
+5. Docs: README (LiteSepforge spine: add the member everywhere the roster is listed), llms.txt,
+   CHANGELOG, decisions/0012. Then `/release 1.9.0`, `/sync-card lite-adaptive`, and a lite-hud note:
+   M4 latency means unblocked (50 channels = 79,600 B).
+**Lessons from 1.8.0, binding for every agent this session:**
+- The ONLY allocation meter is the pinned-semi-space steady probe (test/perf/AllocProbe.mjs; min over
+  windows 1..n-1, a must-box control that reads >= 12). `measureAllocs` is blind to transient boxes.
+  A per-EVENT box (one per rotate / fire) needs an EVENT-HEAVY lane -- an average over quiet adds hid
+  the latched-PH fire box (<= 0.5 B/op passed a real 16 B/fire).
+- Never gate a lane under a flag the shipped code does not run with (`--no-maglev`) to make it pass,
+  and never move a lane out of a sweep to make the sweep green.
+- Every doc number is a measured number with the lane that measures it; "0-alloc" without a gate is a
+  finding (SHLL count() was advertised 0 B/call and never measured).
+- Keep coder briefs small enough to finish in ~60 turns; split, don't resume three times.
+
+## 10. v1.10.0 -- zero-alloc readers + the latched-PH fix (from the 1.8.0 doc-truth findings)  [PLANNED]
+
+One theme: every reader a render path needs is 0 B/call, and the latch path is 0 B/op under every tier.
+
 - `SlidingHyperLogLog.countInto(out, i?)` -- a 0-alloc reader that writes the windowed distinct
   estimate into a caller-owned `Float64Array` slot instead of returning a boxed double (finding A;
   section 8 decided option (c)). Keep the plain `count()` as the lane's must-box control (16-32 B/op);
@@ -797,10 +819,26 @@ is DONE (planner, 2026-09-26) and is the brief for that session:
   because six `_guardFinite` getters in one render function exceed V8's cumulative inlining budget and
   three of them box their fractional returns. The `Into` siblings land the values in caller slots so the
   render path is 0 B/tick (mirrors SDD `quantileInto` / SCM `estimateInto`).
-- Finish the demo passes P3-P5 (deferred from the 1.8.0 demo session): P3 = the DD / SDD blockers fixed
-  in the tree but not yet re-reviewed; P4 = the SCM D7 (`total(w)` readout + eps x N band) and D8
-  (contracts line + Chromium 31-bit-Smi key-magnitude readout) contracts; P5 = the S11 lane + the static
-  DEMO AUDIT test.
-- Exit: verify + gates:red green, /release 1.9.0, /sync-card, a lite-hud note (M4 latency means).
+- SETTLE before code (maintainer): the latched-PH fix changes WHEN a latched PH fires on some streams
+  (bound vs reset the extremes at the fire). latch:false stays bit-identical. The planner measures both
+  options on the DDParity + demo streams and brings one recommendation with the fire-sequence diff.
+- Exit: verify + gates:red green (no todo), `/release 1.10.0`, `/sync-card`.
 
-MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
+## 11. The demo session (repo-only; no npm release)  [PLANNED]
+
+Finish demo/ for 1.7.0 -- 1.10.0. The tree already holds P0-P2 (APPROVED + QA'd) and P3 (the DD / SDD
+blockers fixed, NOT yet re-reviewed). Run after section 10, so the DD scene reads the new `Into`
+readers (render 0 B/tick) and the `dd_frame` `todo` becomes a real <= 0.5 gate.
+- P3: re-review the DD / SDD pass (it was rejected once; every blocker is fixed in the tree).
+- P4: SCM D7 (`total(w)` readout + the eps x N band from the ORACLE N; the render reads through
+  `estimateInto`) + D8 (the contracts line).
+- P5: the S11 Chromium-only key-magnitude lane (a meter self-test; "n/a", never 0) + the static DEMO
+  AUDIT test over index.html with an injected-violation control per rule.
+- The SlidingAggregate scene (formerly D9): a lite-hud-shaped latency panel vs the exact oracle, next to
+  the EH sum() skew failure.
+- The same demo law as 1.8.0: every allocation claim on demo/DemoProbe.mjs; oracle-off NaN writes in
+  renderXPrep (tested); NaN renders "n/a" neutral; no layout call in a rebuild; reviewers run BOTH
+  demo test files.
+- Exit: full `npm run demo` green, reviewer approves the DEMO AUDIT, a repo-only CHANGELOG note.
+
+
