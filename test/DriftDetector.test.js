@@ -29,7 +29,7 @@ function newDD(mode, opts) {
 }
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '1.7.0');
+    assert.equal(VERSION, '1.8.0');
 });
 
 test('the mode consts are the documented numeric values', () => {
@@ -311,4 +311,242 @@ test('a larger shift is detected no slower than a smaller one', () => {
         assert.ok(Number.isFinite(large), name + ' a large shift is detected, got ' + large);
         assert.ok(large <= small, name + ' a larger shift should detect no slower: large ' + large + ' vs small ' + small);
     }
+});
+
+// ===========================================================================
+// S9 -- the `latch` option (1.8.0): fire ONCE per regime + hysteresis re-arm,
+// with `lastDriftIndex` / `lastDirection` getters (ADR 0007 amendment).
+// ===========================================================================
+
+test('the latch option door rejects a non-boolean (typeof-first, no truthy coercion)', () => {
+    for (const bad of [1, 0, 'true', 'false', null, {}, []]) {
+        assert.throws(() => new DriftDetector(DRIFT_PH, { latch: bad }), /\[lite-adaptive\]/, 'latch=' + String(bad));
+    }
+    // undefined -> the false default (no throw), and an explicit boolean is accepted.
+    assert.equal(new DriftDetector(DRIFT_PH, { latch: undefined }).latch, false);
+    assert.equal(new DriftDetector(DRIFT_PH, { latch: true }).latch, true);
+    assert.equal(new DriftDetector(DRIFT_PH, { latch: false }).latch, false);
+});
+
+test('latch defaults to false, and latched/lastDriftIndex/lastDirection start unlatched + NaN (null is not zero)', () => {
+    for (const [name, mode] of MODES) {
+        const dd = newDD(mode);
+        assert.equal(dd.latch, false, name + ' latch default');
+        assert.equal(dd.latched, false, name + ' not latched before any fire');
+        assert.ok(Number.isNaN(dd.lastDriftIndex), name + ' lastDriftIndex NaN before any fire');
+        assert.ok(Number.isNaN(dd.lastDirection), name + ' lastDirection NaN before any fire');
+        // a non-firing add leaves the getters NaN (a fire is what populates them).
+        dd.add(0);
+        assert.ok(Number.isNaN(dd.lastDriftIndex), name + ' lastDriftIndex still NaN with no fire');
+        assert.ok(Number.isNaN(dd.lastDirection), name + ' lastDirection still NaN with no fire');
+    }
+});
+
+test('CUSUM latch: a sustained +10 step fires EXACTLY once, latches, and records index 0 / direction +1', () => {
+    const dd = new DriftDetector(DRIFT_CUSUM, { target: 0, delta: 0.5, threshold: 8, latch: true });
+    let fires = 0;
+    for (let i = 0; i < 5000; i++) if (dd.add(10)) fires++;
+    assert.equal(fires, 1, 'exactly one fire on a sustained regime');
+    assert.equal(dd.lastDriftIndex, 0, 'fired on the first item');
+    assert.equal(dd.lastDirection, 1, 'upward direction');
+    assert.equal(dd.latched, true, 'stays latched through the sustained regime');
+});
+
+test('CUSUM latch:false on the same +10 step re-fires every item (the 1.x discipline is unchanged)', () => {
+    const dd = new DriftDetector(DRIFT_CUSUM, { target: 0, delta: 0.5, threshold: 8 });
+    let fires = 0;
+    for (let i = 0; i < 5000; i++) if (dd.add(10)) fires++;
+    assert.equal(fires, 5000, 'unlatched CUSUM re-fires on every sustained item');
+});
+
+test('CUSUM latch: an opposite-direction regime re-fires immediately and flips direction', () => {
+    const dd = new DriftDetector(DRIFT_CUSUM, { target: 0, delta: 0.5, threshold: 8, latch: true });
+    const fires = [];
+    for (let i = 0; i < 5000; i++) {
+        const x = i < 2500 ? 10 : -10;
+        if (dd.add(x)) fires.push({ i, idx: dd.lastDriftIndex, dir: dd.lastDirection });
+    }
+    assert.equal(fires.length, 2, 'exactly two fires: one per regime');
+    assert.deepEqual(fires[0], { i: 0, idx: 0, dir: 1 }, 'first fire: index 0, up');
+    assert.deepEqual(fires[1], { i: 2500, idx: 2500, dir: -1 }, 'second fire on the reversal item, down');
+    assert.equal(dd.latched, true);
+    assert.equal(dd.lastDirection, -1, 'now latched downward');
+});
+
+test('CUSUM latch: a stationary stream never fires and leaves the getters NaN, latched false', () => {
+    for (const latch of [false, true]) {
+        const dd = new DriftDetector(DRIFT_CUSUM, { target: 0, delta: 0.5, threshold: 8, latch });
+        let fires = 0;
+        for (let i = 0; i < 5000; i++) if (dd.add(0)) fires++;
+        assert.equal(fires, 0, 'latch=' + latch + ' no false alarm on x=0');
+        assert.ok(Number.isNaN(dd.lastDriftIndex), 'latch=' + latch + ' lastDriftIndex NaN');
+        assert.equal(dd.latched, false, 'latch=' + latch + ' not latched');
+    }
+});
+
+test('latch: clear() re-arms and resets both getters to NaN', () => {
+    const dd = new DriftDetector(DRIFT_CUSUM, { target: 0, delta: 0.5, threshold: 8, latch: true });
+    dd.add(10);
+    assert.equal(dd.latched, true);
+    assert.equal(dd.lastDriftIndex, 0);
+    assert.equal(dd.lastDirection, 1);
+    const ret = dd.clear();
+    assert.equal(ret, dd, 'clear() returns this');
+    assert.equal(dd.latched, false, 're-armed after clear()');
+    assert.ok(Number.isNaN(dd.lastDriftIndex), 'lastDriftIndex NaN after clear()');
+    assert.ok(Number.isNaN(dd.lastDirection), 'lastDirection NaN after clear()');
+    // and it fires cleanly again from a fresh regime.
+    let fires = 0;
+    for (let i = 0; i < 100; i++) if (dd.add(10)) fires++;
+    assert.equal(fires, 1, 'fires once again after clear()');
+    assert.equal(dd.lastDriftIndex, 0, 'the item index restarts from 0 after clear()');
+});
+
+test('latch: the threshold/2 hysteresis boundary -- just above stays latched, just below re-arms', () => {
+    // threshold 8 -> half 4; delta 0, target 0 so the CUSUM gap tracks gP exactly (clamped to 8 on latch).
+    function afterLatch(erode) {
+        const dd = new DriftDetector(DRIFT_CUSUM, { target: 0, delta: 0, threshold: 8, latch: true });
+        dd.add(10);            // fire + latch, gP clamped to 8
+        dd.add(erode);         // gP := 8 + erode; erode is negative so the latched gap shrinks toward half
+        return dd.latched;
+    }
+    assert.equal(afterLatch(-3.9), true, 'gap 4.1 (> half 4) stays latched');
+    assert.equal(afterLatch(-4.0), true, 'gap 4.0 (== half) is NOT below half -> stays latched');
+    assert.equal(afterLatch(-4.1), false, 'gap 3.9 (< half 4) re-arms');
+});
+
+test('latch: a genuinely NEW same-direction shift after a re-arm fires again', () => {
+    // delta 3 keeps the opposite accumulator floored while gP is eroded, so the re-arm is clean
+    // (no spurious opposite fire) and the second + shift is a fresh arming->latched fire.
+    const dd = new DriftDetector(DRIFT_CUSUM, { target: 0, delta: 3, threshold: 8, latch: true });
+    const fires = [];
+    // idx 0: +20 fires up + latches. idx 1: -2 erodes gP to 3 (< half 4) -> re-arm, no fire.
+    // idx 2..4: 0 keeps it armed. idx 5: +20 is a fresh same-direction shift -> fires up again.
+    const stream = [20, -2, 0, 0, 0, 20];
+    for (let i = 0; i < stream.length; i++) if (dd.add(stream[i])) fires.push({ idx: dd.lastDriftIndex, dir: dd.lastDirection });
+    assert.equal(fires.length, 2, 'two fires: the original and the post-re-arm same-direction shift');
+    assert.deepEqual(fires[0], { idx: 0, dir: 1 });
+    assert.deepEqual(fires[1], { idx: 5, dir: 1 }, 'the second fire is a genuinely new + shift after re-arm');
+});
+
+test('PH latch: a step up fires EXACTLY once, at the same item as the latch:false twin', () => {
+    function phStep(latch) {
+        const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 50, latch });
+        const fires = [];
+        for (let i = 0; i < 5000; i++) if (dd.add(i < 2500 ? 0 : 10)) fires.push(i);
+        return fires;
+    }
+    const off = phStep(false);
+    const on = phStep(true);
+    assert.equal(off.length, 1, 'PH already fires once on a clean step (mean re-tracks after the reset)');
+    assert.equal(on.length, 1, 'latch:true fires exactly once');
+    const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 50, latch: true });
+    for (let i = 0; i < 5000; i++) dd.add(i < 2500 ? 0 : 10);
+    assert.equal(dd.lastDriftIndex, off[0], 'latch:true lastDriftIndex equals the latch:false first-fire index');
+    assert.equal(dd.lastDirection, 1, 'the step is upward');
+});
+
+test('PH latch: a slow ramp fires strictly fewer times than unlatched', () => {
+    function phRamp(latch) {
+        const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 50, latch });
+        let f = 0;
+        for (let i = 0; i < 5000; i++) if (dd.add(i * 0.05)) f++;
+        return f;
+    }
+    const off = phRamp(false);
+    const on = phRamp(true);
+    assert.ok(off > 1, 'the unlatched detector re-fires on the ramp, got ' + off);
+    assert.ok(on < off, 'latch:true fires strictly fewer, got ' + on + ' vs ' + off);
+});
+
+test('latch: a sustained regime never lets the latched gap dip under threshold/2 (no spurious re-arm)', () => {
+    // 20k sustained +items: the clamp holds the gap at threshold each item, so it stays latched
+    // and fires exactly once -- proof the clamp keeps state bounded.
+    const dd = new DriftDetector(DRIFT_CUSUM, { target: 0, delta: 0.5, threshold: 8, latch: true });
+    let fires = 0;
+    for (let i = 0; i < 20000; i++) if (dd.add(10)) fires++;
+    assert.equal(fires, 1, 'one fire across a long sustained regime');
+    assert.equal(dd.latched, true, 'still latched');
+    // The clamp pins the sustained gap at EXACTLY threshold -- not merely "finite". A no-clamp variant
+    // drives the statistic unbounded (NoClampDD measured 47500 here), so === threshold has teeth.
+    assert.equal(dd.statistic, 8, 'the sustained latched statistic sits at exactly threshold (clamped, bounded)');
+});
+
+test('latch: a GRADUAL return to baseline re-arms, so a later same-direction regime fires again [0, 5100]', () => {
+    // The F-latch-rearm regression guard. +10 x100 (fire + latch at 0), 0 x5000 (a gradual decay of
+    // the latched gap toward baseline -> the gap falls under threshold/2 and RE-ARMS), +10 x100 (a
+    // genuine NEW same-direction regime -> a second fire at 5100). The pre-fix code re-inflated the
+    // shrinking gap to threshold every latched item, so it NEVER re-armed: 1 fire, statistic stuck at 8.
+    const dd = new DriftDetector(DRIFT_CUSUM, { target: 0, delta: 0.5, threshold: 8, latch: true });
+    const fires = [];
+    let i = 0;
+    for (let k = 0; k < 100; k++, i++) if (dd.add(10)) fires.push(i);
+    for (let k = 0; k < 5000; k++, i++) if (dd.add(0)) fires.push(i);
+    for (let k = 0; k < 100; k++, i++) if (dd.add(10)) fires.push(i);
+    assert.deepEqual(fires, [0, 5100], 'exactly 2 fires: the first regime and the post-re-arm second one');
+    assert.equal(dd.lastDirection, 1, 'both fires are upward');
+});
+
+test('PH latch: a sharp REVERSAL after a re-arm is reported with the correct direction (F-ph-latch-rearm)', () => {
+    // The re-arm KEEPS the running-mean reference (_n / _mean survive), so the reversal accumulates
+    // against the true online mean and fires with the correct direction. The pre-fix re-arm called
+    // _reset(), which zeroed _n / _mean; the new post-shift level silently became the reference and the
+    // reversal was NEVER reported (a fail-open latch). Ground truth from the true step edges:
+    //   0x2000 / +10x2000 / -10x2000 -> up-fire on entering +10 (edge 2000), down-fire on the reversal
+    //   into -10 (edge 4000): EXACTLY 2 fires, dirs +1 then -1.
+    const L = 2000;
+    function runPH(stream) {
+        const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 50, latch: true });
+        const fires = [];
+        for (let i = 0; i < stream.length; i++) if (dd.add(stream[i])) fires.push({ i, dir: dd.lastDirection });
+        return fires;
+    }
+    const seg = (v, n) => Array(n).fill(v);
+    // (a) 0 / +10 / -10 : up then down reversal.
+    const upDown = runPH([...seg(0, L), ...seg(10, L), ...seg(-10, L)]);
+    assert.equal(upDown.length, 2, 'up then a reversal: exactly 2 fires (the reversal is reported)');
+    assert.equal(upDown[0].dir, 1, 'fire#1 is upward');
+    assert.ok(upDown[0].i >= 2000 && upDown[0].i < 2020, 'fire#1 lands on the +10 edge [2000,2020), got ' + upDown[0].i);
+    assert.equal(upDown[1].dir, -1, 'fire#2 (the reversal) is downward');
+    assert.ok(upDown[1].i >= 4000 && upDown[1].i < 4020, 'fire#2 lands on the -10 edge [4000,4020), got ' + upDown[1].i);
+    // (b) 0 / +10 / -30 : a sharper reversal still fires down (edge 4000).
+    const upDownBig = runPH([...seg(0, L), ...seg(10, L), ...seg(-30, L)]);
+    assert.equal(upDownBig.length, 2, '0/10/-30: 2 fires');
+    assert.deepEqual([upDownBig[0].dir, upDownBig[1].dir], [1, -1], '0/10/-30 dirs are +1 then -1');
+    assert.ok(upDownBig[1].i >= 4000 && upDownBig[1].i < 4020, '0/10/-30 reversal on the -30 edge, got ' + upDownBig[1].i);
+    // (c) 0 / -10 / +10 : the mirror -- down then an up reversal.
+    const downUp = runPH([...seg(0, L), ...seg(-10, L), ...seg(10, L)]);
+    assert.equal(downUp.length, 2, '0/-10/+10: 2 fires');
+    assert.deepEqual([downUp[0].dir, downUp[1].dir], [-1, 1], '0/-10/+10 dirs are -1 then +1');
+    assert.ok(downUp[0].i >= 2000 && downUp[0].i < 2020, '0/-10/+10 fire#1 on the -10 edge, got ' + downUp[0].i);
+    assert.ok(downUp[1].i >= 4000 && downUp[1].i < 4020, '0/-10/+10 reversal on the +10 edge, got ' + downUp[1].i);
+});
+
+test('PH latch: a reversal TOWARD the running mean fires, and the delay does NOT grow with history (F-ph-latch)', () => {
+    // The PH reference is reset AT the fire (1.x discipline), so after the up-fire the reference restarts
+    // from the shifted level (10). A shift TOWARD a level (5) near the mean-since-clear() is therefore a
+    // reportable down-move -- the pre-fix code (which kept the reference across the fire) left the PH
+    // reference at the whole-history mean, so a shift toward it was swallowed and the delay grew without
+    // bound with history. Ground truth from the true step edges.
+    function runPH(stream) {
+        const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 50, latch: true });
+        const fires = [];
+        for (let i = 0; i < stream.length; i++) if (dd.add(stream[i])) fires.push({ i, dir: dd.lastDirection });
+        return fires;
+    }
+    const seg = (v, n) => Array(n).fill(v);
+    // (a) 0 / +10 / +5 (L=2000): up-fire on the +10 edge (2000), down-fire on the 10->5 reversal (4000).
+    const shortR = runPH([...seg(0, 2000), ...seg(10, 2000), ...seg(5, 2000)]);
+    assert.equal(shortR.length, 2, '0/10/5: 2 fires (the shift toward the mean is reported)');
+    assert.deepEqual([shortR[0].dir, shortR[1].dir], [1, -1], '0/10/5 dirs are +1 then -1');
+    assert.ok(shortR[0].i >= 2000 && shortR[0].i < 2020, '0/10/5 fire#1 on the +10 edge, got ' + shortR[0].i);
+    assert.ok(shortR[1].i >= 4000 && shortR[1].i < 4020, '0/10/5 reversal on the 10->5 edge [4000,4020), got ' + shortR[1].i);
+    // (b) 0 / +10 / +5 with L=100000: the down-fire STILL lands on the true reversal edge (200000), proving
+    // the delay is bounded by the step geometry, NOT by how long the up-regime ran.
+    const HL = 100000;
+    const longR = runPH([...seg(0, HL), ...seg(10, HL), ...seg(5, HL)]);
+    assert.equal(longR.length, 2, '0x100k/10x100k/5x100k: 2 fires even after a long up-regime');
+    assert.deepEqual([longR[0].dir, longR[1].dir], [1, -1], 'long-history dirs are +1 then -1');
+    assert.ok(longR[0].i >= 100000 && longR[0].i < 100020, 'long-history fire#1 on the +10 edge, got ' + longR[0].i);
+    assert.ok(longR[1].i >= 200000 && longR[1].i < 200020, 'long-history reversal on the true edge [200000,200020), got ' + longR[1].i);
 });

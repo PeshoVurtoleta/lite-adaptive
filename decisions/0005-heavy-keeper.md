@@ -26,7 +26,7 @@ A d x w SoA table of two Uint32 columns (row-major, `cell(r,c) = r*w + c`):
 `_fp` (fingerprints) and `_cnt` (counts). A key is hashed with the two-lane
 MurmurHash3 mixer (copied INLINE from lite-sketch `Sketch.js`, ADR 0001 there --
 design-parity, NEVER a dep) into a fingerprint `fp` (lane HK_H1) and a position
-base (lane HK_H2); row `r`'s column is `hkFinal(base ^ r*ODD) % w`.
+base (lane HK_H2); row `r`'s column is `fmix32(base ^ r*ODD) % w` (fmix32 inlined in int32 locals since 1.8.0 F19).
 
 HOT `add(key, weight)`, per row r at cell `(r, col_r)`:
 - (a) `count == 0` (empty): `fp = fpKey`, `count = weight`.
@@ -59,7 +59,7 @@ After the table update the top-k min-forest is maintained (below).
    PRNG; a `seed` getter exposes it. `seed = 0` is a VALID distinct seed -- the
    ctor guards `options.seed === undefined`, not falsy (null is not zero). Because
    xorshift32 is degenerate at state 0, the PRNG state is DERIVED from the seed via
-   a nonzero-forcing mix (`hkFinal(seed ^ RNG_SALT) | 1`), so `seed = 0` yields a
+   a nonzero-forcing mix (`fmix32(seed ^ RNG_SALT) | 1`), so `seed = 0` yields a
    distinct, non-degenerate stream. The state is stored as a signed int32 (`| 0`)
    so the module never boxes a uint32 >= 2^31 into a field (the lite-sketch lane
    lesson). `clear()` resets the state to its seeded initial, so a cleared
@@ -145,5 +145,32 @@ delegated). It is additive but belongs in the frozen 1.0.0 surface (ROADMAP M4).
 - The four-member roster is COMPLETE: HARD window (EH) / ADAPTIVE window (ADWIN) /
   SMOOTH decay (ForwardDecay) / DECAYED TOP-K (HeavyKeeper). 1.0.0 (the API-freeze
   milestone, no new member) is next.
+
+## Amendment (1.8.0, F19) -- the hash path drops its boxable argument
+
+F3 (1.7.0) routed the `add` / `addFrom` numeric INPUTS (key, weight, seed) through the `HK_KIN`
+Float64Array slot so nothing boxed at the PUBLIC call boundary. F19 closes the same hole one level
+down, INSIDE the hash: the MurmurHash3 helpers `hkRound` / `hkFinal` used to take the key's low
+32-bit word `lo` (a HeapNumber for any key with bit 31 set: `2^31 .. 2^32-1`, `2^53-1`, `-2^31`) and
+the running int32 hash state as CALL ARGUMENTS. When V8 left one `*Round` call un-inlined
+(deterministic under `--no-turbo-inlining`; flaky under CPU contention when Turbofan's cumulative
+inlining budget ran out -- measured ~15-20 in 300 runs at concurrency 12), each large-key `addFrom`
+boxed 32 B/op. F19 removes the boxable argument. The two-lane murmur ROUNDS + `fmix` (F19v2) now run
+entirely in register-resident int32 LOCALS INSIDE the argument-free helpers `hkHash` / `hkMapHash`
+(key + seed arrive via the `HK_KIN` Float64Array slots, the two lanes leave via the `HK_HS`
+Int32Array): no hash word -- neither the key word `lo` nor the running state -- ever crosses an inner
+call boundary, so nothing can box even on a 31-bit-Smi engine or under `--no-turbo-inlining`.
+`hkPos(r, w)` still takes arguments, but only Smi-range ints (`r < d`, `w` the column count), which
+never box. The single `Int32Array` store of each lane applies `ToInt32`, identical to `Math.imul`'s
+own `ToInt32`, so every fingerprint / position / decay draw / estimate is BIT-IDENTICAL to 1.6.0
+(the `HKParity` golden vectors still pass unchanged). Rejected: the minimal `lo | 0` -- an int32
+`>= 2^30` still boxes at a call on a 31-bit-Smi build, so masking the argument is not enough; the
+argument itself must not cross the call. Also rejected (F19v1): parking each round in a module
+`Int32Array` scratch so the helpers took NO argument at all -- V8 could not scalar-replace that
+per-round memory round-trip, and it cost ~16% here (~59% on SlidingCountMin; see ADR 0010), so it was
+reverted to register-resident locals. Gated by the `noInlineLargeKey` group in
+`test/perf/AllocMatrix.test.mjs` (the same lanes read 32 B/op against the pre-fix file) AND by the
+throughput-regression guard `test/perf/HashThroughput.test.mjs`, an in-process A/B that times the
+shipped `addFrom` against the frozen 1.7.0 baseline (a reintroduced round-trip trips it at > 1.15x).
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

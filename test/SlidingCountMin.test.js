@@ -21,7 +21,7 @@ function mulberry32(seed) {
 // version pin (the 8th pin -> 8 VERSION pins total)
 // ---------------------------------------------------------------------------
 test('VERSION is 1.7.0 (DecayedReservoir milestone)', () => {
-    assert.equal(VERSION, '1.7.0');
+    assert.equal(VERSION, '1.8.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -102,8 +102,8 @@ test('getters report the shape / knobs / mode / theoretical error', () => {
     assert.equal(s.lastNow, 0);
     assert.ok(Math.abs(s.epsilon - Math.E / 256) < 1e-12);
     assert.ok(Math.abs(s.delta - Math.exp(-4)) < 1e-12);
-    // bytes = (panes+1)*d*w*4 + paneEnd + idx
-    assert.equal(s.bytes, 17 * 4 * 256 * 4 + 17 * 8 + 4 * 4);
+    // bytes = (panes+1)*d*w*4 + paneEnd + paneTotal (1.8.0) + idx
+    assert.equal(s.bytes, 17 * 4 * 256 * 4 + 17 * 8 + 17 * 8 + 4 * 4);
 });
 
 // ---------------------------------------------------------------------------
@@ -399,4 +399,185 @@ test('clear() empties the window, unlocks the mode, and keeps bytes constant', (
     s.add(undefined, 7, 5);
     assert.equal(s.mode, 'count');
     assert.equal(s.estimate(7), 5);
+});
+
+// ---------------------------------------------------------------------------
+// total(w?) -- the exact per-pane Float64 windowed N (1.8.0)
+// ---------------------------------------------------------------------------
+test('total() returns NaN on a bad sub-window w and 0 when unset', () => {
+    const s = new SlidingCountMin(1000, { panes: 8 });
+    // UNSET (no add yet) -> 0, not NaN (a legitimate empty window, distinct from a bad w).
+    assert.equal(s.total(), 0);
+    assert.equal(s.total(500), 0);
+    for (let t = 1; t <= 500; t++) s.add(t, 7, 1);
+    // bad w -> NaN (parity with estimate's w axis).
+    for (const badW of [0, -1, NaN, Infinity, -Infinity, 1001, '5', null]) {
+        assert.ok(Number.isNaN(s.total(badW)), 'total(' + String(badW) + ') -> NaN');
+    }
+    // a good w still answers a number.
+    assert.equal(typeof s.total(500), 'number');
+    assert.ok(!Number.isNaN(s.total(500)));
+});
+
+test('total() equals the exact sum of counts added within one window', () => {
+    const s = new SlidingCountMin(1000, { panes: 16 });
+    let exact = 0;
+    for (let t = 1; t <= 900; t++) { const c = (t % 5) + 1; s.add(t, t % 30, c); exact += c; }
+    // every add is within the covered span (900 < W) -> total is the EXACT sum of counts.
+    assert.equal(s.total(), exact);
+    assert.equal(s.total(1000), exact);
+});
+
+test('total() stays EXACT even when the d x w cells saturate at 2^32-1', () => {
+    const s = new SlidingCountMin(1000, { panes: 4, w: 16, d: 3 });
+    // two adds of ~2^31 to the SAME key: the cells clip at SAT, but total sums the validated counts.
+    s.add(1, 42, 2 ** 31);
+    s.add(2, 42, 2 ** 31);
+    assert.equal(s.estimate(42), SAT);            // cell saturated (2^32-1)
+    assert.equal(s.total(), 2 ** 32);             // total EXACT (2^31 + 2^31), past the cell ceiling
+    assert.ok(s.saturated > 0);
+});
+
+test('total() slides to 0 after advance(now + 2W)', () => {
+    const s = new SlidingCountMin(1000, { panes: 8 });
+    for (let t = 1; t <= 900; t++) s.add(t, 7, 2);
+    assert.ok(s.total() > 0);
+    s.advance(900 + 2 * 1000);                    // idle-slide past the whole window
+    assert.equal(s.total(), 0);
+    assert.equal(s.estimate(7), 0);               // and the estimate agrees
+});
+
+test('total(w) exercises the w argument BY VALUE against an independent per-add oracle', () => {
+    // The oracle sums the stored per-add `count` over adds whose GRID pane-end > now - w, recomputed
+    // straight from the stored (t, count) -- it never calls total(). An ignore-w total() (one that reads
+    // now - W regardless of w) over-counts every sub-window and FAILS this (see the mutant proof).
+    const W = 2000, panes = 32, pw = W / panes;
+    const s = new SlidingCountMin(W, { epsilon: 0.02, panes, seed: 5 });
+    const rng = mulberry32(23);
+    const N = 5000;
+    const ts = new Float64Array(N), cs = new Float64Array(N);
+    let now = 0;
+    for (let i = 0; i < N; i++) { now += 1; const c = (i % 4) + 1; s.add(now, (rng() * 600) | 0, c); ts[i] = now; cs[i] = c; }
+    const oracle = (w) => {
+        const cut = now - w; let sum = 0;
+        for (let i = 0; i < N; i++) { const pe = (Math.floor(ts[i] / pw) + 1) * pw; if (pe > cut) sum += cs[i]; }
+        return sum;
+    };
+    let checked = 0;
+    for (const w of [W / 4, W / 2, (3 * W) / 4, W]) {
+        assert.equal(s.total(w), oracle(w), 'total(' + w + ') == independent oracle');
+        checked++;
+    }
+    // the sub-windows must genuinely differ (a bug that ignores w would make them all equal to total(W)).
+    assert.ok(s.total(W / 4) < s.total(W / 2), 'total(W/4) < total(W/2) (w narrows the window)');
+    assert.ok(s.total(W / 2) < s.total(W), 'total(W/2) < total(W)');
+    assert.equal(checked, 4);
+});
+
+// ---------------------------------------------------------------------------
+// estimateInto(keys, out, w?) -- the batch 0-alloc reader (1.8.0)
+// ---------------------------------------------------------------------------
+test('estimateInto throws on a non-Float64Array keys/out and a short out', () => {
+    const s = new SlidingCountMin(1000, { panes: 8 });
+    for (let t = 1; t <= 300; t++) s.add(t, t % 20, 1);
+    const out = new Float64Array(4);
+    assert.throws(() => s.estimateInto([1, 2], out), /\[lite-adaptive\].*Float64Array/);
+    assert.throws(() => s.estimateInto(new Float64Array([1]), [0]), /\[lite-adaptive\].*Float64Array/);
+    assert.throws(() => s.estimateInto(new Float64Array(5), out), /\[lite-adaptive\].*length/);
+});
+
+test('estimateInto writes a NaN slot for an invalid key, leaving valid neighbours unaffected', () => {
+    const s = new SlidingCountMin(1000, { panes: 8 });
+    for (let t = 1; t <= 300; t++) s.add(t, 7, 1);
+    const keys = new Float64Array([7, 1.5, 7]);   // valid, invalid (non-integer), valid
+    const out = new Float64Array(3);
+    const n = s.estimateInto(keys, out);
+    assert.equal(n, 3);
+    assert.equal(out[0], s.estimate(7));
+    assert.ok(Number.isNaN(out[1]));              // invalid key -> NaN
+    assert.equal(out[2], s.estimate(7));          // neighbour unaffected
+});
+
+test('estimateInto with a bad w fills every slot with NaN and returns n', () => {
+    const s = new SlidingCountMin(1000, { panes: 8 });
+    for (let t = 1; t <= 300; t++) s.add(t, t % 10, 1);
+    const keys = new Float64Array([0, 1, 2, 3]);
+    const out = new Float64Array(4);
+    const n = s.estimateInto(keys, out, -1);
+    assert.equal(n, 4);
+    for (let j = 0; j < 4; j++) assert.ok(Number.isNaN(out[j]), 'slot ' + j + ' NaN');
+});
+
+test('estimateInto equals estimate key-for-key on >= 2000 (key, w) pairs', () => {
+    const s = new SlidingCountMin(2000, { epsilon: 0.02, panes: 32, seed: 3 });
+    const rng = mulberry32(19);
+    let t = 0;
+    for (let i = 0; i < 6000; i++) { t += 1; s.add(t, (rng() * 800) | 0, (i % 4) + 1); }
+    // build a batch of 40 keys and test across several sub-windows -> >= 2000 comparisons.
+    const keys = new Float64Array(40);
+    for (let k = 0; k < 40; k++) keys[k] = (rng() * 800) | 0;
+    const out = new Float64Array(40);
+    let pairs = 0, mism = 0;
+    for (const w of [undefined, 500, 1000, 1500, 2000]) {
+        const n = s.estimateInto(keys, out, w);
+        assert.equal(n, 40);
+        for (let k = 0; k < 40; k++) {
+            const ref = s.estimate(keys[k], w);
+            if (out[k] !== ref) mism++;
+            pairs++;
+        }
+    }
+    // also a spread of single keys across many sub-windows for volume (>= 2000 total comparisons).
+    const subs = [];
+    for (let w = 40; w <= 2000; w += 40) subs.push(w);   // 50 distinct sub-windows in (0, W]
+    for (let k = 0; k < 40; k++) {
+        for (const w of subs) {
+            const one = new Float64Array([keys[k]]); const o1 = new Float64Array(1);
+            s.estimateInto(one, o1, w);
+            const ref = s.estimate(keys[k], w);
+            if (!(o1[0] === ref || (Number.isNaN(o1[0]) && Number.isNaN(ref)))) mism++;
+            pairs++;
+        }
+    }
+    assert.ok(pairs >= 2000, 'compared ' + pairs + ' (key, w) pairs (>= 2000)');
+    assert.equal(mism, 0, 'estimateInto == estimate on all ' + pairs + ' pairs');
+});
+
+test('estimateInto == estimate slot-for-slot INCLUDING the unset + bad-w case (fail-closed parity)', () => {
+    // An UNSET instance (no add yet) with a BAD w must fail closed to NaN in BOTH estimate() and
+    // estimateInto() -- not fail-open 0 in one and NaN in the other (blocker 1/2).
+    const s = new SlidingCountMin(1000, { panes: 8 });
+    const keys = new Float64Array([0, 7, 1.5, -3, 42]);
+    const out = new Float64Array(5);
+    const cmp = (w) => {
+        s.estimateInto(keys, out, w);
+        for (let k = 0; k < keys.length; k++) {
+            const ref = s.estimate(keys[k], w);
+            assert.ok(out[k] === ref || (Number.isNaN(out[k]) && Number.isNaN(ref)),
+                'unset w=' + String(w) + ' key=' + keys[k] + ': into=' + out[k] + ' est=' + ref);
+        }
+    };
+    for (const w of [undefined, 500, 0, -1, NaN, Infinity, 1001]) cmp(w);
+    // a bad w on the UNSET instance is NaN, not 0 -- assert directly (not just parity).
+    assert.ok(Number.isNaN(s.estimate(7, -1)), 'unset estimate bad-w -> NaN');
+    s.estimateInto(keys, out, -1);
+    for (let k = 0; k < keys.length; k++) assert.ok(Number.isNaN(out[k]), 'unset into bad-w slot ' + k + ' -> NaN');
+});
+
+// review (F19v2): a Proxy typed array passes `instanceof Float64Array` and its get trap can run user
+// code mid-loop; estimateInto must never leave a shared hash slot live across that read.
+test('estimateInto is correct when keys is a Proxy whose get trap re-enters other sketches', async () => {
+    const { HeavyKeeper } = await import('../Adaptive.js');
+    const a = new SlidingCountMin(1000, { panes: 8, w: 256, d: 4, seed: 7 });
+    const other = new SlidingCountMin(1000, { panes: 8, w: 256, d: 4, seed: 99 });
+    const hk = new HeavyKeeper(4, 64, 4, { seed: 3 });
+    const raw = new Float64Array(97);
+    for (let j = 0; j < 97; j++) { raw[j] = (j * 7919) - 40000 + (j % 3 === 0 ? 2 ** 40 : 0); a.add(1, raw[j], 1 + (j % 5)); other.add(1, raw[j] + 1, 3); }
+    const keys = new Proxy(raw, { get(tgt, prop) { if (typeof prop === 'string' && /^\d+$/.test(prop)) { other.estimate(5); hk.add(2 ** 40 + 3, 1); } const v = Reflect.get(tgt, prop); return typeof v === 'function' ? v.bind(tgt) : v; } });
+    assert.ok(keys instanceof Float64Array, 'the Proxy passes the container check');
+    const out = new Float64Array(97);
+    a.estimateInto(keys, out);
+    let bad = 0;
+    for (let j = 0; j < 97; j++) if (!Object.is(out[j], a.estimate(raw[j]))) bad++;
+    assert.equal(bad, 0, 'estimateInto == estimate on every key despite re-entrant user code');
 });

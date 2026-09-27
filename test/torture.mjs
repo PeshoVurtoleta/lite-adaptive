@@ -89,6 +89,9 @@ async function main() {
             let scmt = 0;
             for (let k = 0; k < 4096; k++) scm.add(scmt++, ((k * 2654435761) >>> 0) % 5000);
             scm.estimate(1234); scm.estimate(1234, 500);   // cold sum-then-min queries (0 alloc)
+            scm.total(); scm.total(500);                    // cold exact per-pane N queries (1.8.0, 0 alloc)
+            const scmAK = new Float64Array([1234, 42]); const scmAO = new Float64Array(2);
+            scm.estimateInto(scmAK, scmAO);                 // cold batch reader (1.8.0, 0 alloc)
             scm.clear();
             tracker.track(scm, noop, 'slidingcountmin', { audit: true });
 
@@ -506,6 +509,80 @@ async function main() {
     const ddClearBpc = ddClearRes.bytesPerCall === null ? 0 : ddClearRes.bytesPerCall;
     const ddClearBytes = Math.max(0, Math.round(ddClearBpc));
     const ddClearOk = ddClearBytes === 0;
+
+    // ---- phase 2a-sexies-bis: DriftDetector LATCH (S9, 1.8.0). A regime stream with a GRADUAL RETURN
+    // to baseline, so the latched cold path is exercised end to end EVERY window through ALL of its
+    // branches: fire + latch on a regime start, stay latched (clamp) through a sustained regime, and --
+    // critically -- RE-ARM via the `_reset()` branch when the gap decays back under threshold/2 on the
+    // gradual return (an abrupt flip only ever hits the opposite-fire branch; the F-latch-rearm fix
+    // lives in the re-arm branch, so this lane must execute it). While latched _lvl = -Infinity routes
+    // EVERY item into the cold _fired(), so this lane proves the latched per-item cold call -- clamp
+    // AND re-arm -- allocates NOTHING (0 B/op), both mode branches + addFrom.
+    // DriftDetector add PH latch: online-mean reference, latch on. Integer sawtooth (rise to 100, then
+    // a staircase DOWN to 0) so add() never boxes and the up-gap gradually decays past threshold/2 to
+    // re-arm (an abrupt 100->0 would fire opposite instead -- PH references the risen online mean).
+    const DD_PH_PAT_N = 512;
+    const DD_PH_PAT = new Int32Array(DD_PH_PAT_N);
+    {
+        const hi = DD_PH_PAT_N >> 2, ramp = (DD_PH_PAT_N * 3) >> 2;
+        for (let p = 0; p < DD_PH_PAT_N; p++) {
+            if (p < hi) DD_PH_PAT[p] = 100;
+            else if (p < ramp) DD_PH_PAT[p] = Math.round(100 * (1 - (p - hi) / (ramp - hi)));
+            else DD_PH_PAT[p] = 0;
+        }
+    }
+    const ddPhL = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5, latch: true });
+    let ddPhLI = 0;
+    for (let k = 0; k < 40000; k++) { ddPhL.add(DD_PH_PAT[ddPhLI & (DD_PH_PAT_N - 1)]); ddPhLI++; }
+    let ddPhLSink = 0;
+    const ddPhLStep = () => {
+        const cut = ddPhL.add(DD_PH_PAT[ddPhLI & (DD_PH_PAT_N - 1)]);
+        ddPhLI = (ddPhLI + 1) | 0;
+        ddPhLSink = (ddPhLSink + (cut ? 1 : 0) + (ddPhL.latched ? 1 : 0) + (ddPhL.count & 255)) | 0;   // observe (defeat DCE)
+    };
+    const ddPhLRes = measureAllocs(ddPhLStep, { iterations: 100000, batches: 8 });
+    const ddPhLBpc = ddPhLRes.bytesPerCall === null ? 0 : ddPhLRes.bytesPerCall;
+    const ddPhLBytes = Math.max(0, Math.round(ddPhLBpc));
+    const ddPhLOk = ddPhLBytes === 0;
+
+    // DriftDetector add CUSUM latch: fixed target, latch on. Up-regime 1000, then a long hold AT the
+    // target (500 == baseline) so the up-gap decays at delta/item back under threshold/2 and re-arms;
+    // both values integer so add() never boxes.
+    const ddCuL = new DriftDetector(DRIFT_CUSUM, { delta: 0.005, threshold: 5, target: 500, latch: true });
+    let ddCuLI = 0;
+    for (let k = 0; k < 40000; k++) { ddCuL.add(((ddCuLI >> 10) & 1) ? 1000 : 500); ddCuLI++; }
+    let ddCuLSink = 0;
+    const ddCuLStep = () => {
+        const cut = ddCuL.add(((ddCuLI >> 10) & 1) ? 1000 : 500);
+        ddCuLI = (ddCuLI + 1) | 0;
+        ddCuLSink = (ddCuLSink + (cut ? 1 : 0) + (ddCuL.latched ? 1 : 0) + (ddCuL.count & 255)) | 0;   // observe (defeat DCE)
+    };
+    const ddCuLRes = measureAllocs(ddCuLStep, { iterations: 100000, batches: 8 });
+    const ddCuLBpc = ddCuLRes.bytesPerCall === null ? 0 : ddCuLRes.bytesPerCall;
+    const ddCuLBytes = Math.max(0, Math.round(ddCuLBpc));
+    const ddCuLOk = ddCuLBytes === 0;
+
+    // DriftDetector addFrom latch: the zero-box sibling on a FRACTIONAL stream, latch on. Up-regime
+    // 1000.5, then a hold at 499.999 (fractional, just under target by < delta) so the up-gap decays
+    // and re-arms without an opposite fire -- the re-arm branch on the fractional/unboxed read path.
+    const DD_CU_PAT_N = 1024;
+    const DD_CU_PAT = new Float64Array(DD_CU_PAT_N);
+    for (let p = 0; p < DD_CU_PAT_N; p++) DD_CU_PAT[p] = p < 256 ? 1000.5 : 499.999;
+    const ddFromL = new DriftDetector(DRIFT_CUSUM, { delta: 0.005, threshold: 5, target: 500, latch: true });
+    const DDLBUF = new Float64Array(1);
+    let ddfLI = 0;
+    for (let k = 0; k < 40000; k++) { DDLBUF[0] = DD_CU_PAT[ddfLI & (DD_CU_PAT_N - 1)]; ddFromL.addFrom(DDLBUF, 0); ddfLI++; }
+    let ddFromLSink = 0;
+    const ddFromLStep = () => {
+        DDLBUF[0] = DD_CU_PAT[ddfLI & (DD_CU_PAT_N - 1)];   // fractional regime stream with a gradual return
+        const cut = ddFromL.addFrom(DDLBUF, 0);
+        ddfLI = (ddfLI + 1) | 0;
+        ddFromLSink = (ddFromLSink + (cut ? 1 : 0) + (ddFromL.latched ? 1 : 0) + (ddFromL.count & 255)) | 0;   // observe (defeat DCE)
+    };
+    const ddFromLRes = measureAllocs(ddFromLStep, { iterations: 100000, batches: 8 });
+    const ddFromLBpc = ddFromLRes.bytesPerCall === null ? 0 : ddFromLRes.bytesPerCall;
+    const ddFromLBytes = Math.max(0, Math.round(ddFromLBpc));
+    const ddFromLOk = ddFromLBytes === 0;
 
     // ---- phase 2a-septies: SlidingDDSketch -- add (log-bucket key + pane rotate/clear + collapse) +
     // the ZERO-BOX addFrom on FRACTIONAL [now, value] + quantile + quantileInto + clear. ----
@@ -952,6 +1029,38 @@ async function main() {
     const scmEstBytes = Math.max(0, Math.round(scmEstBpc));
     const scmEstOk = scmEstBytes === 0;
 
+    // SlidingCountMin total (1.8.0): the exact per-pane Float64 windowed N must be 0-alloc per query.
+    let scmTotSink = 0;
+    const scmTotStep = () => {
+        scmTotSink = (scmTotSink + (scmAdd.total() > 0 ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const scmTotRes = measureAllocs(scmTotStep, { iterations: 50000, batches: 8 });
+    const scmTotBpc = scmTotRes.bytesPerCall === null ? 0 : scmTotRes.bytesPerCall;
+    const scmTotBytes = Math.max(0, Math.round(scmTotBpc));
+    const scmTotOk = scmTotRes.bytesPerCall !== null && scmTotBytes === 0;   // null bytesPerCall FAILS closed
+
+    // SlidingCountMin estimateInto (1.8.0): the batch reader over caller-owned Float64Arrays must be
+    // 0-alloc even when a key's windowed count >= 2^31 (the result lands in an out slot, never boxed).
+    // A DEDICATED instance carrying a 2^31 count on one live key makes that claim TRUE (SCM_KEYS[0]).
+    const scmInto = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 3 });
+    let scmIntoT = 0;
+    for (let k = 0; k < 4000; k++) scmInto.add(scmIntoT++, ((k * 2654435761) >>> 0) % 5000);
+    scmInto.add(scmIntoT++, 1234, 2 ** 31);   // one LIVE key with a windowed count >= 2^31
+    const SCM_KEYS = new Float64Array(16);
+    for (let k = 0; k < 16; k++) SCM_KEYS[k] = (k * 733) + 1;
+    SCM_KEYS[0] = 1234;
+    const SCM_OUT = new Float64Array(16);
+    if (!(scmInto.estimate(1234) >= 2 ** 31)) throw new Error('torture scmInto setup: key 1234 must read >= 2^31');   // fail closed
+    let scmIntoSink = 0;
+    const scmIntoStep = () => {
+        scmInto.estimateInto(SCM_KEYS, SCM_OUT);
+        scmIntoSink = (scmIntoSink + (SCM_OUT[0] >= 2 ** 31 ? 1 : 0)) | 0;   // observe the >=2^31 slot (defeat DCE)
+    };
+    const scmIntoRes = measureAllocs(scmIntoStep, { iterations: 50000, batches: 8 });
+    const scmIntoBpc = scmIntoRes.bytesPerCall === null ? 0 : scmIntoRes.bytesPerCall;
+    const scmIntoBytes = Math.max(0, Math.round(scmIntoBpc));
+    const scmIntoOk = scmIntoRes.bytesPerCall !== null && scmIntoBytes === 0;   // null bytesPerCall FAILS closed
+
     // SlidingCountMin advance: slide the pane ring forward (rotate + clear stale panes), re-primed each call.
     const scmAdv = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 9 });
     let scmAdvT = 0;
@@ -1158,6 +1267,7 @@ async function main() {
     SINK += addSink + addTSink + adSink + fpSink + frSink + ehFromSink + fdFromSink + ehBoxedSink + fdBoxedSink +
         hkSink + hkFromSink + hkBoxedSink + adFromSink + hkClearSink + slSink + slFromSink + slClearSink +
         ddPhSink + ddCuSink + ddFromSink + ddClearSink +
+        ddPhLSink + ddCuLSink + ddFromLSink +
         sdSink + sdFromSink + sdQSink + sdIntoSink + sdClearSink +
         ehAdvSink + ehAvfSink + slAdvSink + slAvfSink + sdAdvSink + sdAvfSink +
         ehBigSink + slBigSink + sdBigSink +
@@ -1215,10 +1325,11 @@ async function main() {
         addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk &&
         hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk && slCountOk &&
         ddPhOk && ddCuOk && ddFromOk && ddClearOk &&
+        ddPhLOk && ddCuLOk && ddFromLOk &&
         sdOk && sdFromOk && sdStrictOk && sdRangeOk && sdReancOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk &&
         ehAdvOk && ehAvfOk && slAdvOk && slAvfOk && sdAdvOk && sdAvfOk && advRetOk &&
         ehBigOk && slBigOk && sdBigOk && hugeOk &&
-        scmOk && scmPlainOk && scmRotOk && scmFromOk && scmEstOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
+        scmOk && scmPlainOk && scmRotOk && scmFromOk && scmEstOk && scmTotOk && scmIntoOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
         drOk && drRebOk && drFromOk && drSampOk && drClearOk && drRetOk &&
         report.ok && abOk;
     console.log(
@@ -1244,6 +1355,9 @@ async function main() {
         ddCuBytes + ' B/op (DriftDetector add CUSUM) ' +
         ddFromBytes + ' B/op (DriftDetector addFrom fractional) ' +
         ddClearBytes + ' B/op (DriftDetector clear) ' +
+        ddPhLBytes + ' B/op (DriftDetector add PH latch) ' +
+        ddCuLBytes + ' B/op (DriftDetector add CUSUM latch) ' +
+        ddFromLBytes + ' B/op (DriftDetector addFrom latch) ' +
         sdBytes + ' B/op (SlidingDDSketch add + pane rotate + collapse) ' +
         sdFromBytes + ' B/op (SlidingDDSketch addFrom fractional) ' +
         sdStrictBytes + ' B/op (SlidingDDSketch strict add span re-anchor) ' +
@@ -1263,6 +1377,8 @@ async function main() {
         scmRotBytes + ' B/op (SlidingCountMin rotate-every-add) ' +
         scmFromBytes + ' B/op (SlidingCountMin addFrom stride-3) ' +
         scmEstBytes + ' B/op (SlidingCountMin estimate sum-then-min) ' +
+        scmTotBytes + ' B/op (SlidingCountMin total per-pane N) ' +
+        scmIntoBytes + ' B/op (SlidingCountMin estimateInto batch) ' +
         scmAdvBytes + ' B/op (SlidingCountMin advance) ' +
         scmAvfBytes + ' B/op (SlidingCountMin advanceFrom) ' +
         scmClearBytes + ' B/op (SlidingCountMin clear) ' +
@@ -1322,6 +1438,8 @@ async function main() {
         if (!scmRotOk) console.error('  alloc ' + scmRotBytes + ' B/op SlidingCountMin rotate-every-add (raw ' + scmRotBpc + ')');
         if (!scmFromOk) console.error('  alloc ' + scmFromBytes + ' B/op SlidingCountMin addFrom (raw ' + scmFromBpc + ')');
         if (!scmEstOk) console.error('  alloc ' + scmEstBytes + ' B/op SlidingCountMin estimate (raw ' + scmEstBpc + ')');
+        if (!scmTotOk) console.error('  alloc ' + scmTotBytes + ' B/op SlidingCountMin total (raw ' + scmTotBpc + ')');
+        if (!scmIntoOk) console.error('  alloc ' + scmIntoBytes + ' B/op SlidingCountMin estimateInto (raw ' + scmIntoBpc + ')');
         if (!scmAdvOk) console.error('  alloc ' + scmAdvBytes + ' B/op SlidingCountMin advance (raw ' + scmAdvBpc + ')');
         if (!scmAvfOk) console.error('  alloc ' + scmAvfBytes + ' B/op SlidingCountMin advanceFrom (raw ' + scmAvfBpc + ')');
         if (!scmClearOk) console.error('  alloc ' + scmClearBytes + ' B/op SlidingCountMin clear (raw ' + scmClearBpc + ')');

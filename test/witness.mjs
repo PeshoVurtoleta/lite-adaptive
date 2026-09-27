@@ -1428,6 +1428,96 @@ class NoResetDD extends DriftDetector {
     _reset() { /* BUG: never resets the accumulators / running mean -> false-alarms forever */ }
 }
 
+/**
+ * A BROKEN latch: it RESETS on every latched fire instead of clamping + staying latched, so a
+ * sustained regime re-fires on every item (the exact bug the latch discipline removes). The
+ * ddLatch lane's "exactly one fire per regime" gate must REJECT it.
+ */
+class ResetLatchDD extends DriftDetector {
+    _fired() { this._s[1] = this._s[0] - 1; this._s[2] = 1; this._reset(); return true; }
+}
+
+/**
+ * A latch that NEVER re-arms: it suppresses `_reset()` while latched, so once the detector fires it
+ * stays latched forever and every LATER same-direction regime is silently missed. This is the
+ * F-latch-rearm fail-open shape (equivalent to the pre-fix "clamp unconditionally" bug: a shrinking
+ * gap could never fall to threshold/2). The true-regime-boundary lane MUST REJECT it (it sees 1 fire
+ * where the ground truth has 2; for PH it also emits a spurious opposite fire at the return edge).
+ */
+class NeverRearmDD extends DriftDetector {
+    _reset() { if (this._lDir !== 0) return; super._reset(); }
+}
+
+/**
+ * A latch with NO clamp: the firing-direction accumulator is never bounded, so a sustained regime
+ * drives the statistic unbounded and the eroding gap crosses threshold/2 on chatter. The up/down lane
+ * MUST REJECT it (it re-fires thousands of times) AND the sustained-statistic == threshold check MUST
+ * REJECT it (the statistic runs far above threshold).
+ */
+class NoClampDD extends DriftDetector {
+    _clampGap() { /* BUG: no clamp -> unbounded accumulator, chatter re-arms */ }
+}
+
+/**
+ * A PH latch that RE-ARMS with the full _reset() (the pre-fix F-ph-latch-rearm shape): the re-arm
+ * zeroes _n / _mean, so the new post-shift level silently BECOMES the running-mean reference and a
+ * later reversal is never reported. The up/down reversal lane MUST REJECT it -- it sees only the
+ * first (up) fire where the ground truth has an up-fire AND a down reversal fire.
+ */
+class PhSwallowRevDD extends DriftDetector {
+    _rearm() { this._reset(); }   // BUG: drop the running-mean reference on re-arm -> swallow reversals
+}
+
+/**
+ * The pre-fix `_fired` (round-3 shape): PH does NOT reset `_n` / `_mean` at a latched fire and relies
+ * on `_rearm()` keeping them, so the PH reference stays the mean-since-clear() (the WHOLE history)
+ * across the fire. A later shift TOWARD that historical mean (e.g. 0 -> 10 -> 5) never rebuilds a gap
+ * past threshold and is never reported; on long histories the reversal delay grows without bound. The
+ * new true-edge lanes (0/10/5 and the long-history stream) MUST REJECT it. This is a faithful copy of
+ * the shipped `_fired` MINUS the two `if (ph) { this._n = 0; this._mean = 0; }` reference resets.
+ */
+class PhNoFireResetDD extends DriftDetector {
+    _fired() {
+        const ph = this._mode === DRIFT_PH;
+        const th = this._threshold;
+        const up = ph ? this._gP - this._mMin : this._gP;
+        const dn = ph ? this._mMax - this._gN : this._gN;
+        const dir = up >= dn ? 1 : -1;
+        if (!this._latch) {
+            this._s[1] = this._s[0] - 1;
+            this._s[2] = dir;
+            this._reset();
+            return true;
+        }
+        if (this._lDir === 0) {
+            this._s[1] = this._s[0] - 1;
+            this._s[2] = dir;
+            this._lDir = dir;
+            this._lvl = -Infinity;
+            // BUG: no `if (ph) { this._n = 0; this._mean = 0; }` -> the PH reference is the whole history.
+            this._clampGap(dir, ph, th);
+            return true;
+        }
+        const latchedGap = this._lDir === 1 ? up : dn;
+        const oppositeGap = this._lDir === 1 ? dn : up;
+        if (oppositeGap > th) {
+            const ndir = -this._lDir;
+            this._s[1] = this._s[0] - 1;
+            this._s[2] = ndir;
+            this._lDir = ndir;
+            // BUG: no reference reset at the opposite fire either.
+            this._clampGap(ndir, ph, th);
+            return true;
+        }
+        if (latchedGap < this._half) {
+            if (ph) this._rearm(); else this._reset();
+            return false;
+        }
+        if (latchedGap > th) this._clampGap(this._lDir, ph, th);
+        return false;
+    }
+}
+
 /** Per-mode options: CUSUM REQUIRES a fixed target; inject the in-control mean (0) unless given. */
 function ddOpts(mode, extra) {
     const o = Object.assign({}, extra);
@@ -1585,6 +1675,176 @@ for (const [name, mode] of [['PH', DRIFT_PH], ['CUSUM', DRIFT_CUSUM]]) {
 console.log('');
 console.log('WITNESS DriftDetector negative controls (huge-threshold + no-reset rejected) ' +
     (ddControlsOk ? 'ok' : 'FAIL'));
+
+// ===========================================================================
+// LATCH Witness -- DriftDetector `latch` (S9, ADR 0007 amendment, 1.8.0). MEASURED vs the settled
+// contract: latch:true fires ONCE per regime (vs the 1.7.0 re-fire), records lastDriftIndex /
+// lastDirection, re-fires on an opposite regime, stays NaN on a stationary stream, and fires
+// strictly fewer times than unlatched on a slow ramp. NEGATIVE CONTROL: a reset-on-latched-fire
+// subclass re-fires repeatedly and is REJECTED by the same "exactly one fire" gate.
+// ===========================================================================
+console.log('');
+console.log('LATCH Witness -- DriftDetector.latch v' + VERSION + ' (fire ONCE per regime + threshold/2 hysteresis re-arm):');
+let ddLatchOk = true;
+function ddLatchAssert(label, measured, contract, pass) {
+    if (!pass) ddLatchOk = false;
+    console.log('  ' + label.padEnd(52) + ' measured=' + String(measured).padEnd(22) +
+        ' contract=' + String(contract).padEnd(14) + (pass ? 'ok' : 'FAIL'));
+}
+// Runs a constant/step stream through add(); returns { fires:[indices], li, dir, latched }.
+function ddLatchRun(Ctor, mode, extra, stream) {
+    const dd = new Ctor(mode, ddOpts(mode, extra));
+    const fires = [];
+    for (let i = 0; i < stream.length; i++) if (dd.add(stream[i])) fires.push({ i, li: dd.lastDriftIndex, dir: dd.lastDirection });
+    return { fires, li: dd.lastDriftIndex, dir: dd.lastDirection, latched: dd.latched, stat: dd.statistic };
+}
+const CU_LATCH = { delta: 0.5, threshold: 8 };
+const up10 = Array.from({ length: 5000 }, () => 10);
+// 1) CUSUM +10 x5000: latch:false == the 1.7.0 count (5000); latch:true == exactly 1.
+const cuOff = ddLatchRun(DriftDetector, DRIFT_CUSUM, { ...CU_LATCH, latch: false }, up10);
+ddLatchAssert('CUSUM +10x5000 latch:false fires (1.7.0 count)', cuOff.fires.length, 5000, cuOff.fires.length === 5000);
+const cuOn = ddLatchRun(DriftDetector, DRIFT_CUSUM, { ...CU_LATCH, latch: true }, up10);
+ddLatchAssert('CUSUM +10x5000 latch:true fires', cuOn.fires.length, 1, cuOn.fires.length === 1);
+ddLatchAssert('CUSUM +10x5000 latch:true lastDriftIndex', cuOn.li, 0, cuOn.li === 0);
+ddLatchAssert('CUSUM +10x5000 latch:true lastDirection', cuOn.dir, '+1', cuOn.dir === 1);
+ddLatchAssert('CUSUM +10x5000 latch:true latched', cuOn.latched, true, cuOn.latched === true);
+// The clamp pins the sustained statistic at EXACTLY threshold (bounded). A no-clamp variant runs it
+// unbounded (NoClampDD measures 47500 here), so === threshold is a gate with teeth, not "isFinite".
+ddLatchAssert('CUSUM +10x5000 latch:true statistic == threshold', cuOn.stat, 8, cuOn.stat === 8);
+// 2) up then down: exactly 2 fires; lastDriftIndex 0 then 2500; dir +1 then -1.
+const upDown = Array.from({ length: 5000 }, (_, i) => (i < 2500 ? 10 : -10));
+const cuUD = ddLatchRun(DriftDetector, DRIFT_CUSUM, { ...CU_LATCH, latch: true }, upDown);
+ddLatchAssert('CUSUM up/down latch:true fires', cuUD.fires.length, 2, cuUD.fires.length === 2);
+ddLatchAssert('CUSUM up/down fire#1 (index,dir)', cuUD.fires[0] ? cuUD.fires[0].li + ',' + cuUD.fires[0].dir : 'none', '0,+1',
+    !!cuUD.fires[0] && cuUD.fires[0].li === 0 && cuUD.fires[0].dir === 1);
+ddLatchAssert('CUSUM up/down fire#2 (index,dir)', cuUD.fires[1] ? cuUD.fires[1].li + ',' + cuUD.fires[1].dir : 'none', '2500,-1',
+    !!cuUD.fires[1] && cuUD.fires[1].li === 2500 && cuUD.fires[1].dir === -1);
+// 3) stationary x=0 x5000: 0 fires either way, lastDriftIndex NaN.
+const zeros = Array.from({ length: 5000 }, () => 0);
+for (const latch of [false, true]) {
+    const z = ddLatchRun(DriftDetector, DRIFT_CUSUM, { ...CU_LATCH, latch }, zeros);
+    ddLatchAssert('CUSUM stationary latch:' + latch + ' fires', z.fires.length, 0, z.fires.length === 0);
+    ddLatchAssert('CUSUM stationary latch:' + latch + ' lastDriftIndex', z.li, 'NaN', Number.isNaN(z.li));
+}
+// 4) PH step (0 then 10 @2500): latch:true exactly 1, lastDriftIndex == the latch:false first-fire index.
+const phStep = Array.from({ length: 5000 }, (_, i) => (i < 2500 ? 0 : 10));
+const PH_LATCH = { delta: 0.005, threshold: 50 };
+const phOff = ddLatchRun(DriftDetector, DRIFT_PH, { ...PH_LATCH, latch: false }, phStep);
+const phOn = ddLatchRun(DriftDetector, DRIFT_PH, { ...PH_LATCH, latch: true }, phStep);
+const phFirst = phOff.fires.length ? phOff.fires[0].i : NaN;
+ddLatchAssert('PH step latch:true fires', phOn.fires.length, 1, phOn.fires.length === 1);
+ddLatchAssert('PH step latch:true lastDriftIndex == latch:false first', phOn.li, phFirst, phOn.li === phFirst);
+// 5) PH slow ramp: latch:true fires strictly fewer than unlatched.
+const ramp = Array.from({ length: 5000 }, (_, i) => i * 0.05);
+const rOff = ddLatchRun(DriftDetector, DRIFT_PH, { ...PH_LATCH, latch: false }, ramp).fires.length;
+const rOn = ddLatchRun(DriftDetector, DRIFT_PH, { ...PH_LATCH, latch: true }, ramp).fires.length;
+ddLatchAssert('PH ramp latch:true fires strictly fewer', rOn + ' vs ' + rOff, '< ' + rOff, rOn < rOff);
+// 6) TRUE-REGIME-BOUNDARY lane (F-latch-rearm teeth). The oracle is the GROUND-TRUTH regime structure,
+// NOT the detector's own geometry: a GRADUAL return to baseline is a genuine regime end, so a later
+// same-direction shift is a NEW regime that MUST fire. A latch that re-inflates the shrinking gap (or
+// never re-arms) sees only the first regime and is REJECTED.
+//   CUSUM(0,.5,8): +10 x100 (up-regime, boundary 0), 0 x5000 (return, the gap decays past threshold/2
+//   and re-arms), +10 x100 (a NEW up-regime, boundary 5100). Ground truth = 2 up-fires at 0 and 5100.
+const gradUp = [...Array(100).fill(10), ...Array(5000).fill(0), ...Array(100).fill(10)];
+const cuGrad = ddLatchRun(DriftDetector, DRIFT_CUSUM, { ...CU_LATCH, latch: true }, gradUp);
+const cuGradIdx = cuGrad.fires.map((f) => f.i).join(',');
+const cuGradDir = cuGrad.fires.every((f) => f.dir === 1);
+ddLatchAssert('CUSUM gradual up/base/up fires at true boundaries', cuGradIdx, '0,5100',
+    cuGradIdx === '0,5100' && cuGradDir);
+//   PH(0.005, 50): 0/10/0/10 with L=2000 segments. The GROUND TRUTH regime structure is up(2000) /
+//   down-return(4000) / up(6000): every edge is a genuine regime boundary a working detector reports.
+//   PH re-arms KEEPING the running-mean reference, so the down-return at 4000 IS a reported reversal
+//   (F-ph-latch-rearm: the old re-arm dropped _n/_mean and swallowed it). Oracle = the latch:false
+//   1.x reference fires (the true design behavior); latch:true must match them in COUNT (3), DIRECTION
+//   (+,-,+) and index within +-20 items (the latch re-arm shifts an edge a few items, never a regime).
+const PH_L = 2000;
+const phBounce = [...Array(PH_L).fill(0), ...Array(PH_L).fill(10), ...Array(PH_L).fill(0), ...Array(PH_L).fill(10)];
+const phBRef = ddLatchRun(DriftDetector, DRIFT_PH, { ...PH_LATCH, latch: false }, phBounce).fires;   // oracle: 1.x edges
+const phB = ddLatchRun(DriftDetector, DRIFT_PH, { ...PH_LATCH, latch: true }, phBounce);
+const phBIdx = phB.fires.map((f) => (f.dir === 1 ? f.i + '+' : f.i + '-')).join(',');
+const phBDirs = phB.fires.map((f) => f.dir).join(',');
+const phBNearRef = phB.fires.length === phBRef.length &&
+    phB.fires.every((f, k) => f.dir === phBRef[k].dir && Math.abs(f.i - phBRef[k].i) <= 20);
+ddLatchAssert('PH 0/10/0/10 fires 3x (+,-,+) at the latch:false edges (+-20)', phBIdx + ' dirs=' + phBDirs, '1,-1,1',
+    phBDirs === '1,-1,1' && phBNearRef);
+// TRUE-REVERSAL lane (F-ph-latch-rearm teeth). PH(0.005, 50): 0x2000 / 10x2000 / -10x2000. The ground
+// truth from the true step edges is EXACTLY 2 fires: an up-fire on entering the +10 regime (edge 2000)
+// and a down-fire on the sharp reversal into the -10 regime (edge 4000). A re-arm that KEEPS the
+// running-mean reference reports the reversal (fires at 2005+ then 4005-); a re-arm that drops it
+// (PhSwallowRevDD) swallows the reversal and shows only 1 fire -- REJECTED below.
+const phUpDown = [...Array(PH_L).fill(0), ...Array(PH_L).fill(10), ...Array(PH_L).fill(-10)];
+const phUD = ddLatchRun(DriftDetector, DRIFT_PH, { ...PH_LATCH, latch: true }, phUpDown);
+ddLatchAssert('PH 0/10/-10 latch:true fires', phUD.fires.length, 2, phUD.fires.length === 2);
+ddLatchAssert('PH 0/10/-10 fire#1 up in [2000,2020)', phUD.fires[0] ? phUD.fires[0].i + ',' + phUD.fires[0].dir : 'none', '2000..,+1',
+    !!phUD.fires[0] && phUD.fires[0].dir === 1 && phUD.fires[0].i >= 2000 && phUD.fires[0].i < 2020);
+ddLatchAssert('PH 0/10/-10 fire#2 down in [4000,4020)', phUD.fires[1] ? phUD.fires[1].i + ',' + phUD.fires[1].dir : 'none', '4000..,-1',
+    !!phUD.fires[1] && phUD.fires[1].dir === -1 && phUD.fires[1].i >= 4000 && phUD.fires[1].i < 4020);
+// FIRE-RESET lane (F-ph-latch teeth). PH(0.005, 50): 0x2000 / 10x2000 / 5x2000. The reversal is a shift
+// TOWARD a level (5) NEAR the mean-since-clear() -- exactly the case the pre-fix `_fired` (no reference
+// reset AT the fire) drops. The 1.x discipline resets the PH reference at the fire, so after the up-fire
+// the reference restarts from the shifted level (10) and the 10->5 down-move rebuilds a reportable gap.
+// Ground truth from the true step edges = EXACTLY 2 fires: up in [2000,2020), down in [4000,4020).
+const phDown5 = [...Array(PH_L).fill(0), ...Array(PH_L).fill(10), ...Array(PH_L).fill(5)];
+const phD5 = ddLatchRun(DriftDetector, DRIFT_PH, { ...PH_LATCH, latch: true }, phDown5);
+ddLatchAssert('PH 0/10/5 latch:true fires', phD5.fires.length, 2, phD5.fires.length === 2);
+ddLatchAssert('PH 0/10/5 fire#1 up in [2000,2020)', phD5.fires[0] ? phD5.fires[0].i + ',' + phD5.fires[0].dir : 'none', '2000..,+1',
+    !!phD5.fires[0] && phD5.fires[0].dir === 1 && phD5.fires[0].i >= 2000 && phD5.fires[0].i < 2020);
+ddLatchAssert('PH 0/10/5 fire#2 down in [4000,4020)', phD5.fires[1] ? phD5.fires[1].i + ',' + phD5.fires[1].dir : 'none', '4000..,-1',
+    !!phD5.fires[1] && phD5.fires[1].dir === -1 && phD5.fires[1].i >= 4000 && phD5.fires[1].i < 4020);
+// LONG-HISTORY lane (F-ph-latch teeth). PH(0.005, 50): 0x100k / 10x100k / 5x100k. The pre-fix reference
+// was the mean-since-clear() (the WHOLE history), so the reversal delay grew WITHOUT bound with history
+// and the 10->5 down-shift was never reported. With the fire-reset the down fires at the TRUE reversal
+// edge (200000) regardless of how long the up-regime ran -- 200010, bit-identical to latch:false's edge.
+const PH_HL = 100000;
+const phLong = [...Array(PH_HL).fill(0), ...Array(PH_HL).fill(10), ...Array(PH_HL).fill(5)];
+const phLR = ddLatchRun(DriftDetector, DRIFT_PH, { ...PH_LATCH, latch: true }, phLong);
+ddLatchAssert('PH 0x100k/10x100k/5x100k latch:true fires', phLR.fires.length, 2, phLR.fires.length === 2);
+ddLatchAssert('PH long-history fire#1 up in [100000,100020)', phLR.fires[0] ? phLR.fires[0].i + ',' + phLR.fires[0].dir : 'none', '100000..,+1',
+    !!phLR.fires[0] && phLR.fires[0].dir === 1 && phLR.fires[0].i >= 100000 && phLR.fires[0].i < 100020);
+ddLatchAssert('PH long-history fire#2 down in [200000,200020)', phLR.fires[1] ? phLR.fires[1].i + ',' + phLR.fires[1].dir : 'none', '200000..,-1',
+    !!phLR.fires[1] && phLR.fires[1].dir === -1 && phLR.fires[1].i >= 200000 && phLR.fires[1].i < 200020);
+console.log('');
+console.log('WITNESS DriftDetector latch (one fire per regime + direction + hysteresis re-arm) ' + (ddLatchOk ? 'ok' : 'FAIL'));
+// NEGATIVE CONTROL: a reset-on-latched-fire variant re-fires on the sustained regime -> REJECTED.
+console.log('');
+console.log('NEGATIVE CONTROL -- a reset-on-latched-fire DriftDetector MUST be rejected by the same latch gate:');
+let ddLatchCtrlOk = true;
+const brokenFires = ddLatchRun(ResetLatchDD, DRIFT_CUSUM, { ...CU_LATCH, latch: true }, up10).fires.length;
+const brokenRejected = brokenFires !== 1;   // the "exactly one fire" gate must REJECT it
+if (!brokenRejected) ddLatchCtrlOk = false;
+console.log('  reset-on-latched-fire latch:true fires=' + brokenFires + ' (!= 1 == re-fires) -> ' +
+    (brokenRejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+// NeverRearmDD: never re-arms while latched -> misses the second regime in the true-boundary lane.
+const nrFires = ddLatchRun(NeverRearmDD, DRIFT_CUSUM, { ...CU_LATCH, latch: true }, gradUp).fires.map((f) => f.i).join(',');
+const nrRejected = nrFires !== '0,5100';   // the true-regime-boundary gate must REJECT it
+if (!nrRejected) ddLatchCtrlOk = false;
+console.log('  never-rearm gradual up/base/up fires=[' + nrFires + '] (!= 0,5100 == missed regime) -> ' +
+    (nrRejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+// NoClampDD: no clamp -> chatters on up/down AND runs the sustained statistic unbounded. BOTH gates fire.
+const ncUD = ddLatchRun(NoClampDD, DRIFT_CUSUM, { ...CU_LATCH, latch: true }, upDown).fires.length;
+const ncStat = ddLatchRun(NoClampDD, DRIFT_CUSUM, { ...CU_LATCH, latch: true }, up10).stat;
+const ncRejected = ncUD !== 2 && ncStat !== 8;   // up/down count AND sustained statistic == threshold
+if (!ncRejected) ddLatchCtrlOk = false;
+console.log('  no-clamp up/down fires=' + ncUD + ' (!= 2), sustained statistic=' + ncStat + ' (!= 8) -> ' +
+    (ncRejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+// PhSwallowRevDD: PH re-arm drops the running-mean reference (the pre-fix bug) -> the reversal after
+// re-arm is never reported. The TRUE-REVERSAL lane (0/10/-10) MUST REJECT it: 1 fire, not 2.
+const swFires = ddLatchRun(PhSwallowRevDD, DRIFT_PH, { ...PH_LATCH, latch: true }, phUpDown).fires.length;
+const swRejected = swFires !== 2;   // the "exactly 2 fires (up then reversal)" gate must REJECT it
+if (!swRejected) ddLatchCtrlOk = false;
+console.log('  ph-swallow-reversal 0/10/-10 fires=' + swFires + ' (!= 2 == reversal swallowed) -> ' +
+    (swRejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+// PhNoFireResetDD: PH does NOT reset the reference AT the fire (the pre-fix `_fired`), so the PH
+// reference stays the mean-since-clear(). The FIRE-RESET lane (0/10/5) MUST REJECT it -- the shift
+// toward the historical mean is swallowed, 1 fire not 2 -- and the LONG-HISTORY lane MUST REJECT it too.
+const nfrShort = ddLatchRun(PhNoFireResetDD, DRIFT_PH, { ...PH_LATCH, latch: true }, phDown5).fires.length;
+const nfrLong = ddLatchRun(PhNoFireResetDD, DRIFT_PH, { ...PH_LATCH, latch: true }, phLong).fires.length;
+const nfrRejected = nfrShort !== 2 && nfrLong !== 2;   // both new lanes must reject it
+if (!nfrRejected) ddLatchCtrlOk = false;
+console.log('  ph-no-fire-reset 0/10/5 fires=' + nfrShort + ', 0x100k/10x100k/5x100k fires=' + nfrLong +
+    ' (both != 2 == reversal-toward-mean swallowed) -> ' + (nfrRejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+console.log('');
+console.log('WITNESS DriftDetector latch negative control (reset-on-latched-fire rejected) ' + (ddLatchCtrlOk ? 'ok' : 'FAIL'));
 
 // ===========================================================================
 // WINDOWED-QUANTILE Witness -- SlidingDDSketch (ADR 0008; Masson-Rim-Lee, VLDB 2019, on a pane ring).
@@ -2068,7 +2328,7 @@ function scmDrive(W, eps, panes, N, warm, gen, estFn, Ctor) {
     const s = new (Ctor || SlidingCountMin)(W, { epsilon: eps, panes });
     const pw = W / panes;
     const tv = new Float64Array(N), key = new Float64Array(N);
-    let queries = 0, lowerViol = 0, upperViol = 0;
+    let queries = 0, lowerViol = 0, upperViol = 0, totalViol = 0;
     for (let t = 1; t <= N; t++) {
         const k = gen(t);
         s.add(t, k);
@@ -2079,22 +2339,40 @@ function scmDrive(W, eps, panes, N, warm, gen, estFn, Ctor) {
             const liveThresh = E - W;          // an add is LIVE iff paneEndOf(tv') >= E - W
             const idealCut = now - W;          // ideal window (now - W, now]
             const scan0 = Math.max(0, (Math.floor(now - W - pw) | 0) - 2);
+            // The EXACT item total N over the covered span (all live panes) -- independent of the key
+            // AND independent of the implementation's own total() (grid pane-end recomputed from tv[i]).
+            let NliveAll = 0, NliveQ = 0, NliveH = 0;
+            const cutQ = now - W / 4, cutH = now - W / 2;   // sub-window cuts (grid pane-end > now - w)
+            for (let i = scan0; i < t; i++) {
+                const pe = (Math.floor(tv[i] / pw) + 1) * pw;
+                if (pe >= liveThresh) NliveAll++;
+                if (pe > cutQ) NliveQ++;
+                if (pe > cutH) NliveH++;
+            }
+            // 1.8.0 HARD gate: scm.total(W) must EQUAL the exact oracle N over the covered span, AND
+            // total(W/4)/total(W/2) must equal their independent sub-window oracles (exercises `w` by VALUE:
+            // an ignore-w total() that reads now-W would over-count both sub-windows -> totalViol fires).
+            const totW = s.total(W);
+            if (totW !== NliveAll) totalViol++;
+            if (s.total(W / 4) !== NliveQ) totalViol++;
+            if (s.total(W / 2) !== NliveH) totalViol++;
             const qkeys = [k, key[(now * 0.37) | 0], key[(now * 0.71) | 0]];
             for (const qk of qkeys) {
-                let trueIdeal = 0, trueLive = 0, Nlive = 0;
+                let trueIdeal = 0, trueLive = 0;
                 for (let i = scan0; i < t; i++) {
                     const pe = (Math.floor(tv[i] / pw) + 1) * pw;
-                    if (pe >= liveThresh) { Nlive++; if (key[i] === qk) trueLive++; }
+                    if (pe >= liveThresh && key[i] === qk) trueLive++;
                     if (tv[i] > idealCut && key[i] === qk) trueIdeal++;
                 }
                 const est = estFn(s, qk, W);
                 if (!(est >= trueIdeal)) lowerViol++;                        // lower: true(W) <= est
-                if (!(est <= trueLive + s.epsilon * Nlive)) upperViol++;     // upper: <= true(W+W/B) + eps*N
+                // upper: <= true(W+W/B) + eps*N, with N the INDEPENDENT oracle NliveAll (never total()).
+                if (!(est <= trueLive + s.epsilon * NliveAll)) upperViol++;
                 queries++;
             }
         }
     }
-    return { queries, lowerViol, upperViol };
+    return { queries, lowerViol, upperViol, totalViol };
 }
 
 console.log('');
@@ -2102,10 +2380,10 @@ console.log('WINDOWED-FREQUENCY Witness -- SlidingCountMin v' + VERSION + ' (Cor
     '2005, (B+1)-pane ring): windowed frequency vs an EXACT ring oracle (one-sided: true(W) <= est <= ' +
     'true(W+W/B) + eps*N)');
 console.log('');
-console.log('  W        epsilon  panes  shape          queries  lowerViol  upperViol  status');
-console.log('  -------  -------  -----  -------------  -------  ---------  ---------  ------');
+console.log('  W        epsilon  panes  shape          queries  lowerViol  upperViol  totalViol  status');
+console.log('  -------  -------  -----  -------------  -------  ---------  ---------  ---------  ------');
 
-let scmOk = true, scmQueries = 0;
+let scmOk = true, scmQueries = 0, scmTotalViol = 0;
 
 // a fixed set of active keys per tick, i.i.d. -- a stationary key distribution.
 function scmUniform(seed, span) { const r = mulberry32(seed); return () => (r() * span) | 0; }
@@ -2117,11 +2395,13 @@ for (const [W, eps] of [[500, 0.1], [1000, 0.05], [2000, 0.02], [4000, 0.01]]) {
     const gen = scmUniform(4242 + W, Math.max(50, (W / 4) | 0));
     const r = scmDrive(W, eps, panes, 3 * W, W, gen, estSumThenMin);
     scmQueries += r.queries;
-    const cellOk = r.lowerViol === 0 && r.upperViol === 0;
+    scmTotalViol += r.totalViol;
+    const cellOk = r.lowerViol === 0 && r.upperViol === 0 && r.totalViol === 0;
     if (!cellOk) scmOk = false;
     console.log('  ' + nStr(W).padEnd(7) + '  ' + String(eps).padEnd(7) + '  ' + String(panes).padEnd(5) +
         '  ' + 'uniform'.padEnd(13) + '  ' + String(r.queries).padEnd(7) + '  ' +
-        String(r.lowerViol).padStart(9) + '  ' + String(r.upperViol).padStart(9) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+        String(r.lowerViol).padStart(9) + '  ' + String(r.upperViol).padStart(9) + '  ' +
+        String(r.totalViol).padStart(9) + '  ' + (cellOk ? 'ok' : 'FAIL'));
 }
 
 // churny / evolving key stream (the active band drifts): the same bound must still hold on 100%.
@@ -2130,11 +2410,13 @@ for (const [W, eps] of [[500, 0.1], [1000, 0.05], [2000, 0.02], [4000, 0.01]]) {
     const gen = scmChurn(777, 300, W);
     const r = scmDrive(W, eps, panes, 4 * W, W, gen, estSumThenMin);
     scmQueries += r.queries;
-    const cellOk = r.lowerViol === 0 && r.upperViol === 0;
+    scmTotalViol += r.totalViol;
+    const cellOk = r.lowerViol === 0 && r.upperViol === 0 && r.totalViol === 0;
     if (!cellOk) scmOk = false;
     console.log('  ' + nStr(W).padEnd(7) + '  ' + String(eps).padEnd(7) + '  ' + String(panes).padEnd(5) +
         '  ' + 'churn-drift'.padEnd(13) + '  ' + String(r.queries).padEnd(7) + '  ' +
-        String(r.lowerViol).padStart(9) + '  ' + String(r.upperViol).padStart(9) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+        String(r.lowerViol).padStart(9) + '  ' + String(r.upperViol).padStart(9) + '  ' +
+        String(r.totalViol).padStart(9) + '  ' + (cellOk ? 'ok' : 'FAIL'));
 }
 
 // self-check: the witness's replicated sum-then-min equals the shipped public estimate() (so the
@@ -2167,6 +2449,8 @@ const scmEnough = scmQueries >= 2000;
 if (!scmEnough) scmOk = false;
 console.log('  total queries=' + scmQueries + ' (>= 2000 required: ' + (scmEnough ? 'ok' : 'FAIL') +
     '); one-sided bound holds on 100%: ' + (scmOk ? 'ok' : 'FAIL'));
+console.log('  total(w) == exact oracle N over the covered span: totalViol=' + scmTotalViol +
+    ' -> ' + (scmTotalViol === 0 ? 'ok (100%)' : 'FAIL'));
 console.log('');
 console.log('WITNESS SlidingCountMin (windowed frequency one-sided bound true(W) <= est <= true(W+W/B) + eps*N) ' +
     (scmOk ? 'ok' : 'FAIL'));
@@ -2187,16 +2471,20 @@ let scmControlsOk = true;
         ' -> ' + (rejected ? 'REJECTED (under-counts, ok)' : 'NOT rejected (FAIL)'));
 }
 // (2) NO-CLEAR-ON-ROTATE: `_clearPane` disabled -> a pane rotated back into the ring keeps STALE
-//     counts from prior ring cycles -> ancient mass counted as live -> est OVER-shoots
-//     true(W+W/B) + eps*N. Fed the SAME one-sided gate (the upper side), it MUST be rejected.
+//     counts from prior ring cycles AND its STALE per-pane total (both are cleared on rotate) ->
+//     ancient mass counted as live. The upper bound uses the INDEPENDENT oracle N, so stale cell mass
+//     breaks it (upperViol > 0); the broken per-pane total diverges from the independent oracle
+//     (totalViol > 0). BOTH gates must fire to reject -- two separate teeth, not one masking the other.
 {
     const W = 2000, eps = 0.02, panes = 32;
     const gen = scmUniform(4242 + W, Math.max(50, (W / 4) | 0));   // same stream as the fair W=2000 lane
     const r = scmDrive(W, eps, panes, 4 * W, W, gen, estSumThenMin, NoClearSCM);   // 4W >> ring -> wraps
-    const rejected = r.upperViol > 0;   // stale mass breaks the upper bound
+    // Both conditions must fire independently: the INDEPENDENT-N upper bound catches the stale cell mass,
+    // AND the independent-oracle totalViol catches the stale per-pane totals. (blocker 3)
+    const rejected = r.upperViol > 0 && r.totalViol > 0;
     if (!rejected) scmControlsOk = false;
-    console.log('  no-clear-on-rotate estimator: upperViol=' + r.upperViol + '/' + r.queries +
-        ' -> ' + (rejected ? 'REJECTED (stale mass over-counts, ok)' : 'NOT rejected (FAIL)'));
+    console.log('  no-clear-on-rotate estimator: totalViol=' + r.totalViol + ' upperViol=' + r.upperViol +
+        '/' + r.queries + ' -> ' + (rejected ? 'REJECTED (stale mass over-counts total, ok)' : 'NOT rejected (FAIL)'));
 }
 // NOTE (why min-then-sum is NOT a rejectable control): `sum of mins <= min of sums`, so min-then-sum
 // <= sum-then-min (== the exact merged-window CMS query), and each pane's min-row >= that pane's true
@@ -2369,7 +2657,7 @@ console.log('WITNESS DecayedReservoir negative controls (no-decay + no-forest re
     (drControlsOk ? 'ok' : 'FAIL'));
 
 const all = ok && controlsOk && adOk && adControlsOk && adOffsetOk && (adRecoverOk && adControlHasTeeth) && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
-    slOk && slControlsOk && slPureOk && ddOk && ddControlsOk && sdOk && sdControlsOk && isOk && isControlsOk &&
+    slOk && slControlsOk && slPureOk && ddOk && ddControlsOk && ddLatchOk && ddLatchCtrlOk && sdOk && sdControlsOk && isOk && isControlsOk &&
     scmOk && scmControlsOk && drOk && drControlsOk;
 console.log('');
 console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper + ' +

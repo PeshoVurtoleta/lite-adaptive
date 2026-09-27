@@ -75,7 +75,8 @@
  * of x from its running mean, two-sided) or DRIFT_CUSUM (two-sided CUSUM: two accumulators gP /
  * gN each floored at 0). `add(x) -> boolean` (and the zero-box `addFrom(buf, i)`) updates a
  * running mean, runs the ONE mode branch, and returns true EXACTLY on the detecting item,
- * resetting the accumulators so the NEXT shift is caught -- 0 B/op. It is the item-based, scalar,
+ * resetting the accumulators so the NEXT shift is caught (the `latch: false` default; `latch: true`
+ * fires ONCE per regime and re-arms on hysteresis instead) -- 0 B/op. It is the item-based, scalar,
  * fixed-scalar-state complement to ADWIN's adaptive window: no pool (pure scalars, like
  * ForwardDecay), no window, just a bounded test statistic. DDM / EDDM (which need a Bernoulli
  * error-bit stream + tri-state output) are deliberately OUT of this class -- a future member.
@@ -157,6 +158,36 @@
  * centred sums + live-window range; SHLL pure count; ctor memory caps; one NaN query contract; one
  * shared option door). Every change is listed per class in CHANGELOG 1.7.0.
  *
+ * v1.8.0 is the additive-API release (ROADMAP section 8). SlidingCountMin gains two cold readers:
+ * total(w?) -- the EXACT windowed item count N (the eps x N denominator) from a NEW per-pane Float64
+ * total (this._paneTotal, +(panes+1)*8 B; default B=32 -> +264 B), summed over the SAME live panes as
+ * estimate (straddling oldest pane included), NaN on a bad w, 0 when unset; and estimateInto(keys,
+ * out, w?) -- a 0-alloc batch reader over caller-owned Float64Arrays (F6/R7), each slot exactly what
+ * estimate(keys[j], w) returns, no computed double crossing a non-inlined call. The hot bodies of
+ * add / addFrom gain ONE line (this._paneTotal[this._cur] += count, AFTER the pane rotation); the
+ * cell writes otherwise stay in place.
+ *
+ * v1.8.0 also lands F19, a REPRESENTATION change to the shared hash paths so a key word >= 2^31
+ * never boxes a 31-bit-Smi HeapNumber at an un-inlined call. HeavyKeeper routes the key through the
+ * ARGUMENT-FREE helpers hkHash / hkMapHash (key + seed in Float64Array slots, int32 lanes in
+ * Int32Array slots -- no number crosses that boundary; hkPos(r, w) passes only Smi-range ints, which
+ * never box); SlidingHyperLogLog and SlidingCountMin
+ * HAND-INLINE the two-lane murmur in the hot body. Either way every murmur round + fmix runs in
+ * register-resident int32 LOCALS (F19v2 -- the earlier per-round Int32Array round-trip that V8 could
+ * not scalar-replace cost ~59% on the SCM hot path and was reverted to locals; the throughput-
+ * regression guard test/perf/HashThroughput.test.mjs now pins that ratio vs an embedded replica).
+ * An Int32Array store applies ToInt32, identical to `| 0` and to Math.imul's own ToInt32, so
+ * the OUTPUT is BIT-IDENTICAL: HeavyKeeper, SlidingHyperLogLog and SlidingCountMin produce the same
+ * hashes, column positions and estimates as pre-F19. This is PROVEN by the differential parity suites
+ * (HKParity incl. the _cnt/_fp column-layout pin, SHLLParity, SCMParity incl. the column-shift
+ * teeth), not merely asserted.
+ *
+ * v1.8.0 also adds the DriftDetector `latch` option (S9, default false): a latched detector fires
+ * ONCE per regime and re-arms when the latched gap falls below threshold / 2; `lastDriftIndex` /
+ * `lastDirection` record the last fire. `latch: false` is OUTPUT-IDENTICAL to 1.7.0 (DDParity).
+ * The remaining classes (ExponentialHistogram, ForwardDecay, ADWIN, DecayedReservoir,
+ * SlidingDDSketch) stay BYTE-IDENTICAL.
+ *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
  *
@@ -164,7 +195,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.7.0';
+export const VERSION = '1.8.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -2031,63 +2062,64 @@ const HK_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { seed: t
  * boundary" trick (ROADMAP N6). A safe-integer KEY or a uint32 SEED >= 2^30 held in a `let` or
  * crossed as a call argument boxes a 31-bit-Smi Chrome HeapNumber; a Float64Array / Int32Array
  * slot never does. So the caller writes the numeric inputs into HK_KIN and each helper reads them
- * from the slot -- no numeric argument crosses hkHash / hkPos / hkMapHash / _promote / the map ops.
+ * from the slot -- no numeric argument crosses hkHash / hkMapHash / _promote / the map ops (hkPos(r, w)
+ * takes only Smi-range ints r, w, which never box).
  *
  * HK_KIN (Float64Array(4)) inputs: [0] = key, [1] = seed, [2] = map-key, [3] = estimate.
  * HK_HS  (Int32Array(3)) hash out: [0] = h1 (fingerprint lane), [1] = h2 (position base lane),
  *                                  [2] = map-index hash. Int32 slots so a lane >= 2^31 never boxes
  *                                  a HeapNumber into a module let; readers recover unsigned via `>>> 0`.
+ *                                  (SlidingCountMin reuses this pair: it calls hkHash then folds
+ *                                  base = (HK_HS[0] ^ HK_HS[1]) | 0, bit-identical to its own two-lane
+ *                                  murmur -- proven by SCMParity.)
  *
- * CONTRACT: a slot lives only inside ONE synchronous add / addFrom / estimate call. No user code
- * runs inside that body (forEach callbacks fire OUTSIDE add), so interleaved HeavyKeeper instances
- * never observe each other's scratch -- each fully drains HK_KIN before the next call touches it.
+ * The murmur ROUNDS + fmix run entirely in `let` int32 locals inside each argument-free helper
+ * (F19v2): no hash word crosses an inner call boundary, so nothing can box on a 31-bit-Smi build,
+ * yet -- unlike the earlier per-round Int32Array round-trip -- the locals stay register-resident so
+ * V8 keeps the hot body fast (the round-trip cost ~59% on the SCM hot path). The single Int32Array
+ * store of each lane applies ToInt32 exactly as `| 0` would, so every hash output is BIT-IDENTICAL.
+ *
+ * CONTRACT: a slot is live only between its writes and the hash / helper that reads it, and NO user
+ * code runs in that window. Every input is read into a LOCAL first -- a read of a caller's typed array
+ * can itself run user code (a Proxy passes `instanceof Float64Array`) -- and the slots are written
+ * immediately before the call (forEach callbacks also fire OUTSIDE add). So interleaved instances
+ * (HeavyKeeper, SlidingCountMin estimate / estimateInto) never observe each other's scratch.
  */
 const HK_KIN = new Float64Array(4);
 const HK_HS = new Int32Array(3);
 
-/** One MurmurHash3 body round (pure int32, zero-alloc). */
-function hkRound(h, k) {
-    k = Math.imul(k, HK_C1);
-    k = (k << 15) | (k >>> 17);
-    k = Math.imul(k, HK_C2);
-    h = h ^ k;
-    h = (h << 13) | (h >>> 19);
-    h = (Math.imul(h, 5) + 0xe6546b64) | 0;
-    return h;
-}
-
-/** MurmurHash3 fmix32 finalizer -- the avalanche step (pure int32, zero-alloc). */
-function hkFinal(h) {
-    h = h ^ (h >>> 16);
-    h = Math.imul(h, HK_FC1);
-    h = h ^ (h >>> 13);
-    h = Math.imul(h, HK_FC2);
-    h = h ^ (h >>> 16);
-    return h;
-}
-
 /**
  * Hash the scratch key HK_KIN[0] with the scratch seed HK_KIN[1] into HK_HS[0] (fingerprint lane)
  * and HK_HS[1] (position base lane): the key's low + high words folded through TWO independently
- * seeded murmur3 bodies. NO numeric argument (the key / seed live in Float64Array slots), so a
- * large key / seed never boxes at this call boundary. Zero allocation, no BigInt, no ref retained.
+ * seeded murmur3 bodies. NO numeric argument (the key / seed live in Float64Array slots), and every
+ * round + fmix runs in `let` int32 LOCALS -- no hash word crosses an inner call boundary either
+ * (F19v2: the earlier per-round Int32Array round-trip defeated V8 scalar-replacement and cost
+ * ~59% on the SCM hot path; locals are register-resident, and the sole Int32Array store applies
+ * ToInt32 exactly as `| 0` would, so the output is BIT-IDENTICAL). Zero allocation, no BigInt.
  */
 function hkHash() {
     let a = HK_KIN[0], neg = 0;
     if (a < 0) { a = -a; neg = 1; }
     const lo = a >>> 0;                        // low 32 bits (ToUint32)
     const hi = ((a - lo) / 4294967296) >>> 0;  // high word (exact for safe integers)
+    const w1 = (hi ^ neg) | 0;
     const s = HK_KIN[1] >>> 0;
-    let h = s | 0;
-    h = hkRound(h, lo);
-    h = hkRound(h, hi ^ neg);
-    h = h ^ 8;
-    HK_HS[0] = hkFinal(h) | 0;
+    // fingerprint lane
+    let h = s | 0, k;
+    k = Math.imul(lo, HK_C1); k = (k << 15) | (k >>> 17); k = Math.imul(k, HK_C2);
+    h ^= k; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+    k = Math.imul(w1, HK_C1); k = (k << 15) | (k >>> 17); k = Math.imul(k, HK_C2);
+    h ^= k; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+    h ^= 8; h ^= h >>> 16; h = Math.imul(h, HK_FC1); h ^= h >>> 13; h = Math.imul(h, HK_FC2); h ^= h >>> 16;
+    HK_HS[0] = h;
+    // position base lane
     let g = (s ^ HK_LANE_SALT) | 0;
-    g = hkRound(g, lo);
-    g = hkRound(g, hi ^ neg);
-    g = g ^ 8;
-    HK_HS[1] = hkFinal(g) | 0;
+    k = Math.imul(lo, HK_C1); k = (k << 15) | (k >>> 17); k = Math.imul(k, HK_C2);
+    g ^= k; g = (g << 13) | (g >>> 19); g = (Math.imul(g, 5) + 0xe6546b64) | 0;
+    k = Math.imul(w1, HK_C1); k = (k << 15) | (k >>> 17); k = Math.imul(k, HK_C2);
+    g ^= k; g = (g << 13) | (g >>> 19); g = (Math.imul(g, 5) + 0xe6546b64) | 0;
+    g ^= 8; g ^= g >>> 16; g = Math.imul(g, HK_FC1); g ^= g >>> 13; g = Math.imul(g, HK_FC2); g ^= g >>> 16;
+    HK_HS[1] = g;
 }
 
 /**
@@ -2096,7 +2128,9 @@ function hkHash() {
  * int in [0, w) (a Smi for any legal w), so the return never boxes.
  */
 function hkPos(r, w) {
-    return (hkFinal((HK_HS[1] ^ Math.imul(r, HK_ODD)) | 0) >>> 0) % w;
+    let h = (HK_HS[1] ^ Math.imul(r, HK_ODD)) | 0;
+    h ^= h >>> 16; h = Math.imul(h, HK_FC1); h ^= h >>> 13; h = Math.imul(h, HK_FC2); h ^= h >>> 16;
+    return (h >>> 0) % w;
 }
 
 /**
@@ -2109,11 +2143,14 @@ function hkMapHash() {
     if (a < 0) { a = -a; neg = 1; }
     const lo = a >>> 0;
     const hi = ((a - lo) / 4294967296) >>> 0;
-    let h = ((HK_KIN[1] | 0) ^ HK_MAP_SALT) | 0;
-    h = hkRound(h, lo);
-    h = hkRound(h, hi ^ neg);
-    h = h ^ 8;
-    HK_HS[2] = hkFinal(h) | 0;
+    const w1 = (hi ^ neg) | 0;
+    let h = ((HK_KIN[1] | 0) ^ HK_MAP_SALT) | 0, k;
+    k = Math.imul(lo, HK_C1); k = (k << 15) | (k >>> 17); k = Math.imul(k, HK_C2);
+    h ^= k; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+    k = Math.imul(w1, HK_C1); k = (k << 15) | (k >>> 17); k = Math.imul(k, HK_C2);
+    h ^= k; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+    h ^= 8; h ^= h >>> 16; h = Math.imul(h, HK_FC1); h ^= h >>> 13; h = Math.imul(h, HK_FC2); h ^= h >>> 16;
+    HK_HS[2] = h;
 }
 
 /**
@@ -2224,7 +2261,9 @@ export class HeavyKeeper {
 
         // the seeded xorshift32 state (kept SIGNED int32 so it never boxes). Derived from the
         // seed via a nonzero-forcing mix so seed=0 is a valid distinct, non-degenerate seed.
-        this._rng0 = (hkFinal((seed ^ HK_RNG_SALT) | 0) | 1) | 0;
+        let rs = (seed ^ HK_RNG_SALT) | 0;
+        rs ^= rs >>> 16; rs = Math.imul(rs, HK_FC1); rs ^= rs >>> 13; rs = Math.imul(rs, HK_FC2); rs ^= rs >>> 16;
+        this._rng0 = (rs | 1) | 0;
         this._rng = this._rng0;
 
         // a fixed memory figure (bytes): table + heap + map + LUT.
@@ -2717,26 +2756,10 @@ const SL_LANE_SALT = 0x85ebca6b | 0;
 /** Frozen marker of the known ctor option keys -- an unknown key is a throw with a did-you-mean. */
 const SL_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { p: true, ringCap: true, seed: true }));
 
-/** One MurmurHash3 body round (pure int32, zero-alloc) -- design-parity with lite-sketch. */
-function slRound(h, k) {
-    k = Math.imul(k, HK_C1);
-    k = (k << 15) | (k >>> 17);
-    k = Math.imul(k, HK_C2);
-    h = h ^ k;
-    h = (h << 13) | (h >>> 19);
-    h = (Math.imul(h, 5) + 0xe6546b64) | 0;
-    return h;
-}
-
-/** MurmurHash3 fmix32 finalizer -- the avalanche step (pure int32, zero-alloc). */
-function slFinal(h) {
-    h = h ^ (h >>> 16);
-    h = Math.imul(h, HK_FC1);
-    h = h ^ (h >>> 13);
-    h = Math.imul(h, HK_FC2);
-    h = h ^ (h >>> 16);
-    return h;
-}
+// The SlidingHyperLogLog two-lane murmur3 (design-parity with lite-sketch HLL) is HAND-INLINED in
+// int32 locals directly in add / addFrom (F19v2): the key word + hash state never leave a register,
+// so no >= 2^31 word crosses a call boundary (no 31-bit-Smi HeapNumber box) and there is no per-round
+// Int32Array round-trip (that cost throughput). Bit-identical to the golden vectors -- SHLLParity.
 
 /**
  * sigma -- the small-range correction series of Ertl's improved HyperLogLog estimator
@@ -2869,7 +2892,9 @@ export class SlidingHyperLogLog {
         this._mask = ringCap - 1;
         this._seed = seed | 0;   // SMI-safe signed int32; the murmur uses it as `s | 0` either way
         // q = 64 - p: the number of hash suffix bits -> rho in [0, q+1]; _hist is the reused
-        // Ertl multiplicity vector (scratch for count(), so count() itself allocates nothing).
+        // Ertl multiplicity vector -- the scratch keeps count() free of ARRAY allocation, but the
+        // estimator RETURNS a double: count() boxes 16-32 B per call (16 B steady in the estimator
+        // tail, +16 B when the caller is not yet optimized -- see the README F6 alloc table).
         this._q = 64 - p;
 
         const cells = this._m * ringCap;
@@ -2973,21 +2998,27 @@ export class SlidingHyperLogLog {
         }
         this._now = t;
 
-        // --- the inline two-lane murmur (pure int32 locals; lanes never touch a module slot, so a
-        //     uint32 >= 2^31 lane never boxes a HeapNumber -- design-parity with lite-sketch HLL). ---
+        // --- the two-lane murmur, HAND-INLINED in int32 locals (F19v2): the key word / hash state
+        //     never leaves a register, so nothing crosses a call boundary (no >= 2^31 HeapNumber box)
+        //     and there is no per-round Int32Array round-trip (that cost throughput). Output
+        //     bit-identical -- design-parity with lite-sketch HLL, proven by SHLLParity. ---
         let a = key, neg = 0;
         if (a < 0) { a = -a; neg = 1; }
         const lo = a >>> 0;
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const w1 = (a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0)) ^ neg;
         const seed = this._seed;
-        let hh = seed | 0;
-        hh = slRound(hh, lo);
-        hh = slRound(hh, hiw ^ neg);
-        hh = slFinal(hh ^ 8);
+        let hh = seed | 0, kk;
+        kk = Math.imul(lo, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        hh ^= kk; hh = (hh << 13) | (hh >>> 19); hh = (Math.imul(hh, 5) + 0xe6546b64) | 0;
+        kk = Math.imul(w1, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        hh ^= kk; hh = (hh << 13) | (hh >>> 19); hh = (Math.imul(hh, 5) + 0xe6546b64) | 0;
+        hh ^= 8; hh ^= hh >>> 16; hh = Math.imul(hh, HK_FC1); hh ^= hh >>> 13; hh = Math.imul(hh, HK_FC2); hh ^= hh >>> 16;
         let gg = (seed ^ SL_LANE_SALT) | 0;
-        gg = slRound(gg, lo);
-        gg = slRound(gg, hiw ^ neg);
-        gg = slFinal(gg ^ 8);
+        kk = Math.imul(lo, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        gg ^= kk; gg = (gg << 13) | (gg >>> 19); gg = (Math.imul(gg, 5) + 0xe6546b64) | 0;
+        kk = Math.imul(w1, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        gg ^= kk; gg = (gg << 13) | (gg >>> 19); gg = (Math.imul(gg, 5) + 0xe6546b64) | 0;
+        gg ^= 8; gg ^= gg >>> 16; gg = Math.imul(gg, HK_FC1); gg ^= gg >>> 13; gg = Math.imul(gg, HK_FC2); gg ^= gg >>> 16;
         const p = this._p;
         const j = hh >>> (32 - p);
         // hiSuf kept SIGNED (no `>>> 0`): Math.clz32 does its own ToUint32 and `!== 0` is
@@ -3065,20 +3096,24 @@ export class SlidingHyperLogLog {
         }
         this._now = t;
 
-        // --- the inline two-lane murmur -- DUPLICATED from add() to keep add()'s hot body byte-identical. ---
+        // --- the two-lane murmur, HAND-INLINED in int32 locals -- DUPLICATED from add() (see there). ---
         let a = key, neg = 0;
         if (a < 0) { a = -a; neg = 1; }
         const lo = a >>> 0;
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const w1 = (a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0)) ^ neg;
         const seed = this._seed;
-        let hh = seed | 0;
-        hh = slRound(hh, lo);
-        hh = slRound(hh, hiw ^ neg);
-        hh = slFinal(hh ^ 8);
+        let hh = seed | 0, kk;
+        kk = Math.imul(lo, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        hh ^= kk; hh = (hh << 13) | (hh >>> 19); hh = (Math.imul(hh, 5) + 0xe6546b64) | 0;
+        kk = Math.imul(w1, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        hh ^= kk; hh = (hh << 13) | (hh >>> 19); hh = (Math.imul(hh, 5) + 0xe6546b64) | 0;
+        hh ^= 8; hh ^= hh >>> 16; hh = Math.imul(hh, HK_FC1); hh ^= hh >>> 13; hh = Math.imul(hh, HK_FC2); hh ^= hh >>> 16;
         let gg = (seed ^ SL_LANE_SALT) | 0;
-        gg = slRound(gg, lo);
-        gg = slRound(gg, hiw ^ neg);
-        gg = slFinal(gg ^ 8);
+        kk = Math.imul(lo, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        gg ^= kk; gg = (gg << 13) | (gg >>> 19); gg = (Math.imul(gg, 5) + 0xe6546b64) | 0;
+        kk = Math.imul(w1, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        gg ^= kk; gg = (gg << 13) | (gg >>> 19); gg = (Math.imul(gg, 5) + 0xe6546b64) | 0;
+        gg ^= 8; gg ^= gg >>> 16; gg = Math.imul(gg, HK_FC1); gg ^= gg >>> 13; gg = Math.imul(gg, HK_FC2); gg ^= gg >>> 16;
         const p = this._p;
         const j = hh >>> (32 - p);
         // hiSuf kept SIGNED (no `>>> 0`) -- see add() for why (avoids a tagged-HeapNumber box).
@@ -3337,7 +3372,22 @@ export class SlidingHyperLogLog {
 //                  (threshold) fires.
 //
 // On a POSITIVE detection the accumulators + running mean are RESET (the standard PH / CUSUM
-// discipline) so the detector recalibrates to the new concept and catches the NEXT shift.
+// discipline) so the detector recalibrates to the new concept and catches the NEXT shift. That is
+// the DEFAULT (`latch: false`, 1.x-identical). With `latch: true` (ADR 0007 amendment, 1.8.0) a
+// fire does NOT reset: the detector fires ONCE per regime, LATCHES (re-clamping the firing gap back
+// to `threshold` ONLY while it is still ABOVE `threshold`, so a SUSTAINED regime stays bounded while a
+// gap already <= `threshold` -- a gradual return to baseline -- is left to decay), and RE-ARMS
+// only when the latched-direction gap falls back below `threshold / 2` (hysteresis) or on `clear()`.
+// An OPPOSITE-direction crossing (> threshold) while STILL latched fires immediately and flips
+// direction -- for CUSUM (fixed target, independent accumulators) a sharp reversal is caught on its
+// own item. For PH the reference is reset AT the fire and _rearm() keeps the mean built since (so the
+// reference tracks the POST-SHIFT level and the reversal delay does NOT grow with history), so a
+// sustained reversal is still REPORTED with the correct direction, but not on its own item: the
+// latched gap first collapses below threshold/2 and re-arms, THEN the opposite gap builds against the
+// post-shift mean over a few items (measured: a +-10 step reversal fires ~3 items past the true edge,
+// a +-30 step ~2). Only a single-item jump whose opposite gap alone exceeds threshold fires at once.
+// `lastDriftIndex` (0-based item index of the last fire) and `lastDirection` (+1 / -1) are exposed
+// in BOTH modes (NaN before any fire -- null is not zero).
 //
 // DDM / EDDM are deliberately OUT of this class: they consume a Bernoulli ERROR-BIT stream
 // (a classifier's 0/1 correctness) and emit a TRI-STATE (stable / warning / drift) output, a
@@ -3348,7 +3398,7 @@ export const DRIFT_PH = 0;
 export const DRIFT_CUSUM = 1;
 
 /** Frozen marker of the known ctor option keys -- an unknown key is a throw with a did-you-mean. */
-const DD_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { delta: true, threshold: true, target: true }));
+const DD_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { delta: true, threshold: true, target: true, latch: true }));
 
 /** Default magnitude allowance (PH) / slack (CUSUM): 0 is a valid, meaningful setting (null is not zero). */
 const DD_DEFAULT_DELTA = 0.005;
@@ -3382,7 +3432,8 @@ const DD_X_MAX = 1e150;
  * genuinely diverge on the same stream.
  *
  * Headline (the recency TRIPLE):
- *   - SPACE: O(1) -- six scalars, no allocation ever (the lightest member).
+ *   - SPACE: O(1) -- six core scalars + the latch runtime (_lDir / _lvl) + one fixed Float64Array(3);
+ *     no growable pool, no per-op allocation (0 B/op) (the lightest member).
  *   - ERROR: the threshold trades detection latency against false alarms (larger threshold ->
  *     fewer false alarms, longer latency); delta is the magnitude/slack the test ignores.
  *   - RECENCY: a SCALAR change signal (vs EH's hard window, ADWIN's adaptive window, or
@@ -3409,6 +3460,9 @@ export class DriftDetector {
      *   - target: the FIXED in-control mean mu0 the CUSUM test deviates from; a finite number,
      *     ANY sign, |target| <= 1e150 (target = 0 is VALID). REQUIRED for DRIFT_CUSUM; FORBIDDEN
      *     for DRIFT_PH (which uses the online running mean -- fail-closed, never a silent ignore).
+     *   - latch: a boolean (default false). false = the 1.x auto-reset-on-fire discipline. true =
+     *     fire ONCE per regime, latch, and re-arm on the threshold/2 hysteresis or clear() (see the
+     *     class header + ADR 0007 amendment). typeof-first: a non-boolean throws (no truthy coercion).
      *   An unknown key throws [lite-adaptive].
      */
     constructor(mode, options) {
@@ -3420,6 +3474,7 @@ export class DriftDetector {
         let delta = DD_DEFAULT_DELTA;
         let threshold = DD_DEFAULT_THRESHOLD;
         let target;   // undefined = no fixed reference (PH); a finite mu0 is REQUIRED for CUSUM.
+        let latch = false;   // default: 1.x auto-reset-on-fire behavior (undefined -> false).
         if (options !== undefined) {
             optDoor(options, DD_KNOWN_OPTS, 'DriftDetector');
             // delta = 0 is VALID -- guard `undefined`, not falsy (null is not zero). delta is capped at
@@ -3455,6 +3510,16 @@ export class DriftDetector {
                 }
                 target = tg;
             }
+            // latch is a BOOLEAN (typeof-first, no truthy coercion: a 1 / 'true' / null is a THROW,
+            // never a silent yes). undefined -> false (the 1.x default). Fail closed (null is not zero).
+            if (options.latch !== undefined) {
+                const lt = options.latch;
+                if (typeof lt !== 'boolean') {
+                    throw new TypeError(
+                        '[lite-adaptive] DriftDetector latch must be a boolean, got ' + String(lt));
+                }
+                latch = lt;
+            }
         }
         // Mode / target coherence -- fail-closed, no silent ignore (the mode is load-bearing):
         //   DRIFT_CUSUM tests against a FIXED target mu0 -> it is REQUIRED.
@@ -3469,14 +3534,30 @@ export class DriftDetector {
                 '[lite-adaptive] DriftDetector `target` is only valid for DRIFT_CUSUM ' +
                 '(DRIFT_PH uses the online running mean)');
         }
+        // A latch re-arms when the latched gap falls below threshold/2. If that half underflows to 0
+        // (threshold = Number.MIN_VALUE) a floored CUSUM gap can never be < 0, so the detector would
+        // stay latched forever and silently miss every later regime: fail closed at the door
+        // (QA-1.8.0-DD1). NaN-safe form: `!(threshold * 0.5 > 0)`.
+        if (latch && !(threshold * 0.5 > 0)) {
+            throw new RangeError(
+                '[lite-adaptive] DriftDetector latch needs threshold / 2 > 0 (a re-arm level); ' +
+                'threshold ' + String(threshold) + ' underflows -- use threshold >= 2 * Number.MIN_VALUE');
+        }
         this._mode = mode;
         this._delta = delta;
         this._threshold = threshold;
         this._target = target;   // a finite mu0 for CUSUM; undefined for PH (config, never reset)
+        this._latch = latch;     // config, never reset: false = auto-reset-on-fire (1.x), true = latch
+        this._half = threshold * 0.5;   // the re-arm hysteresis level (latch mode), precomputed
+        // _s -- an instance Float64Array(3): [0] the lifetime accepted-add counter (0-based item
+        // index base; reset only by clear()), [1] lastDriftIndex, [2] lastDirection. A typed-array
+        // slot so the hot-path counter store never boxes; allocated ONCE, before _initState().
+        this._s = new Float64Array(3);
+        this._lvl = -Infinity;   // seed as a Double BEFORE _initState() so the trip-level field is never a Smi
         this._initState();
     }
 
-    /** @private Reset all scalar state to empty. Reused by clear(). 0 alloc. */
+    /** @private Reset all scalar state to empty (a full clear() -- also drops the latch + fire log). 0 alloc. */
     _initState() {
         this._n = 0;          // items seen since the last reset
         this._mean = 0;       // running mean of the signal
@@ -3484,6 +3565,11 @@ export class DriftDetector {
         this._gN = 0;         // downward accumulator (PH cumulative +dev; CUSUM floored -dev)
         this._mMin = 0;       // PH running MIN of gP
         this._mMax = 0;       // PH running MAX of gN
+        this._lDir = 0;       // latched direction: 0 = armed (not latched), +1 / -1 = latched
+        this._lvl = this._threshold;   // mutable trip level: threshold when armed, -Infinity when latched
+        this._s[0] = 0;       // lifetime accepted-add counter (0-based item index base)
+        this._s[1] = NaN;     // lastDriftIndex -- NaN before any fire (null is not zero)
+        this._s[2] = NaN;     // lastDirection -- NaN before any fire
     }
 
     /** The detector mode (DRIFT_PH or DRIFT_CUSUM). O(1). */
@@ -3494,7 +3580,27 @@ export class DriftDetector {
     get threshold() { return this._threshold; }
     /** The fixed CUSUM target mu0 (the reference the test deviates from); undefined for PH. O(1). */
     get target() { return this._target; }
-    /** The number of items seen since the last reset (a fire resets it). O(1). */
+    /** Whether latch mode is on (fire ONCE per regime + re-arm on hysteresis). O(1). */
+    get latch() { return this._latch; }
+    /** Whether the detector is currently latched (fired and not yet re-armed). O(1). Always false when latch is off. */
+    get latched() { return this._lDir !== 0; }
+    /**
+     * The 0-based item index of the LAST fire (across the detector's life; reset by clear()), or NaN
+     * before any fire (null is not zero). O(1). Reading this boxes the double once per call (F6).
+     */
+    get lastDriftIndex() { return this._s[1]; }
+    /**
+     * The direction of the LAST fire: +1 (upward gap won; exact tie -> +1) or -1 (downward), or NaN
+     * before any fire. O(1). Reading this boxes the double once per call (F6).
+     */
+    get lastDirection() { return this._s[2]; }
+    /**
+     * The number of items seen since the last reset. O(1). With latch:false a fire resets it (the
+     * accumulators + count clear on the firing item). With latch:true PH resets it AT the fire (the
+     * same 1.x discipline: the running mean is the PH reference, so it must restart from the shifted
+     * level), while CUSUM resets it on the RE-ARM item (CUSUM's reference is the fixed target, so it
+     * keeps climbing across a sustained latched regime until re-arm).
+     */
     get count() { return this._n; }
     /** The running mean of the signal (0 on empty). O(1). Throws if an accumulator overflowed. */
     get mean() {
@@ -3505,7 +3611,10 @@ export class DriftDetector {
     /**
      * The current test statistic (>= 0): how close the detector is to firing. For PH it is the
      * larger of the up-gap (gP - runningMin) and the down-gap (runningMax - gN); for CUSUM it is
-     * max(gP, gN). It crosses `threshold` exactly when `add` returns true. 0 on empty. O(1).
+     * max(gP, gN). With latch:false it crosses `threshold` exactly when `add` returns true. With
+     * latch:true it crosses on the ONE firing item, then while LATCHED it sits at <= threshold (the
+     * gap is clamped at threshold on a sustained shift, and decays toward threshold/2 as the signal
+     * returns to baseline) and `add` returns false until the regime re-arms. 0 on empty. O(1).
      * Throws [lite-adaptive] if an accumulator overflowed (fail-closed, never a silent NaN).
      */
     get statistic() {
@@ -3521,8 +3630,11 @@ export class DriftDetector {
 
     /**
      * Add one value to the signal. HOT, 0 B/op. Updates the running mean, runs the ONE mode branch,
-     * and returns true EXACTLY on the item that trips the threshold (drift detected), resetting the
-     * accumulators + running mean so the NEXT shift is caught.
+     * and returns true EXACTLY on the item that trips the threshold (drift detected). With latch:false
+     * a fire resets the accumulators + running mean so the NEXT shift is caught. With latch:true a fire
+     * LATCHES (fires ONCE per regime, stays latched while the shift persists); PH resets its running-mean
+     * reference AT the fire (1.x discipline), while the accumulator reset that re-arms happens later, on
+     * the item where the gap falls back to threshold/2.
      *
      * Fail closed: a non-number / NaN / +-Infinity x, or a finite |x| > DD_X_MAX (1e150, so the
      * running accumulators cannot overflow), throws [lite-adaptive] (typeof-first, a BYTE-IDENTICAL
@@ -3538,12 +3650,12 @@ export class DriftDetector {
         }
         const n = this._n + 1;
         this._n = n;
+        this._s[0]++;   // lifetime accepted-add counter (0-based item index = _s[0] - 1); a typed-array store, never boxes.
         // Welford running mean (O(1), no accumulated sum to overflow -- bounded by the x range). It
         // is the PH reference AND the CUSUM `mean` observability getter (CUSUM's TEST uses target).
         const mean = this._mean + (x - this._mean) / n;
         this._mean = mean;
         const delta = this._delta;
-        const th = this._threshold;
         if (this._mode === DRIFT_PH) {
             // Page-Hinkley two-sided: cumulative deviation from the ONLINE running mean, watched
             // against its running extreme (a self-referencing / adaptive reference).
@@ -3554,7 +3666,10 @@ export class DriftDetector {
             this._gN = gN;
             if (gP < this._mMin) this._mMin = gP;   // running MIN (upward reference)
             if (gN > this._mMax) this._mMax = gN;   // running MAX (downward reference)
-            if (gP - this._mMin > th || this._mMax - gN > th) { this._reset(); return true; }
+            // Trip compares read the mutable _lvl (armed: threshold; latched: -Infinity, so every
+            // latched item routes into _fired() -- no new hot branch). latch:false keeps _lvl at
+            // threshold, so this is byte-output-identical to 1.x; _fired() takes ZERO args (no box).
+            if (gP - this._mMin > this._lvl || this._mMax - gN > this._lvl) return this._fired();
             return false;
         }
         // Two-sided CUSUM: deviation from the FIXED target mu0 (the classic SPC in-control mean),
@@ -3567,7 +3682,7 @@ export class DriftDetector {
         if (gN < 0) gN = 0;
         this._gP = gP;
         this._gN = gN;
-        if (gP > th || gN > th) { this._reset(); return true; }
+        if (gP > this._lvl || gN > this._lvl) return this._fired();
         return false;
     }
 
@@ -3596,10 +3711,10 @@ export class DriftDetector {
             x > DD_X_MAX || x < -DD_X_MAX) return this._badValue(x);
         const n = this._n + 1;
         this._n = n;
+        this._s[0]++;   // DUPLICATED from add(): lifetime accepted-add counter (a typed-array store, never boxes).
         const mean = this._mean + (x - this._mean) / n;   // DUPLICATED from add()
         this._mean = mean;
         const delta = this._delta;
-        const th = this._threshold;
         if (this._mode === DRIFT_PH) {
             const dev = x - mean;   // PH: deviation from the ONLINE running mean
             const gP = this._gP + (dev - delta);
@@ -3608,7 +3723,7 @@ export class DriftDetector {
             this._gN = gN;
             if (gP < this._mMin) this._mMin = gP;
             if (gN > this._mMax) this._mMax = gN;
-            if (gP - this._mMin > th || this._mMax - gN > th) { this._reset(); return true; }
+            if (gP - this._mMin > this._lvl || this._mMax - gN > this._lvl) return this._fired();
             return false;
         }
         const dev = x - this._target;   // CUSUM: deviation from the FIXED target mu0
@@ -3618,7 +3733,7 @@ export class DriftDetector {
         if (gN < 0) gN = 0;
         this._gP = gP;
         this._gN = gN;
-        if (gP > th || gN > th) { this._reset(); return true; }
+        if (gP > this._lvl || gN > this._lvl) return this._fired();
         return false;
     }
 
@@ -3635,6 +3750,120 @@ export class DriftDetector {
         this._gN = 0;
         this._mMin = 0;
         this._mMax = 0;
+        this._lDir = 0;                // un-latch (a no-op when latch is off: _lDir is already 0)
+        this._lvl = this._threshold;   // re-arm the trip level (a no-op when latch is off: already threshold)
+    }
+
+    /**
+     * @private Re-arm the PH latch WITHOUT dropping the running-mean reference. Clears only the
+     * accumulators + running extremes + the latch, and KEEPS _n / _mean so the online mean built
+     * SINCE THE LAST FIRE survives across the re-arm. The PH reference is reset AT the fire (see
+     * _fired: `if (ph) { this._n = 0; this._mean = 0; }`), so by re-arm time _n / _mean already track
+     * the post-shift level -- exactly the reference a later reversal must deviate from. (F-ph-latch:
+     * an earlier attempt reset the reference ONLY at re-arm and kept it across the fire; the PH
+     * reference then stayed the mean-since-clear(), so a shift toward that historical mean was never
+     * reported and delay grew with history -- a fail-open latch.) CUSUM's reference is the FIXED
+     * target, so CUSUM re-arms via the full _reset() -- this method is PH-only. 0 alloc.
+     */
+    _rearm() {
+        this._gP = 0;
+        this._gN = 0;
+        this._mMin = 0;
+        this._mMax = 0;
+        this._lDir = 0;                // un-latch
+        this._lvl = this._threshold;   // re-arm the trip level
+    }
+
+    /**
+     * @private COLD -- the fire decision, entered whenever a trip compare passes. It owns ALL latch
+     * logic so the hot body carries none of it (the disclosed cost: while latched, _lvl = -Infinity
+     * routes EVERY item here, so latch:true throughput is lower -- ADR 0007 amendment). Zero args so
+     * no double is boxed at the call boundary. 0 alloc.
+     *
+     * Direction: the LARGER gap wins (PH: up = gP - mMin vs dn = mMax - gN; CUSUM: gP vs gN); an
+     * EXACT tie -> +1. lastDriftIndex = _s[0] - 1 (0-based), lastDirection = the fire direction.
+     *
+     * latch:false -> _reset(); return true (the 1.x auto-reset discipline, unchanged).
+     * latch:true:
+     *   - arming -> latched: record the fire, set _lDir, _lvl = -Infinity, CLAMP the firing gap at
+     *     threshold, return true (the ONE fire for this regime).
+     *   - already latched: an OPPOSITE-direction gap > threshold fires immediately (flip _lDir,
+     *     re-clamp, return true) -- checked FIRST so a single-item reversal whose opposite gap alone
+     *     exceeds threshold is caught on its own item (CUSUM's independent accumulators hit this on a
+     *     step; PH's shared running-mean reference usually re-arms first, then rebuilds the opposite
+     *     gap over a few items -- still reported, just delayed a few items past the true edge);
+     *     else the latched-direction gap < threshold/2 RE-ARMS (PH via _rearm(), which KEEPS the
+     *     running-mean reference; CUSUM via _reset(); return false -- the re-arm moves from fire time
+     *     to re-arm time); else a SUSTAINED regime returns false, re-clamping
+     *     the gap ONLY when it is still ABOVE threshold. A gap already <= threshold (a gradual return
+     *     toward baseline) is LEFT to decay so it can fall to threshold/2 and re-arm -- clamping it
+     *     unconditionally re-inflated a shrinking gap and never re-armed (F-latch-rearm).
+     * @returns {boolean}
+     */
+    _fired() {
+        const ph = this._mode === DRIFT_PH;
+        const th = this._threshold;
+        const up = ph ? this._gP - this._mMin : this._gP;   // upward gap
+        const dn = ph ? this._mMax - this._gN : this._gN;    // downward gap
+        const dir = up >= dn ? 1 : -1;                       // larger gap wins; exact tie -> +1
+        if (!this._latch) {
+            this._s[1] = this._s[0] - 1;
+            this._s[2] = dir;
+            this._reset();
+            return true;
+        }
+        if (this._lDir === 0) {
+            // arming -> latched: the ONE fire for this regime.
+            this._s[1] = this._s[0] - 1;
+            this._s[2] = dir;
+            this._lDir = dir;
+            this._lvl = -Infinity;
+            if (ph) { this._n = 0; this._mean = 0; }   // reset the PH reference AT the fire (1.x discipline)
+            this._clampGap(dir, ph, th);
+            return true;
+        }
+        // Already latched. A single-item OPPOSITE gap > threshold fires on its own item (checked before
+        // the re-arm test so both-conditions-at-once resolves to a fire, not a silent re-arm). A
+        // sustained PH reversal instead re-arms below (KEEPING the running mean) then rebuilds here.
+        const latchedGap = this._lDir === 1 ? up : dn;
+        const oppositeGap = this._lDir === 1 ? dn : up;
+        if (oppositeGap > th) {
+            const ndir = -this._lDir;
+            this._s[1] = this._s[0] - 1;
+            this._s[2] = ndir;
+            this._lDir = ndir;
+            if (ph) { this._n = 0; this._mean = 0; }   // reset the PH reference AT the opposite fire (1.x discipline)
+            this._clampGap(ndir, ph, th);
+            return true;
+        }
+        if (latchedGap < this._half) {
+            // Re-arm. PH KEEPS the running-mean reference (_n / _mean survive the re-arm); because the
+            // reference was already reset AT the fire (above), _n / _mean track the POST-SHIFT level, so
+            // a reversal AFTER the re-arm is reported with the correct direction. CUSUM's reference is
+            // the FIXED target, so it re-arms via the full _reset(). (F-ph-latch: keeping the reference
+            // across the FIRE left it the mean-since-clear() and a shift toward it went unreported.)
+            if (ph) this._rearm(); else this._reset();
+            return false;
+        }
+        // SUSTAINED same-direction regime. Clamp the firing gap back to threshold ONLY when it is
+        // ABOVE threshold, so the accumulators stay bounded during a sustained shift; when the gap is
+        // already <= threshold (a gradual return toward baseline) it is LEFT to decay, so it can reach
+        // threshold/2 and re-arm. Clamping unconditionally re-inflated a shrinking gap every item and
+        // silently missed every later same-direction regime (F-latch-rearm).
+        if (latchedGap > th) this._clampGap(this._lDir, ph, th);
+        return false;
+    }
+
+    /**
+     * @private Clamp the fired-direction accumulator so the firing gap equals exactly `threshold`
+     * (PH: gP = mMin + th / gN = mMax - th; CUSUM: gP = th / gN = th). Keeps latched state bounded.
+     */
+    _clampGap(dir, ph, th) {
+        if (dir === 1) {
+            this._gP = ph ? this._mMin + th : th;
+        } else {
+            this._gN = ph ? this._mMax - th : th;
+        }
     }
 
     /** Reset all scalar state; keep the mode / delta / threshold. O(1). @returns {DriftDetector} this */
@@ -4767,8 +4996,10 @@ const SCM_DEFAULT_DELTA = 0.01;
  *
  * Hot path (`add` / `addFrom`, 0 B/op INCLUDING pane rotation): validate key + count, lock/verify the
  * time mode, rotate + clear panes if `now` crossed a boundary (a bounded, alloc-free while-loop capped
- * at B+1 -- one rotation is an O(d*w) fill(0) spike, disclosed as amortized), inline the two-lane
- * murmur into int32 LOCALS (never the module hash slots -- a uint32 >= 2^31 lane never boxes), and write
+ * at B+1 -- one rotation is an O(d*w) fill(0) spike, disclosed as amortized), run the two-lane murmur
+ * through the ARGUMENT-FREE hkHash helper (F19v2: key + seed via HK_KIN slots, lanes via HK_HS, all
+ * rounds + fmix in register-resident int32 locals; base = (HK_HS[0] ^ HK_HS[1])) so a uint32 >= 2^31
+ * lane never boxes; output bit-identical to lite-sketch CMS, proven by SCMParity), and write
  * the d cells of the CURRENT pane (conservative-update per pane by default, plain add otherwise),
  * saturating at 2^32-1.
  *
@@ -4920,8 +5151,10 @@ export class SlidingCountMin {
         this._delta = Math.exp(-d);  // theoretical failure probability e^-d
         this._cells = new Uint32Array(ring * d * w);   // (B+1) dense d x w matrices (saturate at 2^32-1)
         this._paneEnd = new Float64Array(ring);        // per-pane EXCLUSIVE upper time bound
+        this._paneTotal = new Float64Array(ring);      // per-pane EXACT count total (the eps x N denominator; 1.8.0)
         this._idx = new Int32Array(d);                 // per-row flat-index scratch (0-alloc conservative update)
-        this._bytes = this._cells.byteLength + this._paneEnd.byteLength + this._idx.byteLength;
+        this._bytes = this._cells.byteLength + this._paneEnd.byteLength +
+            this._paneTotal.byteLength + this._idx.byteLength;
 
         this._initState();
     }
@@ -4960,6 +5193,7 @@ export class SlidingCountMin {
     _initState() {
         this._cells.fill(0);
         this._paneEnd.fill(0);
+        this._paneTotal.fill(0);     // per-pane exact count total (1.8.0)
         this._cur = 0;               // current (newest) pane index in the ring
         this._mode = MODE_UNSET;     // time mode, locked at the first add
         this._tick = 0;              // count-mode logical clock
@@ -4992,7 +5226,7 @@ export class SlidingCountMin {
     get mode() {
         return this._mode === MODE_EXPLICIT ? 'explicit' : this._mode === MODE_COUNT ? 'count' : 'unset';
     }
-    /** A fixed memory figure in bytes (all pane matrices + paneEnd + scratch). O(1). */
+    /** A fixed memory figure in bytes (all pane matrices + paneEnd + paneTotal + scratch). O(1). */
     get bytes() { return this._bytes; }
 
     /**
@@ -5053,20 +5287,28 @@ export class SlidingCountMin {
         this._now = t;
         // 3. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
         if (t >= this._paneEnd[this._cur]) this._advance(t);
-        // 4. two-lane murmur INLINED into int32 LOCALS (byte-parity with lite-sketch CMS; never the module slots).
+        this._paneTotal[this._cur] += count;   // exact per-pane N (AFTER rotation: lands in the target pane; 1.8.0)
+        // 4. two-lane murmur, HAND-INLINED in int32 locals (F19v2): the key word / hash state never
+        //    leaves a register -- nothing crosses a call boundary (no >= 2^31 HeapNumber box) and
+        //    there is no per-round Int32Array round-trip (that cost ~59% on this hot path). Output
+        //    bit-identical to lite-sketch CMS (base = hi ^ lo), proven by SCMParity.
         let a = key, neg = 0;
         if (a < 0) { a = -a; neg = 1; }
         const lo = a >>> 0;
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const w1 = (a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0)) ^ neg;
         const s = this._seed;
-        let h = s;
-        h = hkRound(h, lo);
-        h = hkRound(h, hiw ^ neg);
-        h = hkFinal(h ^ 8);                            // HI lane
+        let h = s, kk;
+        kk = Math.imul(lo, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        h ^= kk; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+        kk = Math.imul(w1, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        h ^= kk; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+        h ^= 8; h ^= h >>> 16; h = Math.imul(h, HK_FC1); h ^= h >>> 13; h = Math.imul(h, HK_FC2); h ^= h >>> 16;
         let g = s ^ HK_LANE_SALT;
-        g = hkRound(g, lo);
-        g = hkRound(g, hiw ^ neg);
-        g = hkFinal(g ^ 8);                            // LO lane
+        kk = Math.imul(lo, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        g ^= kk; g = (g << 13) | (g >>> 19); g = (Math.imul(g, 5) + 0xe6546b64) | 0;
+        kk = Math.imul(w1, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        g ^= kk; g = (g << 13) | (g >>> 19); g = (Math.imul(g, 5) + 0xe6546b64) | 0;
+        g ^= 8; g ^= g >>> 16; g = Math.imul(g, HK_FC1); g ^= g >>> 13; g = Math.imul(g, HK_FC2); g ^= g >>> 16;
         const base = (h ^ g) | 0;
         // 5. write the d cells of the CURRENT pane (conservative per pane, or plain add).
         const cur = this._cur, d = this._d, w = this._w, mask = this._mask, cells = this._cells, idx = this._idx;
@@ -5074,7 +5316,9 @@ export class SlidingCountMin {
         if (this._conservative) {
             let mn = 0xffffffff;
             for (let i = 0; i < d; i++) {
-                const col = hkFinal((base ^ Math.imul(i, HK_ODD)) | 0) & mask;
+                let m = (base ^ Math.imul(i, HK_ODD)) | 0;   // per-row fmix32 in int32 locals
+                m ^= m >>> 16; m = Math.imul(m, HK_FC1); m ^= m >>> 13; m = Math.imul(m, HK_FC2); m ^= m >>> 16;
+                const col = m & mask;
                 const id = paneBase + i * w + col;
                 idx[i] = id;
                 const v = cells[id];
@@ -5089,7 +5333,9 @@ export class SlidingCountMin {
         } else {
             let sat = 0;
             for (let i = 0; i < d; i++) {
-                const col = hkFinal((base ^ Math.imul(i, HK_ODD)) | 0) & mask;
+                let m = (base ^ Math.imul(i, HK_ODD)) | 0;   // per-row fmix32 in int32 locals
+                m ^= m >>> 16; m = Math.imul(m, HK_FC1); m ^= m >>> 13; m = Math.imul(m, HK_FC2); m ^= m >>> 16;
+                const col = m & mask;
                 const id = paneBase + i * w + col;
                 let v = cells[id] + count;
                 if (v > SCM_SAT) { v = SCM_SAT; sat = 1; }                   // saturate, never wrap
@@ -5143,20 +5389,26 @@ export class SlidingCountMin {
         this._now = t;
         // 3. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
         if (t >= this._paneEnd[this._cur]) this._advance(t);
-        // 4. two-lane murmur INLINED (DUPLICATED from add() -- byte-identical body).
+        this._paneTotal[this._cur] += count;   // exact per-pane N (AFTER rotation: lands in the target pane; 1.8.0)
+        // 4. two-lane murmur, HAND-INLINED in int32 locals (F19v2; DUPLICATED from add() --
+        //    byte-identical body; base = hi ^ lo).
         let a = key, neg = 0;
         if (a < 0) { a = -a; neg = 1; }
         const lo = a >>> 0;
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const w1 = (a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0)) ^ neg;
         const s = this._seed;
-        let h = s;
-        h = hkRound(h, lo);
-        h = hkRound(h, hiw ^ neg);
-        h = hkFinal(h ^ 8);
+        let h = s, kk;
+        kk = Math.imul(lo, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        h ^= kk; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+        kk = Math.imul(w1, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        h ^= kk; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+        h ^= 8; h ^= h >>> 16; h = Math.imul(h, HK_FC1); h ^= h >>> 13; h = Math.imul(h, HK_FC2); h ^= h >>> 16;
         let g = s ^ HK_LANE_SALT;
-        g = hkRound(g, lo);
-        g = hkRound(g, hiw ^ neg);
-        g = hkFinal(g ^ 8);
+        kk = Math.imul(lo, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        g ^= kk; g = (g << 13) | (g >>> 19); g = (Math.imul(g, 5) + 0xe6546b64) | 0;
+        kk = Math.imul(w1, HK_C1); kk = (kk << 15) | (kk >>> 17); kk = Math.imul(kk, HK_C2);
+        g ^= kk; g = (g << 13) | (g >>> 19); g = (Math.imul(g, 5) + 0xe6546b64) | 0;
+        g ^= 8; g ^= g >>> 16; g = Math.imul(g, HK_FC1); g ^= g >>> 13; g = Math.imul(g, HK_FC2); g ^= g >>> 16;
         const base = (h ^ g) | 0;
         // 5. write the d cells of the CURRENT pane (DUPLICATED from add()).
         const cur = this._cur, d = this._d, w = this._w, mask = this._mask, cells = this._cells, idx = this._idx;
@@ -5164,7 +5416,9 @@ export class SlidingCountMin {
         if (this._conservative) {
             let mn = 0xffffffff;
             for (let ii = 0; ii < d; ii++) {
-                const col = hkFinal((base ^ Math.imul(ii, HK_ODD)) | 0) & mask;
+                let m = (base ^ Math.imul(ii, HK_ODD)) | 0;   // per-row fmix32 in int32 locals
+                m ^= m >>> 16; m = Math.imul(m, HK_FC1); m ^= m >>> 13; m = Math.imul(m, HK_FC2); m ^= m >>> 16;
+                const col = m & mask;
                 const id = paneBase + ii * w + col;
                 idx[ii] = id;
                 const v = cells[id];
@@ -5179,7 +5433,9 @@ export class SlidingCountMin {
         } else {
             let sat = 0;
             for (let ii = 0; ii < d; ii++) {
-                const col = hkFinal((base ^ Math.imul(ii, HK_ODD)) | 0) & mask;
+                let m = (base ^ Math.imul(ii, HK_ODD)) | 0;   // per-row fmix32 in int32 locals
+                m ^= m >>> 16; m = Math.imul(m, HK_FC1); m ^= m >>> 13; m = Math.imul(m, HK_FC2); m ^= m >>> 16;
+                const col = m & mask;
                 const id = paneBase + ii * w + col;
                 let v = cells[id] + count;
                 if (v > SCM_SAT) { v = SCM_SAT; sat = 1; }
@@ -5225,6 +5481,8 @@ export class SlidingCountMin {
         }
         if (t >= E) {
             // jumped >= B+1 pane widths: every pane cleared above -> grid-re-anchor around t.
+            // No _paneTotal reset needed here: the <= B+1 _clearPane calls above already zeroed
+            // every pane's total (the ring has B+1 panes, all cleared on a full-ring jump). (1.8.0)
             const newE = (Math.floor(t / pw) + 1) * pw;
             this._paneEnd[cur] = newE;
             let e = newE, idx = cur;
@@ -5233,10 +5491,11 @@ export class SlidingCountMin {
         this._cur = cur;
     }
 
-    /** @private Clear one pane's d x w counter matrix (0 alloc). */
+    /** @private Clear one pane's d x w counter matrix + its exact total (0 alloc). */
     _clearPane(p) {
         const base = p * this._dw;
         this._cells.fill(0, base, base + this._dw);
+        this._paneTotal[p] = 0;      // reset the pane's exact count total (1.8.0)
     }
 
     /**
@@ -5256,7 +5515,8 @@ export class SlidingCountMin {
         // for an upper-bound sketch). An UNSEEN valid key / empty window still reads 0. null is not zero.
         if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
             key > 9007199254740991 || key < -9007199254740991) return NaN;
-        if (this._mode === MODE_UNSET) return 0;
+        // Validate `w` BEFORE the unset return: an unset instance with a bad `w` still fails closed (NaN),
+        // so estimate() == estimateInto() slot-for-slot INCLUDING the unset + bad-w case (1.8.0).
         let effW = this._W;
         if (w !== undefined) {
             if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
@@ -5264,26 +5524,19 @@ export class SlidingCountMin {
             }
             effW = w;
         }
-        let a = key, neg = 0;
-        if (a < 0) { a = -a; neg = 1; }
-        const lo = a >>> 0;
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
-        const s = this._seed;
-        let h = s;
-        h = hkRound(h, lo);
-        h = hkRound(h, hiw ^ neg);
-        h = hkFinal(h ^ 8);
-        let g = s ^ HK_LANE_SALT;
-        g = hkRound(g, lo);
-        g = hkRound(g, hiw ^ neg);
-        g = hkFinal(g ^ 8);
-        const base = (h ^ g) | 0;
+        if (this._mode === MODE_UNSET) return 0;
+        HK_KIN[0] = key;
+        HK_KIN[1] = this._seed;
+        hkHash();
+        const base = (HK_HS[0] ^ HK_HS[1]) | 0;
         const d = this._d, wid = this._w, mask = this._mask, cells = this._cells, dw = this._dw, B = this._ring;
         const cut = this._now - effW;
         const paneEnd = this._paneEnd;
         let mn = Infinity;
         for (let i = 0; i < d; i++) {
-            const cellOff = i * wid + (hkFinal((base ^ Math.imul(i, HK_ODD)) | 0) & mask);
+            let m = (base ^ Math.imul(i, HK_ODD)) | 0;   // per-row fmix32 in int32 locals
+            m ^= m >>> 16; m = Math.imul(m, HK_FC1); m ^= m >>> 13; m = Math.imul(m, HK_FC2); m ^= m >>> 16;
+            const cellOff = i * wid + (m & mask);
             let sum = 0;
             for (let p = 0; p < B; p++) {
                 if (paneEnd[p] > cut) sum += cells[p * dw + cellOff];   // sum this row across LIVE panes
@@ -5291,6 +5544,121 @@ export class SlidingCountMin {
             if (sum < mn) mn = sum;                                     // then MIN over rows (sum-then-min)
         }
         return mn === Infinity ? 0 : mn;
+    }
+
+    /**
+     * The EXACT total number of items N observed over the covered window (the last W, or a sub-window
+     * `w <= W`) -- the eps x N denominator a consumer needs for the additive error term. COLD,
+     * O(B+1), 0 alloc; NEVER throws. Summed from a per-pane Float64 total over the SAME live panes as
+     * `estimate` (paneEnd > now - effW, INCLUDING the straddling oldest pane), so it is N over exactly
+     * the span `estimate` covers ([W, W + W/B]).
+     *
+     * EXACT, not saturated: the d x w CELLS saturate at 2^32-1, but this Float64 total sums the
+     * VALIDATED per-add `count` (each <= 2^32-1) and the windowed sum across panes loses no unit until
+     * it passes 2^53. So `total()` is the exact N of the covered span even when individual cells clip.
+     *
+     * Fail closed (F12 parity with `estimate`): a bad sub-window `w` (non-number / NaN / +-Infinity /
+     * <= 0 / > W) returns NaN; an UNSET instance (no add yet) returns 0. null is not zero.
+     * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
+     * @returns {number} the exact windowed item total N (>= 0), or NaN for a bad `w`.
+     */
+    total(w) {
+        // Validate `w` BEFORE the unset return: an unset instance with a bad `w` fails closed (NaN),
+        // not fail-open 0 -- byte-parity with estimate()/estimateInto()'s bad-w NaN (1.8.0).
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
+                return NaN;
+            }
+            effW = w;
+        }
+        if (this._mode === MODE_UNSET) return 0;
+        const B = this._ring, paneEnd = this._paneEnd, paneTotal = this._paneTotal;
+        const cut = this._now - effW;
+        let sum = 0;
+        for (let p = 0; p < B; p++) {
+            if (paneEnd[p] > cut) sum += paneTotal[p];   // same live-pane rule as estimate (straddling pane kept)
+        }
+        return sum;
+    }
+
+    /**
+     * Batch reader: estimate a whole ARRAY of `keys` into a caller-owned `out` Float64Array over the
+     * last W (or a sub-window `w <= W`), 0 B/op -- the render-loop sibling of `estimate` (F6/R7). For
+     * each key j in [0, keys.length), `out[j]` gets exactly what `estimate(keys[j], w)` would return:
+     * NaN for an out-of-domain key, 0 for an unseen valid key / empty window, else the sum-then-min
+     * windowed frequency. A bad sub-window `w` fills `out[0..n)` with NaN (matching `estimate`). COLD.
+     *
+     * No computed double is returned from, or passed across, a non-inlined call (F3/F5): the per-row
+     * window sum lives in a LOCAL and lands directly in the `out` slot.
+     *
+     * Fail closed BEFORE any read (typeof-first): `keys` / `out` must be Float64Arrays and
+     * `out.length >= keys.length`, else a tagged TypeError/RangeError (a byte-identical no-op).
+     *
+     * `keys` and `out` MAY be the SAME array (each slot j is read then written before j+1), but they must
+     * NOT PARTIALLY OVERLAP (aliased with a non-zero offset) -- a partial overlap clobbers not-yet-read
+     * keys and yields wrong results.
+     * @param {Float64Array} keys a caller-owned Float64Array of safe-integer keys.
+     * @param {Float64Array} out  a caller-owned Float64Array, `out.length >= keys.length` (may be `keys`
+     *   itself, but must not partially overlap it).
+     * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
+     * @returns {number} n = keys.length (the number of slots written).
+     */
+    estimateInto(keys, out, w) {
+        if (!(keys instanceof Float64Array)) {
+            throw new TypeError(
+                '[lite-adaptive] SlidingCountMin.estimateInto(keys, out, w?) keys must be a Float64Array, got ' + String(keys));
+        }
+        if (!(out instanceof Float64Array)) {
+            throw new TypeError(
+                '[lite-adaptive] SlidingCountMin.estimateInto(keys, out, w?) out must be a Float64Array, got ' + String(out));
+        }
+        const n = keys.length;
+        if (out.length < n) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingCountMin.estimateInto out.length (' + out.length +
+                ') must be >= keys.length (' + n + ')');
+        }
+        // A bad sub-window `w` -> every out slot NaN (parity with estimate's bad-w NaN), then return n.
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
+                for (let j = 0; j < n; j++) out[j] = NaN;
+                return n;
+            }
+            effW = w;
+        }
+        const unset = this._mode === MODE_UNSET;
+        const d = this._d, wid = this._w, mask = this._mask, cells = this._cells, dw = this._dw, B = this._ring;
+        const cut = this._now - effW;
+        const paneEnd = this._paneEnd;
+        const seed = this._seed;  // a LOCAL: the shared HK_KIN slots are written only right before hkHash()
+        for (let j = 0; j < n; j++) {
+            const key = keys[j];     // may run user code (a Proxy typed array) -- so NO slot is live here
+            // out-of-domain key -> NaN (parity with estimate); unset instance -> 0.
+            if (key !== key || !Number.isInteger(key) || key > 9007199254740991 || key < -9007199254740991) {
+                out[j] = NaN;
+                continue;
+            }
+            if (unset) { out[j] = 0; continue; }
+            HK_KIN[0] = key;         // write BOTH slots after the (possibly user-code) key read,
+            HK_KIN[1] = seed;        // immediately before the hash -- no user code in between
+            hkHash();
+            const base = (HK_HS[0] ^ HK_HS[1]) | 0;
+            let mn = Infinity;
+            for (let i = 0; i < d; i++) {
+                let m = (base ^ Math.imul(i, HK_ODD)) | 0;   // per-row fmix32 in int32 locals
+                m ^= m >>> 16; m = Math.imul(m, HK_FC1); m ^= m >>> 13; m = Math.imul(m, HK_FC2); m ^= m >>> 16;
+                const cellOff = i * wid + (m & mask);
+                let sum = 0;                                            // row sum stays a LOCAL (F3/F5)
+                for (let p = 0; p < B; p++) {
+                    if (paneEnd[p] > cut) sum += cells[p * dw + cellOff];
+                }
+                if (sum < mn) mn = sum;
+            }
+            out[j] = mn === Infinity ? 0 : mn;                         // land the double directly in the out slot
+        }
+        return n;
     }
 
     /**
@@ -5573,7 +5941,9 @@ export class DecayedReservoir {
 
         // the seeded xorshift32 state (kept SIGNED int32 so it never boxes; the EXACT HeavyKeeper
         // derivation, so a nonzero-forcing mix makes seed=0 a valid distinct, non-degenerate seed).
-        this._rng0 = (hkFinal((seed ^ HK_RNG_SALT) | 0) | 1) | 0;
+        let rs = (seed ^ HK_RNG_SALT) | 0;
+        rs ^= rs >>> 16; rs = Math.imul(rs, HK_FC1); rs ^= rs >>> 13; rs = Math.imul(rs, HK_FC2); rs ^= rs >>> 16;
+        this._rng0 = (rs | 1) | 0;
 
         // a fixed memory figure (bytes): two Float64Array(k) columns + scalar overhead.
         this._bytes = k * 16 + 64;

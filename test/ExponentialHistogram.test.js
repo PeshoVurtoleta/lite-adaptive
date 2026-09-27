@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { ExponentialHistogram, VERSION } from '../Adaptive.js';
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '1.7.0');
+    assert.equal(VERSION, '1.8.0');
 });
 
 test('constructor validates W fail-closed BEFORE allocation', () => {

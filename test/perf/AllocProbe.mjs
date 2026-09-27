@@ -350,6 +350,20 @@ function ddAF() {
     return { setup() { const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5 }); const buf = new Float64Array(1); for (let k = 0; k < 4000; k++) { buf[0] = FRAC[k & 15] + ((k >> 9) & 1) * 10; dd.addFrom(buf, 0); } return { dd, buf, acc: new Float64Array(1) }; },
         hot(s, n) { const dd = s.dd, buf = s.buf, acc = s.acc; for (let i = 0; i < n; i++) { buf[0] = FRAC[i & 15] + ((i >> 9) & 1) * 10; acc[0] += (dd.addFrom(buf, 0) ? 1 : 0); } } };
 }
+// DriftDetector LATCH steady-state, addFrom, FRACTIONAL threshold (5.5). A CUSUM regime stream with a
+// GRADUAL return (1000.5 up, 499.999 just under target 500) drives the FULL latch cold path every
+// window -- arm+latch, sustained clamp, AND the re-arm _reset() branch -- while _lvl = -Infinity routes
+// every item into cold _fired(). Proof the latched cold path (incl. the F-latch-rearm fix and a
+// fractional threshold / half) is 0 B/op on the unboxed read path. The index persists across windows in
+// a Float64Array slot so the pattern keeps advancing (never a boxed local counter).
+function ddLatchAF() {
+    const PAT_N = 1024;
+    const PAT = new Float64Array(PAT_N);
+    for (let p = 0; p < PAT_N; p++) PAT[p] = p < 256 ? 1000.5 : 499.999;
+    return { setup() { const dd = new DriftDetector(DRIFT_CUSUM, { delta: 0.005, threshold: 5.5, target: 500, latch: true }); const buf = new Float64Array(1); const ix = new Float64Array(1);
+        for (let k = 0; k < 4000; k++) { buf[0] = PAT[k & (PAT_N - 1)]; dd.addFrom(buf, 0); } ix[0] = 4000; return { dd, buf, ix, pat: PAT, acc: new Float64Array(1) }; },
+        hot(s, n) { const dd = s.dd, buf = s.buf, pat = s.pat, acc = s.acc; let idx = s.ix[0] | 0; for (let i = 0; i < n; i++) { buf[0] = pat[idx & (PAT_N - 1)]; idx = (idx + 1) | 0; acc[0] += (dd.addFrom(buf, 0) ? 1 : 0) + (dd.latched ? 1 : 0); } s.ix[0] = idx; } };
+}
 
 // --- N4 (task 10): query lanes. Each hot op is one READ call on a pre-populated instance. ---
 function qSddQuantileInto() {
@@ -368,12 +382,35 @@ function qSddCount() {
         for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((k * 40503) % 9973) + 0.5; sd.addFrom(buf, 0); } return { sd, acc: new Float64Array(1) }; },
         hot(s, n) { const sd = s.sd, acc = s.acc; for (let i = 0; i < n; i++) acc[0] += sd.count(); } };
 }
-function qScmEstimateBig() {
-    // SCM estimate whose windowed count >= 2^31: the boxed RETURN (a double >= 2^31) is F6.
+function qScmEstimateIntoBig() {
+    // SCM batch reader (1.8.0): estimateInto over 16 preallocated keys, ONE with a windowed count
+    // >= 2^31. estimateInto writes each result into an out slot (no boxed double crosses a
+    // non-inlined call), so the whole lane is 0 B/op even though estimate(bigKey) boxes its return.
     return { setup() { const scm = new SlidingCountMin(1000, { panes: 8, w: 128, d: 4, seed: 7 }); const buf = new Float64Array(3); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
         clk[0] += 1.5; buf[0] = clk[0]; buf[1] = 12345; buf[2] = 2 ** 31; scm.addFrom(buf, 0);   // one add, count 2^31 (<= SCM_SAT)
+        const keys = new Float64Array(16); for (let k = 0; k < 16; k++) keys[k] = (k * 733) + 1; keys[0] = 12345;   // key 0 -> the big count
+        keys[1] = 9007199254740991; keys[2] = -2147483648;   // key axis: 2^53-1 and -2^31 through the hot hash
+        const out = new Float64Array(16);
+        if (!(scm.estimate(12345) >= 2 ** 31)) throw new Error('q_scm_estimateInto_big setup: the big key must read >= 2^31');   // fail closed
+        return { scm, keys, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const scm = s.scm, keys = s.keys, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { scm.estimateInto(keys, out); acc[0] += out[0]; } } };
+}
+function qScmEstimateBig() {
+    // CONTROL (must BOX): the PLAIN estimate() returns a windowed count >= 2^31 as a boxed ~16 B
+    // HeapNumber every call -- the must-box sibling of estimateInto (which lands the same double in an
+    // out slot at 0 B/op). If this lane ever reads 0, the box detector has gone blind. Measured 16 B/op.
+    return { setup() { const scm = new SlidingCountMin(1000, { panes: 8, w: 128, d: 4, seed: 7 }); const buf = new Float64Array(3); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        clk[0] += 1.5; buf[0] = clk[0]; buf[1] = 12345; buf[2] = 2 ** 31; scm.addFrom(buf, 0);   // count 2^31 -> estimate boxes a big double
         return { scm, key: 12345, acc: new Float64Array(1) }; },
         hot(s, n) { const scm = s.scm, key = s.key, acc = s.acc; for (let i = 0; i < n; i++) acc[0] += scm.estimate(key); } };
+}
+function qScmTotal() {
+    // SCM total(w) (1.8.0): the exact windowed N. A cold reader a consumer calls per frame for the
+    // eps x N band; 0 B/op (it returns a small integer double here, but the lane asserts the path).
+    return { setup() { const scm = new SlidingCountMin(1000, { panes: 8, w: 128, d: 4, seed: 7 }); const buf = new Float64Array(3); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = (k & 511) + 1; buf[2] = (k & 7) + 1; scm.addFrom(buf, 0); }
+        return { scm, acc: new Float64Array(1) }; },
+        hot(s, n) { const scm = s.scm, acc = s.acc; for (let i = 0; i < n; i++) acc[0] += scm.total(); } };
 }
 function qEhSum() {
     return { setup() { const eh = new ExponentialHistogram(1000, 0.01); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
@@ -392,6 +429,33 @@ function qDrSampleInto() {
     return { setup() { const dr = new DecayedReservoir(32, 100000, { seed: 7 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
         for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[k & 15]; dr.addFrom(buf, 0); } const out = new Float64Array(32); return { dr, out, acc: new Float64Array(1) }; },
         hot(s, n) { const dr = s.dr, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { const m = dr.sampleInto(out); acc[0] += out[0] + m; } } };
+}
+// SHLL count() on a NON-degenerate sketch (thousands of distinct keys across a wide window). Finding
+// (A): count() keeps its Ertl scratch (no ARRAY alloc) but RETURNS a rounded double -- a stable 16 B in
+// the estimator tail (slTau / the k-loop / slSigma / Math.round), +16 B when the caller is not yet
+// optimized. No library alloc gate measured count() before 1.8.0. Documented band [12, 40] B/op: the
+// lower bound proves the probe SEES the cost; the upper bound fails on a third box (the estimator tail
+// stays ONE box). Fed unboxed from a Float64Array key table so the DRIVER never boxes (R3).
+function qShllCount() {
+    return { setup() { const sl = new SlidingHyperLogLog(100000, { p: 12, ringCap: 8, seed: 3 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        for (let k = 0; k < 20000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((k * 2654435761) >>> 0); sl.addFrom(buf, 0); }
+        if (!(sl.count() > 1000)) throw new Error('q_shll_count setup: sketch is degenerate (count=' + sl.count() + '); need thousands of distinct keys');   // fail closed
+        return { sl, acc: new Float64Array(1) }; },
+        hot(s, n) { const sl = s.sl, acc = s.acc; for (let i = 0; i < n; i++) acc[0] += sl.count(); } };
+}
+// DriftDetector latch:true PH on a fire-heavy square wave (low 0 / high HI, HALF each). Finding (B): a
+// latched PH fire can box one ~16 B HeapNumber; the effect is TIER-DEPENDENT (Maglev boxes, steady
+// Turbofan holds the value in a slot). No bit-identical source change removes it (25+ variants). The
+// index persists across windows in a Float64Array slot (never a boxed local counter). Gated as a
+// documented CEILING (<= 4 B/op) so the current code passes deterministically while a regression to a
+// per-add box (>= 16 B/op) fails -- see AllocMatrix.
+function ddLatchPhFireheavy() {
+    const PAT_N = 64;
+    const PAT = new Float64Array(PAT_N);
+    for (let p = 0; p < PAT_N; p++) PAT[p] = (p < 32) ? 0 : 10;
+    return { setup() { const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5, latch: true }); const buf = new Float64Array(1); const ix = new Float64Array(1);
+        for (let k = 0; k < 4000; k++) { buf[0] = PAT[k & (PAT_N - 1)]; dd.addFrom(buf, 0); } ix[0] = 4000; return { dd, buf, ix, pat: PAT, acc: new Float64Array(1) }; },
+        hot(s, n) { const dd = s.dd, buf = s.buf, pat = s.pat, acc = s.acc; let idx = s.ix[0] | 0; for (let i = 0; i < n; i++) { buf[0] = pat[idx & (PAT_N - 1)]; idx = (idx + 1) | 0; acc[0] += (dd.addFrom(buf, 0) ? 1 : 0) + (dd.latched ? 1 : 0); } s.ix[0] = idx; } };
 }
 
 export const LANES = {
@@ -441,16 +505,24 @@ export const LANES = {
     dr_af_epoch: drAF('epoch'),
     adwin_af: adwinAF(),
     dd_af: ddAF(),
+    dd_latch_af: ddLatchAF(),
 
     // N4 (task 10) query lanes.
     q_sdd_quantileInto: qSddQuantileInto(),
     q_sdd_quantile99: qSddQuantile99(),
     q_sdd_count: qSddCount(),
+    q_scm_estimateInto_big: qScmEstimateIntoBig(),
     q_scm_estimate_big: qScmEstimateBig(),
+    q_scm_total: qScmTotal(),
     q_eh_sum: qEhSum(),
     q_hk_estimate: qHkEstimate(),
     q_hk_foreach: qHkForEach(),
     q_dr_sampleInto: qDrSampleInto(),
+
+    // 1.8.0 doc-truth lanes: the two measured findings no library alloc gate saw before (SHLL count()
+    // boxes; latched-PH fire boxes in Maglev).
+    q_shll_count: qShllCount(),
+    dd_latch_ph_fireheavy: ddLatchPhFireheavy(),
 };
 
 // ---------------------------------------------------------------------------
@@ -539,12 +611,23 @@ export function warmSiblings() {
  * @param {string} laneName key into LANES
  * @param {'fresh'|'warmed'} [mode='fresh'] warmed runs warmSiblings() first (polymorphic call sites)
  * @param {number} [N=200000]
- * @returns {Promise<{first:number, steady:number, readings:number[]}>}
+ * @param {string[]} [flags=[]] extra node flags for the child (F19: e.g. ['--no-turbo-inlining'] to
+ *   force the large-key hash lanes to expose an argument box deterministically). Inserted BEFORE the
+ *   pinned --min/--max-semi-space-size=4 flags so, under V8's last-wins rule, the semi-space PINS
+ *   always win (extra flags cannot un-pin new space and drift B/op). A semi-space flag in `flags` is
+ *   REJECTED (fail closed) so the pin can never be silently overridden.
+ * @returns {Promise<{first:number, steady:number, readings:number[], execArgv:string[]}>}
  */
-export function runLane(laneName, mode = 'fresh', N = 200000) {
+export function runLane(laneName, mode = 'fresh', N = 200000, flags = []) {
+    for (const f of flags) {
+        if (/semi[-_]space[-_]size/.test(String(f))) {
+            throw new Error('[AllocProbe] runLane fail closed: a semi-space flag in `flags` (' + f +
+                ') would override the pinned --min/--max-semi-space-size=4; not allowed.');
+        }
+    }
     return new Promise((resolve, reject) => {
         const child = spawn(process.execPath,
-            ['--expose-gc', '--min-semi-space-size=4', '--max-semi-space-size=4', SELF],
+            ['--expose-gc', ...flags, '--min-semi-space-size=4', '--max-semi-space-size=4', SELF],
             { env: Object.assign({}, process.env, { LITE_LANE: laneName, LITE_MODE: mode, LITE_N: String(N) }),
                 stdio: ['ignore', 'pipe', 'inherit'] });
         let out = '';
@@ -575,6 +658,8 @@ if (process.env.LITE_LANE) {
     // LITE_MATRIX=1: skip the 8N scavenge count (the matrix/query lanes gate on steady B/op only, so
     // the expensive scavenge sweep is pure wall-time waste there).
     const scav = process.env.LITE_MATRIX === '1' ? -1 : await scavengesAt(lane, 8 * N, lane.setup());
-    process.stdout.write(JSON.stringify({ lane: laneName, mode, N, first: r.first, steady: r.steady, readings: r.readings, scav8N: scav }) + '\n');
+    // execArgv (F19 blocker 4): echo the node flags this child actually received so the parent can
+    // fail closed unless --no-turbo-inlining truly reached the flagged noInlineLargeKey rows.
+    process.stdout.write(JSON.stringify({ lane: laneName, mode, N, first: r.first, steady: r.steady, readings: r.readings, scav8N: scav, execArgv: process.execArgv }) + '\n');
     process.exit(0);
 }

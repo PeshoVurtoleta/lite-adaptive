@@ -6,7 +6,205 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+## [1.8.0] - 2026-09-27
+
+The additive-API release (ROADMAP section 8). MINOR bump: `DriftDetector` gains the opt-in `latch`
+option with `latched` / `lastDriftIndex` / `lastDirection` (`latch: false` is output-identical to
+1.7.0, proven by the DDParity vectors); `SlidingCountMin` gains `total(w?)` and the 0-alloc
+`estimateInto(keys, out, w?)`; F19 moves the HeavyKeeper / SlidingHyperLogLog / SlidingCountMin hash
+paths to register int32 locals (bit-identical output, throughput guarded against the frozen 1.7.0
+file). Two allocation findings from the demo probe are disclosed under Known limitations. Gates: npm
+test 517/517; torture 0 B/op on all 54 lanes (0 major GC); test:perf 30/30; test:perf:matrix 93/93;
+gates:red exit 0.
+
+### Added
+
+- **`DriftDetector` `latch` option + `lastDriftIndex` / `lastDirection` / `latched` getters (settle
+  S9; ADR 0007 amendment).** A new `latch` boolean option (default `false`, so every 1.x stream is
+  byte-identical -- proven bit-for-bit by the DDParity differential vectors). With `latch: true` the
+  detector fires ONCE per regime instead of on every sustained item: a fire LATCHES (re-clamping the
+  firing gap back to `threshold` ONLY while it is still ABOVE `threshold`, so a SUSTAINED regime stays
+  bounded and never spuriously re-arms, while a gap already `<= threshold` -- a gradual return to
+  baseline -- is left to decay) and re-arms only when the latched-direction gap falls below
+  `threshold / 2` (hysteresis) or on `clear()`. An OPPOSITE-direction crossing while latched flips
+  direction and is REPORTED in BOTH modes: CUSUM (independent accumulators) fires on the reversal's
+  own item, while PH resets its running-mean reference AT the fire and `_rearm()` keeps the mean built
+  since, so a sustained reversal re-arms first and rebuilds the opposite gap against the post-shift
+  mean, reported a few items past the true edge (not on its own item unless a single item jumps more
+  than `threshold`). Measured: `CUSUM(target 0, delta .5, threshold 8)` on a +10 x5000 step fires 5000
+  times unlatched vs EXACTLY 1 latched; on +10 x100 / 0 x5000 / +10 x100 (a regime, a gradual return,
+  then a NEW regime) it fires EXACTLY twice, at items 0 and 5100. `PH(delta .005, threshold 50)` on
+  0/+10/-10 (each x2000) fires EXACTLY twice -- `2005+` then `4003-` (~3 items past the reversal edge);
+  on 0/+10/-30, `4002-` (~2). Three new getters, in BOTH modes: `latch`
+  (the option), `latched` (currently latched?), `lastDriftIndex` (0-based item index of the last
+  fire, NaN before any -- null is not zero) and `lastDirection` (+1 / -1, NaN before any). The
+  option is validated typeof-first (a non-boolean throws `[lite-adaptive]`, no truthy coercion).
+  Disclosed trade: while latched every item routes through the cold fire path, so `latch: true`
+  throughput is lower than `latch: false`; and a SECOND same-direction shift is not seen until the
+  regime ends and re-arms. `lastDriftIndex` / `lastDirection` box one double per read (F6). The hot
+  `add` / `addFrom` gain only a mutable trip-level read, a zero-arg fire call, and one typed-array
+  counter store -- the torture gate proves the three latched lanes (add PH, add CUSUM, addFrom) at
+  0 B/op and the existing DD lanes unchanged at 0 B/op.
+- **`SlidingCountMin.total(w?)` -- the exact windowed item total N (the `eps x N` denominator).**
+  Returns the EXACT number of items observed over the covered span (the last W, or a sub-window
+  `w <= W`), summed from a NEW per-pane Float64 total over the SAME live panes as `estimate`
+  (`paneEnd > now - effW`, INCLUDING the straddling oldest pane), so N covers exactly the span
+  `estimate` covers (`[W, W + W/B]`). EXACT, not saturated: the `d x w` cells saturate at
+  `2^32-1`, but this Float64 total sums the VALIDATED per-add `count` and a pane loses no unit
+  until its running total passes `2^53`. Fail closed (F12 parity with `estimate`): a bad
+  sub-window `w` (non-number / NaN / +-Infinity / `<= 0` / `> W`) returns NaN, an unset instance
+  (no add yet) returns 0 (null is not zero). COLD, `O(B+1)`, 0 B/call.
+- **`SlidingCountMin.estimateInto(keys, out, w?)` -- the 0-alloc batch reader (closes F6).**
+  `keys` and `out` are caller-owned Float64Arrays; for each key j it writes `out[j] =
+  estimate(keys[j], w)` (NaN for an out-of-domain key, 0 for an unseen valid key / empty window,
+  else the sum-then-min windowed frequency; a bad sub-window `w` fills every `out[j]` with NaN),
+  and returns `keys.length`. No computed double is returned from, or passed across, a non-inlined
+  call, so it is 0 B/op where the scalar `estimate` still boxes ONE ~16 B HeapNumber per call for a
+  windowed count `>= 2^31`. It replaces that boxed return on the render path. Container-TYPE
+  contract (a wrong container is a programming error, distinct from a bad data VALUE): a
+  non-Float64Array `keys`/`out`, or `out.length < keys.length`, throws a tagged
+  TypeError/RangeError BEFORE any write (a byte-identical no-op). COLD, 0 B/op.
+
+### Changed
+
+- **`SlidingCountMin` `bytes` grows by `(panes+1) * 8`** for the new per-pane Float64 total
+  (`_paneTotal`, one slot per ring pane; the ring holds `B+1` panes). The default
+  `new SlidingCountMin(60000)` (B = 32) now reports **338468 B**, up from **338204 B** (+264 B).
+- **F6 is closed.** With `estimateInto` shipped as the 0-alloc reader for the boxed `estimate`
+  count `>= 2^31`, no boxed hot read remains under `todo`, so `npm run gates:red` now exits 0 (no
+  `todo` gate remains).
+- **`estimateInto` documents its aliasing contract:** `keys` and `out` MAY be the same
+  `Float64Array` (each slot is read then written before the next), but must NOT PARTIALLY OVERLAP
+  (an aliased non-zero offset clobbers not-yet-read keys and yields wrong results).
+
+### Fixed
+
+- **`DriftDetector` `latch: true` with a `threshold` whose half underflows to 0 fails closed
+  (QA-1.8.0-DD1).** With `threshold = Number.MIN_VALUE`, `threshold / 2` rounds to 0, so a floored
+  CUSUM gap could never fall below the re-arm level: the detector stayed latched forever and silently
+  missed every later regime. The constructor now throws a tagged `RangeError` for a latch whose re-arm
+  level is not `> 0` (`2 * Number.MIN_VALUE` and above are accepted; `latch: false` is unaffected).
+  Disclosed alongside: with `DRIFT_CUSUM` and `delta: 0`, a signal sitting exactly at `target` gives
+  the statistic no evidence to decay, so it stays latched until the signal moves below target -- use
+  `delta > 0` with `latch`.
+
+- **`DriftDetector` `latch: true` now RE-ARMS on a gradual return to baseline (the F-latch-rearm
+  clamp fix).** A latched detector re-clamped the firing-direction accumulator back to `threshold` on
+  EVERY latched item, which re-inflated a SHRINKING gap so a gradual return to baseline never fell to
+  `threshold / 2` -- the detector never re-armed and every LATER same-direction regime was silently
+  missed. The clamp is now conditional: `if (latchedGap > threshold) clamp`, so a sustained regime
+  stays bounded while a gap already `<= threshold` is left to decay and re-arm. Measured before:
+  `CUSUM(target 0, delta .5, threshold 8, latch)` on +10 x100 / 0 x5000 / +10 x100 fired ONCE with the
+  statistic stuck at 8; after: EXACTLY 2 fires at items 0 and 5100. A new true-regime-boundary witness
+  lane (oracle = the ground-truth regime edges), a `DriftDetector.test.js` gradual-return case, and a
+  sustained-latched `statistic === threshold` assertion guard it; the `NeverRearmDD` and `NoClampDD`
+  witness controls are both REJECTED by these gates. This latch discipline is new in this cycle, so no
+  released version was affected.
+- **`DriftDetector` PH `latch: true` now resets the running-mean reference AT the fire, so a reversal
+  toward the running mean is reported and the delay does NOT grow with history (the F-ph-latch fix,
+  amends F-ph-latch-rearm).** PH deviates from the ONLINE running mean, so where that reference resets
+  is load-bearing. The 1.x discipline is to reset `_n` / `_mean` AT the fire so the reference restarts
+  from the shifted level; `_fired` now runs `if (ph) { this._n = 0; this._mean = 0; }` on both the
+  arming->latched fire and the opposite-direction re-fire (CUSUM does not: it deviates from the FIXED
+  `target` and resets only at re-arm). `_rearm()` still keeps `_n` / `_mean`, but since the reference
+  was already reset at the fire, by re-arm time they track the POST-SHIFT level -- exactly the
+  reference a later reversal must deviate from. The earlier fix reset the reference ONLY at re-arm and
+  KEPT it across the fire; that was itself fail-open -- the PH reference stayed the mean-since-`clear()`
+  (the whole history), so a shift TOWARD a level near that historical mean was never reported and the
+  reversal delay grew without bound with history. Measured before: `PH(delta .005, threshold 50,
+  latch)` on 0/+10/+5 (each x2000) fired ONCE (`2005+`, the `+5` reversal swallowed); on
+  0x100k/+10x100k/+5x100k, ONCE (the reversal lost after a long up-regime); 0/+10/0/+10 reported the
+  down edge at `4015` (10 items late and growing). After: EXACTLY 2 fires -- `0/10/5` -> `2005+, 4014-`;
+  `0x100k/10x100k/5x100k` -> `100005+, 200010-` (the down edge is bit-identical to `latch: false`, so
+  the delay is bounded by the step geometry, not history); 0/10/0/10 -> `2005+, 4007-, 6007+`. Two new
+  witness lanes (the 0/10/5 fire-reset lane and the 0x100k/10x100k/5x100k long-history lane, oracle =
+  the true step edges) plus mirrored `DriftDetector.test.js` cases guard it, and a `PhNoFireResetDD`
+  control (the pre-fix `_fired`, no reference reset at the fire) is REJECTED by both (1 fire, not 2);
+  the `PhSwallowRevDD` control stays REJECTED by the `0/10/-10` lane. Disclosed trade: a PH reversal is
+  reported a few items past the true edge (measured delay vs `latch: false`: `+4` items on the `0/10/5`
+  down edge, typically `+2`, `0` on the long-history reversal, `+10` on a `0/10/20/10/0` staircase --
+  measured, not a general bound; a monotone staircase `0/10/20/30` fires ONCE under the latch), not on its
+  own item unless a single item jumps more than `threshold`. A separate 1.x property (not a latch
+  defect): with the default `delta = 0.005`, uniform +-2 noise false-alarms in BOTH modes (order 10^2
+  fires over a 300k stream, `latch: true` about half as often as `latch: false`) -- tune `delta` up for
+  a quieter stream. This latch discipline is new in this cycle, so no released version was affected.
+- **`SlidingCountMin.estimate(key, w)` and `total(w)` now fail CLOSED on an unset instance with a bad
+  `w`.** The `w` validation ran AFTER the `mode === unset` early return, so an instance with no add
+  yet returned a fail-OPEN `0` for `estimate(key, -1)` / `total(NaN)` while `estimateInto` (which
+  validates `w` first) returned `NaN` -- the "each `out` slot is exactly what `estimate(keys[j], w)`
+  returns" contract was false in that case. The `w` check now precedes the unset return in both
+  methods, so an unset instance with a bad `w` returns `NaN` (a good/omitted `w` still returns `0`)
+  and `estimate` / `total` / `estimateInto` agree slot-for-slot. For `estimate` this is a behavior
+  fix (a previously fail-open bad-`w` query on an unset sketch now fails closed to `NaN`).
+- **The `HeavyKeeper` / `SlidingHyperLogLog` / `SlidingCountMin` hash path no longer passes a boxable
+  argument, so a large / negative key no longer boxes under inlining pressure -- and the fix keeps the
+  hot-path throughput flat (F19).** The MurmurHash3 round /
+  finalizer helpers (`hkRound` / `hkFinal` / `slRound` / `slFinal`) used to take the key's low 32-bit
+  word `lo` (a ~16 B HeapNumber for any key with bit 31 set: `2^31 .. 2^32-1`, `2^53-1`, `-2^31`) and
+  the running int32 hash state as CALL ARGUMENTS. When V8 left one `*Round` call site un-inlined --
+  deterministically under `--no-turbo-inlining`, and flakily (measured 15-20 in 300 runs at
+  concurrency 12) when Turbofan's cumulative inlining budget ran out under CPU contention -- each such
+  large-key `addFrom` boxed 16-32 B/op in every window, breaking the advertised 0 B/op for large keys
+  (`HeavyKeeper.addFrom` was the 1.6.0 sweep's High finding; the same pattern lived in the SHLL and
+  SCM hot hashes). The fix (F19v2) HAND-INLINES the whole two-lane murmur -- every round + `fmix` --
+  in register-resident int32 LOCALS directly in each hot body: `SlidingHyperLogLog` and
+  `SlidingCountMin` keep NO `slRound` / `hkRound` sub-call at all, and `HeavyKeeper` runs the rounds
+  inside the argument-free helpers `hkHash` / `hkMapHash` (key + seed via the `HK_KIN` `Float64Array`
+  slots, the two lanes out via the `HK_HS` `Int32Array`; `hkPos(r, w)` passes only Smi-range ints,
+  which never box). No hash word -- neither the key word `lo` nor the running state -- ever crosses an
+  inner call boundary, so nothing boxes even on a 31-bit-Smi engine or under `--no-turbo-inlining`.
+  Each lane's single `HK_HS` `Int32Array` store and the `| 0` / `Math.imul` `ToInt32` in the inlined
+  bodies apply the SAME `ToInt32` as before, so every hash output,
+  column position, top-k order and estimate is BIT-IDENTICAL to 1.7.0. This is PROVEN, not asserted:
+  `SCMParity` now replays ~4096 DISTINCT large / negative keys through an UNSATURATED `d x w` sketch
+  so each key's collision overestimate differs key to key (72 distinct probe values), pinning the
+  column geometry -- a consistent column-shift mutant (`Math.imul(i + 1, HK_ODD)`) mismatches 549/600
+  probes, and a MUST-FAIL control (a different seed) mismatches >= 400; `HKParity` adds a
+  position-sensitive `_cnt` / `_fp` column-layout digest pinned to `HEAD`, so an `hkPos` row-salt
+  mutant (`Math.imul(r + 1, HK_ODD)`) is caught where top-k / estimate alone stay bit-identical and
+  miss it. A `--no-turbo-inlining` gate group (`noInlineLargeKey` in `test/perf/AllocMatrix.test.mjs`,
+  driven through a new `runLane` node-flags parameter) reruns the large / negative-key `addFrom` lanes
+  of all three members, fresh AND warmed, at `<= 0.5 B/op`; every flagged child echoes its
+  `process.execArgv` and the gate FAILS CLOSED unless `--no-turbo-inlining` actually reached it (so the
+  box repro can never silently not run), and the same group measures 16-32 B/op against the pre-fix
+  file (teeth). No released version shipped this flake to a hot loop unconditionally -- it surfaced
+  only under inlining pressure.
+  - **Throughput correction (F19v2).** The first cut of F19 (F19v1) parked each murmur round in an
+    `Int32Array` scratch (`HK_RS` / `SL_RS`) so the helpers took no argument at all. That killed the
+    box, but V8 could not scalar-replace the per-round MEMORY ROUND-TRIP, and the allocation gates --
+    which only see boxes -- were BLIND to the cost: those paths were 0 B/op the whole time while the
+    hot bodies ran materially slower. Measured (bench: 2M `addFrom`, min of 5, large / negative keys,
+    ns/op HEAD 1.7.0 vs F19v1 vs shipped F19v2): `SlidingCountMin` 27 -> 42 (+56%) -> 27 (flat);
+    `SlidingHyperLogLog` 12.5 -> 18.4 (+47%) -> 13.5 (~+8%, at the noise floor); `HeavyKeeper`
+    175 -> 201 (+15%) -> 178 (flat -- its hash is a small slice of `addFrom`). F19v2 reverts the
+    round-trip to register-resident int32 locals (above), restoring HEAD throughput. To keep a future
+    edit from silently reintroducing a hot-path round-trip, a new **throughput-regression guard**
+    (`test/perf/HashThroughput.test.mjs`, wired into `test:perf:matrix` / `gates:red`) runs an
+    in-process interleaved A/B: it times the shipped `HeavyKeeper` / `SlidingCountMin` /
+    `SlidingHyperLogLog` `addFrom` against a FROZEN 1.7.0 baseline (`test/perf/HashThroughputRef.mjs`,
+    the pre-F19v2 argument-passing murmur) -- same process, interleaved trials, median of N -- and
+    fails RED if `median(shipped) / median(baseline) > 1.15` for any class. Teeth: pointed at the
+    F19v1 copy it reads `SlidingCountMin` ~1.59x and `SlidingHyperLogLog` ~1.37x and goes RED.
+
+### Known limitations
+
+- **`SlidingHyperLogLog.count(w?)` is NOT 0 B/call.** count() keeps its Ertl multiplicity scratch (no
+  ARRAY allocation), but it RETURNS a rounded double from the estimator: a stable **16 B/call** in the
+  estimator tail (`slTau` / the k-loop / `slSigma` / `Math.round`) even under Turbofan, plus another
+  **16 B** when the caller is not yet optimized (the integer-valued double is materialized at the call
+  boundary) -- so **16-32 B per call**, measured on a non-degenerate sketch (thousands of distinct keys
+  across the window). No library allocation gate measured count() before 1.8.0; a new
+  `q_shll_count` lane (`test/perf/AllocMatrix.test.mjs`) now gates it in the documented band
+  `[12, 40]` B/op. The 0-alloc `countInto` reader is planned for 1.9.0.
+- **`DriftDetector` `latch: true` PH can box one ~16 B HeapNumber on a latched fire.** The effect is
+  TIER-dependent: in V8's Maglev tier it measures ~**2 B/op** on a fire-heavy stream when a per-window
+  collection re-tiers the hot loop; in steady Turbofan it measures **0** on realistic re-arming streams,
+  where a fire-heavy never-re-arming stream reads ~2 scavenges per 625k fires (16 B/fire). `latch: false`,
+  CUSUM and latched CUSUM read **0**. No bit-identical source change removes it (25+ variants measured).
+  A new `dd_latch_ph_fireheavy` lane gates it at a documented ceiling `<= 4` B/op (a regression to a
+  per-add box `>= 16` fails). A related latent concern: in the never-re-arming case the latched PH
+  accumulators drift without bound (monotone `gP` / `mMin`), which would eventually reach Infinity and
+  trip the `_guardFinite` throw. Both are tracked for 1.9.0 (ROADMAP 8 / 9).
 
 ## [1.7.0] - 2026-09-26
 

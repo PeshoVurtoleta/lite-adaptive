@@ -9,11 +9,13 @@
 //   - addFromMatrix (N3): every member's zero-box addFrom over clock x key x count x fresh/warmed.
 //     Gate: steady B/op <= 0.5 (== the no-op baseline). HK addFrom with a large / negative key or a
 //     weight 2^30 was F3 (a boxed key / weight / seed argument); FIXED -- every HK lane, including
-//     the default-seed variants, now reads <= 0.5 with no `todo`. The remaining todo is F6.
+//     the default-seed variants, now reads <= 0.5 with no `todo`. No todo remains anywhere.
 //   - queryLanes (N4): the windowed READ paths. F5 landed: SDD quantileInto renders 0-alloc, scalar
 //     quantile(0.99) boxes EXACTLY one ~16 B HeapNumber return (asserted 16 +-0.5, both ways). SCM
-//     estimate of a count >= 2^31 boxes its return (F6, doc-only in 1.7.0 -> the reader lands in
-//     1.8.0). EH sum / HK estimate box only in the FIRST window (steady 0, printed).
+//     estimateInto (1.8.0) reads a count >= 2^31 into an out slot with no boxed return (<= 0.5,
+//     fresh + warmed), and SCM total() is 0 B/op; the plain estimate() of that count is KEPT as the must-box control
+//     (q_scm_estimate_big, 16 +-0.5 B/op) so the lane proves it can see the box. EH sum /
+//     HK estimate box only in the FIRST window (steady 0, printed).
 //
 // Each lane runs in its OWN pinned child (AllocProbe.runLane via LITE_LANE) so fresh vs warmed call
 // sites never contaminate each other; a small pool parallelizes the children. Measurement is the
@@ -42,10 +44,11 @@ async function runPool(items, conc, fn) {
     return out;
 }
 
-/** Measure every lane in a group through the child pool, keyed by lane+mode. */
+/** Measure every lane in a group through the child pool, keyed by lane+mode (+ optional r.flags,
+ *  F19: extra node flags per row, e.g. ['--no-turbo-inlining']). */
 async function measureGroup(rows) {
-    const res = await runPool(rows, POOL, (r) => runLane(r.lane, r.mode || 'fresh'));
-    for (let i = 0; i < rows.length; i++) { rows[i]._first = res[i].first; rows[i]._steady = res[i].steady; }
+    const res = await runPool(rows, POOL, (r) => runLane(r.lane, r.mode || 'fresh', 200000, r.flags || []));
+    for (let i = 0; i < rows.length; i++) { rows[i]._first = res[i].first; rows[i]._steady = res[i].steady; rows[i]._execArgv = res[i].execArgv; }
     return rows;
 }
 
@@ -120,8 +123,9 @@ test('addFromMatrix', async (t) => {
         { lane: 'shll_af_epoch_p31', mode: 'fresh', label: 'SHLL addFrom epoch key 2^31', expected: '<=0.5' },
         { lane: 'shll_af_epoch_p53m1', mode: 'fresh', label: 'SHLL addFrom epoch key 2^53-1', expected: '<=0.5' },
         { lane: 'shll_af_epoch_p31', mode: 'warmed', label: 'SHLL addFrom epoch key 2^31 (warm)', expected: '<=0.5' },
-        // SlidingCountMin: clock x key x count. addFrom keeps keys/counts unboxed -> green (the box is
-        // in estimate's return, F6 -- see queryLanes).
+        // SlidingCountMin: clock x key x count. addFrom keeps keys/counts unboxed -> green (a scalar
+        // estimate() of a count >= 2^31 still boxes its single return; the batch estimateInto reader
+        // avoids it -- see queryLanes).
         { lane: 'scm_af_epoch_small_c1', mode: 'fresh', label: 'SCM addFrom small key count=1', expected: '<=0.5' },
         { lane: 'scm_af_epoch_p31_c1', mode: 'fresh', label: 'SCM addFrom key 2^31 count=1', expected: '<=0.5' },
         { lane: 'scm_af_epoch_p32m1_c1', mode: 'fresh', label: 'SCM addFrom key 2^32-1 count=1', expected: '<=0.5' },
@@ -142,6 +146,9 @@ test('addFromMatrix', async (t) => {
         { lane: 'adwin_af', mode: 'warmed', label: 'ADWIN addFrom value (warm)', expected: '<=0.5' },
         { lane: 'dd_af', mode: 'fresh', label: 'DD addFrom value', expected: '<=0.5' },
         { lane: 'dd_af', mode: 'warmed', label: 'DD addFrom value (warm)', expected: '<=0.5' },
+        // DD latch steady-state, addFrom, FRACTIONAL threshold 5.5 (arm+clamp+re-arm cold path every window).
+        { lane: 'dd_latch_af', mode: 'fresh', label: 'DD latch addFrom frac-threshold', expected: '<=0.5' },
+        { lane: 'dd_latch_af', mode: 'warmed', label: 'DD latch addFrom frac-threshold (warm)', expected: '<=0.5' },
     ];
     await measureGroup(rows);
     const gate = (steady) => (steady <= 0.5 ? null : 'steady ' + steady + ' B/op > 0.5 (a box on a zero-box addFrom path)');
@@ -167,17 +174,104 @@ test('queryLanes', async (t) => {
         { lane: 'q_sdd_quantileInto', mode: 'fresh', label: 'SDD quantileInto (3 qs)', expected: '<=0.5', check: gate },
         { lane: 'q_sdd_quantile99', mode: 'fresh', label: 'SDD quantile(0.99)', expected: '16 +-0.5', check: box16 },
         { lane: 'q_sdd_count', mode: 'fresh', label: 'SDD count()', expected: '<=0.5', check: gate },
-        { lane: 'q_scm_estimate_big', mode: 'fresh', label: 'SCM estimate (count>=2^31)', expected: '~16 (F6)', id: 'F6 (1.8.0 estimateInto)', check: gate },
+        { lane: 'q_scm_estimateInto_big', mode: 'fresh', label: 'SCM estimateInto (count>=2^31)', expected: '<=0.5', check: gate },
+        { lane: 'q_scm_estimateInto_big', mode: 'warmed', label: 'SCM estimateInto (warmed)', expected: '<=0.5', check: gate },
+        // CONTROL: the plain scalar estimate() returning a >=2^31 double MUST box (the estimateInto foil).
+        { lane: 'q_scm_estimate_big', mode: 'fresh', label: 'SCM estimate(bigKey) [must-box control]', expected: '16 +-0.5', check: box16 },
+        { lane: 'q_scm_total', mode: 'fresh', label: 'SCM total()', expected: '<=0.5', check: gate },
+        { lane: 'q_scm_total', mode: 'warmed', label: 'SCM total() (warmed)', expected: '<=0.5', check: gate },
         { lane: 'q_eh_sum', mode: 'fresh', label: 'EH sum() (first-window box)', expected: '<=0.5', check: gate },
         { lane: 'q_hk_estimate', mode: 'fresh', label: 'HK estimate() (small count)', expected: '<=0.5', check: gate },
         { lane: 'q_hk_foreach', mode: 'fresh', label: 'HK forEach(fn)', expected: '<=0.5', check: gate },
         { lane: 'q_dr_sampleInto', mode: 'fresh', label: 'DR sampleInto(buf)', expected: '<=0.5', check: gate },
     ];
     await measureGroup(rows);
-    printTable('N4 queryLanes (steady B/op <= 0.5, except the exact quantile-16 box / F6 box):', rows, (r) => {
+    printTable('N4 queryLanes (steady B/op <= 0.5, except the exact quantile-16 box):', rows, (r) => {
         const ok = r.check(r._steady, r._first) === null;
         if (r.id) return ok ? 'todo ' + r.id + ' (green here)' : 'todo ' + r.id;
         return ok ? 'GREEN' : 'NEW FINDING';
     });
     for (const r of rows) await emit(t, r, r.check);
+});
+
+// ===========================================================================
+// 1.8.0 doc-truth findings: two honest lanes no library alloc gate measured before.
+//   - q_shll_count (finding A): SlidingHyperLogLog.count() on a NON-degenerate sketch (thousands of
+//     distinct keys). count() keeps its Ertl scratch (no ARRAY alloc) but RETURNS a rounded double --
+//     a stable 16 B in the estimator tail, +16 B when the caller is not yet optimized. Documented BAND
+//     [12, 40] B/op: the lower bound proves the probe SEES the cost (a 0-alloc claim would fail here),
+//     the upper bound fails on a THIRD box (the tail stays exactly one box). Measured 16 B/op steady.
+//   - dd_latch_ph_fireheavy (finding B): latched-PH on a fire-heavy square wave. A latched fire can box
+//     one ~16 B HeapNumber; the effect is TIER-DEPENDENT -- Maglev boxes (the probe's per-window gc()
+//     can re-tier the hot loop), steady Turbofan holds the value in a slot. No bit-identical source
+//     change removes it (25+ variants measured). Gated as a documented CEILING (<= 4 B/op, naming the
+//     Maglev re-tier mechanism) that the CURRENT code passes deterministically (measured ~0.5 B/op
+//     steady across 5 fresh runs) while a regression to a per-ADD box (>= 16 B/op) fails RED. latch:false
+//     and CUSUM read 0 (the dd_af / dd_latch_af lanes above).
+// ===========================================================================
+test('docTruthFindings', async (t) => {
+    const shllBand = (steady) => (steady >= 12 && steady <= 40 ? null :
+        'steady ' + steady + ' B/op outside the documented band [12, 40] (< 12: the probe went blind to the count() box; > 40: a THIRD box regressed the estimator tail)');
+    // Maglev re-tier ceiling: the current code reads ~0.5 B/op steady (Turbofan holds the value in a
+    // Float64Array slot); the ceiling catches a regression to a per-add box (>= 16), not the tier flake.
+    const fireCeil = (steady) => (steady <= 4 ? null :
+        'steady ' + steady + ' B/op > 4 (a per-ADD latched-PH box regressed; the Maglev re-tier flake is <= ~2)');
+    const rows = [
+        { lane: 'q_shll_count', mode: 'fresh', label: 'SHLL count() non-degenerate [finding A]', expected: '[12,40]', check: shllBand },
+        { lane: 'dd_latch_ph_fireheavy', mode: 'fresh', label: 'DD latch:true PH fire-heavy [finding B]', expected: '<=4', check: fireCeil },
+        { lane: 'dd_latch_ph_fireheavy', mode: 'warmed', label: 'DD latch:true PH fire-heavy (warm)', expected: '<=4', check: fireCeil },
+    ];
+    await measureGroup(rows);
+    printTable('1.8.0 docTruthFindings (SHLL count() band [12,40]; latched-PH fire ceiling <=4):', rows, (r) => {
+        const ok = r.check(r._steady, r._first) === null;
+        return ok ? 'GREEN' : 'NEW FINDING';
+    });
+    for (const r of rows) await emit(t, r, r.check);
+});
+
+// ===========================================================================
+// F19: noInlineLargeKey -- the large-key addFrom hash lanes RERUN under `--no-turbo-inlining`, the
+// DETERMINISTIC repro of the contention flake. Pre-fix (1.7.0), the hash helpers passed the key low
+// word `lo` (a HeapNumber for keys with bit 31 set) and the running int32 hash state as ARGUMENTS to
+// hkRound / slRound; with inlining off (and, flakily, under CPU contention when Turbofan's cumulative
+// budget left one *Round call site un-inlined) every such large-key lane boxed -- HK 32 B/op,
+// SHLL / SCM ~16 B/op. F19 made the round/final helpers argument-free (state + key word in an
+// Int32Array scratch, no number crosses the call), so all lanes now read <= 0.5 B/op even with
+// inlining forced off, fresh AND warmed. Teeth: against the pre-fix file these lanes read 16-32 B/op
+// (verified: HK 32, SHLL 16, SCM ~16). Gate: steady B/op <= 0.5.
+// ===========================================================================
+test('noInlineLargeKey', async (t) => {
+    const NOINLINE = ['--no-turbo-inlining'];
+    const gate = (steady) => (steady <= 0.5 ? null :
+        'steady ' + steady + ' B/op > 0.5 under --no-turbo-inlining (a boxed hash-path argument -- F19 regressed)');
+    const rows = [];
+    // HeavyKeeper: the four large / negative key classes, fresh + warmed (pre-fix: 32 B/op).
+    for (const [lane, lbl] of [['hk_af_p31_w1', 'HK addFrom key 2^31'], ['hk_af_p32m1_w1', 'HK addFrom key 2^32-1'],
+        ['hk_af_neg31_w1', 'HK addFrom key -2^31'], ['hk_af_p53m1_w1', 'HK addFrom key 2^53-1']]) {
+        rows.push({ lane, flags: NOINLINE, mode: 'fresh', label: lbl + ' [no-inline]', expected: '<=0.5' });
+        rows.push({ lane, flags: NOINLINE, mode: 'warmed', label: lbl + ' [no-inline warm]', expected: '<=0.5' });
+    }
+    // SlidingHyperLogLog: epoch + perf.now clocks x key 2^31 / 2^53-1, fresh + warmed (pre-fix: 16 B/op).
+    for (const [lane, lbl] of [['shll_af_now_p31', 'SHLL addFrom now key 2^31'], ['shll_af_now_p53m1', 'SHLL addFrom now key 2^53-1'],
+        ['shll_af_epoch_p31', 'SHLL addFrom epoch key 2^31'], ['shll_af_epoch_p53m1', 'SHLL addFrom epoch key 2^53-1']]) {
+        rows.push({ lane, flags: NOINLINE, mode: 'fresh', label: lbl + ' [no-inline]', expected: '<=0.5' });
+        rows.push({ lane, flags: NOINLINE, mode: 'warmed', label: lbl + ' [no-inline warm]', expected: '<=0.5' });
+    }
+    // SlidingCountMin: key 2^31 / 2^32-1, fresh + warmed (pre-fix: ~16 B/op).
+    for (const [lane, lbl] of [['scm_af_epoch_p31_c1', 'SCM addFrom key 2^31'], ['scm_af_epoch_p32m1_c1', 'SCM addFrom key 2^32-1']]) {
+        rows.push({ lane, flags: NOINLINE, mode: 'fresh', label: lbl + ' [no-inline]', expected: '<=0.5' });
+        rows.push({ lane, flags: NOINLINE, mode: 'warmed', label: lbl + ' [no-inline warm]', expected: '<=0.5' });
+    }
+    await measureGroup(rows);
+    // FAIL CLOSED (F19 blocker 4): prove --no-turbo-inlining actually reached EVERY flagged child.
+    // Without it the lane would silently measure the INLINED (0 B/op) path -- the deterministic box
+    // repro would never fire and the gate would pass blind. The child echoes its process.execArgv.
+    for (const r of rows) {
+        assert.ok(Array.isArray(r._execArgv) && r._execArgv.includes('--no-turbo-inlining'),
+            'child for "' + r.label + '" did NOT receive --no-turbo-inlining (execArgv=' +
+            JSON.stringify(r._execArgv) + '); the no-inline repro never ran, gate is blind');
+    }
+    printTable('F19 noInlineLargeKey (--no-turbo-inlining; steady B/op <= 0.5; pre-fix boxed 16-32):', rows,
+        (r) => (r._steady <= 0.5 ? 'GREEN' : 'NEW FINDING'));
+    for (const r of rows) await emit(t, r, gate);
 });

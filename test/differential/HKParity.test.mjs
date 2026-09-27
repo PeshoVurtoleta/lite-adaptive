@@ -2,12 +2,21 @@
 //   node --test test/differential/HKParity.test.mjs).
 //
 // The F3 hardening moved the HeavyKeeper hot-path numeric inputs into module scratch slots
-// (HK_KIN / HK_HS) so a large key / weight never boxes at a call boundary. That is a
-// REPRESENTATION change ONLY: the hash lanes, positions, decay draws, forest order and estimates
-// must be BIT-IDENTICAL to the committed 1.6.0 code. This replays the exact same 200k-op stream
-// against the CURRENT Adaptive.js and asserts topKInto (order included) + all 512 estimate probes
-// equal the frozen 1.6.0 golden vectors, for the default seed AND seed: 0. It also pins the
-// fail-closed throw messages for a bad key / weight / buf / index (unchanged by the refactor).
+// (HK_KIN / HK_HS) so a large key / weight never boxes at a call boundary; F19 made hkPos / hkHash
+// argument-free (state + key word via the HK_RS Int32Array scratch). Both are REPRESENTATION changes
+// ONLY: the hash lanes, positions, decay draws, forest order and estimates must be BIT-IDENTICAL to
+// the committed code. This replays the exact same 200k-op stream against the CURRENT Adaptive.js and
+// asserts topKInto (order included) + all 512 estimate probes equal the frozen 1.6.0 golden vectors,
+// for the default seed AND seed: 0. It also pins the fail-closed throw messages for a bad key /
+// weight / buf / index (unchanged by the refactor).
+//
+// POSITION PINNING (F19 blocker): topKInto / estimate alone cannot see an hkPos row-salt rewrite
+// (`Math.imul(r + 1, HK_ODD)`) -- a consistent per-row column permutation relocates every cell but
+// leaves each key's read set intact, so the outputs stay bit-identical while the _cnt / _fp COLUMN
+// LAYOUT moves. The extra test below folds a POSITION-SENSITIVE digest (i * value) over _cnt and _fp
+// and pins it to golden digests taken from `git show HEAD:Adaptive.js` (byte-identical geometry from
+// 1.6.0 through 1.8.0). The row-salt mutant changes both digests (verified in scratch), so the pin
+// now sees a moved column.
 //
 // The vectors are a DATA file inside the package (hk-1.6.0-vectors.json); this test imports only
 // package files. The STREAM block below is a VERBATIM copy of the generator's -- the two must stay
@@ -73,6 +82,23 @@ function replay(seedOpt) {
 }
 // ---- END STREAM ----------------------------------------------------------------------------
 
+// POSITION PINNING helpers (NOT part of the verbatim STREAM): re-run the SAME add stream, then fold a
+// POSITION-SENSITIVE digest over _cnt / _fp. The i * value term makes any column PERMUTATION (an hkPos
+// row-salt shift) change the digest, where a plain sum / xor would not. The fold matches the generator
+// byte for byte (git show HEAD:Adaptive.js).
+function colDigest(arr) {
+    let h = 0x811c9dc5 | 0;
+    for (let i = 0; i < arr.length; i++) h = (Math.imul(h, 31) + Math.imul(i, 2654435761) + (arr[i] | 0)) | 0;
+    return h;
+}
+function posProbe(seedOpt) {
+    const hk = seedOpt === undefined ? new HeavyKeeper(D, WIDTH, K) : new HeavyKeeper(D, WIDTH, K, seedOpt);
+    const rng = mkRng(0x1234abcd);
+    const buf = new Float64Array(2);
+    for (let i = 0; i < OPS; i++) { fillPair(rng, buf); hk.addFrom(buf, 0); }
+    return { cntDigest: colDigest(hk._cnt), fpDigest: colDigest(hk._fp), mapSize: hk._mapSize };
+}
+
 function checkParity(label, golden) {
     const got = replay(label === 'seed0' ? { seed: 0 } : undefined);
     // topKInto: entry count, then every [key, estimate] slot bit-identical (heap order included).
@@ -98,6 +124,22 @@ test('HK F3 parity: default seed -- topKInto + 512 estimates bit-identical to 1.
 
 test('HK F3 parity: seed 0 -- topKInto + 512 estimates bit-identical to 1.6.0', () => {
     checkParity('seed0', VECTORS.seed0);
+});
+
+test('HK F19 parity: hkPos column positions pinned -- _cnt/_fp layout digest bit-identical to HEAD', () => {
+    for (const [label, golden] of [['default', VECTORS.defaultSeed], ['seed0', VECTORS.seed0]]) {
+        const got = posProbe(label === 'seed0' ? { seed: 0 } : undefined);
+        // Fail closed if the golden lacks the position fields (an un-regenerated vectors file).
+        assert.equal(typeof golden.cntDigest, 'number', label + ': golden missing cntDigest (regenerate vectors)');
+        assert.equal(typeof golden.fpDigest, 'number', label + ': golden missing fpDigest (regenerate vectors)');
+        assert.equal(got.mapSize, golden.mapSize, label + ': map size differs');
+        assert.equal(got.cntDigest, golden.cntDigest,
+            label + ': _cnt column-layout digest differs -- hkPos moved a column (got ' + got.cntDigest +
+            ', want ' + golden.cntDigest + ')');
+        assert.equal(got.fpDigest, golden.fpDigest,
+            label + ': _fp column-layout digest differs -- hkPos moved a column (got ' + got.fpDigest +
+            ', want ' + golden.fpDigest + ')');
+    }
 });
 
 test('HK F3 parity: fail-closed throw messages (weight text per 1.7.0 F10; estimate NaN per F12)', () => {

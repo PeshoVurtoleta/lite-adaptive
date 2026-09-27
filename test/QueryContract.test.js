@@ -77,7 +77,34 @@ test('F12 SlidingCountMin: bad key / bad w -> NaN; unseen valid key -> 0; no q /
     const before = snap(scm);
     assert.equal(scm.estimate(999999), 0, 'SCM unseen valid key -> 0');
     assert.equal(snap(scm), before, 'SCM unseen-key query left state byte-identical');
-    // bad q: N/A; wrong container: N/A -- skipped explicitly.
+    // total(w): bad w -> NaN, pure (1.8.0, parity with estimate's w axis)
+    assertNaNPure(scm, () => scm.total(-1), 'SCM total(-1)');
+    assertNaNPure(scm, () => scm.total(1e9), 'SCM total(>W)');
+    assertNaNPure(scm, () => scm.total('x'), 'SCM total(non-number)');
+    // estimateInto: WRONG CONTAINER TYPE -> throw, state byte-identical (1.8.0)
+    const scmOut = new Float64Array(2);
+    assertThrowsPure(scm, () => scm.estimateInto([5, 6], scmOut), 'SCM estimateInto(non-F64 keys)');
+    assertThrowsPure(scm, () => scm.estimateInto(new Float64Array([5]), [0]), 'SCM estimateInto(non-F64 out)');
+    assertThrowsPure(scm, () => scm.estimateInto(new Float64Array(3), scmOut), 'SCM estimateInto(out too short)');
+    // estimateInto: a bad w fills every out slot with NaN (parity with estimate); scm state pure
+    const bw = snap(scm);
+    const keysW = new Float64Array([5, 6]); const outW = new Float64Array(2);
+    assert.equal(scm.estimateInto(keysW, outW, -1), 2, 'SCM estimateInto bad w -> returns n');
+    assert.ok(Number.isNaN(outW[0]) && Number.isNaN(outW[1]), 'SCM estimateInto bad w -> all NaN slots');
+    assert.equal(snap(scm), bw, 'SCM estimateInto(bad w) left scm state byte-identical');
+    // UNSET + bad w: fail closed to NaN on every reader (the w check precedes the unset return; 1.8.0).
+    // An unset instance must NOT fail-OPEN to 0 for a bad w while estimateInto returns NaN.
+    const scmU = new SlidingCountMin(1000);
+    assertNaNPure(scmU, () => scmU.total(-1), 'SCM unset total(-1) -> NaN');
+    assertNaNPure(scmU, () => scmU.total('x'), 'SCM unset total(non-number) -> NaN');
+    assertNaNPure(scmU, () => scmU.estimate(5, -1), 'SCM unset estimate(k, -1) -> NaN');
+    assertNaNPure(scmU, () => scmU.estimate(5, NaN), 'SCM unset estimate(k, NaN) -> NaN');
+    const uKeys = new Float64Array([5, 6]); const uOut = new Float64Array(2);
+    assert.equal(scmU.estimateInto(uKeys, uOut, -1), 2, 'SCM unset estimateInto bad w -> returns n');
+    assert.ok(Number.isNaN(uOut[0]) && Number.isNaN(uOut[1]), 'SCM unset estimateInto bad w -> all NaN slots');
+    assert.equal(scmU.total(), 0, 'SCM unset total() (good w) still 0');
+    assert.equal(scmU.estimate(5), 0, 'SCM unset estimate() (good w) still 0');
+    // bad q: N/A -- skipped explicitly.
 });
 
 test('F12 HeavyKeeper: bad key -> NaN; unseen valid key -> 0; wrong container -> throw; no q / w axis', () => {

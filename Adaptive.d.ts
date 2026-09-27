@@ -487,7 +487,10 @@ export class SlidingHyperLogLog {
      * The windowed DISTINCT-COUNT estimate over the last W (or a sub-window `w <= W`). COLD, O(m).
      * Standard error 1.04 / sqrt(m) (guaranteed while not degraded). Returns 0 on an empty window.
      * NEVER throws (F12, one query contract): a sub-window `w` outside `(0, W]` reads NaN; `w`
-     * omitted queries the full window W. null is not zero.
+     * omitted queries the full window W. null is not zero. The scratch keeps count() free of ARRAY
+     * allocation, but it RETURNS a rounded double: it boxes 16 B/call steady (the estimator tail) and
+     * 32 B when the caller is not yet optimized (the boxed return). A 0-alloc `countInto` reader is
+     * planned for 1.9.0. See the README F6 alloc table.
      */
     count(w?: number): number;
 
@@ -521,6 +524,19 @@ export interface DriftDetectorOptions {
      * (which uses the online running mean). A mismatch throws [lite-adaptive].
      */
     target?: number;
+    /**
+     * Latch mode (default false). false = the 1.x auto-reset-on-fire discipline. true = fire ONCE
+     * per regime, latch (clamping the firing gap at `threshold` so a sustained regime stays bounded),
+     * and re-arm only when the latched-direction gap falls below `threshold / 2` (hysteresis) or on
+     * `clear()`. An opposite-direction crossing while latched flips direction and is REPORTED in both
+     * modes; CUSUM (independent accumulators) fires immediately on the reversal item, PH (running-mean
+     * reference reset AT the fire, then kept across the re-arm) usually re-arms first then rebuilds the
+     * opposite gap over a few items (measured ~3 on a +-10 step reversal). typeof-first: a non-boolean
+     * throws [lite-adaptive] (no truthy coercion).
+     */
+    /** Latch mode needs threshold / 2 > 0 (a threshold of Number.MIN_VALUE throws with latch: true).
+     *  With DRIFT_CUSUM and delta 0 a signal exactly at target never re-arms: use delta > 0 with latch. */
+    latch?: boolean;
 }
 
 /**
@@ -529,8 +545,14 @@ export interface DriftDetectorOptions {
  * cumulative deviation of x from the ONLINE running mean, two-sided) or `DRIFT_CUSUM` (two-sided
  * CUSUM: two accumulators gP / gN, each floored at 0, deviating from a FIXED `target` mu0).
  * `add(x)` / the zero-box `addFrom(buf, i)` update a running mean, run the ONE mode branch, and
- * return true EXACTLY on the detecting item, resetting the accumulators + running mean so the NEXT
- * shift is caught (0 B/op). The mode is load-bearing via its reference: PH self-references the
+ * return true EXACTLY on the detecting item (0 B/op with latch:false and in CUSUM). With latch:false a
+ * fire resets the accumulators + running mean so the NEXT shift is caught; with latch:true a fire
+ * LATCHES (fires once per regime), PH resetting its running-mean reference AT the fire while the
+ * accumulator reset that re-arms happens later, when the gap falls back to threshold/2. One honest
+ * caveat: a latch:true PH latched fire can box one 16 B HeapNumber in V8's Maglev tier -- 0 B/op in
+ * steady optimized code on realistic re-arming streams, ~2 B/op measured on a fire-heavy stream when a
+ * per-window collection re-tiers the hot loop (tracked for 1.9.0). The mode is
+ * load-bearing via its reference: PH self-references the
  * online mean (adaptive), CUSUM references a fixed mu0 (classic SPC) -- they genuinely diverge.
  * The item-based, scalar, fixed-scalar-state complement to ADWIN's adaptive window: no pool (pure
  * scalars), no window. (DDM / EDDM -- Bernoulli error-bit + tri-state output -- are out of scope.)
@@ -556,24 +578,51 @@ export class DriftDetector {
     /** The fixed CUSUM target mu0 (the reference the test deviates from); undefined for PH. O(1). */
     readonly target: number | undefined;
 
-    /** The number of items seen since the last reset (a fire resets it). O(1). */
+    /** Whether latch mode is on (fire ONCE per regime + re-arm on hysteresis). O(1). */
+    readonly latch: boolean;
+
+    /** Whether the detector is currently latched (fired and not yet re-armed). O(1). Always false when latch is off. */
+    readonly latched: boolean;
+
+    /**
+     * The 0-based item index of the LAST fire (across the detector's life; reset by clear()), or NaN
+     * before any fire (null is not zero). O(1). Reading this boxes the double once per call (F6).
+     */
+    readonly lastDriftIndex: number;
+
+    /**
+     * The direction of the LAST fire: +1 (upward gap won; exact tie -> +1) or -1 (downward), or NaN
+     * before any fire. O(1). Reading this boxes the double once per call (F6).
+     */
+    readonly lastDirection: number;
+
+    /**
+     * The number of items seen since the last reset. O(1). With latch:false a fire resets it. With
+     * latch:true PH resets it AT the fire (the 1.x discipline: the running mean is the PH reference, so
+     * it restarts from the shifted level), while CUSUM resets it on the RE-ARM item (its reference is
+     * the fixed target, so it keeps climbing across a sustained latched regime until re-arm).
+     */
     readonly count: number;
 
     /** The running mean of the signal (0 on empty). O(1). Throws [lite-adaptive] if an accumulator overflowed. */
     readonly mean: number;
 
     /**
-     * The current test statistic (>= 0): how close the detector is to firing (it crosses
-     * `threshold` exactly when `add` returns true). 0 on empty. O(1). Throws [lite-adaptive] if an
+     * The current test statistic (>= 0): how close the detector is to firing. With latch:false it
+     * crosses `threshold` exactly when `add` returns true. With latch:true it crosses on the ONE firing
+     * item, then while LATCHED it sits at <= threshold (clamped at threshold on a sustained shift,
+     * decaying toward threshold/2 as the signal returns to baseline) and `add` returns false until the
+     * regime re-arms. 0 on empty. O(1). Throws [lite-adaptive] if an
      * accumulator overflowed (fail-closed, never a silent NaN).
      */
     readonly statistic: number;
 
     /**
      * Add one value to the signal. HOT, 0 B/op. Updates the running mean, runs the mode branch, and
-     * returns true EXACTLY on the item that trips the threshold (drift detected), resetting the
-     * accumulators so the next shift is caught. Throws [lite-adaptive] on a non-number / NaN /
-     * +-Infinity x or a finite |x| > 1e150 (a byte-identical no-op).
+     * returns true EXACTLY on the item that trips the threshold (drift detected). With latch:false a
+     * fire resets the accumulators so the next shift is caught; with latch:true a fire LATCHES (fires
+     * once per regime) and the reset that re-arms it happens later, when the gap falls to threshold/2.
+     * Throws [lite-adaptive] on a non-number / NaN / +-Infinity x or a finite |x| > 1e150 (a byte-identical no-op).
      */
     add(x: number): boolean;
 
@@ -826,9 +875,33 @@ export class SlidingCountMin {
      * Returns a DOUBLE (a window sum can exceed 2^32). NEVER throws (F12, one query contract): 0 for
      * an unseen but VALID key or an empty window, NaN for an out-of-domain key or a bad sub-window `w`
      * (0 was a fail-open under-count on an upper-bound sketch; an invalid key was never seen 0 times).
-     * `w` an optional sub-window in (0, W]. null is not zero.
+     * The `w` check PRECEDES the unset return, so an UNSET instance with a bad `w` also returns NaN
+     * (fail-closed parity with `estimateInto`). `w` an optional sub-window in (0, W]. null is not zero.
      */
     estimate(key: number, w?: number): number;
+
+    /**
+     * The EXACT total number of items N observed over the last W (or a sub-window `w <= W`) -- the
+     * eps x N denominator for the additive error term. COLD, O(B+1), 0 alloc; NEVER throws. Summed
+     * from a per-pane Float64 total over the SAME live panes as `estimate` (straddling oldest pane
+     * included), so it is N over exactly the covered span [W, W + W/B]. EXACT even when the d x w
+     * cells saturate at 2^32-1 (it sums validated per-add counts; the windowed sum across panes loses
+     * no unit until 2^53). A bad sub-window `w` (non-number / NaN / +-Infinity / <= 0 / > W) returns
+     * NaN -- the `w` check PRECEDES the unset return, so an UNSET instance with a bad `w` also returns
+     * NaN (an UNSET instance with a good/omitted `w` returns 0). `w` optional in (0, W]. null is not zero.
+     */
+    total(w?: number): number;
+
+    /**
+     * Batch 0-alloc reader (F6/R7): writes `estimate(keys[j], w)` into `out[j]` for every j in
+     * [0, keys.length). NaN for an out-of-domain key, 0 for an unseen valid key / empty window, else
+     * the sum-then-min windowed frequency; a bad sub-window `w` fills `out[0..n)` with NaN. COLD.
+     * Throws a tagged TypeError if `keys` / `out` are not Float64Arrays, or a RangeError if
+     * `out.length < keys.length` (a byte-identical no-op). Returns n = keys.length. `keys` and `out`
+     * MAY be the SAME array (slot j is read then written before j+1), but must NOT PARTIALLY OVERLAP
+     * (an aliased non-zero offset clobbers not-yet-read keys and yields wrong results).
+     */
+    estimateInto(keys: Float64Array, out: Float64Array, w?: number): number;
 
     /** Reset to the empty window; reuse the arrays (also unlocks the mode). */
     clear(): this;

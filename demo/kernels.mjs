@@ -74,6 +74,13 @@ export const EH_DEFAULT_EPS = 0.05;
 export const EH_DEFAULT_SEED = 0x5eed1234;
 /** Exact-ring capacity (pow2) -- holds the in-window arrival timestamps the sketch refuses to store. */
 export const EH_RING_LEN = 1 << 14;
+/** D1 `dense10k` preset: a tight window with a sub-unit arrival gap so the in-window population
+ *  (~W/gap = 10240) blows past a W-sized pool -> the tagged overflow throw the demo catches. */
+export const EH_DENSE_W = 1024;
+export const EH_DENSE_GAP = 0.1;
+/** D1 F17 `spike` values: an INTEGER spike train (exact sum), a big value every EH_SPIKE_PERIOD ticks. */
+export const EH_SPIKE_PERIOD = 1500;
+export const EH_SPIKE_VALUE = 1e6;
 
 // flat render-prep layout (the Truth Panel reads these at ~10Hz)
 export const E_COUNT = 0;         // eh.count() -- the windowed count estimate
@@ -90,18 +97,91 @@ export const E_NOW = 10;          // the current monotone now
 export const E_LEVELS = 11;       // the fixed level count (PUBLIC eh.levels -- canvas annotation)
 export const E_SKETCH_ALLOC = 12; // owned allocation counter, SKETCH path (provably 0)
 export const E_ORACLE_ALLOC = 13; // owned allocation counter, exact-ring path (climbs O(arrivals))
-export const EH_FLAT_LEN = 14;
+// --- 1.8.0 (D1) APPEND-ONLY slots (never renumber 0..13; golden-flat.json pins those bits) ---
+export const E_MAXCOUNT = 14;     // eh.maxCount (the declared population bound, PUBLIC getter)
+export const E_CEIL = 15;         // the EXACT pool ceiling k*(2^levels-1) from eh.k / eh.levels
+export const E_POP = 16;          // exact live window population (the exact-ring occupancy)
+export const E_SUM = 17;          // eh.sum() -- the windowed sum estimate
+export const E_TRUESUM = 18;      // exact windowed sum over the ring VALUE column
+export const E_STRADDLE = 19;     // straddling (oldest) bucket size, via the EhProbe (render only)
+export const E_SUMFRAC = 20;      // |sum - truesum| / (straddle/2) -- the STATED sum bound cursor (<= 1)
+export const E_SUMRELEPS = 21;    // relerr(sum)/eps -- the OLD "sum <= eps" claim (visibly > 1 on spikes)
+export const E_FAILED = 22;       // 1 once the pool overflowed and the tagged throw was caught
+export const EH_FLAT_LEN = 23;
 
-/** Fill the world's reused GAP stream: a deterministic dense -> sparse -> dense rate schedule (the
- *  measureShift shape), so the windowed count visibly fills and expires. Warmup / topology only. */
+/**
+ * Demo-local EhProbe (D1): a subclass that reads the PRIVATE straddling (oldest) bucket size EXACTLY as
+ * test/witness.mjs's EhProbe does -- the ONLY source of sum() error, so the demo can draw sum()'s error
+ * against its STATED bound size(straddling bucket)/2. `straddleInto` writes the size into a caller-owned
+ * slot and NEVER returns the double (zero-box law). count() / sum() / addFrom() inherit UNCHANGED, so
+ * world.eh stays byte-identical to a plain ExponentialHistogram on every hot call (the golden proves it).
+ * Called ONLY from renderEhPrep (~10Hz), never the frame path.
+ */
+class EhProbe extends ExponentialHistogram {
+    straddleInto(flat, idx) {
+        if (this._count === 0) { flat[idx] = 0; return; }
+        const oldest = this._head[this._maxLevel];
+        flat[idx] = this._start[oldest] <= this._now - this._W ? this._size[oldest] : 0;
+    }
+}
+
+/** Write world.eh's straddling-bucket size into flat[idx] via the EhProbe (never a returned double). */
+export function ehStraddleInto(world, flat, idx) { world.eh.straddleInto(flat, idx); }
+
+/** Fill the world's reused GAP + VALUE streams (warmup / topology only). Two shapes:
+ *  - default: a dense -> sparse -> dense rate schedule (the measureShift shape) so the windowed count
+ *    visibly fills and expires; the `dense10k` preset overrides it with a constant sub-unit gap.
+ *  - values 'uniform' (default): every value 1 -> sum == count (golden-identical). 'spike': an INTEGER
+ *    spike train (exact sum) that makes sum()'s error track the straddle mass, NOT epsilon (F17). */
 function fillGapStream(world) {
-    const gaps = world.gaps, len = gaps.length;
+    const gaps = world.gaps, vals = world.vals, len = gaps.length;
     const rng = makeRng(world.seed);
+    const dense = world.preset === 'dense10k', spike = world.values === 'spike';
     for (let i = 0; i < len; i++) {
-        const phase = i / len;
-        // dense (gap ~1) for the outer thirds, sparse (gap ~4) for the middle third -- a rate shift.
-        const base = (phase < 0.34 || phase > 0.66) ? 1 : 4;
-        gaps[i] = base + (rng() < 0.15 ? 1 : 0);   // a touch of jitter, still strictly positive
+        if (dense) {
+            gaps[i] = EH_DENSE_GAP;   // constant sub-unit arrival gap (~10240 in-window at W=1024)
+        } else {
+            const phase = i / len;
+            // dense (gap ~1) for the outer thirds, sparse (gap ~4) for the middle third -- a rate shift.
+            const base = (phase < 0.34 || phase > 0.66) ? 1 : 4;
+            gaps[i] = base + (rng() < 0.15 ? 1 : 0);   // a touch of jitter, still strictly positive
+        }
+        // INTEGER values so the exact-sum oracle is exact; uniform (1) keeps sum == count at defaults.
+        vals[i] = spike ? ((i % EH_SPIKE_PERIOD === 0) ? EH_SPIKE_VALUE : 1) : 1;
+    }
+}
+
+/**
+ * Demo-local option-door guard (fail closed, cold path only): reject anything but a PLAIN object, then
+ * reject any own key not in `allowed` with a did-you-mean hint. Mirrors the shipped lite-law option door
+ * -- an unknown key / a Symbol key / an array / a prototype-bearing object is an ERROR, never a silent
+ * ignore. Never called on a hot loop.
+ * @param {object} opts    the caller options (already known non-null/undefined).
+ * @param {string[]} allowed  the permitted own-key whitelist.
+ * @param {string} label   the scene tag for the thrown message.
+ */
+function checkDemoOptions(opts, allowed, label) {
+    if (typeof opts !== 'object' || opts === null || Array.isArray(opts)) {
+        throw new TypeError('[lite-adaptive] ' + label + ' options must be a plain object, got ' +
+            (Array.isArray(opts) ? 'an array' : (opts === null ? 'null' : typeof opts)));
+    }
+    const proto = Object.getPrototypeOf(opts);
+    if (proto !== Object.prototype && proto !== null) {
+        throw new TypeError('[lite-adaptive] ' + label + ' options must be a plain object (no prototype keys)');
+    }
+    if (Object.getOwnPropertySymbols(opts).length !== 0) {
+        throw new TypeError('[lite-adaptive] ' + label + ' options must not carry Symbol keys');
+    }
+    for (const key of Object.keys(opts)) {
+        if (allowed.indexOf(key) === -1) {
+            let hint = '';
+            for (let i = 0; i < allowed.length; i++) {
+                const a = allowed[i];
+                if (a.toLowerCase() === key.toLowerCase() || a[0] === key[0]) { hint = ' (did you mean "' + a + '"?)'; break; }
+            }
+            throw new TypeError('[lite-adaptive] ' + label + ' unknown option "' + key + '"' + hint +
+                '; allowed: ' + allowed.join(', '));
+        }
     }
 }
 
@@ -113,19 +193,51 @@ function fillGapStream(world) {
  * @param {number} epsilon  relative-error knob in (0, 1).
  * @param {number} [seed]   uint32 gap-jitter seed.
  */
-export function createEhWorld(W, epsilon, seed) {
+export function createEhWorld(W, epsilon, seed, options) {
     // null is not zero: fall back ONLY on undefined/null so an explicit seed=0 is honored.
+    // Fail closed (suite law): reject a non-number / non-finite seed BEFORE allocation -- never coerce
+    // NaN / a string to 0 via >>> 0. -0 and any finite value (incl. >= 2^31, which >>> 0 folds) pass.
+    if (seed !== undefined && seed !== null && (typeof seed !== 'number' || !Number.isFinite(seed))) {
+        throw new TypeError('[lite-adaptive] EH seed must be a finite number, got ' +
+            (typeof seed === 'string' ? JSON.stringify(seed) : String(seed)));
+    }
     const s = (seed === undefined || seed === null) ? EH_DEFAULT_SEED : (seed >>> 0);
-    const eh = new ExponentialHistogram(W, epsilon);   // throws [lite-adaptive] on a bad W/epsilon
+    // Options (D1): a PLAIN object door -- { maxCount, preset, values }. An absent object is the default
+    // (maxCount 2^32, no preset, uniform values) so a 3-arg call stays golden-identical.
+    const opts = (options === undefined || options === null) ? null : options;
+    if (opts !== null) checkDemoOptions(opts, ['maxCount', 'preset', 'values'], 'EH');
+    const preset = opts && opts.preset !== undefined ? opts.preset : null;
+    if (preset !== null && preset !== 'dense10k') {
+        throw new TypeError('[lite-adaptive] EH preset must be null or "dense10k", got ' + JSON.stringify(preset));
+    }
+    const values = opts && opts.values !== undefined ? opts.values : 'uniform';
+    if (values !== 'uniform' && values !== 'spike') {
+        throw new TypeError('[lite-adaptive] EH values must be "uniform" or "spike", got ' + JSON.stringify(values));
+    }
+    // The `dense10k` preset forces the tight window (its constant sub-unit gap is what overflows a
+    // W-sized pool); an explicit W is honored otherwise.
+    const w = preset === 'dense10k' ? EH_DENSE_W : W;
+    // maxCount rides the EH ctor's PLAIN-object option door untouched (typeof-checked, did-you-mean).
+    const eh = (opts && opts.maxCount !== undefined)
+        ? new EhProbe(w, epsilon, { maxCount: opts.maxCount })   // throws [lite-adaptive] on a bad arg
+        : new EhProbe(w, epsilon);
     const world = {
-        eh, W, epsilon, seed: s, paused: false,
+        eh, W: w, epsilon, seed: s, preset, values, paused: false,
+        // oracle gate (D1 blocker 2): the exact-ring oracle can be toggled off. When off, the oracle-derived
+        // slots fail closed to NaN in renderEhPrep (cold branch) instead of showing a frozen stale bound as
+        // live. resumeNow marks the `now` at which it was last re-enabled: the ring is stale for a full
+        // window W after resume, so the sum/accuracy gauges hold NaN until now - resumeNow >= W.
+        oracleOn: true, resumeNow: -Infinity,
+        failed: 0, failMsg: '',                        // fail-closed banner state (set ONCE, cold path)
         gaps: new Float64Array(EH_STREAM_LEN),
+        vals: new Float64Array(EH_STREAM_LEN),         // per-arrival VALUE column (exact-sum oracle)
         streamMask: EH_STREAM_LEN - 1,
         cursor: 0, frameStart: 0, frameCount: 0, frameNowStart: 0, now: 0, sink: 0,
         arrivalsPerFrame: EH_ARRIVALS_PER_FRAME,
         packed: new Float64Array(2),                   // [now, value] scratch for addFrom (reused)
         ring: new Float64Array(EH_RING_LEN),           // exact in-window timestamps
-        ringMask: EH_RING_LEN - 1, ringHead: 0, ringTail: 0,
+        ringV: new Float64Array(EH_RING_LEN),          // exact in-window VALUES (parallel to ring)
+        ringMask: EH_RING_LEN - 1, ringHead: 0, ringTail: 0, trueSum: 0,
         flat: new Float64Array(EH_FLAT_LEN),
     };
     fillGapStream(world);
@@ -149,15 +261,16 @@ export function stepEh(world) {
         world.now = now; world.frameNowStart = now; world.frameCount = 0;
         return 0;
     }
-    const gaps = world.gaps, mask = world.streamMask, eh = world.eh, apf = world.arrivalsPerFrame;
-    const packed = world.packed;
+    const gaps = world.gaps, vals = world.vals, mask = world.streamMask;
+    const eh = world.eh, apf = world.arrivalsPerFrame, packed = world.packed;
     let pos = world.cursor, now = world.now;
     world.frameStart = pos & mask;
     world.frameNowStart = now;
     let sink = 0;
     for (let i = 0; i < apf; i++) {
-        now = now + gaps[pos & mask];
-        packed[0] = now; packed[1] = 1;
+        const idx = pos & mask;
+        now = now + gaps[idx];
+        packed[0] = now; packed[1] = vals[idx];   // value rides a Float64 slot (uniform 1 or integer spike)
         eh.addFrom(packed, 0);
         sink = (sink + (now | 0)) | 0;
         pos = pos + 1;
@@ -170,6 +283,26 @@ export function stepEh(world) {
 }
 
 /**
+ * D1 fail-closed wrapper: run one SKETCH frame inside a try/catch. On the tagged pool-overflow throw
+ * (the `dense10k` preset against a W-sized maxCount) set world.failed and store the LIBRARY's own
+ * message ONCE -- the honesty signal the demo renders instead of a silent NaN. The catch is a COLD
+ * path: once failed, subsequent frames short-circuit, so the normal frame path stays 0 B/op and
+ * branch-light (stepEh itself is unchanged; the guard lives here, not in the hot body).
+ * @param {object} world
+ * @returns {number} the stepEh fold (0 once failed).
+ */
+export function stepEhGuarded(world) {
+    if (world.failed === 1) return 0;   // already overflowed: do not re-enter the throwing add
+    try {
+        return stepEh(world);
+    } catch (e) {
+        world.failed = 1;
+        world.failMsg = (e && e.message) ? e.message : String(e);   // the library's own words, stored ONCE
+        return 0;
+    }
+}
+
+/**
  * One EXACT-ORACLE frame (the allowed-to-allocate-in-spirit contrast): replay the frame's arrivals
  * into the exact ring of in-window timestamps and bump the owned counter once per arrival retained
  * (the 8 bytes the exact windowed-count approach must keep; the sketch keeps NONE). Then expire the
@@ -179,19 +312,22 @@ export function stepEh(world) {
  * @returns {number} the exact windowed count (ring occupancy).
  */
 export function stepEhOracle(world, allocState) {
-    const gaps = world.gaps, mask = world.streamMask;
+    const gaps = world.gaps, vals = world.vals, mask = world.streamMask;
     const start = world.frameStart, count = world.frameCount, W = world.W;
-    const ring = world.ring, rmask = world.ringMask;
+    const ring = world.ring, ringV = world.ringV, rmask = world.ringMask;
     let now = world.frameNowStart, tail = world.ringTail, head = world.ringHead;
+    let trueSum = world.trueSum;
     for (let i = 0; i < count; i++) {
-        now = now + gaps[(start + i) & mask];
-        ring[tail] = now; tail = (tail + 1) & rmask;
-        if (tail === head) head = (head + 1) & rmask;   // ring full -> drop oldest (cap the tab)
+        const idx = (start + i) & mask;
+        now = now + gaps[idx];
+        const v = vals[idx];
+        ring[tail] = now; ringV[tail] = v; tail = (tail + 1) & rmask; trueSum += v;
+        if (tail === head) { trueSum -= ringV[head]; head = (head + 1) & rmask; }   // ring full -> drop oldest
         allocState.oracleCount++;                        // a retained arrival the sketch refuses
     }
     const cutoff = now - W;
-    while (head !== tail && ring[head] <= cutoff) head = (head + 1) & rmask;
-    world.ringHead = head; world.ringTail = tail;
+    while (head !== tail && ring[head] <= cutoff) { trueSum -= ringV[head]; head = (head + 1) & rmask; }
+    world.ringHead = head; world.ringTail = tail; world.trueSum = trueSum;
     return (tail - head) & rmask;
 }
 
@@ -223,6 +359,37 @@ export function renderEhPrep(world, allocState) {
     flat[E_LEVELS] = eh.levels;   // PUBLIC surface -- no private introspection
     flat[E_SKETCH_ALLOC] = allocState.sketchCount;   // provably 0
     flat[E_ORACLE_ALLOC] = allocState.oracleCount;   // climbing
+    // --- 1.8.0 (D1) APPEND-ONLY: the pool gauge, the exact-sum vs straddle bound, the fail-closed flag ---
+    const sum = eh.sum(), truesum = world.trueSum, sumErr = Math.abs(sum - truesum);
+    flat[E_MAXCOUNT] = eh.maxCount;                             // PUBLIC declared population bound
+    flat[E_CEIL] = eh.k * (Math.pow(2, eh.levels) - 1);        // EXACT pool ceiling from the shipped getters
+    flat[E_POP] = live;                                         // exact live window population
+    flat[E_SUM] = sum;
+    flat[E_TRUESUM] = truesum;
+    ehStraddleInto(world, flat, E_STRADDLE);                    // straddle size into the slot (no double return)
+    // STATED bound: |sum_est - sum_true| <= size(straddling bucket)/2 (the witness bound + its FP slack).
+    const bound = flat[E_STRADDLE] / 2 + 1e-6 * Math.max(1, Math.abs(truesum));
+    flat[E_SUMFRAC] = sumErr / bound;                          // the drawn cursor (<= 1 when the bound holds)
+    // the OLD "sum() <= eps" claim: relerr(sum)/eps -- VISIBLY > 1 on a spike stream (sum is NOT eps-bounded).
+    const relSum = Math.abs(truesum) > 0 ? sumErr / Math.abs(truesum) : 0;
+    flat[E_SUMRELEPS] = eps > 0 ? relSum / eps : 0;
+    flat[E_FAILED] = world.failed;
+    // Oracle gate (D1 blocker 2), COLD branch: every displayed number that derives from the exact ring
+    // (E_TRUE, E_RELERR, E_FRAC, E_POP, E_TRUESUM, E_SUMFRAC, E_SUMRELEPS) is meaningless when the ring is
+    // not a faithful (now - W, now] snapshot. Fail closed to NaN (rendered "n/a", gauge skipped) on ALL
+    // seven rather than deriving them from a frozen/half-refilled ring and showing them as live. Two cold
+    // branches, both NaN the same seven slots: (1) oracle off -> the ring is frozen stale; (2) resume hold
+    // -> the ring is refilling and is not a full window valid until now - resumeNow >= W (no false red
+    // gauge from a stale ring). E_RING_BYTES stays a live memory readout (the ring still occupies bytes).
+    // At defaults (oracleOn true, resumeNow -Infinity) neither branch fires, so the golden stays
+    // bit-identical.
+    if (!world.oracleOn) {
+        flat[E_TRUE] = NaN; flat[E_RELERR] = NaN; flat[E_FRAC] = NaN;
+        flat[E_POP] = NaN; flat[E_TRUESUM] = NaN; flat[E_SUMFRAC] = NaN; flat[E_SUMRELEPS] = NaN;
+    } else if (world.now - world.resumeNow < world.W) {
+        flat[E_TRUE] = NaN; flat[E_RELERR] = NaN; flat[E_FRAC] = NaN;
+        flat[E_POP] = NaN; flat[E_TRUESUM] = NaN; flat[E_SUMFRAC] = NaN; flat[E_SUMRELEPS] = NaN;
+    }
     return est;
 }
 
@@ -245,6 +412,19 @@ export const AD_MEAN_HI = 0.8;
 export const AD_DEFAULT_SEED = 0xadadadad;
 /** The adapted-mean band the witness gates against (test/witness.mjs: |mean - mu| < 0.05). */
 export const AD_MEAN_BAND = 0.05;
+/** D2 `bigJumpThenPlus1` preset: mean 0, then a large level shift J, then a later +1 shift (F18 -- a
+ *  1.6.0 instance goes deaf to the +1 because its inflated GLOBAL range term dominates). Small jitter
+ *  (AD_PRESET_JITTER) so the snapped live-window range R stays <= 1+jitter (one straddling oldest bucket
+ *  of pre-shift values) while the ghost global range spans >= J. */
+export const AD_JUMP = 1e4;
+export const AD_JUMP_AT = 20000;
+export const AD_PLUS1_AT = 40000;
+export const AD_PRESET_JITTER = 0.6;
+/** D2 OLD (pre-1.8.0) render scan cap, RETAINED ONLY as a test anchor: renderAdPrep no longer caps the
+ *  live-window-range recompute at 256 -- it now scans the WHOLE retained window (the last `ad.width` fed
+ *  values, bounded by AD_STREAM_LEN = 65536, past which it fails closed to NaN). The D2 faithfulness test
+ *  asserts width > AD_LIVER_SCAN so a re-introduced 256 cap visibly disagrees with the exact range. */
+export const AD_LIVER_SCAN = 256;
 
 export const A_MEAN = 0;        // ad.mean (the adaptive-window mean)
 export const A_TRUEMEAN = 1;    // the current regime mean mu
@@ -263,19 +443,43 @@ export const A_SKETCH_BYTES = 13; // cap * AD_BUCKET_BYTES (fixed)
 export const A_ORACLE_BYTES = 14; // n * 8 -- exact drift needs O(N) retained values (climbs)
 export const A_SKETCH_ALLOC = 15;
 export const A_ORACLE_ALLOC = 16;
-export const AD_FLAT_LEN = 17;
+// --- 1.8.0 (D2) APPEND-ONLY slots (never renumber 0..16; golden-flat.json pins those bits) ---
+export const A_OFFSET = 17;     // the absolute offset added to every stream value (F9 -- behavior invariant)
+export const A_LIVER = 18;      // exact max-min over the last ad.width fed values (the live-window range R oracle)
+export const A_GHOSTR = 19;     // the GHOST 1.6.0 running-GLOBAL range max-min (never shrinks -> deafness)
+export const A_LASTCUT = 20;    // item index of the most recent cut (the detection marker)
+export const AD_FLAT_LEN = 21;
 
 /** The regime mean for a buffer index: alternates AD_MEAN_LO / AD_MEAN_HI every AD_REGIME items. */
 function adRegimeMean(bufIdx) {
     return ((((bufIdx / AD_REGIME) | 0) & 1) ? AD_MEAN_HI : AD_MEAN_LO);
 }
 
-/** Fill the reused value stream: regime mean + tight noise (range R ~ 0.7). Warmup / topology only. */
+/** The `bigJumpThenPlus1` preset's concept mean for a buffer index: 0, then J, then J+1. */
+function adPresetMean(bufIdx) {
+    if (bufIdx < AD_JUMP_AT) return 0;
+    if (bufIdx < AD_PLUS1_AT) return AD_JUMP;
+    return AD_JUMP + 1;
+}
+
+/** The current concept mean for a world at a buffer index (offset included) -- default drift or preset. */
+function adConceptMean(world, bufIdx) {
+    return (world.preset === 'bigJumpThenPlus1' ? adPresetMean(bufIdx) : adRegimeMean(bufIdx)) + world.offset;
+}
+
+/** Fill the reused value stream (warmup / topology only). Default: drift regime + tight noise. Preset
+ *  `bigJumpThenPlus1`: 0 -> J -> J+1 with small jitter. Every value carries world.offset (F9: an additive
+ *  offset shifts the mean, NOT the variance -> ADWIN behavior is offset-invariant). */
 function fillAdStream(world) {
-    const stream = world.stream, len = stream.length;
+    const stream = world.stream, len = stream.length, off = world.offset;
     const rng = makeRng(world.seed);
+    const preset = world.preset === 'bigJumpThenPlus1';
     for (let i = 0; i < len; i++) {
-        stream[i] = adRegimeMean(i) + (rng() - 0.5) * 0.1;   // fractional -> exercises zero-box addFrom
+        if (preset) {
+            stream[i] = adPresetMean(i) + (rng() - 0.5) * AD_PRESET_JITTER + off;
+        } else {
+            stream[i] = adRegimeMean(i) + (rng() - 0.5) * 0.1 + off;   // fractional -> zero-box addFrom
+        }
     }
 }
 
@@ -285,19 +489,41 @@ function fillAdStream(world) {
  * @param {number} delta  confidence knob in (0, 1).
  * @param {number} [seed] uint32 value seed.
  */
-export function createAdWorld(delta, seed) {
+export function createAdWorld(delta, seed, offset, preset) {
+    // Fail closed (suite law): reject a non-number / non-finite seed BEFORE allocation -- never coerce
+    // NaN / a string to 0 via >>> 0. -0 and any finite value (incl. >= 2^31, which >>> 0 folds) pass.
+    if (seed !== undefined && seed !== null && (typeof seed !== 'number' || !Number.isFinite(seed))) {
+        throw new TypeError('[lite-adaptive] ADWIN seed must be a finite number, got ' +
+            (typeof seed === 'string' ? JSON.stringify(seed) : String(seed)));
+    }
     const s = (seed === undefined || seed === null) ? AD_DEFAULT_SEED : (seed >>> 0);
+    // null is not zero: fall back on undefined/null only, so an explicit offset 0 is honored.
+    // Fail closed on the two D2 knobs (throw BEFORE any state write): offset a finite number, preset the
+    // one known tag. An unknown preset / a non-finite offset is an error with a did-you-mean hint.
+    if (offset !== undefined && offset !== null && !Number.isFinite(offset)) {
+        throw new TypeError('[lite-adaptive] ADWIN offset must be a finite number, got ' + String(offset));
+    }
+    if (preset !== undefined && preset !== null && preset !== 'bigJumpThenPlus1') {
+        throw new TypeError('[lite-adaptive] ADWIN preset must be null or "bigJumpThenPlus1", got ' + JSON.stringify(preset));
+    }
+    const off = (offset === undefined || offset === null) ? 0 : offset;
+    const pre = (preset === undefined || preset === null) ? null : preset;
     const ad = new ADWIN(delta);   // throws [lite-adaptive] on a bad delta
     const world = {
-        ad, delta, seed: s,
+        ad, delta, seed: s, offset: off, preset: pre,
         stream: new Float64Array(AD_STREAM_LEN),
         streamMask: AD_STREAM_LEN - 1,
         cursor: 0, frameStart: 0, frameCount: 0, sink: 0,
         valuesPerFrame: AD_VALUES_PER_FRAME,
-        n: 0, cuts: 0, driftThisFrame: 0, curMu: AD_MEAN_LO,
+        n: 0, cuts: 0, driftThisFrame: 0, curMu: 0,    // curMu seeded below from the concept at index 0
+        stepN: 0, lastCut: 0,                          // item counter + the last cut's item index
         cumSum: 0, cumN: 0,                            // the naive cumulative-mean foil
+        ghostMin: Infinity, ghostMax: -Infinity,       // the GHOST 1.6.0 running-GLOBAL range (never shrinks)
         flat: new Float64Array(AD_FLAT_LEN),
     };
+    // Seed curMu from the concept mean at index 0 (a Double, offset included) so A_TRUEMEAN reads right
+    // before the first step -- not the bare offset (which was wrong for the default drift regime).
+    world.curMu = adConceptMean(world, 0);
     fillAdStream(world);
     return world;
 }
@@ -311,18 +537,20 @@ export function createAdWorld(delta, seed) {
  */
 export function stepAd(world) {
     const stream = world.stream, mask = world.streamMask, ad = world.ad, vpf = world.valuesPerFrame;
-    let pos = world.cursor;
+    let pos = world.cursor, stepN = world.stepN, lastCut = world.lastCut;
     world.frameStart = pos & mask;
     let sink = 0, drift = 0;
     for (let i = 0; i < vpf; i++) {
         const idx = pos & mask;
-        const cut = ad.addFrom(stream, idx);   // reads stream[idx] UNBOXED -- zero-box
-        if (cut) { drift = 1; world.cuts = (world.cuts + 1) | 0; }
+        const cut = ad.addFrom(stream, idx);   // reads stream[idx] UNBOXED -- zero-box even at 1.7e12
+        stepN = (stepN + 1) | 0;
+        if (cut) { drift = 1; world.cuts = (world.cuts + 1) | 0; lastCut = stepN; }
         sink = (sink + (cut ? 1 : 0) + ad.bucketCount) | 0;
         pos = pos + 1;
     }
     world.cursor = pos & 0x3fffffff;
-    world.curMu = adRegimeMean((pos - 1) & mask);   // the regime the last consumed value belongs to
+    world.stepN = stepN; world.lastCut = lastCut;
+    world.curMu = adConceptMean(world, (pos - 1) & mask);   // the concept the last consumed value belongs to
     world.driftThisFrame = drift;
     world.frameCount = vpf;
     world.sink = (world.sink + sink) | 0;
@@ -330,33 +558,67 @@ export function stepAd(world) {
 }
 
 /**
+ * One ALWAYS-RUN ghost-range frame: fold this frame's values into the GHOST 1.6.0 running-GLOBAL range
+ * (min/max over ALL values ever fed -- never shrinks). It is the D2 deafness demonstration, NOT the
+ * naive-mean foil, so it must stay LIVE even when the foil (stepAdOracle) is paused -- otherwise A_GHOSTR
+ * freezes stale. stepAdGhost is the SOLE owner of ghostMin / ghostMax (stepAdOracle no longer touches
+ * them -- it is purely the naive-mean foil now), and the golden driver runs stepAd + stepAdGhost. 0 B/op.
+ * @param {object} world
+ * @returns {number} the frame's value count (folded, defeats DCE).
+ */
+export function stepAdGhost(world) {
+    const stream = world.stream, mask = world.streamMask;
+    const start = world.frameStart, count = world.frameCount;
+    let gmin = world.ghostMin, gmax = world.ghostMax;
+    for (let i = 0; i < count; i++) {
+        const v = stream[(start + i) & mask];
+        if (v < gmin) gmin = v;
+        if (v > gmax) gmax = v;
+    }
+    world.ghostMin = gmin; world.ghostMax = gmax;
+    return count;
+}
+
+/**
  * One EXACT-ORACLE frame (the allowed-to-allocate-in-spirit contrast): replay the frame's values
  * into a naive cumulative mean (never forgets -> the foil that lags after a shift) and bump the
- * owned counter once per value (exact drift detection must retain O(N) values). 0 B/op (scalars).
+ * owned counter once per value (exact drift detection must retain O(N) values). Does NOT touch the
+ * ghost global range (stepAdGhost owns that, always-run) nor any live-window ring (renderAdPrep
+ * recomputes A_LIVER straight from the stream suffix): it is purely the naive-mean foil now. Returns
+ * an int32 fold, never a boxed double (zero-box law: never RETURN a double from a non-inlined helper).
+ * 0 B/op (scalars).
  * @param {object} world
  * @param {object} allocState
- * @returns {number} the running cumulative mean.
+ * @returns {number} the frame's value count (int32 fold, defeats DCE).
  */
 export function stepAdOracle(world, allocState) {
     const stream = world.stream, mask = world.streamMask;
     const start = world.frameStart, count = world.frameCount;
     let cumSum = world.cumSum, cumN = world.cumN;
     for (let i = 0; i < count; i++) {
-        cumSum += stream[(start + i) & mask];
+        const v = stream[(start + i) & mask];
+        cumSum += v;
         cumN += 1;
         allocState.oracleCount++;   // a retained value exact drift-tracking would keep
     }
     world.cumSum = cumSum; world.cumN = cumN;
     world.n = (world.n + count) | 0;
-    return cumN > 0 ? cumSum / cumN : 0;
+    return count | 0;
 }
 
 /**
  * Render-prep (~10Hz): re-derive every displayed ADWIN number LIVE from the shipped instance vs the
- * current regime mean + the cumulative foil. ad.mean / variance / width are O(1) 0-alloc getters. 0 B/op.
+ * current regime mean + the cumulative foil. ad.mean / variance / width are O(1) 0-alloc getters, and
+ * every value stays in a Float64Array slot end to end -- this returns an int32 fold, never a boxed
+ * double. Measured 0 B/op in the optimized steady state (DemoProbe ad_render_* lanes, gated <= 0.5): V8
+ * elides the getter returns because they never escape. The ad.mean / ad.variance returns DO box 16 B,
+ * but only when they escape into a retaining slot -- proven by the ad_mean_sink / ad_variance_sink
+ * controls, which sink the return and MUST fail the 0 gate. HEAD's `return mean` boxed 48 B/call: it
+ * sank a fractional double across the render boundary. The per-frame step path (stepAd + stepAdGhost +
+ * stepAdOracle) stays 0 B/op.
  * @param {object} world
  * @param {object} allocState
- * @returns {number} the adaptive-window mean (folded).
+ * @returns {number} an int32 fold of the item count (defeats DCE; never a boxed double).
  */
 export function renderAdPrep(world, allocState) {
     const ad = world.ad, flat = world.flat;
@@ -379,7 +641,26 @@ export function renderAdPrep(world, allocState) {
     flat[A_ORACLE_BYTES] = world.n * BYTES_PER_F64;
     flat[A_SKETCH_ALLOC] = allocState.sketchCount;
     flat[A_ORACLE_ALLOC] = allocState.oracleCount;
-    return mean;
+    // --- 1.8.0 (D2) APPEND-ONLY: offset, the live-window range R vs the 1.6.0 ghost global range ---
+    flat[A_OFFSET] = world.offset;
+    // A_LIVER: exact value range (max-min) of the RETAINED window -- the last ad.width fed values read
+    // straight from the stream suffix stream[(cursor-width .. cursor-1) & mask], i.e. EXACTLY ADWIN's
+    // window INCLUDING the straddling oldest bucket (the library's internal F18 R excludes that oldest
+    // bucket). Fails closed to NaN when the width exceeds the stream ring -- an exact range over values
+    // we no longer hold cannot be recomputed (null is not zero).
+    const width = ad.width | 0;
+    if (width > AD_STREAM_LEN) {
+        flat[A_LIVER] = NaN;
+    } else {
+        const stream = world.stream, mask = world.streamMask, cur = world.cursor;
+        let mn = Infinity, mx = -Infinity;
+        for (let i = 1; i <= width; i++) { const v = stream[(cur - i) & mask]; if (v < mn) mn = v; if (v > mx) mx = v; }
+        flat[A_LIVER] = width > 0 ? (mx - mn) : 0;
+    }
+    // A_GHOSTR: the 1.6.0 running-GLOBAL range (never shrinks) -- why 1.6.0 went deaf to a later +1.
+    flat[A_GHOSTR] = (world.ghostMax >= world.ghostMin) ? (world.ghostMax - world.ghostMin) : 0;
+    flat[A_LASTCUT] = world.lastCut;
+    return world.n | 0;   // int32 fold (defeats DCE); mean lives in flat[A_MEAN], never RETURNED (would box)
 }
 
 // =======================================================================================
@@ -627,6 +908,15 @@ export const HK_DRIFT_OFFSET = 500000;
 export const HK_DEFAULT_SEED = 0x243f6a88;
 /** The faithful inline Space-Saving baseline size (matches the witness marquee CAP = k * 4). */
 export const HK_SS_MULT = 4;
+/** D3 key-magnitude classes (F3): the transform applied to each drawn Zipf index AT FILL TIME (cold),
+ *  so `addFrom` streams keys of that class through a Float64 slot -- a large / negative key NEVER boxes.
+ *  small = k; big = k + 2^31 (a HeapNumber as a plain `add` arg); neg = -(k + 1). */
+export const HK_KEY_SMALL = 0;
+export const HK_KEY_BIG = 1;
+export const HK_KEY_NEG = 2;
+export const HK_BIG_OFFSET = 2147483648;   // 2^31 -- the >= 2^31 key-class offset (still a safe integer)
+/** D3 weight ceiling (F10): a single weight up to 2^32-1; the accumulated uint32 cell SATURATES here. */
+export const HK_WEIGHT_MAX = 4294967295;   // 2^32-1
 
 export const H_RECALL = 0;      // recall of the true heavy hitters above N/k (target 1.0)
 export const H_TRUEHH = 1;      // # of true HH above N/k
@@ -649,11 +939,18 @@ export const H_ROWS = 17;         // leaderboard rows populated
 export const H_MAXCOUNT = 18;     // top leader estimate (leaderboard normalization)
 export const H_SKETCH_ALLOC = 19;
 export const H_ORACLE_ALLOC = 20;
-export const HK_FLAT_LEN = 21;
+// --- 1.8.0 (D3) APPEND-ONLY slots (never renumber 0..20; golden-flat.json pins those bits) ---
+export const H_KEYMODE = 21;      // the key-magnitude class fed through addFrom (0 small, 1 >= 2^31, 2 neg)
+export const H_WEIGHT = 22;       // the per-add weight (up to 2^32-1; rides a Float64 slot, never boxed)
+export const H_SAT = 23;          // 1 when the top estimate saturates the uint32 cell (== 4294967295)
+export const HK_FLAT_LEN = 24;
 
-/** Fill the reused stream with a STATIONARY Zipfian skew (cached CDF). Warmup / topology only. */
+/** Fill the reused stream with a STATIONARY Zipfian skew (cached CDF), each drawn index TRANSFORMED to
+ *  the world's key-magnitude class (D3). Warmup / topology only -- the transform is cold, never per frame,
+ *  so the hot `addFrom` path only ever reads a ready transformed key from a Float64 slot (zero-box, F3). */
 function fillZipfStream(world) {
-    const stream = world.stream, len = stream.length, nKeys = world.nKeys, skew = world.skew;
+    const stream = world.stream, raw = world.rawStream, len = stream.length, nKeys = world.nKeys, skew = world.skew;
+    const km = world.keyMode;
     const rng = makeRng(world.seed);
     const cdf = new Float64Array(nKeys);
     let sum = 0;
@@ -663,7 +960,11 @@ function fillZipfStream(world) {
         const u = rng();
         let lo = 0, hi = nKeys - 1;
         while (lo < hi) { const mid = (lo + hi) >> 1; if (cdf[mid] < u) lo = mid + 1; else hi = mid; }
-        stream[n] = lo;
+        // The UNTRANSFORMED Zipf index (always a Smi, 0..nKeys-1) is the oracle Map / Space-Saving key --
+        // a large / negative TRANSFORMED key would box once per Map.get on the render path (D3 blocker 1).
+        raw[n] = lo;
+        // small = k; big = k + 2^31 (>= 2^31, a HeapNumber as a plain arg); neg = -(k + 1). All safe integers.
+        stream[n] = km === HK_KEY_BIG ? lo + HK_BIG_OFFSET : (km === HK_KEY_NEG ? -(lo + 1) : lo);
     }
 }
 
@@ -693,12 +994,21 @@ function ssEstimate(ss, key) {
     return 0;
 }
 
-/** Build the per-world recall callback ONCE (never per frame) -- 0-alloc when Map.forEach calls it. */
+/** Build the per-world recall callback ONCE (never per frame) -- 0-alloc when Map.forEach calls it.
+ *  D3: membership is read from a topBuf scan (the top-k leaders, [key, estimate] pairs) -- NEVER scalar
+ *  hk.estimate(key) on the render path, which boxes a key >= 2^31 / negative at the non-inlined call
+ *  boundary. The topBuf keys ride Float64 slots (0 B/op), so the render stays allocation-free. */
 function makeHkRecallCb(world) {
+    // `key` is the oracle Map key -- the UNTRANSFORMED Zipf INDEX (a Smi), never the large / negative
+    // transformed key. Membership is scanned against world.topIdx, the leaders' indices recovered by the
+    // inverse transform once per render (D3 blocker 1) -- so every comparison here is Smi === Smi, 0-box.
     return function recallCb(count, key) {
-        const hk = world.hk;
         const thr = world.n / world.k;
-        if (count > thr) { world.recallTrue++; if (hk.estimate(key) > 0) world.recallFound++; }
+        if (count > thr) {
+            world.recallTrue++;
+            const topIdx = world.topIdx, rows = world.topRows;
+            for (let r = 0; r < rows; r++) { if (topIdx[r] === key) { world.recallFound++; break; } }
+        }
     };
 }
 
@@ -710,22 +1020,56 @@ function makeHkRecallCb(world) {
  * @param {number} w       width (cols), >= 1.
  * @param {number} k       top-k size, >= 1.
  * @param {number} [seed]  uint32 stream + hash seed.
+ * @param {number} [keyMode] D3 key-magnitude class (HK_KEY_SMALL / HK_KEY_BIG / HK_KEY_NEG). Default small.
+ * @param {number} [weight]  D3 per-add weight, a positive integer up to 2^32-1. Default 1.
  */
-export function createHkWorld(d, w, k, seed) {
+export function createHkWorld(d, w, k, seed, keyMode, weight) {
+    // Fail closed (suite law): reject a non-number / non-finite seed BEFORE allocation -- never coerce
+    // NaN / a string to 0 via >>> 0. -0 and any finite value (incl. >= 2^31, which >>> 0 folds) pass.
+    if (seed !== undefined && seed !== null && (typeof seed !== 'number' || !Number.isFinite(seed))) {
+        throw new TypeError('[lite-adaptive] HK seed must be a finite number, got ' +
+            (typeof seed === 'string' ? JSON.stringify(seed) : String(seed)));
+    }
     const s = (seed === undefined || seed === null) ? HK_DEFAULT_SEED : (seed >>> 0);
+    // null is not zero: fall back on undefined/null only, so an explicit keyMode 0 / weight is honored.
+    const km = (keyMode === undefined || keyMode === null) ? HK_KEY_SMALL : keyMode;
+    const wt = (weight === undefined || weight === null) ? 1 : weight;
+    // D3 blocker 4: fail closed BEFORE any allocation (a bad keyMode / weight must never build a world
+    // that then bombs inside rAF). keyMode is one of {0, 1, 2}; weight is an integer in [1, 2^32-1].
+    if (km !== HK_KEY_SMALL && km !== HK_KEY_BIG && km !== HK_KEY_NEG) {
+        let hint = '';
+        if (km === 'small') hint = ' (did you mean 0?)';
+        else if (km === 'big') hint = ' (did you mean 1?)';
+        else if (km === 'neg' || km === 'negative') hint = ' (did you mean 2?)';
+        throw new TypeError('[lite-adaptive] HK keyMode must be 0 (small), 1 (>= 2^31), or 2 (negative), got ' +
+            (typeof keyMode === 'string' ? JSON.stringify(keyMode) : String(keyMode)) + hint);
+    }
+    // Cold create-time TYPE guard (demo-authored): fail closed BEFORE any allocation on a non-number /
+    // non-integer / < 1 weight, so a world never builds on rubbish and never bombs inside rAF.
+    if (typeof wt !== 'number' || !Number.isInteger(wt) || wt < 1) {
+        throw new RangeError('[lite-adaptive] HK weight must be an integer >= 1, got ' +
+            (typeof weight === 'string' ? JSON.stringify(weight) : String(weight)));
+    }
+    // Upper bound (F10) is DELEGATED to the library so the banner shows the library's OWN tagged message,
+    // not a demo paraphrase: a tiny throwaway HeavyKeeper.add(0, wt) fires the library's weight guard
+    // ([1, 4294967295]) at CREATE time (never inside rAF). For a valid weight this is a silent no-op, so
+    // the world + the golden are unaffected. (D3 blocker 4: the check still precedes the real build.)
+    new HeavyKeeper(1, 1, 1).add(0, wt);
     const hk = new HeavyKeeper(d, w, k, { seed: s });   // throws [lite-adaptive] on a bad d/w/k
     const world = {
-        hk, d, w, k, seed: s, nKeys: HK_NKEYS, skew: HK_SKEW,
+        hk, d, w, k, seed: s, nKeys: HK_NKEYS, skew: HK_SKEW, keyMode: km, weight: wt, oracleOn: true,
         oracle: new Map(),
         ss: makeSpaceSaving(k * HK_SS_MULT),
-        stream: new Uint32Array(HK_STREAM_LEN),
+        stream: new Float64Array(HK_STREAM_LEN),        // transformed keys (may be >= 2^31 or negative)
+        rawStream: new Uint32Array(HK_STREAM_LEN),      // UNTRANSFORMED Zipf index (Smi) -- the oracle key
         streamMask: HK_STREAM_LEN - 1,
         cursor: 0, frameStart: 0, frameCount: 0, sink: 0,
         keysPerFrame: HK_KEYS_PER_FRAME,
         keyBuf: new Float64Array(2),                    // [key, weight] scratch for addFrom (reused)
         topBuf: new Float64Array(2 * k),                // topKInto target ([key, estimate] pairs)
+        topIdx: new Float64Array(k),                    // leaders' UNTRANSFORMED indices (Smi Map lookups)
         lbTrue: new Float64Array(k),                    // per-leader true count (for the bracket)
-        n: 0, recallTrue: 0, recallFound: 0,
+        n: 0, recallTrue: 0, recallFound: 0, topRows: 0,
         flat: new Float64Array(HK_FLAT_LEN),
     };
     fillZipfStream(world);
@@ -742,12 +1086,12 @@ export function createHkWorld(d, w, k, seed) {
  */
 export function stepHk(world) {
     const stream = world.stream, mask = world.streamMask, hk = world.hk, kpf = world.keysPerFrame;
-    const buf = world.keyBuf;
+    const buf = world.keyBuf, weight = world.weight;   // weight into a Float64 slot -> never boxed (F3/F10)
     let pos = world.cursor;
     world.frameStart = pos & mask;
     let sink = 0;
     for (let i = 0; i < kpf; i++) {
-        buf[0] = stream[pos & mask]; buf[1] = 1;
+        buf[0] = stream[pos & mask]; buf[1] = weight;   // key + weight ride Float64 slots (zero-box addFrom)
         hk.addFrom(buf, 0);
         sink = (sink + hk.size) | 0;
         pos = pos + 1;
@@ -767,16 +1111,18 @@ export function stepHk(world) {
  * @returns {number} the Map size after this frame.
  */
 export function stepHkOracle(world, allocState) {
-    const stream = world.stream, mask = world.streamMask, map = world.oracle, ss = world.ss;
-    const start = world.frameStart, count = world.frameCount;
+    const raw = world.rawStream, mask = world.streamMask, map = world.oracle, ss = world.ss;
+    const start = world.frameStart, count = world.frameCount, weight = world.weight;
     for (let i = 0; i < count; i++) {
-        const key = stream[(start + i) & mask];
+        const key = raw[(start + i) & mask];   // UNTRANSFORMED Zipf index (a Smi) -- never boxes on Map.get
         const c = map.get(key);
-        if (c === undefined) { map.set(key, 1); allocState.oracleCount++; }   // a new entry allocates
-        else map.set(key, c + 1);
-        ssAdd(ss, key, 1);
+        if (c === undefined) { map.set(key, weight); allocState.oracleCount++; }   // a new entry allocates
+        else map.set(key, c + weight);
+        ssAdd(ss, key, weight);
     }
-    world.n = (world.n + count) | 0;
+    // n is the TOTAL MASS (sum of weights), so the N/k threshold + the Map counts share one unit; a
+    // Float accumulator (no `| 0`) keeps it exact past 2^31 when a large weight is engaged.
+    world.n = world.n + count * weight;
     return map.size;
 }
 
@@ -792,9 +1138,10 @@ export function stepHkOracle(world, allocState) {
  */
 export function renderHkPrep(world, allocState) {
     const hk = world.hk, flat = world.flat, map = world.oracle, ss = world.ss;
-    const k = world.k, w = world.w, N = world.n;
-    const topBuf = world.topBuf, lbTrue = world.lbTrue;
+    const k = world.k, w = world.w, N = world.n, km = world.keyMode;
+    const topBuf = world.topBuf, topIdx = world.topIdx, lbTrue = world.lbTrue;
     const rows = hk.topKInto(topBuf);   // [key, estimate] pairs, heap order; returns entry count
+    world.topRows = rows;               // published for recallCb's membership scan (no scalar estimate)
 
     // per-leader bracket + never-overestimate + marquee (HeavyKeeper vs Space-Saving) -- all 0-alloc.
     const errBound = w > 0 ? N / w : 0;
@@ -803,7 +1150,12 @@ export function renderHkPrep(world, allocState) {
     for (let r = 0; r < rows; r++) {
         const key = topBuf[r * 2];
         const est = topBuf[r * 2 + 1];
-        const tc = map.get(key);
+        // Recover the UNTRANSFORMED index (a Smi) from the transformed leader key BEFORE any Map lookup:
+        // a large / negative double would box once per Map.get here (D3 blocker 1). The subtraction /
+        // negation is an inlined float op; the result is a small integer the Map canonicalizes to a Smi.
+        const idx = km === HK_KEY_BIG ? key - HK_BIG_OFFSET : (km === HK_KEY_NEG ? -key - 1 : key);
+        topIdx[r] = idx;   // published for recallCb's Smi membership scan
+        const tc = map.get(idx);
         const t = tc === undefined ? 0 : tc;
         lbTrue[r] = t;
         if (est > t) { const over = est - t; if (over > maxOver) maxOver = over; bracketOk = 0; }
@@ -811,7 +1163,7 @@ export function renderHkPrep(world, allocState) {
         if (est > maxCount) maxCount = est;
         if (t > 0) {
             hkErrSum += Math.abs(est - t) / t;
-            ssErrSum += Math.abs(ssEstimate(ss, key) - t) / t;
+            ssErrSum += Math.abs(ssEstimate(ss, idx) - t) / t;
             errN++;
         }
     }
@@ -821,7 +1173,10 @@ export function renderHkPrep(world, allocState) {
     // recall of the true heavy hitters above N/k (the headline) -- Map.forEach, hoisted cb, 0-alloc.
     world.recallTrue = 0; world.recallFound = 0;
     map.forEach(world.recallCb);
-    const recall = world.recallTrue === 0 ? 1 : world.recallFound / world.recallTrue;
+    // null is not zero: with NO true heavy hitters yet (recallTrue 0), recall is UNDEFINED, not a
+    // perfect 1 -- write NaN so hkTick / hkWitDraw render "n/a" (neutral), never a false 100%. At the
+    // golden's 300 frames there ARE heavy hitters (recallTrue > 0), so this branch never fires there.
+    const recall = world.recallTrue === 0 ? NaN : world.recallFound / world.recallTrue;
 
     flat[H_RECALL] = recall;
     flat[H_TRUEHH] = world.recallTrue;
@@ -844,6 +1199,22 @@ export function renderHkPrep(world, allocState) {
     flat[H_MAXCOUNT] = maxCount;
     flat[H_SKETCH_ALLOC] = allocState.sketchCount;
     flat[H_ORACLE_ALLOC] = allocState.oracleCount;
+    // --- 1.8.0 (D3) APPEND-ONLY: the key-magnitude class, the per-add weight, the saturation flag ---
+    flat[H_KEYMODE] = world.keyMode;
+    flat[H_WEIGHT] = world.weight;
+    flat[H_SAT] = maxCount === HK_WEIGHT_MAX ? 1 : 0;   // top estimate pinned at the uint32 ceiling (F10)
+    // Oracle gate (blocker 2, COLD branch): with the oracle toggle OFF the exact Map + Space-Saving foil
+    // are FROZEN while the sketch keeps counting, so every oracle-derived number (recall, the [true-N/w]
+    // bracket, max-overestimate, the HK-vs-SS marquee) plus the per-leader true counts, the N/k threshold
+    // and the ~N/w error bound would read STALE against a frozen Map and n. Fail closed to NaN -> rendered
+    // "n/a", markers skipped in hkDraw, never a false "recall 100%". At the default (oracleOn true) the
+    // branch never fires, so the golden stays bit-identical. This write lives in the kernel a test drives.
+    if (!world.oracleOn) {
+        flat[H_RECALL] = NaN; flat[H_FOUND] = NaN; flat[H_TRUEHH] = NaN; flat[H_MAXOVER] = NaN; flat[H_BRACKETOK] = NaN;
+        flat[H_HKERR] = NaN; flat[H_SSERR] = NaN; flat[H_MARQUEEOK] = NaN;
+        flat[H_THRESH] = NaN; flat[H_ERRBOUND] = NaN;
+        for (let r = 0; r < rows; r++) lbTrue[r] = NaN;   // per-leader true-count markers -> hkDraw skips them
+    }
     return recall;
 }
 
@@ -867,6 +1238,9 @@ export const SHLL_UNIVERSE = 1 << 13;      // 8192
 export const SHLL_RING_LEN = 1 << 14;      // 16384 > any slider W
 /** The 3-sigma gate multiplier the witness applies (rel <= 3 * standardError). */
 export const SHLL_SIGMA_MULT = 3;
+/** D4 query-cadence cap (in 10Hz TICKS): queryEvery is Infinity ("never") or an integer in [1, cap].
+ *  Anything else (0, fractional, NaN, a string, 1e300) fails closed -- never a silent "never" default. */
+export const SHLL_QEVERY_MAX = 1 << 16;   // 65536 ticks -- covers the {1, 8, 64} select with head-room
 
 export const S_EST = 0;          // sl.count() -- the windowed distinct estimate
 export const S_TRUE = 1;         // exact in-window distinct (oracle Map size)
@@ -883,7 +1257,11 @@ export const S_ORACLE_BYTES = 11;// map.size*MAP_BYTES_PER_ENTRY + ring bytes (O
 export const S_NOW = 12;         // the current monotone now
 export const S_SKETCH_ALLOC = 13;
 export const S_ORACLE_ALLOC = 14;
-export const SHLL_FLAT_LEN = 15;
+// --- 1.8.0 (D4) APPEND-ONLY slots (never renumber 0..14; golden-flat.json pins those bits) ---
+export const S_OVF_A = 15;        // twin A overflows (the count()-queried instance)
+export const S_OVF_B = 16;        // twin B overflows (the never-queried instance) -- ALWAYS == S_OVF_A (F8)
+export const S_QEVERY = 17;       // query cadence in 10Hz ticks (Infinity = never queried)
+export const SHLL_FLAT_LEN = 18;
 
 /** Fill the reused key stream: a deterministic spread over SHLL_UNIVERSE (one key per tick). */
 function fillShllStream(world) {
@@ -900,12 +1278,34 @@ function fillShllStream(world) {
  * @param {number} p        precision (register count 2^p).
  * @param {number} ringCap  per-register LFPM ring capacity.
  * @param {number} [seed]   uint32 stream + hash seed.
+ * @param {number} [queryEvery] D4 query cadence in 10Hz TICKS -- slA is count()-queried (folded into
+ *                              sink2) every `queryEvery` ticks (Infinity = never queried at all). The
+ *                              DISPLAY estimate comes from the separate slD twin (queried every tick);
+ *                              the twin slB is NEVER queried. F8 makes all three `overflows` EQUAL.
  */
-export function createShllWorld(W, p, ringCap, seed) {
+export function createShllWorld(W, p, ringCap, seed, queryEvery) {
+    // Fail closed (suite law): reject a non-number / non-finite seed BEFORE allocation -- never coerce
+    // NaN / a string to 0 via >>> 0. -0 and any finite value (incl. >= 2^31, which >>> 0 folds) pass.
+    if (seed !== undefined && seed !== null && (typeof seed !== 'number' || !Number.isFinite(seed))) {
+        throw new TypeError('[lite-adaptive] SHLL seed must be a finite number, got ' +
+            (typeof seed === 'string' ? JSON.stringify(seed) : String(seed)));
+    }
     const s = (seed === undefined || seed === null) ? SHLL_DEFAULT_SEED : (seed >>> 0);
-    const sl = new SlidingHyperLogLog(W, { p, ringCap, seed: s });   // throws [lite-adaptive] on bad args
+    const qe = (queryEvery === undefined || queryEvery === null) ? Infinity : queryEvery;
+    // D4 blocker 5: fail closed BEFORE any allocation. queryEvery counts 10Hz TICKS -- Infinity ("never")
+    // or an integer in [1, SHLL_QEVERY_MAX]. 0 / -3 / 2.5 / NaN / '8' / -Infinity / 1e300 are all errors
+    // (never a silent "never" with a bogus stored cadence). Number.isInteger(Infinity) is false, so the
+    // Infinity sentinel is matched first.
+    if (qe !== Infinity && (typeof qe !== 'number' || !Number.isInteger(qe) || qe < 1 || qe > SHLL_QEVERY_MAX)) {
+        throw new RangeError('[lite-adaptive] SHLL queryEvery must be Infinity or an integer in [1, ' +
+            SHLL_QEVERY_MAX + '] ticks, got ' + (typeof queryEvery === 'string' ? JSON.stringify(queryEvery) : String(queryEvery)));
+    }
+    const sl = new SlidingHyperLogLog(W, { p, ringCap, seed: s });   // slA: cadence-queried (count() on cadence)
+    const slB = new SlidingHyperLogLog(W, { p, ringCap, seed: s });  // the twin: same stream, NEVER queried
+    const slD = new SlidingHyperLogLog(W, { p, ringCap, seed: s });  // display-only twin: count() EVERY 10Hz tick
     const world = {
-        sl, W, p, ringCap, seed: s, paused: false,
+        sl, slB, slD, W, p, ringCap, seed: s, paused: false, oracleOn: true,
+        queryEvery: qe, queryOn: qe !== Infinity, qcountdown: qe !== Infinity ? qe : 0, sink2: 0, slaQueryCount: 0,
         stream: new Uint32Array(SHLL_STREAM_LEN),
         streamMask: SHLL_STREAM_LEN - 1,
         cursor: 0, frameStart: 0, frameCount: 0, frameNowStart: 0, now: 0, n: 0, sink: 0,
@@ -933,10 +1333,12 @@ export function stepShll(world) {
         const now = world.now + world.keysPerFrame;
         world.packed[0] = now;
         world.sl.advanceFrom(world.packed, 0);
+        world.slB.advanceFrom(world.packed, 0);   // the twin idle-slides in lockstep
+        world.slD.advanceFrom(world.packed, 0);   // the display twin idle-slides too
         world.now = now; world.frameNowStart = now; world.frameCount = 0;
         return 0;
     }
-    const stream = world.stream, mask = world.streamMask, sl = world.sl, kpf = world.keysPerFrame;
+    const stream = world.stream, mask = world.streamMask, sl = world.sl, slB = world.slB, slD = world.slD, kpf = world.keysPerFrame;
     const packed = world.packed;
     let pos = world.cursor, now = world.now;
     world.frameStart = pos & mask;
@@ -946,9 +1348,14 @@ export function stepShll(world) {
         now = now + 1;
         packed[0] = now; packed[1] = stream[pos & mask];
         sl.addFrom(packed, 0);
+        slB.addFrom(packed, 0);   // the IDENTICAL add into the twin (expiry lives in add, not count -- F8)
+        slD.addFrom(packed, 0);   // the IDENTICAL add into the display twin (count()-queried every 10Hz tick)
         sink = (sink + (now | 0)) | 0;
         pos = pos + 1;
     }
+    // D4 blocker 2: the cadence query lives on the 10Hz TICK (renderShllPrep), NOT here. sl.count() boxes
+    // its 16 B double return once per call (the documented one-boxed-return, not a library bug), which the
+    // measureAllocs lane cannot see -- so the per-frame path stays honestly 0 B/op by never calling it.
     world.cursor = pos & 0x3fffffff;
     world.now = now; world.frameCount = kpf;
     world.sink = (world.sink + sink) | 0;
@@ -992,14 +1399,26 @@ export function stepShllOracle(world, allocState) {
 
 /**
  * Render-prep (~10Hz): re-derive every displayed SlidingHyperLogLog number LIVE from the shipped
- * instance vs the exact windowed-distinct Map. sl.count() is O(m) 0-alloc; map.size is O(1). 0 B/op.
+ * instances vs the exact windowed-distinct Map. The DISPLAY estimate is slD.count() (the display-only
+ * twin, queried EVERY tick): count() is O(m) and costs >= 16 B per call (see MEASURED COST) -- fine at
+ * 10Hz; the gated shll_render probe lane SEES it where measureAllocs reads a false 0. slA is
+ * count()-queried ONLY when the cadence countdown fires (0 queries when queryEvery is Infinity /
+ * "never"), so the query-rate control has teeth.
+ * map.size is O(1). No per-frame count(); only this 10Hz tick boxes, once per queried instance.
+ *
+ * MEASURED COST: 16-32 B per tick, depending on the V8 tier. 16 B is a STABLE allocation inside the
+ * shipped SlidingHyperLogLog.count() itself (present Turbofan-only; not its return, not the slTau /
+ * slSigma boundaries -- a scratch bisect localizes it to the estimator tail, non-degenerate registers
+ * only). A second 16 B appears when this render is not Turbofan-optimized: count()'s integer-valued
+ * double return is materialized as a HeapNumber at the call boundary -> 32 B. No demo-side value boxes
+ * (standardError / relerr / the gate each 0 B). Logged as a library finding in ROADMAP.md. Never > 32 B.
  * @param {object} world
  * @param {object} allocState
  * @returns {number} the windowed distinct estimate (folded).
  */
 export function renderShllPrep(world, allocState) {
     const sl = world.sl, flat = world.flat, map = world.oMap;
-    const est = sl.count();
+    const est = world.slD.count();   // the display twin -- the documented ~16 B boxed return, once per tick
     const trueD = map.size;
     const relerr = trueD > 0 ? Math.abs(est - trueD) / trueD : 0;
     const gate = SHLL_SIGMA_MULT * sl.standardError;
@@ -1019,6 +1438,28 @@ export function renderShllPrep(world, allocState) {
     flat[S_NOW] = world.now;
     flat[S_SKETCH_ALLOC] = allocState.sketchCount;
     flat[S_ORACLE_ALLOC] = allocState.oracleCount;
+    // --- 1.8.0 (D4) APPEND-ONLY: both twins' overflows (ALWAYS EQUAL, F8) + the query cadence ---
+    flat[S_OVF_A] = sl.overflows;
+    flat[S_OVF_B] = world.slB.overflows;
+    flat[S_QEVERY] = world.queryEvery;
+    // D4 blocker 1/2: the query cadence counts 10Hz TICKS. slA (world.sl) is count()-queried ONLY when the
+    // countdown fires -- so "never" (queryOn false) queries slA ZERO times; the DISPLAY estimate came from
+    // slD above, independent of the cadence. Each firing folds slA's estimate into sink2 and bumps the
+    // slaQueryCount (the control's teeth: it changes how OFTEN slA.count() actually runs). slB is NEVER
+    // queried -- yet all three overflows stay EQUAL (F8: count() is non-destructive). Integer countdown.
+    if (world.queryOn) {
+        const qc = world.qcountdown - 1;
+        if (qc <= 0) {
+            world.qcountdown = world.queryEvery;
+            world.sink2 = (world.sink2 + (sl.count() | 0)) | 0;   // the ONLY slA query -- on cadence
+            world.slaQueryCount = (world.slaQueryCount + 1) | 0;
+        } else world.qcountdown = qc;
+    }
+    // Oracle gate (blocker 2, COLD branch): with the exact windowed-distinct Map frozen (oracle toggle off)
+    // the oracle-derived true distinct / rel-error / accuracy cursor are meaningless -> fail closed to NaN
+    // (rendered "n/a", gauge skipped) rather than a frozen stale number shown as live. At the default
+    // (oracleOn true) the branch never fires, so the golden stays bit-identical.
+    if (!world.oracleOn) { flat[S_TRUE] = NaN; flat[S_RELERR] = NaN; flat[S_FRAC] = NaN; }
     return est;
 }
 
@@ -1064,7 +1505,25 @@ export const G_SKETCH_BYTES = 15;// both detectors' fixed scalar state
 export const G_ORACLE_BYTES = 16;// N*8 -- exact detection retains O(N) values
 export const G_SKETCH_ALLOC = 17;
 export const G_ORACLE_ALLOC = 18;
-export const DD_FLAT_LEN = 19;
+// --- 1.8.0 (D5) APPEND-ONLY: the LATCHED twins of PH and CUSUM (S9). Same signal, latch:true, so each
+// fires ONCE per regime + re-arms only when its statistic falls back below threshold/2 (the library's
+// hysteresis; the demo only READS the shipped latch / lastDriftIndex / lastDirection getters). ---
+export const G_PHL_STAT = 19;     // phL.statistic (latched PH)
+export const G_PHL_FRAC = 20;     // phL.statistic / threshold (latched fire cursor)
+export const G_CUL_STAT = 21;     // cuL.statistic (latched CUSUM)
+export const G_CUL_FRAC = 22;     // cuL.statistic / threshold
+export const G_PHL_FIRES = 23;    // latched PH total fires (ONE per regime, vs the unlatched storm)
+export const G_CUL_FIRES = 24;    // latched CUSUM total fires
+export const G_PHL_FIRED = 25;    // latched PH fired this frame (one marker per regime)
+export const G_CUL_FIRED = 26;    // latched CUSUM fired this frame
+export const G_PHL_LASTIDX = 27;  // phL.lastDriftIndex (item index of the last fire; NaN before any)
+export const G_PHL_LASTDIR = 28;  // phL.lastDirection (+1 / -1; NaN before any fire)
+export const G_CUL_LASTIDX = 29;  // cuL.lastDriftIndex
+export const G_CUL_LASTDIR = 30;  // cuL.lastDirection
+export const G_PHL_LATCHED = 31;  // phL.latched (1 while latched and not yet re-armed)
+export const G_CUL_LATCHED = 32;  // cuL.latched
+export const G_LATCH_ON = 33;     // the latch DISPLAY toggle state (1/0) -- draws the latched channels
+export const DD_FLAT_LEN = 34;
 
 /** Fixed scalar footprint of the two detectors (both share the tiny O(1)-state class). */
 export const DD_SKETCH_BYTES = 128;
@@ -1087,17 +1546,33 @@ function fillDdStream(world) {
  * injected changepoints are the ground truth). Fails closed on a bad delta / threshold via the ctor.
  * @param {number} delta      magnitude allowance (>= 0).
  * @param {number} threshold  decision level (> 0).
+ * @param {boolean} [latch]   D5 latch DISPLAY toggle (default false, so a 2-arg call stays golden-
+ *                            identical). typeof-first: a non-boolean throws BEFORE any allocation.
  */
-export function createDdWorld(delta, threshold) {
+export function createDdWorld(delta, threshold, latch) {
+    // null is not zero: fall back to false only on undefined/null, so an explicit `false` is honored.
+    const lt = (latch === undefined || latch === null) ? false : latch;
+    // D5 blocker (fail-closed option): validate the toggle state BEFORE constructing any detector -- a
+    // non-boolean latch must never build a world that then draws a bogus channel (no truthy coercion).
+    if (typeof lt !== 'boolean') {
+        throw new TypeError('[lite-adaptive] DD latch must be a boolean (true / false), got ' +
+            (typeof latch === 'string' ? JSON.stringify(latch) : String(latch)));
+    }
     const ph = new DriftDetector(DRIFT_PH, { delta, threshold });                 // throws on bad args
     const cu = new DriftDetector(DRIFT_CUSUM, { delta, threshold, target: DD_TARGET });
+    // The LATCHED twins (S9): same delta / threshold / target, latch: true -- fire ONCE per regime and
+    // re-arm only when the statistic falls back below threshold/2 (the shipped hysteresis). Fed the SAME
+    // signal as the unlatched pair; the demo reads their latch / lastDriftIndex / lastDirection getters.
+    const phL = new DriftDetector(DRIFT_PH, { delta, threshold, latch: true });
+    const cuL = new DriftDetector(DRIFT_CUSUM, { delta, threshold, target: DD_TARGET, latch: true });
     const world = {
-        ph, cu, delta, threshold,
+        ph, cu, phL, cuL, delta, threshold, latchOn: lt,
         stream: new Float64Array(DD_STREAM_LEN),
         streamMask: DD_STREAM_LEN - 1,
         cursor: 0, frameStart: 0, frameCount: 0, sink: 0,
         valuesPerFrame: DD_VALUES_PER_FRAME,
         n: 0, phFires: 0, cuFires: 0, phFired: 0, cuFired: 0, cp: 0, curMu: DD_MEAN_LO,
+        phLFires: 0, cuLFires: 0, phLFired: 0, cuLFired: 0,
         flat: new Float64Array(DD_FLAT_LEN),
     };
     fillDdStream(world);
@@ -1112,25 +1587,33 @@ export function createDdWorld(delta, threshold) {
  */
 export function stepDd(world) {
     const stream = world.stream, mask = world.streamMask, ph = world.ph, cu = world.cu;
+    const phL = world.phL, cuL = world.cuL;
     const vpf = world.valuesPerFrame;
     let pos = world.cursor;
     world.frameStart = pos & mask;
-    let sink = 0, phF = 0, cuF = 0, cp = 0, prevReg = ((world.n / DD_REGIME) | 0);
+    let sink = 0, phF = 0, cuF = 0, phLF = 0, cuLF = 0, cp = 0, prevReg = ((world.n / DD_REGIME) | 0);
     for (let i = 0; i < vpf; i++) {
         const idx = pos & mask;
         const reg = (((world.n + i) / DD_REGIME) | 0);
         if (reg !== prevReg) { cp = 1; prevReg = reg; }
         const pf = ph.addFrom(stream, idx);
         const cf = cu.addFrom(stream, idx);
+        // the LATCHED twins ride the IDENTICAL signal (S9): each fires ONCE per regime + re-arms at
+        // threshold/2 in the library, so the unlatched re-firing storm above dwarfs these counts.
+        const pLf = phL.addFrom(stream, idx);
+        const cLf = cuL.addFrom(stream, idx);
         if (pf) { phF = 1; world.phFires = (world.phFires + 1) | 0; }
         if (cf) { cuF = 1; world.cuFires = (world.cuFires + 1) | 0; }
-        sink = (sink + (pf ? 1 : 0) + (cf ? 1 : 0)) | 0;
+        if (pLf) { phLF = 1; world.phLFires = (world.phLFires + 1) | 0; }
+        if (cLf) { cuLF = 1; world.cuLFires = (world.cuLFires + 1) | 0; }
+        sink = (sink + (pf ? 1 : 0) + (cf ? 1 : 0) + (pLf ? 1 : 0) + (cLf ? 1 : 0)) | 0;
         pos = pos + 1;
     }
     world.cursor = pos & 0x3fffffff;
     world.n = (world.n + vpf) | 0;
     world.curMu = ddRegimeMean((pos - 1) & mask);
     world.phFired = phF; world.cuFired = cuF;
+    world.phLFired = phLF; world.cuLFired = cuLF;
     if (cp) world.cp = (world.cp + 1) | 0;
     world.frameCount = vpf;
     world.sink = (world.sink + sink) | 0;
@@ -1152,11 +1635,14 @@ export function stepDdOracle(world, allocState) {
 }
 
 /**
- * Render-prep (~10Hz): re-derive every displayed DriftDetector number LIVE from BOTH shipped detectors.
- * statistic / threshold / mean are O(1) 0-alloc getters. 0 B/op.
+ * Render-prep (~10Hz): re-derive every displayed DriftDetector number LIVE from ALL FOUR shipped
+ * detectors (the unlatched PH/CUSUM plus the D5 latched twins). Every getter return is read into a local
+ * and stored into a Float64Array slot (lite-law: elided by V8) and the function returns an int32 fold, so
+ * nothing boxes -- HEAD returned `ps` (a fractional statistic) and boxed 16 B/call, which the DemoProbe
+ * dd_render lane now gates against. 0 B/op steady.
  * @param {object} world
  * @param {object} allocState
- * @returns {number} the PH statistic (folded).
+ * @returns {number} an int32 fold of the fire counts (defeats DCE; never a boxed double).
  */
 export function renderDdPrep(world, allocState) {
     const ph = world.ph, cu = world.cu, flat = world.flat;
@@ -1180,7 +1666,29 @@ export function renderDdPrep(world, allocState) {
     flat[G_ORACLE_BYTES] = world.n * BYTES_PER_F64;
     flat[G_SKETCH_ALLOC] = allocState.sketchCount;
     flat[G_ORACLE_ALLOC] = allocState.oracleCount;
-    return ps;
+    // --- 1.8.0 (D5) APPEND-ONLY: the LATCHED twins (S9). Every getter return is read into a local and
+    // stored into a Float64Array slot (lite-law: elided by V8). lastDriftIndex / lastDirection are NaN
+    // before any fire (null is not zero -- the UI tick renders "n/a", never String(NaN) -> "NaN"). The
+    // latched statistic is read into the pls/cls locals ONCE and reused for both the slot and the frac
+    // cursor. 0 B/op steady (DemoProbe dd_render lane; HEAD's `return ps` boxed 16 B, now an int fold).
+    const phL = world.phL, cuL = world.cuL;
+    const pls = phL.statistic, cls = cuL.statistic;
+    flat[G_PHL_STAT] = pls;
+    flat[G_PHL_FRAC] = pt > 0 ? pls / pt : 0;
+    flat[G_CUL_STAT] = cls;
+    flat[G_CUL_FRAC] = ct > 0 ? cls / ct : 0;
+    flat[G_PHL_FIRES] = world.phLFires;
+    flat[G_CUL_FIRES] = world.cuLFires;
+    flat[G_PHL_FIRED] = world.phLFired;
+    flat[G_CUL_FIRED] = world.cuLFired;
+    flat[G_PHL_LASTIDX] = phL.lastDriftIndex;
+    flat[G_PHL_LASTDIR] = phL.lastDirection;
+    flat[G_CUL_LASTIDX] = cuL.lastDriftIndex;
+    flat[G_CUL_LASTDIR] = cuL.lastDirection;
+    flat[G_PHL_LATCHED] = phL.latched ? 1 : 0;
+    flat[G_CUL_LATCHED] = cuL.latched ? 1 : 0;
+    flat[G_LATCH_ON] = world.latchOn ? 1 : 0;
+    return (world.phFires + world.cuFires + world.phLFires + world.cuLFires) | 0;
 }
 
 // =======================================================================================
@@ -1204,6 +1712,16 @@ export const SLD_MU_LO = 1.0;
 export const SLD_MU_HI = 2.0;
 export const SLD_SIGMA = 0.55;
 
+/** D6 mode selector (locked at ctor, drives strict / range). 0 = default (strict off, collapse-lowest);
+ *  1 = strict (span-based, no declared range); 2 = declared range [SLD_RANGE_MIN, SLD_RANGE_MAX]. */
+export const SLD_MODE_DEFAULT = 0;
+export const SLD_MODE_STRICT = 1;
+export const SLD_MODE_RANGE = 2;
+/** The declared strict range band [1, 20] (F2): a value outside it is PRE-CHECKED out (counted rejected),
+ *  never added -- so a consumer pre-checks the accepted band instead of catching a "would collapse" throw. */
+export const SLD_RANGE_MIN = 1;
+export const SLD_RANGE_MAX = 20;
+
 export const Q_P50 = 0;          // sd.quantile(0.5)
 export const Q_P50T = 1;         // exact windowed p50 (oracle)
 export const Q_P90 = 2;
@@ -1225,7 +1743,18 @@ export const Q_SKETCH_BYTES = 17;// sd.bytes (fixed)
 export const Q_ORACLE_BYTES = 18;// live * 16 ((t, value) pairs, O(W))
 export const Q_SKETCH_ALLOC = 19;
 export const Q_ORACLE_ALLOC = 20;
-export const SLD_FLAT_LEN = 21;
+// --- 1.8.0 (D6) APPEND-ONLY: the B+1 covered span vs the TRUE (now-W, now] window, and the 3-way
+// strict / range toggle (F2, F7). ---
+export const Q_TRUEW = 21;       // true(W) count over the TRUE (now-W, now] window (independent oracle)
+export const Q_CNT_CURSOR = 22;  // sd.count() / true(W) -- the F7 lower-bound cursor (never < 1)
+export const Q_COVMIN = 23;      // covered-span min = W (the FULL window is always covered)
+export const Q_COVMAX = 24;      // covered-span max = W + W/panes (over-covered by <= one pane)
+export const Q_STRICT = 25;      // sd.strict (0/1)
+export const Q_RANGEMIN = 26;    // sd.rangeMin (NaN when no range is declared)
+export const Q_RANGEMAX = 27;    // sd.rangeMax (NaN when no range is declared)
+export const Q_REJECTED = 28;    // out-of-declared-range values pre-checked out (range mode only)
+export const Q_MODE = 29;        // the demo mode selector (0 default / 1 strict / 2 range)
+export const SLD_FLAT_LEN = 30;
 
 /** The grid-pane end covering time `t` for pane width `pw` (matches test/witness.mjs sldPaneEnd). */
 function sldPaneEnd(t, pw) { return (Math.floor(t / pw) + 1) * pw; }
@@ -1253,16 +1782,44 @@ function fillSldStream(world) {
  * @param {number} W       window span (finite > 0).
  * @param {number} alpha   relative-error target in (0, 1).
  * @param {number} panes   pane-ring size B in [2, 1024].
+ * @param {number} [mode]  D6 mode selector 0 (default / strict off) / 1 (strict span-based) / 2
+ *                         (declared range [1, 20]). Default 0 -> a 3-arg call stays golden-identical.
+ *                         A bad mode throws [lite-adaptive] BEFORE any allocation (fail-closed knob).
  */
-export function createSldWorld(W, alpha, panes) {
-    const sd = new SlidingDDSketch(W, { alpha, panes });   // throws [lite-adaptive] on bad args
+export function createSldWorld(W, alpha, panes, mode) {
+    // null is not zero: fall back to the default mode only on undefined/null (an explicit 0 is honored).
+    const md = (mode === undefined || mode === null) ? SLD_MODE_DEFAULT : mode;
+    // D6 blocker (fail-closed option): validate the mode BEFORE any allocation. 0 / 1 / 2 only; a
+    // non-integer / out-of-set / string mode is a tagged throw, never a silent fall-through to default.
+    if (md !== SLD_MODE_DEFAULT && md !== SLD_MODE_STRICT && md !== SLD_MODE_RANGE) {
+        throw new TypeError('[lite-adaptive] SLD mode must be 0 (default), 1 (strict), or 2 (range [' +
+            SLD_RANGE_MIN + ', ' + SLD_RANGE_MAX + ']), got ' +
+            (typeof mode === 'string' ? JSON.stringify(mode) : String(mode)));
+    }
+    // Build the sketch through the shipped option door: default (strict off), strict (span-based, no
+    // range), or a declared range (strict derived, rangeMin / rangeMax populated). Each throws on a bad arg.
+    const sd = md === SLD_MODE_STRICT ? new SlidingDDSketch(W, { alpha, panes, strict: true })
+        : md === SLD_MODE_RANGE ? new SlidingDDSketch(W, { alpha, panes, range: [SLD_RANGE_MIN, SLD_RANGE_MAX] })
+            : new SlidingDDSketch(W, { alpha, panes });   // throws [lite-adaptive] on bad args
+    // Range-mode PRE-CHECK bounds read ONCE from the shipped getters (NaN when no range) -- a hot-path
+    // read of the getter per value would box; these plain-number locals ride the step loop unboxed.
+    const rMin = sd.rangeMin, rMax = sd.rangeMax;
     const world = {
-        sd, W, alpha, panes, pw: W / panes, paused: false,
+        sd, W, alpha, panes, pw: W / panes, paused: false, mode: md,
+        // oracle gate (D6 blocker 7): the exact-ring oracles (quantile true values + true(W) count) can be
+        // toggled off. When off, every oracle-derived slot fails closed to NaN in renderSldPrep's cold
+        // branch instead of showing a frozen stale bound as live. resumeNow marks the `now` at which the
+        // oracle was last re-enabled: the ring is stale for a full window W after resume, so the accuracy /
+        // count gauges hold NaN until now - resumeNow >= W (mirrors EH's oracleOn / resumeNow).
+        oracleOn: true, resumeNow: -Infinity,
+        rMin, rMax, rejected: 0,
         vals: new Float64Array(SLD_STREAM_LEN),
         streamMask: SLD_STREAM_LEN - 1,
         cursor: 0, frameStart: 0, frameCount: 0, frameNowStart: 0, now: 0, n: 0, sink: 0,
         valuesPerFrame: SLD_VALUES_PER_FRAME,
         packed: new Float64Array(2),                   // [now, value] scratch for addFrom (reused)
+        qs: new Float64Array([0.5, 0.9, 0.99]),        // the render's quantile probes (F5 quantileInto)
+        qout: new Float64Array(3),                     // quantileInto output (0 B/call reader)
         oT: new Float64Array(SLD_ORACLE_LEN),          // in-window arrival times (ring)
         oV: new Float64Array(SLD_ORACLE_LEN),          // in-window values (ring)
         oMask: SLD_ORACLE_LEN - 1, oHead: 0, oTail: 0,
@@ -1290,20 +1847,33 @@ export function stepSld(world) {
     }
     const vals = world.vals, mask = world.streamMask, sd = world.sd, vpf = world.valuesPerFrame;
     const packed = world.packed;
+    // D6 range mode: PRE-CHECK each value against the declared band [rMin, rMax] read once at build. An
+    // out-of-band value is NOT added (counted rejected) but the clock still slides via advanceFrom, so a
+    // consumer pre-checks the accepted band (F2) instead of catching a throw -- 0 B/op, no try/catch.
+    // `!(v >= rMin && v <= rMax)` rejects NaN too (fail closed). rangeOn is false for modes 0/1 (the
+    // default hot body is byte-identical to pre-D6: a straight addFrom, no per-value branch cost there).
+    const rangeOn = world.mode === SLD_MODE_RANGE, rMin = world.rMin, rMax = world.rMax;
     let pos = world.cursor, now = world.now;
     world.frameStart = pos & mask;
     world.frameNowStart = now;
-    let sink = 0;
+    let sink = 0, rej = 0;
     for (let i = 0; i < vpf; i++) {
         const idx = pos & mask;
+        const v = vals[idx];
         now = now + 1;
-        packed[0] = now; packed[1] = vals[idx];
-        sd.addFrom(packed, 0);
+        if (rangeOn && !(v >= rMin && v <= rMax)) {
+            packed[0] = now; sd.advanceFrom(packed, 0);   // slide the clock past the rejected tick (0 B/op)
+            rej = (rej + 1) | 0;
+        } else {
+            packed[0] = now; packed[1] = v;
+            sd.addFrom(packed, 0);
+        }
         sink = (sink + (now | 0)) | 0;
         pos = pos + 1;
     }
     world.cursor = pos & 0x3fffffff;
     world.now = now; world.frameCount = vpf;
+    world.rejected = (world.rejected + rej) | 0;
     world.sink = (world.sink + sink) | 0;
     return sink;
 }
@@ -1321,10 +1891,15 @@ export function stepSldOracle(world, allocState) {
     const vals = world.vals, mask = world.streamMask;
     const start = world.frameStart, count = world.frameCount, W = world.W, pw = world.pw;
     const oT = world.oT, oV = world.oV, omask = world.oMask;
+    // Mirror the step's D6 range pre-check EXACTLY: only accepted values enter the oracle ring, so the
+    // oracle content matches the sketch's physically-retained content (rel-error is purely bucket error).
+    const rangeOn = world.mode === SLD_MODE_RANGE, rMin = world.rMin, rMax = world.rMax;
     let now = world.frameNowStart, head = world.oHead, tail = world.oTail;
     for (let i = 0; i < count; i++) {
         now = now + 1;
-        oT[tail] = now; oV[tail] = vals[(start + i) & mask]; tail = (tail + 1) & omask;
+        const v = vals[(start + i) & mask];
+        if (rangeOn && !(v >= rMin && v <= rMax)) continue;   // pre-checked out -> not retained (matches step)
+        oT[tail] = now; oV[tail] = v; tail = (tail + 1) & omask;
         allocState.oracleCount++;                       // a retained sample the sketch refuses to keep
     }
     // 1.7.0 F7: the ring holds B+1 panes, so the covered span is (E - W - pw, E] -- [W, W + W/B].
@@ -1337,22 +1912,29 @@ export function stepSldOracle(world, allocState) {
 
 /**
  * Render-prep (~10Hz): re-derive every displayed SlidingDDSketch number LIVE from the shipped instance
- * vs an exact sorted-array oracle over the LIVE pane content. The oracle scans the ring, insertion-sorts
- * the live values into the PREALLOCATED sortBuf (0 alloc, NO .sort()), and reads the p50/p90/p99. The
- * sd.quantile queries are COLD 0-alloc. 0 B/op.
+ * vs TWO independent exact oracles. (a) The QUANTILE oracle: the exact multiset of the COVERED span
+ * [W, W+W/B] (the geometry the sketch physically retains), insertion-sorted into the PREALLOCATED sortBuf
+ * (0 alloc, NO .sort()); the p50/p90/p99 rel-error is then purely DDSketch bucket error (rel <= alpha).
+ * (b) The COUNT oracle: true(W) over the TRUE (now - W, now] window -- a DIFFERENT window than the sketch's
+ * geometry, so the F7 lower-bound cursor `count() / true(W)` is honest (>= 1, never < 1) and an oracle that
+ * shared the sketch's covered span would agree with an under-coverage bug. The render reads quantiles
+ * through `quantileInto` (F5, 0 B/call; the scalar `quantile()` keeps its one boxed return). 0 B/op.
  * @param {object} world
  * @param {object} allocState
- * @returns {number} the windowed p50 (folded).
+ * @returns {number} an int32 fold (defeats DCE; never a boxed double).
  */
 export function renderSldPrep(world, allocState) {
     const sd = world.sd, flat = world.flat, pw = world.pw, W = world.W;
     const oT = world.oT, oV = world.oV, omask = world.oMask, sortBuf = world.sortBuf;
     const liveCut = sldPaneEnd(world.now, pw) - W - pw;   // B+1 covered span (F7)
-    // insertion-sort the live pane content into the preallocated buffer (0 alloc).
-    let m = 0, i = world.oHead;
+    const trueCut = world.now - W;                        // the TRUE (now - W, now] window (count oracle)
+    // one ring pass: insertion-sort the COVERED-span content into sortBuf AND count the TRUE-window items.
+    let m = 0, trueW = 0, i = world.oHead;
     const tail = world.oTail;
     while (i !== tail) {
-        if (sldPaneEnd(oT[i], pw) > liveCut) {
+        const t = oT[i];
+        if (t > trueCut) trueW++;                         // exact true(W) over (now - W, now]
+        if (sldPaneEnd(t, pw) > liveCut) {
             const v = oV[i];
             let j = m - 1;
             while (j >= 0 && sortBuf[j] > v) { sortBuf[j + 1] = sortBuf[j]; j--; }
@@ -1360,7 +1942,10 @@ export function renderSldPrep(world, allocState) {
         }
         i = (i + 1) & omask;
     }
-    const p50e = sd.quantile(0.5), p90e = sd.quantile(0.9), p99e = sd.quantile(0.99);
+    // F5: merge the live panes ONCE via quantileInto (0 B/call) -- byte-identical to three scalar
+    // quantile() calls but without their three boxed returns.
+    sd.quantileInto(world.qs, world.qout);
+    const qout = world.qout, p50e = qout[0], p90e = qout[1], p99e = qout[2];
     let p50t = NaN, p90t = NaN, p99t = NaN, maxRel = 0;
     if (m > 0) {
         p50t = sortBuf[(0.5 * (m - 1)) | 0];
@@ -1390,7 +1975,39 @@ export function renderSldPrep(world, allocState) {
     flat[Q_ORACLE_BYTES] = m * (BYTES_PER_F64 * 2);
     flat[Q_SKETCH_ALLOC] = allocState.sketchCount;
     flat[Q_ORACLE_ALLOC] = allocState.oracleCount;
-    return p50e;
+    // --- 1.8.0 (D6) APPEND-ONLY: the B+1 covered span vs the TRUE window, and the strict / range readouts.
+    // rangeMin / rangeMax are read into locals (NaN when undeclared) then stored into slots (elided). The
+    // count cursor uses the TRUE-window trueW (never the covered span m), so it exposes under-coverage. ---
+    const rmin = sd.rangeMin, rmax = sd.rangeMax;
+    flat[Q_TRUEW] = trueW;
+    // Empty window (null is not zero): with no items in the TRUE (now - W, now] window the F7 cursor is
+    // UNDEFINED, not 1 -- an empty window reading "1.00x in green" is a false pass. Fail closed to NaN
+    // (rendered "n/a", neutral class) so the cursor never claims coverage over nothing.
+    flat[Q_CNT_CURSOR] = trueW > 0 ? cnt / trueW : NaN;
+    flat[Q_COVMIN] = W;
+    flat[Q_COVMAX] = W + pw;
+    flat[Q_STRICT] = sd.strict ? 1 : 0;
+    flat[Q_RANGEMIN] = rmin;
+    flat[Q_RANGEMAX] = rmax;
+    flat[Q_REJECTED] = world.rejected;
+    flat[Q_MODE] = world.mode;
+    // Oracle gate (D6 blocker 7), COLD branch: every displayed number derived from the exact ring (the
+    // quantile true values Q_P*T, the accuracy cursor Q_MAXREL / Q_FRAC, the live/edge counts Q_LIVE /
+    // Q_EDGE, and the true(W) count Q_TRUEW + its cursor Q_CNT_CURSOR) is meaningless when the ring is not
+    // a faithful (now - W, now] snapshot. Fail closed to NaN (rendered "n/a", gauge skipped) rather than
+    // derive from a frozen / half-refilled ring and show it as live. Two cold branches, both NaN the same
+    // slots: (1) oracle off -> the ring is frozen stale; (2) resume hold -> the ring is refilling and is
+    // not a full valid window until now - resumeNow >= W. At defaults (oracleOn true, resumeNow -Infinity)
+    // neither branch fires, so the golden stays bit-identical. Q_COUNT / Q_ORACLE_BYTES stay live readouts.
+    if (!world.oracleOn || world.now - world.resumeNow < W) {
+        flat[Q_P50T] = NaN; flat[Q_P90T] = NaN; flat[Q_P99T] = NaN;
+        flat[Q_MAXREL] = NaN; flat[Q_FRAC] = NaN;
+        flat[Q_LIVE] = NaN; flat[Q_EDGE] = NaN;
+        flat[Q_TRUEW] = NaN; flat[Q_CNT_CURSOR] = NaN;
+    }
+    // HEAD returned `p50e` (a fractional quantile) and boxed 16 B/call across the render boundary; return
+    // an int32 fold instead (lite-law) so the whole render measures 0 B/op (DemoProbe sld_render lane).
+    return (world.n + world.rejected) | 0;
 }
 
 // =======================================================================================

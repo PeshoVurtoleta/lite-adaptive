@@ -74,6 +74,27 @@ gap (member fixed vs oracle growing).
 | 08 | **SlidingCountMin** | how OFTEN did key k occur in the last W? | tracked-key est bars inside the one-sided band | exact per-key windowed (t,key) ring | `true(W) <= est <= true(W+W/B) + eps*N` | scm.bytes fixed vs ring O(W) |
 | 09 | **DecayedReservoir** | give me k RECENT items | the k-sample by AGE (recent = left) | brute-force decayed sampler (retains O(N)) | inclusion rate by age `~ exp(-lambda*age)` | dr.bytes fixed vs O(N) retained |
 
+### 1.8.0 additions (D1-D8) -- what each scene grows to demonstrate the 1.7.0 / 1.8.0 work
+
+The nine scenes above stay; 1.8.0 adds controls + readouts so every 1.7.0 hardening fix and every
+1.8.0 additive-API surface is VISIBLE and re-derived live (DEMO.md section 0). Each is proven by a D10
+faithfulness test + a frame-path 0 B/op test with the control engaged (section 7). The flat layout is
+APPEND-ONLY: a new readout is a NEW slot after the last existing index; `demo/golden-flat.json` +
+`demo/Demo.test.mjs` pin the pre-existing slots bit-identical (section 7).
+
+| D-step | Scene | New control(s) | New readout(s) | Fix / API demonstrated | Re-derived against |
+|--------|-------|----------------|----------------|------------------------|--------------------|
+| D1 | 01 EH | `maxCount` select; `dense10k` preset (W=1024, gap 0.1); F17 skewed/spike-value toggle | pool gauge (live pop vs EXACT ceiling `k*(2^levels-1)` vs capacity/bytes); fail-closed overflow banner; `sum()` error cursor vs the STATED `straddle/2` bound next to the old `<= eps` line failing | F1/F11 (`maxCount` + capped pool, tagged overflow throw), F17 (`sum()` is NOT `<= eps`) | a demo-local `EhProbe` reads the straddle size (like `test/witness.mjs`); the exact ring |
+| D2 | 02 ADWIN | absolute-offset slider {0, 1e3, 1e6, 1e9, 1.7e12}; `bigJumpThenPlus1` preset | live-window range R vs a GHOST of the 1.6.0 global (never-shrinking) range | F9 (offset-invariant false-alarm via centred sums), F18 (R is the retained window's value range, incl. the straddling oldest bucket -- NOT the library's internal R, which excludes it) | the exact regime mean; the ghost is the demo's own running global min/max |
+| D3 | 04 HK | key-magnitude toggle {small, `>= 2^31`, negative}; log2 weight slider whose `2^32` notch is REJECTED | the PRIMARY allocation counter pinned at 0 through `addFrom` AND `renderHkPrep` across all key classes; a SAT badge at the `2^32-1` ceiling; a fail banner on the `2^32` rejection | F3 (`addFrom` boxes no large/negative key; the render Map is keyed by the untransformed Smi index so `renderHkPrep` boxes none either), F10 (weight `> 2^32-1` is a tagged throw) | the shipped `hk.estimate` / top-k; the allocation counter itself |
+| D4 | 05 SHLL | query-rate select {1, 8, 64, never} (10Hz ticks): `slA` is `count()`-queried only on the cadence ("never" = 0 queries), `slB` never, a display twin `slD` every tick for the estimate | the `slA` / `slB` `overflows` shown side by side, always EQUAL; the live estimate (from `slD`) | F8 (`count()` is non-destructive: overflows independent of query rate) | the shipped `sl.overflows` getters directly; the display estimate is the shipped `slD.count()` |
+| D5 | 06 DD | 1.8.0 `latch` toggle (latched vs unlatched twins) | a FEW fire markers per regime (latched PH 1-4, latched CUSUM 0-4; 0 on the HI->LO steps) with `lastDirection` arrows + `lastDriftIndex`, vs the unlatched CUSUM storm (~10.9k fires over 21 regimes) | S9 (`latch` + `lastDriftIndex` + `lastDirection`) | a from-spec PH/CUSUM state machine (fire index+direction, per regime); the shipped latched/unlatched detectors on the same signal |
+| D6 | 07 SLD | 3-way strict / `range` toggle (declared range `[1, 20]`) | B+1 pane strip: covered span `[W, W+W/B]` vs the TRUE window bracket; a rejected-value counter + `rangeMin` / `rangeMax` | F7 (B+1 panes cover the full W), F2 (declared `range` strict), F5 (`quantileInto` at 0 B/call) | TWO oracles: the quantile oracle on the covered span `[W, W+W/B]` (matching `test/witness.mjs`); the count oracle `true(W)` on `(now-W, now]`; the render reads through `quantileInto` |
+| D7 | 08 SCM | heavy-count mode (`count >= 2^31`) | `total(w)` readout + the `eps x N` band computed from the ORACLE N; the render reads through `estimateInto` | S2 (`total(w?)`), F6 (`estimateInto` 0-alloc reader) | the exact windowed oracle N (NEVER the library's own `total`); the shipped `estimateInto` |
+| D8 | Truth Panel | -- | a "contracts" line + a Chromium-only key-magnitude allocation lane (see section 4 items 5-6) | F12 / F13 query + option contracts, S11 (31-bit-Smi browser) | the shipped throws / NaN returns; `usedJSHeapSize` deltas |
+
+D9 (SlidingAggregate scene) is MOVED to v1.9.0 with the member -- excluded here.
+
 ---
 
 ## 3. Per-scene specification
@@ -87,6 +108,33 @@ gap (member fixed vs oracle growing).
 - **Bound band**: the HARD windowed `relerr <= epsilon` (reuse the `test/witness.mjs`
   measureCount / measureShift gate); the cursor is `relerr / epsilon`, must stay `<= 1`.
 - Sliders: window `W`, error knob `epsilon`.
+- **1.8.0 (D1)**:
+  - A `maxCount` select (the declared population bound, F1/F11/S3). A **pool gauge** shows the live
+    population against the EXACT ceiling `k * (2^levels - 1)` and the fixed `capacity` / `bytes`
+    (all PUBLIC getters -- `eh.levels`, `eh.capacity`, `eh.bytes`), so a consumer reads headroom
+    without a size-vs-capacity heuristic.
+  - A `dense10k` preset: `W = 1024`, gap `0.1`, pool sized with `maxCount = W`. Its merge cascade
+    overflows the pool; the shipped code throws a TAGGED `[lite-adaptive]` RangeError (1.6.0 went to
+    `count() = NaN` here). The demo wraps the add in a try/catch and renders a **fail-closed banner
+    carrying the library's own message** -- the honesty signal, not a silent NaN.
+  - An **F17 toggle** (skewed / integer-spike values). With it on, the `sum()` error cursor is drawn
+    against the STATED bound `straddle / 2` (a demo-local `EhProbe` reads the straddling bucket's size
+    exactly as `test/witness.mjs` does), NEXT TO the old `sum() <= eps` line VISIBLY failing -- the
+    scene's proof that `sum()` is bounded by the straddle mass, never by `epsilon`.
+  - **Oracle-off fail-closed** (in `renderEhPrep`, behind `world.oracleOn`, a COLD branch): with the
+    exact ring toggled off, ALL SEVEN oracle-derived slots (`E_TRUE`, `E_RELERR`, `E_FRAC`, `E_POP`,
+    `E_TRUESUM`, `E_SUMFRAC`, `E_SUMRELEPS`) are set to `NaN` -- rendered "n/a", gauge skipped -- rather
+    than a frozen stale ring shown as live (null is not zero). `E_RING_BYTES` stays a live memory readout.
+    The write lives in the kernel, not the untested UI tick, so a test drives it. On RE-ENABLE the exact
+    ring is refilling for a full window: the SAME seven slots hold `NaN` until `now - resumeNow >= W`, so
+    a half-refilled ring never paints a false red gauge for the ticks after resume. At defaults (`oracleOn`
+    true, `resumeNow = -Infinity`) neither branch fires, so the golden stays bit-identical. The pool gauge
+    draws only the ceiling hairline (the right-edge marker), so its label reads "population vs exact
+    ceiling", not "vs capacity".
+  - **10Hz render cost, honestly**: `renderEhPrep` measures 0 B/op in the optimized steady state
+    (`eh.count()` / `eh.sum()` return Smi-range integer doubles at these configs). On the F17 spike world
+    it boxes ~32 B/call before V8 fully optimizes it, settling to 0 by ~200k warm-up calls -- the
+    `eh_render_spike` probe lane warms past that point, so the gate reads the optimized steady state.
 
 ### Scene 02 -- ADWIN (drift + adaptive window)
 - A stream drifting between two concept means. `ADWIN.addFrom` GROWS the window
@@ -97,6 +145,32 @@ gap (member fixed vs oracle growing).
   the on-screen witness is the adapted-mean band `|mean - mu| / 0.05` (the witness's
   adapted-window gate), cursor `<= 1` once settled.
 - Slider: confidence `delta`.
+- **1.8.0 (D2)**:
+  - An **absolute-offset slider** {0, 1e3, 1e6, 1e9, 1.7e12} added to every value. Behavior is
+    IDENTICAL across offsets (F9: centred/Welford variance, not `E[x^2] - mean^2`) -- the false-alarm
+    count and the step-detection delay stay within a couple of items of the offset-0 run.
+  - A `bigJumpThenPlus1` preset: a large level shift, then a later `+1` shift. The later shift IS
+    detected (F18) -- the honesty test measures the ITEM-EXACT first cut after the shift (a fresh replay,
+    not `world.lastCut`, which is the LAST cut inside a 32-item frame while ADWIN sheds buckets) and gates
+    it within `1.5*d0 + 10` items per seed over 100 seeds, with the old running-GLOBAL-R variant as a
+    MUST-FAIL control (it stays deaf). The scene draws the **live-window range R** -- the exact value range
+    (max-min) of the RETAINED window (the last `ad.width` fed values read straight from the stream suffix),
+    INCLUDING the straddling oldest bucket; this is NOT the library's internal F18 R, which EXCLUDES that
+    oldest bucket -- against a GHOST of the 1.6.0 behavior -- a demo-maintained running GLOBAL min/max that
+    never shrinks -- to show why 1.6.0 went deaf (an inflated Bernstein range term). ADWIN cuts at bucket
+    granularity, so right after a cut the live window may still carry ONE straddling oldest bucket of
+    pre-shift values (R ~1.5) for a few frames before it is shed. The GHOST global range is folded by a
+    dedicated always-run kernel (`stepAdGhost`), OUTSIDE the vs-oracle (naive-mean foil) branch, so
+    pausing the foil never freezes it stale. The live-window range is recomputed each render from the
+    stream suffix over the WHOLE retained window (the last `ad.width` values, bounded by the stream ring
+    `AD_STREAM_LEN = 65536`, past which it fails closed to `NaN`) -- there is no 256-value scan cap
+    (`AD_LIVER_SCAN = 256` survives only as the OLD-cap anchor a faithfulness test asserts `width >`).
+  - **10Hz render cost, honestly**: the per-frame path (`stepAd` + `stepAdGhost` + `stepAdOracle`) is
+    0 B/op. `renderAdPrep` is ALSO 0 B/op in the optimized steady state: `ad.mean` / `ad.variance`
+    return fractional doubles that box ~16 B each when their return ESCAPES (proven by the DemoProbe
+    `ad_mean_sink` / `ad_variance_sink` controls, which read 16 B/op), but the render keeps every value
+    in a `Float64Array` slot end to end and returns an int32 fold, so V8 ELIDES the getter returns.
+    (HEAD's `return mean` sank such a double across the render boundary and boxed 48 B/call.)
 
 ### Scene 03 -- ForwardDecay (time-decayed aggregate)
 - A stream whose value distribution shifts; `ForwardDecay.addFrom` keeps TWO scalars
@@ -117,15 +191,54 @@ gap (member fixed vs oracle growing).
   (100%). The MARQUEE (proven on a DRIFTING stream in the test): HeavyKeeper's mean
   rel-error is far BELOW a faithful Space-Saving baseline of the same size.
 - Slider: top-k `k` (drives the `N/k` threshold).
+- **1.8.0 (D3)**:
+  - A **key-magnitude toggle** {small, `>= 2^31`, negative} that feeds keys of that class through
+    `addFrom`. The Truth Panel PRIMARY allocation counter stays PINNED at 0 across ALL classes (F3:
+    the key rides Float64 slots, `hkMapHash` returns `| 0`) -- the box the plain `add` path shows is the
+    control. Never call `topK()` in the render (it allocates); use `topKInto`.
+  - A **log2 weight slider** whose notches are `2^s`: `s in [0,31]` -> `2^s`; `s == 32` -> the ceiling
+    `2^32-1`, where the top uint32 cell SATURATES and the **SAT badge** lights; `s == 33` -> `2^32`,
+    which the library's **F10 guard REJECTS** (a tagged `[lite-adaptive]` throw, not a silent
+    `estimate = 0`). The rejection is caught into a **fail banner** showing the library's own message,
+    and the last valid world keeps running (never a dead rAF loop).
+  - With the **exact-Map oracle toggle OFF** the recall / bracket / max-overestimate / HK-vs-SS marquee
+    read **`n/a`** (the Map + Space-Saving foil are frozen while the sketch keeps counting -- fail closed
+    to NaN rather than show a stale "recall 100%").
 
 ### Scene 05 -- SlidingHyperLogLog (windowed distinct-count)
 - A key stream cycling over a fixed universe flies in via `addFrom([now, key])`; the
   canvas scrolls the windowed DISTINCT estimate (violet) against the exact in-window
   `Map` size (magenta). The register bank is a FIXED `m = 2^p`; the oracle keeps every
   in-window key. Idle-slide toggle -> `advanceFrom` empties the window to 0.
+- The "sketch bytes (fixed, per instance)" readout is ONE instance's `sl.bytes`. The scene holds
+  three identical instances (slA queried on the cadence, slB never queried, slD display-only), so
+  the scene's total fixed sketch memory is 3x that figure -- still independent of the stream.
 - **Bound band**: `relerr <= 3 sigma = 3 * 1.04/sqrt(m)` (reuse the `test/witness.mjs`
   slDrive gate), and `degraded === false`; the cursor is `relerr / 3-sigma`, `<= 1`.
 - Sliders: window `W`, precision `p`. Pause-the-stream toggle (windowed member).
+- **1.8.0 (D4)**:
+  - A **query-rate select** {1, 8, 64, never} (in 10Hz TICKS) driving THREE instances fed the IDENTICAL
+    stream: `slA` is `count()`-queried ONLY when the tick countdown fires (so **"never" queries `slA`
+    ZERO times** -- the control has teeth, proven by a counting wrapper), the twin `slB` is NEVER queried,
+    and a display-only twin `slD` is `count()`-queried EVERY tick for the on-screen estimate (always live,
+    independent of the cadence). All three `overflows` getters are ALWAYS EQUAL (F8: `count()` is
+    non-destructive -- expiry moved into the add push, so `overflows` / `degraded` no longer depend on
+    query frequency). `slA` and `slB` are shown side by side.
+  - The display `count()` (on `slD`) boxes a double return once per 10Hz tick (the documented
+    one-boxed-return, NOT a library bug); the per-frame `stepShll` calls NO `count()`, so it is honestly
+    0 B/op. A shared steady-state probe (`demo/DemoProbe.mjs`, pinned semi-space) SEES the box in the
+    `shll_render` lane (built at cadence "never" to isolate the render) where the demo's `measureAllocs`
+    gate reads a false 0 -- and proves every per-frame lane is <= 0.5 B/op. The render's cost is
+    **16-32 B per tick, depending on the V8 tier**. 16 B is a STABLE allocation inside the shipped
+    `SlidingHyperLogLog.count()` itself: it is present even Turbofan-only, it is not the return value and
+    not the `slTau` / `slSigma` call boundaries -- a scratch bisect localizes it to the estimator tail and
+    it fires only on non-degenerate (fractional) register data. A SECOND 16 B appears in some runs: when
+    the render is not Turbofan-optimized, `count()`'s integer-valued double return is materialized as a
+    HeapNumber at the call boundary -> 32 B. Nothing in the demo code boxes (`standardError` / `relerr` /
+    the gate each read 0 B). The per-call library cost is a known finding logged in ROADMAP.md, not
+    hidden here. The `shll_render` gate is banded `>= 12 AND <= 40` B/op -- a THIRD box (48 B) fails it.
+  - **Oracle-off fail-closed**: with the exact-`Map` oracle toggle off, `renderShllPrep` NaNs `S_TRUE` /
+    `S_RELERR` / `S_FRAC` in its cold branch (rendered "n/a", gauge skipped), never a frozen stale number.
 
 ### Scene 06 -- DriftDetector (Page-Hinkley vs CUSUM)
 - ONE regime-stepping signal feeds TWO O(1)-state detectors via `addFrom` -- Page-Hinkley
@@ -136,6 +249,38 @@ gap (member fixed vs oracle growing).
   divergence gate): on a slow mean ramp CUSUM fires far more than PH. Two witness gauges
   (PH statistic/threshold, CUSUM statistic/threshold). NO pause toggle (item-indexed).
 - Sliders: `threshold`, `delta`.
+- **1.8.0 (D5)**:
+  - A **`latch` toggle** (S9) driving LATCHED twins of PH and CUSUM beside their UNLATCHED selves on
+    the same signal. The latched channels re-arm only when the statistic falls back below `threshold / 2`,
+    so they draw a FEW markers per regime -- MEASURED on the demo stream (21 regimes, two stream laps):
+    latched PH fires 1-4 times per regime, latched CUSUM fires 0-4 (exactly **0 on every HI->LO step** --
+    a fixed-target property, since a CUSUM referenced to the LO baseline `mu0=0` accumulates no evidence
+    when the mean drops back TO its target; explained on-canvas). This is NOT "one fire per regime"; the
+    win is the CONTRAST with the unlatched CUSUM storm (~10.9k fires over the same 21 regimes; unlatched
+    PH is adaptive and barely fires, ~50). Each latched marker carries a `lastDirection` (+1 / -1) arrow
+    and `lastDriftIndex`. All read the shipped `latch` / `lastDriftIndex` / `lastDirection` getters; the
+    `latch:false` path is byte-identical to 1.x. The fire (index, direction) sequence of both latched
+    channels is asserted EQUAL to an in-test **from-spec state machine** (PH online-mean reset at the fire;
+    CUSUM fixed target; re-arm at `threshold/2`; opposite single-item gap `> threshold` fires) written from
+    the spec + decisions/0007, never from kernel output; a per-regime gate bounds the counts. `createDdWorld`
+    builds FOUR detectors (unlatched PH/CUSUM + the `latch:true` twins) and feeds all four the SAME signal
+    in `stepDd`; the toggle only sets the display-emphasis flag `G_LATCH_ON` (no rebuild, no forced reflow).
+    A non-boolean `latch` is a tagged `[lite-adaptive]` throw BEFORE any allocation (fail-closed knob).
+    `lastDriftIndex` / `lastDirection` are `NaN` before any fire (null is not zero) -- the tick renders
+    "n/a", never `String(NaN)`.
+  - **Cost, honestly**: `stepDd` (32 values x 4 detectors' `addFrom`) is **0 B/op** in the steady state
+    under DEFAULT flags (DemoProbe `dd_frame` + `dd_frame_nolatch` lanes, pinned semi-space, gated
+    `<= 0.5 B/op` -- the library holds every value in a `Float64Array` slot end to end, so the frame path
+    never boxes; no `--no-maglev` exemption). The ~10Hz `renderDdPrep` reads SIX fractional `statistic` /
+    `mean` getters in one unit (unlatched PH/CUSUM + the two latched twins). Each getter calls
+    `_guardFinite()`; six of them in one function exhaust V8's cumulative inlining budget, so THREE of the
+    returns run out of line and box ~16 B each -> **~48 B/tick**, a DOCUMENTED cost the DemoProbe `dd_render`
+    lane measures in the band `[44, 52]` (never claimed 0). It is NOT that "V8 will not elide each getter"
+    -- each getter read alone elides to 0 B/op (proven: two/three getters read 0, four read 16, six read
+    48); the box is the cumulative-budget cutoff. Reading fewer getters per tick is not possible without
+    leaving a displayed slot stale (the golden pins them). HEAD's `renderDdPrep` also returned `ps` (a
+    fractional statistic) and boxed a fourth 16 B; the render now returns an int32 fire-count fold, so the
+    ONLY boxes are the three required getter reads.
 
 ### Scene 07 -- SlidingDDSketch (windowed relative-error quantiles)
 - A positive lognormal stream (its center shifts each lap) flies in via
@@ -146,6 +291,30 @@ gap (member fixed vs oracle growing).
 - **Bound band**: `relerr <= alpha` per quantile (reuse the `test/witness.mjs` sldDrive
   gate) and window-edge `<= one pane width W/panes`; cursor `relerr / alpha`, `<= 1`.
 - Sliders: window `W`, `alpha`. Pause-the-stream toggle (windowed member).
+- **1.8.0 (D6)**:
+  - A **B+1 pane strip** drawing the covered span `[W, W + W/B]` against the TRUE `(now-W, now]` window
+    bracket, with the straddling oldest pane sticking out past the true edge (F7: the sketch keeps B+1
+    panes so the span ALWAYS covers the full W). There are TWO oracles on TWO windows (see below): the
+    quantile oracle stays on the COVERED span `[W, W+W/B]`; a SEPARATE count oracle `true(W)` is added on
+    the TRUE `(now-W, now]` window, and a `count() >= true(W)` cursor is drawn from it (never `< 1`).
+  - A **3-way strict / `range` toggle** (`createSldWorld` mode 0 default / 1 strict span-based / 2
+    declared range `[1, 20]`, locked at the ctor, fail-closed on a bad mode) with a rejected-value
+    counter and the `rangeMin` / `rangeMax` getters, so a consumer PRE-CHECKS the accepted band instead
+    of catching a "would collapse" throw. In range mode `stepSld` pre-checks each value against
+    `[rangeMin, rangeMax]` read ONCE at build (`!(v >= rMin && v <= rMax)` rejects NaN too): an
+    out-of-band value is NOT added (the rejected counter climbs) but the clock slides via `advanceFrom`
+    -- 0 B/op, no try/catch, no throw on the hot path. The exact oracle applies the identical pre-check,
+    so its content mirrors the accepted set.
+  - **Two INDEPENDENT oracles**: the quantile oracle is the exact sorted multiset of the COVERED span
+    `[W, W + W/B]` (rel-error is purely DDSketch bucket error, `<= alpha`); the count cursor
+    `count() / true(W)` uses a SEPARATE `true(W)` over the TRUE `(now - W, now]` window (a covered-span
+    count would read ~1 always and hide under-coverage). The cursor never drops below 1 (F7).
+  - The render path reads through **`quantileInto`** (F5: 0 B/call; byte-identical to three scalar
+    `quantile()` calls, so the pre-existing golden slots stay bit-identical). `renderSldPrep` returns an
+    int32 fold (HEAD returned `p50e` and boxed 16 B). **Cost, honestly**: `stepSld` (both modes) and
+    `renderSldPrep` are 0 B/op in the steady state (DemoProbe `sld_frame_range` / `sld_frame_strict` /
+    `sld_render` lanes); the scalar `quantile()` keeps its one boxed return (~16 B/call, the `sld_quantile_box`
+    control lane), documented -- the render never calls it.
 
 ### Scene 08 -- SlidingCountMin (windowed per-label frequency)
 - A Zipfian key stream flies in via `addFrom([now, key, count])`; the canvas draws a few
@@ -156,6 +325,15 @@ gap (member fixed vs oracle growing).
   queries (reuse the `test/witness.mjs` scmDrive one-sided gate); the saturated flag is
   the honesty signal.
 - Sliders: window `W`, `epsilon`. Pause-the-stream toggle (windowed member).
+- **1.8.0 (D7)**:
+  - A **`total(w)` readout** (S2: an exact windowed N from a Float64 total per pane, +8 B/pane) and the
+    `eps x N` band. CRITICAL: the band on screen is computed from the ORACLE's exact N over the covered
+    span, NEVER from the library's own `total()` -- an oracle that shares the design's geometry would
+    agree with a bug. `total(w)` is displayed BESIDE the oracle N as its own faithfulness check.
+  - A **heavy-count mode** (`count >= 2^31`) so the `estimate` of a large windowed count is exercised
+    (F6: the large-count return boxes once per call; the render reads through **`estimateInto`**, a
+    batch 0-alloc reader over Float64Arrays).
+  - Same `w` semantics as `estimate`: a bad sub-window reads NaN (F12), never a fail-open 0.
 
 ### Scene 09 -- DecayedReservoir (recency-biased fixed-k sample)
 - A stream flies in via `addFrom([now, value])` (value = the arrival timestamp, so age =
@@ -205,6 +383,19 @@ lite-sketch verbatim); item 4 is the lite-adaptive family witness.
      that must contain it.
    - **Space vs exact**: the member's FIXED bytes (flat) vs the exact oracle's bytes
      climbing O(N)/O(W)/O(distinct). Both in KB with the live N.
+5. **CONTRACTS (1.8.0, D8).** A cold "contracts" line driven by a demo probe that exercises the
+   shipped fail-closed surface once (NOT per frame): a bad sub-window `w` reads NaN (SCM/SDD/SHLL,
+   F12), a bad quantile `q` reads NaN (SDD), a bad key reads NaN, and a typo'd option key
+   (`{maxCuont: 5}`) surfaces the shipped **did-you-mean** message (F13). The line shows the actual
+   returned NaN / thrown message from `Adaptive.js`, never a hardcoded string -- fail-closed proven,
+   not asserted.
+6. **KEY-MAGNITUDE ALLOCATION (1.8.0, D8, S11) -- labeled secondary, Chromium-only, coarse.** A
+   HeavyKeeper `addFrom` burst readout contrasting small keys against keys in `[2^30, 2^31)` via
+   `performance.memory.usedJSHeapSize` deltas, exposing that `[2^30, 2^31)` keys are HeapNumbers on a
+   31-bit-Smi build (N6). It is a labeled SECONDARY overlay like the heap readout (item 3), gated
+   behind a **meter self-test control**: a lane KNOWN to box `>= 8 B/op` must read `>= 8`, else the
+   readout shows **"n/a (meter blind)"** -- NEVER 0 (null is not zero; a blind meter must not read as a
+   clean pass). Absent `performance.memory` (non-Chromium) the whole lane reads "n/a".
 
 ---
 
@@ -218,6 +409,23 @@ explicit resize or a topology change (a new W / epsilon / delta / halfLife / k
 rebuilds the member). No `ctx.save`/`restore`, no object/array literals, no closures,
 no allocating `Array` methods, no string concat in the hot draw path. `topK()`
 ALLOCATES by contract -- the render path uses `topKInto` / `forEach` only. ASCII-only.
+
+### The DEMO AUDIT law (1.8.0, enforced by a static test over `index.html`, section 7 D10)
+
+These are LAW, not style, and `demo/Demo.test.mjs` reads `index.html` as text and FAILS the build on
+a violation (with an injected-violation control per rule, so the audit itself has teeth):
+- **No layout read in a hot body.** No `getElementById` / `querySelector` / `getBoundingClientRect` /
+  `.offsetWidth` / `.clientWidth` / `getComputedStyle` inside any `*Tick` / `*Draw` / loop / rAF-callback
+  body. Every DOM handle is cached ONCE at init in a `$`-prefixed const; a forced reflow in the frame
+  path is a defect.
+- **Pointer events only for low-level interaction.** No `mousedown` / `mousemove` / `mouseup` /
+  `touchstart` / `touchmove` / `touchend` listeners. `pointer*` for dragging; `click` stays for
+  accessible button activation.
+- **Hex before oklch.** Every CSS color declares a hex fallback BEFORE any `oklch()` on the same
+  property, so a browser that ignores oklch takes the hex.
+- **`:hover` inside `@media (hover: hover)`.** No bare `:hover` rule.
+- **Telemetry text under the frame mask.** `textContent` / `innerText` writes happen only under the
+  ~10Hz frame-counter mask, never every frame; no `toFixed` / `toLocaleString` in a per-frame loop.
 
 ---
 
@@ -250,6 +458,28 @@ ALLOCATES by contract -- the render path uses `topKInto` / `forEach` only. ASCII
   `eh.bucketCount` stays `<= capacity`; and after pause cycles on the four windowed
   scenes the readout slides to empty (`eh.count()` / `shll.count()` / `scm.estimate(k)`
   -> 0, `sld.quantile(0.5)` -> NaN).
+- **D10 (1.8.0) -- every new control/readout is gated**:
+  - **Append-only golden**: `demo/golden-flat.json` pins each scene's flat buffer (big-endian Float64
+    hex, 300 frames at defaults). A test re-runs the CURRENT kernels the same way and asserts every
+    PRE-EXISTING slot is bit-identical; layouts are APPEND-ONLY (new slots only after the last existing
+    index). A declared exception list carries any slot a pass legitimately changes (empty at P0; P2
+    adds HK `H_RECALL` / `H_FOUND`). A must-fail control flips one golden bit and confirms the
+    comparison reports it.
+  - **Faithfulness per new readout**: every new displayed number equals the shipped getter / reader
+    (`eh.levels` / `eh.capacity` / `eh.bytes`, the `maxCount` overflow throw's message, `ad` live
+    range, `hk.estimate` under each key class, twin `sl.overflows`, `dd.lastDriftIndex` /
+    `lastDirection`, `sd.rangeMin` / `rangeMax` / `quantileInto`, `scm.total(w)` / `estimateInto`),
+    never hardcoded.
+  - **Frame-path 0 B/op with the control ENGAGED**: the `dense10k` add-in-try/catch, the F17 sum
+    lane, each key-magnitude class through `addFrom`, the query-rate twins, the latched twins, the
+    B+1 render through `quantileInto`, and the `estimateInto` render path each measure 0 B/op and 0
+    major GC over the long run (mirroring `test/torture.mjs`), plus the idle-slide/retention proof for
+    each windowed scene.
+  - **Contracts + S11 probes**: the D8 contracts probe asserts a bad `w` / `q` / key reads NaN
+    (F12) and `{maxCuont: 5}` yields the shipped did-you-mean (F13); the S11 meter self-test asserts
+    the "n/a (meter blind)" fallback fires when the known-boxing control reads `< 8 B/op` (never 0).
+  - **The DEMO AUDIT** static test over `index.html` (sections 5-6) with a per-rule injected-violation
+    control.
 - **`demo:check` in `verify`**: a fast lane (trinity + faithfulness + one alloc batch
   per scene, skipping the 200k-frame GC lanes) runs as the last step of `npm run verify`,
   so the demo can never silently rot behind a library release again. The full
@@ -272,8 +502,11 @@ ALLOCATES by contract -- the render path uses `topKInto` / `forEach` only. ASCII
   scene, skipping the GC lanes), and `"demo:serve": "node demo/serve.mjs"`. `demo:check`
   is appended to the `verify` chain so the demo can never silently rot behind a release.
   `files[]` UNCHANGED (6 entries); `npm pack --dry-run` still shows exactly 7 files with
-  `demo/` absent. `Adaptive.js` is NOT touched (the demo imports it, read-only); the
-  library VERSION stays 1.6.0 (a demo update never bumps the library).
+  `demo/` absent. `Adaptive.js` is NOT touched (the demo imports it, read-only); a demo update
+  never bumps the library VERSION -- the demo TRACKS the working tree (whatever VERSION
+  `Adaptive.js` currently carries; `/release` owns the bump), and the version-trinity test asserts
+  kernels === `Adaptive.js` === `package.json` with NO hardcoded semver, so the demo can never pin a
+  stale version. (`demo/golden-flat.json` is likewise repo-only, absent from `files[]`.)
 - **Pipeline**: coder builds -> reviewer audits the diff for per-frame allocation AND
   fail-open metric lies (a band that can't be exceeded, a hardcoded error) -> qa
   proves faithfulness + witness + version-trinity + 0-B/op + non-vacuous. USER

@@ -146,7 +146,20 @@
             text-transform: uppercase; margin-bottom: 4px;
         }
         .field input[type="range"] { width: 100%; accent-color: var(--accent); }
+        .field select {
+            width: 100%; background: var(--bg-3); color: var(--text); border: 1px solid var(--line-strong);
+            border-radius: 4px; padding: 4px 6px; font-family: inherit; font-size: 11px;
+        }
         .field-value { color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+        /* Fail-closed banner: carries the library's OWN thrown message (never a hardcoded string). */
+        .fail-banner {
+            margin-top: 10px; padding: 8px 10px; border-radius: 4px; font-size: 11px; line-height: 1.5;
+            color: #f87171; color: var(--red);
+            background: rgba(248, 113, 113, 0.08); border: 1px solid rgba(248, 113, 113, 0.4);
+        }
+        .fail-banner[hidden] { display: none; }
+        .fail-banner b { color: #f87171; color: var(--red); }
 
         .help-line { color: var(--text-dim); font-size: 11px; line-height: 1.55; margin: 10px 0 0; }
         .help-line code { color: var(--accent); background: rgba(139, 124, 246, 0.08); padding: 0 4px; border-radius: 3px; }
@@ -188,6 +201,9 @@
         .stat-row .v.accent { color: var(--accent); font-weight: 700; }
         .stat-row .v.inband { color: var(--green); font-weight: 700; }
         .stat-row .v.outband { color: var(--red); font-weight: 700; }
+        /* D3 saturation badge: dim until the top cell hits the 2^32-1 ceiling, then a red alarm. */
+        .sat-badge { color: var(--text-faint); font-weight: 700; border: 1px solid var(--line-strong); border-radius: 3px; padding: 0 4px; }
+        .sat-badge[data-on="true"] { color: var(--red); border-color: var(--red); box-shadow: var(--glow-red); }
         .caveat { font-size: 10px; color: var(--text-faint); line-height: 1.5; }
 
         /* Stage overlays ---------------------------------------------------- */
@@ -286,8 +302,49 @@
                     </p>
                 </section>
                 <section>
+                    <h3>1.8.0 - pool bound &amp; the sum() truth</h3>
+                    <div class="field">
+                        <label>maxCount (declared population bound) <span class="field-value" id="eh-maxcount-v">2^32</span></label>
+                        <select id="eh-maxcount">
+                            <option value="default" selected>2^32 (default -- pool never overflows)</option>
+                            <option value="w">W (the pre-1.7.0 W-sized pool)</option>
+                            <option value="small">256 (a tiny pool)</option>
+                        </select>
+                    </div>
+                    <div class="toggle-row">
+                        <div class="toggle" id="eh-dense-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">dense10k preset (W=1024, gap 0.1): <b id="eh-dense-label">off</b></span>
+                    </div>
+                    <div class="toggle-row">
+                        <div class="toggle" id="eh-values-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">F17 values: <b id="eh-values-label">uniform (sum == count)</b></span>
+                    </div>
+                    <div class="fail-banner" id="eh-fail" hidden>
+                        <b>fail-closed:</b> <span id="eh-fail-msg"></span>
+                    </div>
+                    <p class="help-line">
+                        A W-sized pool + dense10k OVERFLOWS: the shipped code throws a tagged
+                        <code>[lite-adaptive]</code> RangeError (1.6.0 went to <code>NaN</code>) -- the demo
+                        catches it and shows the library's OWN message. F17: <code>sum()</code> is bounded
+                        by the straddling-bucket mass, NOT by epsilon.
+                    </p>
+                </section>
+                <section>
                     <h3>truth panel - the two proofs</h3>
                     <div class="truth">
+                        <div>
+                            <div class="primary-label">1.8.0 - pool gauge (population vs exact ceiling k*(2^levels-1), marked by the right-edge hairline)</div>
+                            <canvas id="eh-pool" class="space-c"></canvas>
+                            <div class="stat-row"><span class="k">live population / ceiling</span><span class="v" id="eh-pool-pop">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">maxCount / capacity (buckets)</span><span class="v" id="eh-pool-cap">0 / 0</span></div>
+                        </div>
+                        <div>
+                            <div class="primary-label">1.8.0 - sum() error vs its STATED bound straddle/2 (F17)</div>
+                            <canvas id="eh-sum" class="witness-c"></canvas>
+                            <div class="jank-caption">cursor = |sum - true| / (straddle/2); green inside the STATED bound, red past 1.0</div>
+                            <div class="stat-row"><span class="k">sum() / true sum</span><span class="v" id="eh-sum-v">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">relerr(sum) / epsilon (OLD claim)</span><span class="v outband" id="eh-sumreleps">0.00x</span></div>
+                        </div>
                         <div>
                             <div class="primary-label">primary - jank detector</div>
                             <canvas id="eh-jank" class="jank-c"></canvas>
@@ -365,6 +422,22 @@
                         Smaller delta -> fewer false alarms, slower detection. Window memory is a FIXED
                         <span class="field-value" id="ad-mem">0 KB</span> pool -- exact drift tracking
                         would keep O(N) values.
+                    </p>
+                </section>
+                <section>
+                    <h3>1.8.0 - offset invariance &amp; the 1.6.0 ghost</h3>
+                    <div class="field">
+                        <label>absolute offset (added to every value) <span class="field-value" id="ad-offset-v">0</span></label>
+                        <input type="range" id="ad-offset" min="0" max="4" step="1" value="0">
+                    </div>
+                    <div class="btn-row"><button class="btn" id="ad-preset">big jump then +1</button></div>
+                    <div class="stat-row"><span class="k">live-window range R</span><span class="v accent" id="ad-liver">0</span></div>
+                    <div class="stat-row"><span class="k">1.6.0 ghost global range</span><span class="v outband" id="ad-ghostr">0</span></div>
+                    <p class="help-line">
+                        F9: an additive offset shifts the MEAN, not the variance -- ADWIN behaves
+                        IDENTICALLY at offset 1.7e12 (centred sums). F18: the live-window range R stays
+                        small after a snap, while a 1.6.0 GHOST global range never shrinks -- why 1.6.0
+                        went deaf to a later +1 shift.
                     </p>
                 </section>
                 <section>
@@ -541,6 +614,32 @@
                     </p>
                 </section>
                 <section>
+                    <h3>1.8.0 - key magnitude &amp; weight (F3 / F10)</h3>
+                    <div class="field">
+                        <label>key magnitude (fed through addFrom) <span class="field-value" id="hk-keymode-v">small</span></label>
+                        <select id="hk-keymode">
+                            <option value="0" selected>small (k)</option>
+                            <option value="1">&gt;= 2^31 (k + 2^31)</option>
+                            <option value="2">negative (-(k + 1))</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label>weight = 2^<span class="field-value" id="hk-weight-exp">0</span> (per add) <span class="field-value" id="hk-weight-v">1</span></label>
+                        <input type="range" id="hk-weight" min="0" max="33" step="1" value="0">
+                    </div>
+                    <p class="help-line">
+                        <code>addFrom</code> reads a key >= 2^31 or negative UNBOXED (F3) -- the sketch
+                        allocation counter stays PINNED at 0 across every class. A weight up to
+                        <code>2^32-1</code> rides a Float64 slot (F10); at the ceiling the top cell
+                        SATURATES: <b class="sat-badge" id="hk-sat" data-on="false">SAT</b>. The last
+                        notch (<code>2^32</code>) is REJECTED by the library's F10 guard (a tagged throw,
+                        not a silent <code>estimate = 0</code>) -- caught into the fail banner below.
+                    </p>
+                    <div class="fail-banner" id="hk-fail" hidden>
+                        <b>fail-closed:</b> <span id="hk-fail-msg"></span>
+                    </div>
+                </section>
+                <section>
                     <h3>truth panel - the two proofs</h3>
                     <div class="truth">
                         <div>
@@ -552,7 +651,7 @@
                             <div class="primary-label">primary - allocations since warmup</div>
                             <div class="alloc-pair">
                                 <div class="alloc-cell"><div class="alloc-big zero" id="hk-alloc-sketch">0</div><div class="alloc-sub">sketch path</div></div>
-                                <div class="alloc-cell"><div class="alloc-big climbing" id="hk-alloc-oracle">0</div><div class="alloc-sub">exact Map path</div></div>
+                                <div class="alloc-cell"><div class="alloc-big climbing" id="hk-alloc-oracle">0</div><div class="alloc-sub">new entries</div></div>
                             </div>
                         </div>
                         <div>
@@ -570,6 +669,8 @@
                             <div class="stat-row"><span class="k">monitored / k</span><span class="v" id="hk-size">0 / 12</span></div>
                             <div class="stat-row"><span class="k">max overestimate</span><span class="v inband" id="hk-maxover">0</span></div>
                             <div class="stat-row"><span class="k">bracket holds</span><span class="v inband" id="hk-bracket">yes</span></div>
+                            <div class="stat-row"><span class="k">key class / weight</span><span class="v" id="hk-keyweight">small / 1</span></div>
+                            <div class="stat-row"><span class="k">top estimate saturated (2^32-1)</span><span class="v inband" id="hk-saturated">no</span></div>
                             <div class="stat-row"><span class="k">marquee: HK vs Space-Saving</span><span class="v accent" id="hk-marquee">--</span></div>
                             <div class="stat-row"><span class="k">table bytes (fixed)</span><span class="v accent" id="hk-sketch-kb">0 KB</span></div>
                             <div class="stat-row"><span class="k">Map bytes (climbing)</span><span class="v" id="hk-map-kb">0 KB</span></div>
@@ -633,6 +734,24 @@
                     </p>
                 </section>
                 <section>
+                    <h3>1.8.0 - query rate &amp; twin overflows (F8)</h3>
+                    <div class="field">
+                        <label>query slA every <span class="field-value" id="shll-qevery-v">never</span> tick(s)</label>
+                        <select id="shll-qevery">
+                            <option value="1">1 (every tick)</option>
+                            <option value="8">8</option>
+                            <option value="64">64</option>
+                            <option value="never" selected>never</option>
+                        </select>
+                    </div>
+                    <p class="help-line">
+                        TWO instances get the IDENTICAL stream; slA is <code>count()</code>-queried at the
+                        chosen cadence, slB is NEVER queried. <code>count()</code> is non-destructive
+                        (expiry lives in <code>add</code>), so both <code>overflows</code> counters stay
+                        EQUAL no matter the query rate.
+                    </p>
+                </section>
+                <section>
                     <h3>truth panel - the two proofs</h3>
                     <div class="truth">
                         <div>
@@ -664,7 +783,8 @@
                             <div class="stat-row"><span class="k">relerr / 3-sigma</span><span class="v inband" id="shll-frac">0.00x</span></div>
                             <div class="stat-row"><span class="k">registers m</span><span class="v" id="shll-m">0</span></div>
                             <div class="stat-row"><span class="k">degraded (ring overflow)</span><span class="v inband" id="shll-degraded">no</span></div>
-                            <div class="stat-row"><span class="k">sketch bytes (fixed)</span><span class="v accent" id="shll-sketch-kb">0 KB</span></div>
+                            <div class="stat-row"><span class="k">overflows slA (queried) / slB (never)</span><span class="v inband" id="shll-ovf">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">sketch bytes (fixed, per instance)</span><span class="v accent" id="shll-sketch-kb">0 KB</span></div>
                             <div class="stat-row"><span class="k">Map bytes (O(distinct))</span><span class="v" id="shll-oracle-kb">0 KB</span></div>
                             <div class="stat-row"><span class="k">frame rate</span><span class="v" id="shll-fps">--</span></div>
                         </div>
@@ -712,6 +832,26 @@
                         Higher threshold -> fewer false alarms, slower detection. Detector memory is a
                         FIXED <span class="field-value" id="dd-mem">0 KB</span> -- exact detection keeps O(N).
                     </p>
+                </section>
+                <section>
+                    <h3>1.8.0 - latch (S9)</h3>
+                    <div class="field">
+                        <div class="toggle" id="dd-latch-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">latched twins: <b id="dd-latch-label">off (1.x re-firing storm)</b></span>
+                    </div>
+                    <p class="help-line">
+                        With <code>latch: true</code> each channel re-arms only when its statistic falls
+                        back below <code>threshold / 2</code>, so it fires just a FEW times per regime
+                        (latched PH 1-4, latched CUSUM 0-4) -- vs the unlatched CUSUM storm (~10.9k alarms
+                        over 21 regimes). Latched CUSUM fires <b>0 times on every HI-&gt;LO step</b>: its
+                        fixed target <code>mu0</code> sits at the LO baseline, so a drop back TO the target
+                        accumulates no evidence (a fixed-target property, not a miss). The latched twins run
+                        on the SAME signal; the demo reads the shipped <code>lastDriftIndex</code> /
+                        <code>lastDirection</code> getters. The <code>latch: false</code> path is byte-identical to 1.x.
+                    </p>
+                    <div class="stat-row"><span class="k">latched CUSUM fires vs unlatched storm</span><span class="v accent" id="dd-latch-fires">0 / 0</span></div>
+                    <div class="stat-row"><span class="k">latched CUSUM last drift (index, dir)</span><span class="v" id="dd-cul-last">n/a</span></div>
+                    <div class="stat-row"><span class="k">latched PH last drift (index, dir)</span><span class="v" id="dd-phl-last">n/a</span></div>
                 </section>
                 <section>
                     <h3>truth panel - the two proofs</h3>
@@ -805,6 +945,29 @@
                         Smaller alpha -> more log bins -> tighter quantiles. Sketch memory is a FIXED
                         <span class="field-value" id="sld-mem">0 KB</span> whatever the value range.
                     </p>
+                </section>
+                <section>
+                    <h3>1.8.0 - strict / range (F2 / F5 / F7)</h3>
+                    <div class="field">
+                        <label>mode <span class="field-value" id="sld-mode-v">default</span></label>
+                        <select id="sld-mode">
+                            <option value="0" selected>default (collapse-lowest)</option>
+                            <option value="1">strict (span-based)</option>
+                            <option value="2">range [1, 20] (declared)</option>
+                        </select>
+                    </div>
+                    <p class="help-line">
+                        The sketch keeps <code>B+1</code> panes, so the covered span
+                        <span class="field-value" id="sld-cov">0</span> ALWAYS covers the full window W (F7);
+                        the <code>count() / true(W)</code> cursor never drops below 1. A declared
+                        <code>range</code> lets a consumer PRE-CHECK the accepted band (F2) instead of
+                        catching a throw -- out-of-band values are counted, not added. The render reads
+                        quantiles through <code>quantileInto</code> (F5, 0 B/call).
+                    </p>
+                    <div class="stat-row"><span class="k">true(W) count (now-W, now]</span><span class="v" id="sld-truew">0</span></div>
+                    <div class="stat-row"><span class="k">count() / true(W) cursor (>= 1)</span><span class="v accent" id="sld-cnt-cursor">1.00x</span></div>
+                    <div class="stat-row"><span class="k">strict / rangeMin / rangeMax</span><span class="v" id="sld-range">off</span></div>
+                    <div class="stat-row"><span class="k">rejected (out-of-range)</span><span class="v inband" id="sld-rejected">0</span></div>
                 </section>
                 <section>
                     <h3>truth panel - the two proofs</h3>
@@ -1038,36 +1201,41 @@
     import {
         VERSION,
         createAllocState,
-        createEhWorld, stepEh, stepEhOracle, renderEhPrep,
-        EH_DEFAULT_W, EH_DEFAULT_EPS, EH_BUCKET_BYTES,
+        createEhWorld, stepEh, stepEhGuarded, stepEhOracle, renderEhPrep,
+        EH_DEFAULT_W, EH_DEFAULT_EPS, EH_BUCKET_BYTES, EH_DENSE_W,
         E_COUNT, E_TRUE, E_RELERR, E_EPS, E_FRAC, E_BUCKETS, E_CAP, E_SKETCH_BYTES, E_RING_BYTES,
         E_SKETCH_ALLOC, E_ORACLE_ALLOC,
-        createAdWorld, stepAd, stepAdOracle, renderAdPrep,
+        E_MAXCOUNT, E_CEIL, E_POP, E_SUM, E_TRUESUM, E_STRADDLE, E_SUMFRAC, E_SUMRELEPS, E_FAILED,
+        createAdWorld, stepAd, stepAdGhost, stepAdOracle, renderAdPrep,
         AD_DEFAULT_DELTA, AD_MEAN_LO, AD_MEAN_HI,
         A_MEAN, A_TRUEMEAN, A_CUMMEAN, A_WIDTH, A_MEANFRAC, A_CUTS, A_DRIFT, A_N,
         A_SKETCH_BYTES, A_ORACLE_BYTES, A_SKETCH_ALLOC, A_ORACLE_ALLOC,
+        A_OFFSET, A_LIVER, A_GHOSTR,
         createFdWorld, stepFd, stepFdOracle, renderFdPrep,
         FD_DEFAULT_HALFLIFE,
         D_COUNT, D_MEAN, D_CUMMEAN, D_RATE, D_RELERR, D_FRAC, D_LANDMARK, D_N, D_ORACLEN,
         D_SKETCH_BYTES, D_ARR_BYTES, D_SKETCH_ALLOC, D_ORACLE_ALLOC,
         createHkWorld, stepHk, stepHkOracle, renderHkPrep,
-        HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K,
+        HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K, HK_KEY_SMALL, HK_KEY_BIG, HK_KEY_NEG, HK_WEIGHT_MAX,
         H_RECALL, H_TRUEHH, H_MAXOVER, H_BRACKETOK, H_HKERR, H_SSERR, H_MARQUEEOK,
-        H_SIZE, H_K, H_W, H_THRESH, H_ERRBOUND, H_MAXCOUNT, H_N,
+        H_SIZE, H_K, H_W, H_THRESH, H_ERRBOUND, H_MAXCOUNT, H_N, H_KEYMODE, H_WEIGHT, H_SAT,
         H_SKETCH_BYTES, H_MAP_BYTES, H_SKETCH_ALLOC, H_ORACLE_ALLOC,
         createShllWorld, stepShll, stepShllOracle, renderShllPrep,
         SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, SHLL_DEFAULT_SEED,
         S_EST, S_TRUE, S_RELERR, S_GATE, S_FRAC, S_M, S_DEGRADED, S_SKETCH_BYTES, S_ORACLE_BYTES,
-        S_SKETCH_ALLOC, S_ORACLE_ALLOC,
+        S_SKETCH_ALLOC, S_ORACLE_ALLOC, S_OVF_A, S_OVF_B, S_QEVERY,
         createDdWorld, stepDd, stepDdOracle, renderDdPrep,
         DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD, DD_SKETCH_BYTES,
         G_PH_STAT, G_PH_THRESH, G_PH_FRAC, G_CU_STAT, G_CU_THRESH, G_CU_FRAC, G_PH_FIRES, G_CU_FIRES,
         G_PH_FIRED, G_CU_FIRED, G_TRUEMEAN, G_PH_MEAN, G_N, G_CP, G_SKETCH_BYTES, G_ORACLE_BYTES,
         G_SKETCH_ALLOC, G_ORACLE_ALLOC,
+        G_PHL_FRAC, G_CUL_FRAC, G_PHL_FIRES, G_CUL_FIRES, G_PHL_FIRED, G_CUL_FIRED,
+        G_PHL_LASTIDX, G_PHL_LASTDIR, G_CUL_LASTIDX, G_CUL_LASTDIR, G_PHL_LATCHED, G_CUL_LATCHED, G_LATCH_ON,
         createSldWorld, stepSld, stepSldOracle, renderSldPrep,
-        SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES,
+        SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES, SLD_MODE_DEFAULT, SLD_MODE_STRICT, SLD_MODE_RANGE,
         Q_P50, Q_P50T, Q_P90, Q_P90T, Q_P99, Q_P99T, Q_MAXREL, Q_ALPHA, Q_FRAC, Q_COUNT, Q_LIVE,
         Q_EDGE, Q_COLLAPSED, Q_N, Q_SKETCH_BYTES, Q_ORACLE_BYTES, Q_SKETCH_ALLOC, Q_ORACLE_ALLOC,
+        Q_TRUEW, Q_CNT_CURSOR, Q_COVMIN, Q_COVMAX, Q_STRICT, Q_RANGEMIN, Q_RANGEMAX, Q_REJECTED, Q_MODE,
         createScmWorld, stepScm, stepScmOracle, renderScmPrep,
         SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, SCM_DEFAULT_SEED, SCM_TRACKED, SCM_STRIDE,
         C_BOUNDOK, C_SATURATED, C_NLIVE, C_N, C_SKETCH_BYTES, C_ORACLE_BYTES, C_SKETCH_ALLOC, C_ORACLE_ALLOC,
@@ -1168,6 +1336,13 @@
         if (t !== last) el.textContent = Math.floor(t / 10) + '.' + (t % 10) + ' MB';
         return t;
     }
+    // Compact integer-ish formatter for a ~10Hz readout (never called per frame): k / M suffixes.
+    function fmtNum(x) {
+        const a = Math.abs(x);
+        if (a >= 1e6) return (x / 1e6).toFixed(2) + 'M';
+        if (a >= 1e3) return (x / 1e3).toFixed(1) + 'k';
+        return String(Math.round(x));
+    }
 
     // ---- controls / state --------------------------------------------------------------
     let paused = false;
@@ -1189,7 +1364,16 @@
     // SCENE 01 -- ExponentialHistogram
     // ====================================================================================
     let ehW = EH_DEFAULT_W, ehEps = EH_DEFAULT_EPS;
-    let ehWorld = createEhWorld(ehW, ehEps, 0x5eed1234);
+    let ehMaxCountMode = 'default', ehPreset = null, ehValues = 'uniform';   // D1 control state
+    function ehOptions() {
+        const effW = ehPreset === 'dense10k' ? EH_DENSE_W : ehW;
+        const o = { values: ehValues };
+        if (ehPreset) o.preset = ehPreset;
+        if (ehMaxCountMode === 'w') o.maxCount = effW;         // the pre-1.7.0 W-sized pool
+        else if (ehMaxCountMode === 'small') o.maxCount = 256; // a tiny pool -- overflows readily
+        return o;                                              // 'default' -> omit -> EH's 2^32 default
+    }
+    let ehWorld = createEhWorld(ehW, ehEps, 0x5eed1234, ehOptions());
     const ehAlloc = createAllocState();
     let ehOracleOn = true;
     const ehCanvas = $('eh-canvas');
@@ -1198,8 +1382,18 @@
     const ehJank = $('eh-jank'); let ehJankCtx = null, EJW = 0, EJH = 0;
     const ehWit = $('eh-witness'); let ehWitCtx = null, EWW = 0, EWH = 0;
     const ehSpace = $('eh-space'); let ehSpCtx = null, ESW = 0, ESH = 0;
-    function ehPanels() { let s = sizeCanvas(ehJank); ehJankCtx = s.ctx; EJW = s.w; EJH = s.h; s = sizeCanvas(ehWit); ehWitCtx = s.ctx; EWW = s.w; EWH = s.h; s = sizeCanvas(ehSpace); ehSpCtx = s.ctx; ESW = s.w; ESH = s.h; }
-    function ehStep() { stepEh(ehWorld); if (ehOracleOn) stepEhOracle(ehWorld, ehAlloc); }
+    const ehPool = $('eh-pool'); let ehPoolCtx = null, EPW = 0, EPH = 0;
+    const ehSum = $('eh-sum'); let ehSumCtx = null, EUW = 0, EUH = 0;
+    function ehPanels() {
+        let s = sizeCanvas(ehJank); ehJankCtx = s.ctx; EJW = s.w; EJH = s.h;
+        s = sizeCanvas(ehWit); ehWitCtx = s.ctx; EWW = s.w; EWH = s.h;
+        s = sizeCanvas(ehSpace); ehSpCtx = s.ctx; ESW = s.w; ESH = s.h;
+        s = sizeCanvas(ehPool); ehPoolCtx = s.ctx; EPW = s.w; EPH = s.h;
+        s = sizeCanvas(ehSum); ehSumCtx = s.ctx; EUW = s.w; EUH = s.h;
+    }
+    // stepEhGuarded catches the tagged pool-overflow throw; once failed, stop stepping the oracle too
+    // (the readouts freeze at the overflow, the fail-closed banner carries the library's OWN message).
+    function ehStep() { stepEhGuarded(ehWorld); if (ehOracleOn && ehWorld.failed === 0) stepEhOracle(ehWorld, ehAlloc); }
     // Arrival-density histogram scratch (reused, 0 alloc). The window picture is drawn from the
     // demo's OWN in-window ring (world.ring) + the PUBLIC EH surface -- never library internals.
     const EH_COLS = 80;
@@ -1235,37 +1429,98 @@
         g.fillStyle = rgbaq(STALE_RGB, 0.12); g.fillRect(ehGX, ehGY + ehGH - 12, ehGW, 10);
         g.fillStyle = rgbaq(CYAN_RGB, 0.8); g.fillRect(ehGX, ehGY + ehGH - 12, ehGW * fill, 10);
     }
-    function ehWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, ehWorld.flat[E_FRAC]); }
-    const ehDom = { big: $('eh-count-big'), aS: $('eh-alloc-sketch'), aO: $('eh-alloc-oracle'), count: $('eh-count'), tr: $('eh-true'), rel: $('eh-relerr'), eps: $('eh-eps'), frac: $('eh-frac'), buckets: $('eh-buckets'), skb: $('eh-sketch-kb'), rkb: $('eh-ring-kb'), fps: $('eh-fps'), heap: $('eh-heap'), mem: $('eh-mem') };
-    let ehHeap = -1;
+    // E_FRAC gauge: skipped when NaN (oracle off / resume-hold -- renderEhPrep holds it NaN while the exact
+    // ring is stale, so no false red accuracy gauge from a frozen ring).
+    function ehWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); const v = ehWorld.flat[E_FRAC]; if (Number.isNaN(v)) return; drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, v); }
+    // D1 sum() gauge: |sum - true| / (straddle/2) against its STATED bound (green <= 1, red past). Skipped
+    // when the oracle is off (E_SUMFRAC is NaN then -- no true sum to bound against, so no gauge).
+    function ehSumDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); const v = ehWorld.flat[E_SUMFRAC]; if (Number.isNaN(v)) return; drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, v); }
+    // D1 pool gauge: live population (exact, from the oracle ring) against the EXACT ceiling k*(2^levels-1).
+    // The right-edge hairline marks the ceiling (100% of the population axis). When the oracle is off, E_POP
+    // is NaN -> draw only the empty track + the ceiling marker (no stale population bar). 0 alloc.
+    function ehPoolDraw(g, w, h) {
+        if (!g) return;
+        g.clearRect(0, 0, w, h);
+        const f = ehWorld.flat;
+        const ceil = f[E_CEIL] || 1, pop = f[E_POP];
+        const barX = 6, barW = w - 12, barH = 16, y = h * 0.5 - barH * 0.5;
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y, barW, barH);
+        if (!Number.isNaN(pop)) {
+            let pf = pop / ceil; if (pf > 1) pf = 1; if (pf < 0) pf = 0;
+            g.fillStyle = ehWorld.failed ? rgbaq(RED_RGB, 0.9) : rgbaq(ACCENT_RGB, 0.9);
+            g.fillRect(barX, y, barW * pf, barH);
+        }
+        // ceiling marker: the right edge IS the exact ceiling k*(2^levels-1) (100% of the population axis).
+        g.fillStyle = rgbaq(CYAN_RGB, 0.85); g.fillRect(barX + barW - 1, y - 3, 2, barH + 6);
+    }
+    const ehDom = {
+        big: $('eh-count-big'), aS: $('eh-alloc-sketch'), aO: $('eh-alloc-oracle'), count: $('eh-count'),
+        tr: $('eh-true'), rel: $('eh-relerr'), eps: $('eh-eps'), frac: $('eh-frac'), buckets: $('eh-buckets'),
+        skb: $('eh-sketch-kb'), rkb: $('eh-ring-kb'), fps: $('eh-fps'), heap: $('eh-heap'), mem: $('eh-mem'),
+        poolPop: $('eh-pool-pop'), poolCap: $('eh-pool-cap'), sumV: $('eh-sum-v'), sumReleps: $('eh-sumreleps'),
+        fail: $('eh-fail'), failMsg: $('eh-fail-msg'),
+    };
+    let ehHeap = -1, ehFailShown = -1;
     function ehTick() {
         renderEhPrep(ehWorld, ehAlloc);
         const f = ehWorld.flat;
+        // The oracle-off + resume-hold fail-closed NaN writes now live in renderEhPrep (behind world.oracleOn
+        // / world.resumeNow), so a test that drives the kernel SEES them -- not this untested UI tick.
         ehDom.big.textContent = String(f[E_COUNT] | 0);
         ehDom.count.textContent = String(f[E_COUNT] | 0);
-        ehDom.tr.textContent = String(f[E_TRUE] | 0);
-        ehDom.rel.textContent = (f[E_RELERR] * 100).toFixed(2) + '%';
+        ehDom.tr.textContent = Number.isNaN(f[E_TRUE]) ? 'n/a' : String(f[E_TRUE] | 0);
+        ehDom.rel.textContent = Number.isNaN(f[E_RELERR]) ? 'n/a' : (f[E_RELERR] * 100).toFixed(2) + '%';
         ehDom.eps.textContent = (f[E_EPS] * 100).toFixed(2) + '%';
-        const fr = f[E_FRAC]; ehDom.frac.textContent = fr.toFixed(2) + 'x'; ehDom.frac.className = fr <= 1 ? 'v inband' : 'v outband';
+        const fr = f[E_FRAC];
+        if (Number.isNaN(fr)) { ehDom.frac.textContent = 'n/a'; ehDom.frac.className = 'v'; }
+        else { ehDom.frac.textContent = fr.toFixed(2) + 'x'; ehDom.frac.className = fr <= 1 ? 'v inband' : 'v outband'; }
         ehDom.buckets.textContent = (f[E_BUCKETS] | 0) + ' / ' + (f[E_CAP] | 0);
         ehDom.skb.textContent = (f[E_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
         ehDom.rkb.textContent = (f[E_RING_BYTES] / 1024).toFixed(1) + ' KB';
         ehDom.aS.textContent = String(f[E_SKETCH_ALLOC] | 0);
         ehDom.aO.textContent = String(f[E_ORACLE_ALLOC]);
         ehDom.fps.textContent = String(fpsValue);
+        // D1 pool gauge + sum() vs straddle bound readouts ('n/a' when the oracle is off -> NaN above).
+        ehDom.poolPop.textContent = (Number.isNaN(f[E_POP]) ? 'n/a' : String(f[E_POP] | 0)) + ' / ' + (f[E_CEIL] | 0);
+        ehDom.poolCap.textContent = (f[E_MAXCOUNT] >= 4294967296 ? '2^32' : String(f[E_MAXCOUNT] | 0)) + ' / ' + (f[E_CAP] | 0);
+        ehDom.sumV.textContent = fmtNum(f[E_SUM]) + ' / ' + (Number.isNaN(f[E_TRUESUM]) ? 'n/a' : fmtNum(f[E_TRUESUM]));
+        const sre = f[E_SUMRELEPS];
+        if (Number.isNaN(sre)) { ehDom.sumReleps.textContent = 'n/a'; ehDom.sumReleps.className = 'v'; }
+        else { ehDom.sumReleps.textContent = sre.toFixed(2) + 'x'; ehDom.sumReleps.className = sre <= 1 ? 'v inband' : 'v outband'; }
+        // fail-closed banner: flip the hidden attribute ONLY when the state changes (no per-tick reflow churn).
+        const failed = ehWorld.failed | 0;
+        if (failed !== ehFailShown) {
+            ehFailShown = failed;
+            if (failed) { ehDom.failMsg.textContent = ehWorld.failMsg; ehDom.fail.hidden = false; }
+            else { ehDom.fail.hidden = true; }
+        }
         ehHeap = heapText(ehDom.heap, ehHeap);
     }
-    wireToggle('eh-mode-toggle', 'eh-mode-label', 'running (retains O(W))', 'paused (sketch only)', (on) => { ehOracleOn = on; });
+    // Toggle sets the world field renderEhPrep reads; re-enabling stamps resumeNow so the sum/accuracy
+    // gauges hold NaN for a full window W while the stale exact ring refills (no false red gauge).
+    wireToggle('eh-mode-toggle', 'eh-mode-label', 'running (retains O(W))', 'paused (sketch only)', (on) => { ehOracleOn = on; ehWorld.oracleOn = on; if (on) ehWorld.resumeNow = ehWorld.now; });
     wireToggle('eh-stream-toggle', 'eh-stream-label', 'stream paused (sliding to empty)', 'streaming', (on) => { ehWorld.paused = on; });
-    function ehRebuild() { const p = ehWorld.paused; ehWorld = createEhWorld(ehW, ehEps, 0x5eed1234); ehWorld.paused = p; ehAlloc.sketchCount = 0; ehAlloc.oracleCount = 0; ehDom.mem.textContent = (ehWorld.eh.capacity * EH_BUCKET_BYTES / 1024).toFixed(1) + ' KB'; ehLayout(); }
+    // A world rebuild changes NO canvas geometry, so it must NOT call ehLayout() (that forces a reflow:
+    // sizeCanvas -> getBoundingClientRect right after the mem.textContent write). Layout is owned by resize.
+    function ehRebuild() { const p = ehWorld.paused; ehWorld = createEhWorld(ehW, ehEps, 0x5eed1234, ehOptions()); ehWorld.paused = p; ehWorld.oracleOn = ehOracleOn; ehAlloc.sketchCount = 0; ehAlloc.oracleCount = 0; ehDom.mem.textContent = (ehWorld.eh.capacity * EH_BUCKET_BYTES / 1024).toFixed(1) + ' KB'; ehFailShown = -1; }
     $('eh-w').addEventListener('input', (e) => { ehW = +e.target.value; $('eh-w-v').textContent = String(ehW); ehRebuild(); });
     $('eh-eps').addEventListener('input', (e) => { ehEps = (+e.target.value) / 1000; $('eh-eps-v').textContent = ehEps.toFixed(3); ehRebuild(); });
+    // D1 controls: maxCount select, dense10k preset toggle, F17 values toggle.
+    const $ehMcv = $('eh-maxcount-v');
+    $('eh-maxcount').addEventListener('change', (e) => {
+        ehMaxCountMode = e.target.value;
+        $ehMcv.textContent = ehMaxCountMode === 'default' ? '2^32' : (ehMaxCountMode === 'w' ? 'W' : '256');
+        ehRebuild();
+    });
+    wireToggle('eh-dense-toggle', 'eh-dense-label', 'on (W=1024, gap 0.1)', 'off', (on) => { ehPreset = on ? 'dense10k' : null; ehRebuild(); });
+    wireToggle('eh-values-toggle', 'eh-values-label', 'spike (integer spikes)', 'uniform (sum == count)', (on) => { ehValues = on ? 'spike' : 'uniform'; ehRebuild(); });
 
     // ====================================================================================
     // SCENE 02 -- ADWIN
     // ====================================================================================
     let adDelta = AD_DEFAULT_DELTA;
-    let adWorld = createAdWorld(adDelta, 0xadadadad);
+    let adOffset = 0, adPreset = null;   // D2 control state (absolute offset, bigJumpThenPlus1 preset)
+    let adWorld = createAdWorld(adDelta, 0xadadadad, adOffset, adPreset);
     const adAlloc = createAllocState();
     let adFoilOn = true;
     const adCanvas = $('ad-canvas');
@@ -1275,7 +1530,10 @@
     const adWit = $('ad-witness'); let adWitCtx = null, AWW = 0, AWH = 0;
     const adSpace = $('ad-space'); let adSpCtx = null, ASW = 0, ASH = 0;
     function adPanels() { let s = sizeCanvas(adJank); adJankCtx = s.ctx; AJW = s.w; AJH = s.h; s = sizeCanvas(adWit); adWitCtx = s.ctx; AWW = s.w; AWH = s.h; s = sizeCanvas(adSpace); adSpCtx = s.ctx; ASW = s.w; ASH = s.h; }
-    function adStep() { stepAd(adWorld); if (adFoilOn) stepAdOracle(adWorld, adAlloc); }
+    // The ghost global range (A_GHOSTR, the D2 deafness demo) is stepped ALWAYS, independent of the foil:
+    // it is not the naive-mean foil, so pausing the foil must not freeze it stale. The live-window range R
+    // (A_LIVER) is re-derived from the stream suffix in renderAdPrep, already foil-independent.
+    function adStep() { stepAd(adWorld); stepAdGhost(adWorld); if (adFoilOn) stepAdOracle(adWorld, adAlloc); }
     // 10Hz history rings for the scrolling plot (drawing state, pre-allocated, updated in adTick).
     const AD_HIST = 256, AD_HMASK = 255;
     const adMeanH = new Float64Array(AD_HIST), adMuH = new Float64Array(AD_HIST), adCumH = new Float64Array(AD_HIST), adDriftH = new Float64Array(AD_HIST);
@@ -1313,12 +1571,14 @@
         g.stroke();
     }
     function adWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, adWorld.flat[A_MEANFRAC]); }
-    const adDom = { big: $('ad-mean-big'), aS: $('ad-alloc-sketch'), aO: $('ad-alloc-oracle'), mean: $('ad-mean'), tm: $('ad-truemean'), cm: $('ad-cummean'), width: $('ad-width'), frac: $('ad-frac'), cuts: $('ad-cuts'), n: $('ad-n'), skb: $('ad-sketch-kb'), okb: $('ad-oracle-kb'), fps: $('ad-fps'), heap: $('ad-heap'), mem: $('ad-mem') };
+    const adDom = { big: $('ad-mean-big'), aS: $('ad-alloc-sketch'), aO: $('ad-alloc-oracle'), mean: $('ad-mean'), tm: $('ad-truemean'), cm: $('ad-cummean'), width: $('ad-width'), frac: $('ad-frac'), cuts: $('ad-cuts'), n: $('ad-n'), skb: $('ad-sketch-kb'), okb: $('ad-oracle-kb'), fps: $('ad-fps'), heap: $('ad-heap'), mem: $('ad-mem'), liver: $('ad-liver'), ghostr: $('ad-ghostr') };
     let adHeap = -1;
     function adTick() {
         renderAdPrep(adWorld, adAlloc);
         const f = adWorld.flat;
-        adMeanH[adHPtr] = f[A_MEAN]; adMuH[adHPtr] = f[A_TRUEMEAN]; adCumH[adHPtr] = f[A_CUMMEAN]; adDriftH[adHPtr] = f[A_DRIFT];
+        // plot the mean series with the absolute offset REMOVED so the drift shape stays on-scale.
+        const off = f[A_OFFSET];
+        adMeanH[adHPtr] = f[A_MEAN] - off; adMuH[adHPtr] = f[A_TRUEMEAN] - off; adCumH[adHPtr] = f[A_CUMMEAN] - off; adDriftH[adHPtr] = f[A_DRIFT];
         adHPtr = (adHPtr + 1) & AD_HMASK; if (adHFilled < AD_HIST) adHFilled++;
         adDom.big.textContent = f[A_MEAN].toFixed(3);
         adDom.mean.textContent = f[A_MEAN].toFixed(3);
@@ -1333,11 +1593,31 @@
         adDom.aS.textContent = String(f[A_SKETCH_ALLOC] | 0);
         adDom.aO.textContent = String(f[A_ORACLE_ALLOC]);
         adDom.fps.textContent = String(fpsValue);
+        // D2 live-window range R (small after a snap) vs the 1.6.0 ghost global range (never shrinks).
+        adDom.liver.textContent = fmtNum(f[A_LIVER]);
+        adDom.ghostr.textContent = fmtNum(f[A_GHOSTR]);
         adHeap = heapText(adDom.heap, adHeap);
     }
     wireToggle('ad-mode-toggle', 'ad-mode-label', 'running (never forgets)', 'paused', (on) => { adFoilOn = on; });
-    function adRebuild() { adWorld = createAdWorld(adDelta, 0xadadadad); adAlloc.sketchCount = 0; adAlloc.oracleCount = 0; adHPtr = 0; adHFilled = 0; adDom.mem.textContent = (adWorld.ad.capacity * 32 / 1024).toFixed(1) + ' KB'; adLayout(); }
+    // A world rebuild changes NO canvas geometry -> no adLayout() (that would force a reflow right after
+    // the mem.textContent write via sizeCanvas -> getBoundingClientRect). Layout is owned by resize.
+    function adRebuild() { adWorld = createAdWorld(adDelta, 0xadadadad, adOffset, adPreset); adAlloc.sketchCount = 0; adAlloc.oracleCount = 0; adHPtr = 0; adHFilled = 0; adDom.mem.textContent = (adWorld.ad.capacity * 32 / 1024).toFixed(1) + ' KB'; }
     $('ad-delta').addEventListener('input', (e) => { adDelta = (+e.target.value) / 100; $('ad-delta-v').textContent = adDelta.toFixed(3); adRebuild(); });
+    // D2 controls: absolute-offset slider {0, 1e3, 1e6, 1e9, 1.7e12} + the bigJumpThenPlus1 preset.
+    const AD_OFFSETS = [0, 1e3, 1e6, 1e9, 1.7e12], AD_OFFSET_LABELS = ['0', '1e3', '1e6', '1e9', '1.7e12'];
+    const $adOffV = $('ad-offset-v');
+    $('ad-offset').addEventListener('input', (e) => {
+        const i = (+e.target.value) | 0; adOffset = AD_OFFSETS[i]; $adOffV.textContent = AD_OFFSET_LABELS[i]; adRebuild();
+    });
+    const $adPreset = $('ad-preset');
+    $adPreset.setAttribute('aria-pressed', 'false');   // hook the initial pressed state from adPreset === null
+    $adPreset.addEventListener('click', () => {
+        const on = adPreset !== 'bigJumpThenPlus1';
+        adPreset = on ? 'bigJumpThenPlus1' : null;
+        $adPreset.setAttribute('aria-pressed', on ? 'true' : 'false');
+        $adPreset.textContent = on ? 'big jump then +1 (on)' : 'big jump then +1';
+        adRebuild();
+    });
 
     // ====================================================================================
     // SCENE 03 -- ForwardDecay
@@ -1409,7 +1689,8 @@
     // SCENE 04 -- HeavyKeeper
     // ====================================================================================
     let hkK = HK_DEFAULT_K;
-    let hkWorld = createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, hkK, 0x243f6a88);
+    let hkKeyMode = HK_KEY_SMALL, hkWeight = 1;   // D3 control state (key magnitude class, per-add weight)
+    let hkWorld = createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, hkK, 0x243f6a88, hkKeyMode, hkWeight);
     const hkAlloc = createAllocState();
     let hkOracleOn = true;
     const hkCanvas = $('hk-canvas');
@@ -1429,62 +1710,113 @@
         const rows = f[H_SIZE] | 0;
         let maxCount = f[H_MAXCOUNT]; if (maxCount < 1) maxCount = 1;
         const thresh = f[H_THRESH], errBound = f[H_ERRBOUND];
+        // oracle OFF -> renderHkPrep NaNs errBound / thresh / lbTrue: skip the true-count + bracket + N/k
+        // markers (the sketch's own estimate bar still draws live). A NaN check, not a stale frozen band.
+        const oracleDraw = !Number.isNaN(errBound);
         if (rows < 1) return;
         const rowH = hkGH / rows, bh = rowH - 4;
         const topBuf = hkWorld.topBuf, lbTrue = hkWorld.lbTrue;
         for (let r = 0; r < rows; r++) {
-            const est = topBuf[r * 2 + 1], t = lbTrue[r];
+            const est = topBuf[r * 2 + 1];
             const y = hkGY + r * rowH + 2;
             g.fillStyle = COL_FAINT; g.fillText(RANK_LABELS[r], PAD, y + bh * 0.5 + 3);
             g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(hkGX, y, hkGW, bh);
             const eW = hkGW * (est / maxCount);
             g.fillStyle = rgbaq(ACCENT_RGB, 0.85); g.fillRect(hkGX, y, eW, bh);
-            // bracket floor [est ... would sit within N/w below true]; draw the true - errBound band
-            const loW = hkGW * (Math.max(0, t - errBound) / maxCount);
-            g.fillStyle = rgbaq(AMBER_RGB, 0.5); g.fillRect(hkGX + loW, y, Math.max(0, hkGW * (t / maxCount) - loW), bh);
-            const tX = hkGX + hkGW * (t / maxCount);
-            g.fillStyle = rgbaq(MAGENTA_RGB, 0.95); g.fillRect(tX - 1, y - 1, 2, bh + 2);
+            if (oracleDraw) {
+                const t = lbTrue[r];
+                // bracket floor [est ... would sit within N/w below true]; draw the true - errBound band
+                const loW = hkGW * (Math.max(0, t - errBound) / maxCount);
+                g.fillStyle = rgbaq(AMBER_RGB, 0.5); g.fillRect(hkGX + loW, y, Math.max(0, hkGW * (t / maxCount) - loW), bh);
+                const tX = hkGX + hkGW * (t / maxCount);
+                g.fillStyle = rgbaq(MAGENTA_RGB, 0.95); g.fillRect(tX - 1, y - 1, 2, bh + 2);
+            }
         }
-        const thX = hkGX + hkGW * (thresh / maxCount);
-        if (thX >= hkGX && thX <= hkGX + hkGW) { g.fillStyle = rgbaq(RED_RGB, 0.7); for (let y = hkGY; y < hkGY + hkGH; y += 6) g.fillRect(thX - 1, y, 2, 3); }
+        if (oracleDraw) {
+            const thX = hkGX + hkGW * (thresh / maxCount);
+            if (thX >= hkGX && thX <= hkGX + hkGW) { g.fillStyle = rgbaq(RED_RGB, 0.7); for (let y = hkGY; y < hkGY + hkGH; y += 6) g.fillRect(thX - 1, y, 2, 3); }
+        }
     }
     function hkWitDraw(g, w, h) {
         if (!g) return; g.clearRect(0, 0, w, h);
         const recall = hkWorld.flat[H_RECALL];
         const barX = 6, barW = w - 12, barH = 22, y = h * 0.5 - barH * 0.5;
         g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y, barW, barH);
+        if (Number.isNaN(recall)) return;   // oracle off: track only, no bar (never rest on canvas NaN semantics)
         const full = recall >= 0.9999;
         g.fillStyle = full ? rgbaq(GREEN_RGB, 0.9) : rgbaq(RED_RGB, 0.9);
         g.fillRect(barX, y, barW * recall, barH);
         g.fillStyle = rgbaq(GREEN_RGB, 0.7); g.fillRect(barX + barW - 1, y - 4, 2, barH + 8);
     }
-    const hkDom = { big: $('hk-recall-big'), aS: $('hk-alloc-sketch'), aO: $('hk-alloc-oracle'), recall: $('hk-recall'), truehh: $('hk-truehh'), size: $('hk-size'), maxover: $('hk-maxover'), bracket: $('hk-bracket'), marquee: $('hk-marquee'), skb: $('hk-sketch-kb'), mkb: $('hk-map-kb'), fps: $('hk-fps'), heap: $('hk-heap'), mem: $('hk-mem'), hkerr: $('hk-hkerr'), sserr: $('hk-sserr') };
-    let hkHeap = -1;
+    const HK_KEY_LABELS = ['small', '>= 2^31', 'negative'];
+    const hkDom = { big: $('hk-recall-big'), aS: $('hk-alloc-sketch'), aO: $('hk-alloc-oracle'), recall: $('hk-recall'), truehh: $('hk-truehh'), size: $('hk-size'), maxover: $('hk-maxover'), bracket: $('hk-bracket'), marquee: $('hk-marquee'), skb: $('hk-sketch-kb'), mkb: $('hk-map-kb'), fps: $('hk-fps'), heap: $('hk-heap'), mem: $('hk-mem'), hkerr: $('hk-hkerr'), sserr: $('hk-sserr'), keyweight: $('hk-keyweight'), saturated: $('hk-saturated'), sat: $('hk-sat'), fail: $('hk-fail'), failMsg: $('hk-fail-msg') };
+    let hkHeap = -1, hkSatShown = -1;
     function hkTick() {
         renderHkPrep(hkWorld, hkAlloc);
         const f = hkWorld.flat;
+        // With the oracle toggle OFF, hkStep skips stepHkOracle, so the exact Map + Space-Saving foil are
+        // FROZEN while the sketch keeps counting. renderHkPrep itself fails the oracle-derived slots closed
+        // to NaN in its COLD branch (behind hkWorld.oracleOn), so a test can drive it -- this untested UI
+        // tick no longer writes those NaNs. Rendered "n/a" (as P1 did for EH), never a false "recall 100%".
         const recall = f[H_RECALL];
-        hkDom.big.textContent = (recall * 100).toFixed(0) + '%';
-        hkDom.recall.textContent = (recall * 100).toFixed(1) + '%'; hkDom.recall.className = recall >= 0.9999 ? 'v inband' : 'v outband';
-        hkDom.truehh.textContent = String(f[H_TRUEHH] | 0);
+        const rNa = Number.isNaN(recall);
+        hkDom.big.textContent = rNa ? 'n/a' : (recall * 100).toFixed(0) + '%';
+        hkDom.recall.textContent = rNa ? 'n/a' : (recall * 100).toFixed(1) + '%'; hkDom.recall.className = rNa ? 'v' : (recall >= 0.9999 ? 'v inband' : 'v outband');
+        hkDom.truehh.textContent = Number.isNaN(f[H_TRUEHH]) ? 'n/a' : String(f[H_TRUEHH] | 0);
         hkDom.size.textContent = String(f[H_SIZE] | 0) + ' / ' + String(f[H_K] | 0);
-        const mo = f[H_MAXOVER] | 0; hkDom.maxover.textContent = String(mo); hkDom.maxover.className = mo === 0 ? 'v inband' : 'v outband';
-        const bok = f[H_BRACKETOK] === 1; hkDom.bracket.textContent = bok ? 'yes' : 'NO'; hkDom.bracket.className = bok ? 'v inband' : 'v outband';
-        const won = f[H_MARQUEEOK] === 1;
-        hkDom.marquee.textContent = (f[H_HKERR] * 100).toFixed(2) + '% vs ' + (f[H_SSERR] * 100).toFixed(2) + '%';
-        hkDom.marquee.className = won ? 'v inband' : 'v';
-        hkDom.hkerr.textContent = (f[H_HKERR] * 100).toFixed(2) + '%';
-        hkDom.sserr.textContent = (f[H_SSERR] * 100).toFixed(2) + '%';
+        const moNa = Number.isNaN(f[H_MAXOVER]); const mo = f[H_MAXOVER] | 0;
+        hkDom.maxover.textContent = moNa ? 'n/a' : String(mo); hkDom.maxover.className = moNa ? 'v' : (mo === 0 ? 'v inband' : 'v outband');
+        const bNa = Number.isNaN(f[H_BRACKETOK]); const bok = f[H_BRACKETOK] === 1;
+        hkDom.bracket.textContent = bNa ? 'n/a' : (bok ? 'yes' : 'NO'); hkDom.bracket.className = bNa ? 'v' : (bok ? 'v inband' : 'v outband');
+        const mqNa = Number.isNaN(f[H_HKERR]); const won = f[H_MARQUEEOK] === 1;
+        hkDom.marquee.textContent = mqNa ? 'n/a' : (f[H_HKERR] * 100).toFixed(2) + '% vs ' + (f[H_SSERR] * 100).toFixed(2) + '%';
+        hkDom.marquee.className = mqNa ? 'v' : (won ? 'v inband' : 'v');
+        hkDom.hkerr.textContent = mqNa ? 'n/a' : (f[H_HKERR] * 100).toFixed(2) + '%';
+        hkDom.sserr.textContent = mqNa ? 'n/a' : (f[H_SSERR] * 100).toFixed(2) + '%';
         hkDom.skb.textContent = (f[H_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
         hkDom.mkb.textContent = (f[H_MAP_BYTES] / 1024).toFixed(1) + ' KB';
         hkDom.aS.textContent = String(f[H_SKETCH_ALLOC] | 0);
         hkDom.aO.textContent = String(f[H_ORACLE_ALLOC]);
+        hkDom.keyweight.textContent = HK_KEY_LABELS[f[H_KEYMODE] | 0] + ' / ' + fmtNum(f[H_WEIGHT]);
+        const sat = f[H_SAT] === 1 ? 1 : 0;
+        // guard the SAT badge writes with a last-value check -- no per-tick setAttribute / className churn.
+        if (sat !== hkSatShown) {
+            hkSatShown = sat;
+            hkDom.saturated.textContent = sat ? 'YES' : 'no'; hkDom.saturated.className = sat ? 'v outband' : 'v inband';
+            hkDom.sat.setAttribute('data-on', sat ? 'true' : 'false');
+        }
         hkDom.fps.textContent = String(fpsValue);
         hkHeap = heapText(hkDom.heap, hkHeap);
     }
-    wireToggle('hk-mode-toggle', 'hk-mode-label', 'running (allocates)', 'paused (sketch only)', (on) => { hkOracleOn = on; });
-    function hkRebuild() { hkWorld = createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, hkK, 0x243f6a88); hkAlloc.sketchCount = 0; hkAlloc.oracleCount = 0; hkDom.mem.textContent = (hkWorld.hk.bytes / 1024).toFixed(1) + ' KB'; hkLayout(); }
+    wireToggle('hk-mode-toggle', 'hk-mode-label', 'running (allocates)', 'paused (sketch only)', (on) => { hkOracleOn = on; hkWorld.oracleOn = on; });
+    // A world rebuild changes NO canvas geometry, so it must NOT call hkLayout() -- that forces a reflow
+    // (sizeCanvas -> getBoundingClientRect + a canvas.width/height backing-store reset) on every slider /
+    // select input, right after the mem.textContent write. Layout is owned by resize (P1 did this for EH).
+    // The 2^32 weight notch is REJECTED by createHkWorld's F10 guard: catch it into the fail banner
+    // (showing the library's OWN message) and keep the last valid world running -- never a dead loop.
+    let hkFailShown = -1;
+    function hkRebuild() {
+        let nw;
+        try { nw = createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, hkK, 0x243f6a88, hkKeyMode, hkWeight); }
+        catch (e) {
+            if (hkFailShown !== 1) { hkFailShown = 1; hkDom.failMsg.textContent = (e && e.message) ? e.message : String(e); hkDom.fail.hidden = false; }
+            return;   // keep the last valid world -- do NOT swap in a broken one
+        }
+        if (hkFailShown !== 0) { hkFailShown = 0; hkDom.fail.hidden = true; }
+        hkWorld = nw; hkWorld.oracleOn = hkOracleOn; hkAlloc.sketchCount = 0; hkAlloc.oracleCount = 0; hkDom.mem.textContent = (hkWorld.hk.bytes / 1024).toFixed(1) + ' KB';
+    }
     $('hk-k').addEventListener('input', (e) => { hkK = +e.target.value; $('hk-k-v').textContent = String(hkK); hkRebuild(); });
+    // D3 controls: the key-magnitude select + the log2 weight slider (up to 2^32-1, the saturating ceiling).
+    const $hkKmv = $('hk-keymode-v'), $hkWv = $('hk-weight-v'), $hkWexp = $('hk-weight-exp');
+    $('hk-keymode').addEventListener('change', (e) => { hkKeyMode = +e.target.value; $hkKmv.textContent = HK_KEY_LABELS[hkKeyMode]; hkRebuild(); });
+    $('hk-weight').addEventListener('input', (e) => {
+        const s = +e.target.value;
+        // s in [0,31] -> 2^s; s==32 -> 2^32-1 (the saturating ceiling, valid); s==33 -> 2^32 (REJECTED
+        // by the F10 guard, shown in the fail banner). null is not zero: the ceiling is exact, not clamped.
+        hkWeight = s <= 31 ? Math.pow(2, s) : (s === 32 ? HK_WEIGHT_MAX : HK_WEIGHT_MAX + 1);
+        $hkWexp.textContent = String(s); $hkWv.textContent = fmtNum(hkWeight);
+        hkRebuild();
+    });
 
     // ---- shared scrolling-history line drawer (0 alloc; the ring is caller-owned) ------
     function drawHistLine(g, ring, ptr, mask, n, cap, gx, gy, gw, gh, vmax, rgb, alpha) {
@@ -1504,7 +1836,8 @@
     // SCENE 05 -- SlidingHyperLogLog
     // ====================================================================================
     let shllW = SHLL_DEFAULT_W, shllP = SHLL_DEFAULT_P;
-    let shllWorld = createShllWorld(shllW, shllP, SHLL_DEFAULT_RINGCAP, SHLL_DEFAULT_SEED);
+    let shllQuery = Infinity;   // D4 query cadence (10Hz ticks); Infinity = never query slA
+    let shllWorld = createShllWorld(shllW, shllP, SHLL_DEFAULT_RINGCAP, SHLL_DEFAULT_SEED, shllQuery);
     const shllAlloc = createAllocState();
     let shllOracleOn = true;
     const shllCanvas = $('shll-canvas');
@@ -1527,8 +1860,8 @@
         drawHistLine(g, shllTrueH, shllHPtr, SHLL_HMASK, shllHFilled, SHLL_HIST, shGX, shGY, shGW, plotH, shllVMax, MAGENTA_RGB, 0.8);
         drawHistLine(g, shllEstH, shllHPtr, SHLL_HMASK, shllHFilled, SHLL_HIST, shGX, shGY, shGW, plotH, shllVMax, ACCENT_RGB, 0.95);
     }
-    function shllWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, shllWorld.flat[S_FRAC]); }
-    const shllDom = { big: $('shll-distinct-big'), aS: $('shll-alloc-sketch'), aO: $('shll-alloc-oracle'), est: $('shll-est'), tr: $('shll-true'), rel: $('shll-relerr'), gate: $('shll-gate'), frac: $('shll-frac'), m: $('shll-m'), deg: $('shll-degraded'), skb: $('shll-sketch-kb'), okb: $('shll-oracle-kb'), fps: $('shll-fps'), heap: $('shll-heap'), mem: $('shll-mem') };
+    function shllWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); const fr = shllWorld.flat[S_FRAC]; if (!Number.isNaN(fr)) drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, fr); }
+    const shllDom = { big: $('shll-distinct-big'), aS: $('shll-alloc-sketch'), aO: $('shll-alloc-oracle'), est: $('shll-est'), tr: $('shll-true'), rel: $('shll-relerr'), gate: $('shll-gate'), frac: $('shll-frac'), m: $('shll-m'), deg: $('shll-degraded'), skb: $('shll-sketch-kb'), okb: $('shll-oracle-kb'), fps: $('shll-fps'), heap: $('shll-heap'), mem: $('shll-mem'), ovf: $('shll-ovf') };
     let shllHeap = -1;
     function shllTick() {
         renderShllPrep(shllWorld, shllAlloc);
@@ -1538,12 +1871,17 @@
         let vm = 1; for (let i = 0; i < shllHFilled; i++) { const a = shllEstH[i], b = shllTrueH[i]; if (a > vm) vm = a; if (b > vm) vm = b; } shllVMax = vm;
         shllDom.big.textContent = String(f[S_EST] | 0);
         shllDom.est.textContent = String(f[S_EST] | 0);
-        shllDom.tr.textContent = String(f[S_TRUE] | 0);
-        shllDom.rel.textContent = (f[S_RELERR] * 100).toFixed(2) + '%';
+        // oracle OFF -> renderShllPrep NaNs S_TRUE / S_RELERR / S_FRAC: render "n/a", never a stale number.
+        const trNa = Number.isNaN(f[S_TRUE]);
+        shllDom.tr.textContent = trNa ? 'n/a' : String(f[S_TRUE] | 0);
+        shllDom.rel.textContent = Number.isNaN(f[S_RELERR]) ? 'n/a' : (f[S_RELERR] * 100).toFixed(2) + '%';
         shllDom.gate.textContent = (f[S_GATE] * 100).toFixed(2) + '%';
-        const fr = f[S_FRAC]; shllDom.frac.textContent = fr.toFixed(2) + 'x'; shllDom.frac.className = fr <= 1 ? 'v inband' : 'v outband';
+        const fr = f[S_FRAC]; const frNa = Number.isNaN(fr);
+        shllDom.frac.textContent = frNa ? 'n/a' : fr.toFixed(2) + 'x'; shllDom.frac.className = frNa ? 'v' : (fr <= 1 ? 'v inband' : 'v outband');
         shllDom.m.textContent = String(f[S_M] | 0);
         const deg = f[S_DEGRADED] === 1; shllDom.deg.textContent = deg ? 'YES' : 'no'; shllDom.deg.className = deg ? 'v outband' : 'v inband';
+        const ovfA = f[S_OVF_A] | 0, ovfB = f[S_OVF_B] | 0;   // F8: ALWAYS equal (green) regardless of query rate
+        shllDom.ovf.textContent = String(ovfA) + ' / ' + String(ovfB); shllDom.ovf.className = ovfA === ovfB ? 'v inband' : 'v outband';
         shllDom.skb.textContent = (f[S_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
         shllDom.okb.textContent = (f[S_ORACLE_BYTES] / 1024).toFixed(1) + ' KB';
         shllDom.aS.textContent = String(f[S_SKETCH_ALLOC] | 0);
@@ -1551,17 +1889,23 @@
         shllDom.fps.textContent = String(fpsValue);
         shllHeap = heapText(shllDom.heap, shllHeap);
     }
-    wireToggle('shll-mode-toggle', 'shll-mode-label', 'running (O(distinct))', 'paused (sketch only)', (on) => { shllOracleOn = on; });
+    wireToggle('shll-mode-toggle', 'shll-mode-label', 'running (O(distinct))', 'paused (sketch only)', (on) => { shllOracleOn = on; shllWorld.oracleOn = on; });
     wireToggle('shll-stream-toggle', 'shll-stream-label', 'stream paused (sliding to empty)', 'streaming', (on) => { shllWorld.paused = on; });
-    function shllRebuild() { const p = shllWorld.paused; shllWorld = createShllWorld(shllW, shllP, SHLL_DEFAULT_RINGCAP, SHLL_DEFAULT_SEED); shllWorld.paused = p; shllAlloc.sketchCount = 0; shllAlloc.oracleCount = 0; shllHPtr = 0; shllHFilled = 0; shllDom.mem.textContent = (shllWorld.sl.bytes / 1024).toFixed(1) + ' KB'; shllLayout(); }
+    // A world rebuild changes NO canvas geometry, so it must NOT call shllLayout() (that forces a reflow:
+    // sizeCanvas -> getBoundingClientRect + a canvas backing-store reset on every slider / select input).
+    // Layout is owned by resize (P1 did this for EH).
+    function shllRebuild() { const p = shllWorld.paused; shllWorld = createShllWorld(shllW, shllP, SHLL_DEFAULT_RINGCAP, SHLL_DEFAULT_SEED, shllQuery); shllWorld.paused = p; shllWorld.oracleOn = shllOracleOn; shllAlloc.sketchCount = 0; shllAlloc.oracleCount = 0; shllHPtr = 0; shllHFilled = 0; shllDom.mem.textContent = (shllWorld.sl.bytes / 1024).toFixed(1) + ' KB'; }
     $('shll-w').addEventListener('input', (e) => { shllW = +e.target.value; $('shll-w-v').textContent = String(shllW); shllRebuild(); });
     $('shll-p').addEventListener('input', (e) => { shllP = +e.target.value; $('shll-p-v').textContent = String(shllP); shllRebuild(); });
+    // D4 control: the query-rate select {1, 8, 64, never} driving the twin instances.
+    const $shllQv = $('shll-qevery-v');
+    $('shll-qevery').addEventListener('change', (e) => { const v = e.target.value; shllQuery = v === 'never' ? Infinity : +v; $shllQv.textContent = v; shllRebuild(); });
 
     // ====================================================================================
     // SCENE 06 -- DriftDetector
     // ====================================================================================
-    let ddDelta = DD_DEFAULT_DELTA, ddThr = DD_DEFAULT_THRESHOLD;
-    let ddWorld = createDdWorld(ddDelta, ddThr);
+    let ddDelta = DD_DEFAULT_DELTA, ddThr = DD_DEFAULT_THRESHOLD, ddLatch = false;
+    let ddWorld = createDdWorld(ddDelta, ddThr, ddLatch);
     const ddAlloc = createAllocState();
     let ddOracleOn = true;
     const ddCanvas = $('dd-canvas');
@@ -1574,21 +1918,54 @@
     function ddStep() { stepDd(ddWorld); if (ddOracleOn) stepDdOracle(ddWorld, ddAlloc); }
     const DD_HIST = 256, DD_HMASK = 255;
     const ddSigH = new Float64Array(DD_HIST), ddPhH = new Float64Array(DD_HIST), ddCuH = new Float64Array(DD_HIST), ddFireH = new Float64Array(DD_HIST);
+    // D5 latched-channel history (drawn only when the latch display toggle is on): the latched fire cursors
+    // (statistic / threshold), the one-per-latched-fire markers, and the fire DIRECTION for the arrow glyph.
+    const ddPhLH = new Float64Array(DD_HIST), ddCuLH = new Float64Array(DD_HIST), ddLFireH = new Float64Array(DD_HIST), ddLDirH = new Float64Array(DD_HIST);
     let ddHPtr = 0, ddHFilled = 0;
     function ddDraw() {
         const g = ddCtx; if (!g) return;
+        const f = ddWorld.flat;
+        const latchOn = f[G_LATCH_ON] > 0;   // the D5 display toggle: draw the latched channels contrasted
         g.clearRect(0, 0, DDW, DDH);
         g.font = LABEL_FONT; g.fillStyle = COL_DIM;
-        g.fillText('the SIGNAL (dim) with regime steps; violet = PH fire cursor, cyan = CUSUM fire cursor (statistic / threshold); red = a fire', ddGX, ddGY - 8);
+        g.fillText(latchOn
+            ? 'SIGNAL (dim); violet/cyan = unlatched PH/CUSUM storm; amber/green = LATCHED PH/CUSUM (one fire per regime + arrow); red = unlatched fire'
+            : 'the SIGNAL (dim) with regime steps; violet = PH fire cursor, cyan = CUSUM fire cursor (statistic / threshold); red = a fire', ddGX, ddGY - 8);
         const n = ddHFilled; if (n < 2) return;
         const plotH = ddGH - 12;
-        // fires
-        for (let i = 0; i < n; i++) { const idx = (ddHPtr - n + i + DD_HIST) & DD_HMASK; if (ddFireH[idx] > 0) { const x = ddGX + (i / (n - 1)) * ddGW; g.fillStyle = rgbaq(RED_RGB, 0.3); g.fillRect(x - 1, ddGY, 2, plotH); } }
+        // unlatched fires (the re-firing storm): dim when the latch channels are on, to CONTRAST them.
+        const stormA = latchOn ? 0.14 : 0.3;
+        for (let i = 0; i < n; i++) { const idx = (ddHPtr - n + i + DD_HIST) & DD_HMASK; if (ddFireH[idx] > 0) { const x = ddGX + (i / (n - 1)) * ddGW; g.fillStyle = rgbaq(RED_RGB, stormA); g.fillRect(x - 1, ddGY, 2, plotH); } }
         // the raw signal (normalized to [0,1] over its LO..HI band)
         drawHistLine(g, ddSigH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.2, STALE_RGB, 0.6);
-        // the two fire cursors (statistic / threshold, clamped to [0,1.3])
-        drawHistLine(g, ddPhH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.3, ACCENT_RGB, 0.95);
-        drawHistLine(g, ddCuH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.3, CYAN_RGB, 0.9);
+        // the two unlatched fire cursors (statistic / threshold, clamped to [0,1.3]); dimmed under the latch.
+        const stormLineA = latchOn ? 0.45 : 0.95;
+        drawHistLine(g, ddPhH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.3, ACCENT_RGB, stormLineA);
+        drawHistLine(g, ddCuH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.3, CYAN_RGB, latchOn ? 0.4 : 0.9);
+        // D5: the LATCHED channels, drawn ONLY when the toggle is on and CONTRASTED (bright amber/green) vs
+        // the dimmed unlatched storm. One bright marker per latched fire + an up/down arrow for its
+        // lastDirection (reads f[G_PHL_FIRED] / f[G_CUL_FIRED] per-tick history; skips NaN, no layout read).
+        if (latchOn) {
+            drawHistLine(g, ddPhLH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.3, AMBER_RGB, 0.95);
+            drawHistLine(g, ddCuLH, ddHPtr, DD_HMASK, n, DD_HIST, ddGX, ddGY, ddGW, plotH, 1.3, GREEN_RGB, 0.9);
+            // live-fire flash at the right (now) edge when a latched channel fired THIS tick (reads the
+            // per-frame G_PHL_FIRED / G_CUL_FIRED flags so a fresh latched fire is visible immediately).
+            if (f[G_PHL_FIRED] > 0 || f[G_CUL_FIRED] > 0) { g.fillStyle = rgbaq(AMBER_RGB, 0.35); g.fillRect(ddGX + ddGW - 3, ddGY, 3, plotH); }
+            for (let i = 0; i < n; i++) {
+                const idx = (ddHPtr - n + i + DD_HIST) & DD_HMASK;
+                if (!(ddLFireH[idx] > 0)) continue;
+                const x = ddGX + (i / (n - 1)) * ddGW;
+                g.fillStyle = rgbaq(GREEN_RGB, 0.95); g.fillRect(x - 1.5, ddGY, 3, plotH);
+                const dir = ddLDirH[idx];
+                if (Number.isNaN(dir)) continue;   // no direction (skip) -- null is not zero
+                // up/down arrow glyph at the top of the plot for the latched fire direction (+1 up / -1 down).
+                const ay = ddGY + 8, up = dir > 0;
+                g.fillStyle = rgbaq(AMBER_RGB, 0.98); g.beginPath();
+                if (up) { g.moveTo(x, ay - 6); g.lineTo(x - 4, ay + 2); g.lineTo(x + 4, ay + 2); }
+                else { g.moveTo(x, ay + 6); g.lineTo(x - 4, ay - 2); g.lineTo(x + 4, ay - 2); }
+                g.closePath(); g.fill();
+            }
+        }
         // the fire threshold (1.0) line
         const ty = ddGY + plotH - (1 / 1.3) * plotH;
         g.strokeStyle = rgbaq(RED_RGB, 0.4); g.setLineDash(DASH_44); g.beginPath(); g.moveTo(ddGX, ty); g.lineTo(ddGX + ddGW, ty); g.stroke(); g.setLineDash(DASH_NONE);
@@ -1598,12 +1975,21 @@
         drawGauge(g, 8, h * 0.30, w - 16, h * 0.30, ddWorld.flat[G_PH_FRAC]);
         drawGauge(g, 8, h * 0.72, w - 16, h * 0.72, ddWorld.flat[G_CU_FRAC]);
     }
-    const ddDom = { big: $('dd-ph-big'), aS: $('dd-alloc-sketch'), aO: $('dd-alloc-oracle'), ph: $('dd-ph'), cu: $('dd-cu'), phf: $('dd-ph-fires'), cuf: $('dd-cu-fires'), cp: $('dd-cp'), tm: $('dd-truemean'), n: $('dd-n'), skb: $('dd-sketch-kb'), okb: $('dd-oracle-kb'), fps: $('dd-fps'), heap: $('dd-heap'), mem: $('dd-mem') };
+    const ddDom = { big: $('dd-ph-big'), aS: $('dd-alloc-sketch'), aO: $('dd-alloc-oracle'), ph: $('dd-ph'), cu: $('dd-cu'), phf: $('dd-ph-fires'), cuf: $('dd-cu-fires'), cp: $('dd-cp'), tm: $('dd-truemean'), n: $('dd-n'), skb: $('dd-sketch-kb'), okb: $('dd-oracle-kb'), fps: $('dd-fps'), heap: $('dd-heap'), mem: $('dd-mem'),
+        latchFires: $('dd-latch-fires'), culLast: $('dd-cul-last'), phlLast: $('dd-phl-last') };
     let ddHeap = -1;
+    // "index, arrow" for a latched last-drift: NaN (no fire yet) renders "n/a" with a neutral class -- never
+    // String(NaN) -> "NaN" (null is not zero). +1 -> up arrow, -1 -> down.
+    function ddDriftText(idx, dir) { return Number.isNaN(idx) || Number.isNaN(dir) ? 'n/a' : (String(idx | 0) + ', ' + (dir > 0 ? '^ up' : 'v down')); }
     function ddTick() {
         renderDdPrep(ddWorld, ddAlloc);
         const f = ddWorld.flat;
         ddSigH[ddHPtr] = f[G_PH_MEAN]; ddPhH[ddHPtr] = f[G_PH_FRAC]; ddCuH[ddHPtr] = f[G_CU_FRAC]; ddFireH[ddHPtr] = (f[G_PH_FIRED] || f[G_CU_FIRED]) ? 1 : 0;
+        // D5 latched history: the latched fire cursors + one marker per latched fire + its direction (for
+        // the up/down arrow). NaN direction (no latched fire this tick) is skipped by ddDraw.
+        ddPhLH[ddHPtr] = f[G_PHL_FRAC]; ddCuLH[ddHPtr] = f[G_CUL_FRAC];
+        ddLFireH[ddHPtr] = (f[G_PHL_FIRED] || f[G_CUL_FIRED]) ? 1 : 0;
+        ddLDirH[ddHPtr] = f[G_PHL_FIRED] ? f[G_PHL_LASTDIR] : (f[G_CUL_FIRED] ? f[G_CUL_LASTDIR] : NaN);
         ddHPtr = (ddHPtr + 1) & DD_HMASK; if (ddHFilled < DD_HIST) ddHFilled++;
         ddDom.big.textContent = f[G_PH_STAT].toFixed(2);
         ddDom.ph.textContent = f[G_PH_STAT].toFixed(2) + ' / ' + f[G_PH_THRESH].toFixed(0);
@@ -1617,19 +2003,28 @@
         ddDom.okb.textContent = (f[G_ORACLE_BYTES] / 1024).toFixed(1) + ' KB';
         ddDom.aS.textContent = String(f[G_SKETCH_ALLOC] | 0);
         ddDom.aO.textContent = String(f[G_ORACLE_ALLOC]);
+        // D5 latched twins: fires (latched vs unlatched storm) + last-drift index / direction arrows.
+        ddDom.latchFires.textContent = String(f[G_CUL_FIRES] | 0) + ' / ' + String(f[G_CU_FIRES] | 0);
+        ddDom.culLast.textContent = ddDriftText(f[G_CUL_LASTIDX], f[G_CUL_LASTDIR]);
+        ddDom.phlLast.textContent = ddDriftText(f[G_PHL_LASTIDX], f[G_PHL_LASTDIR]);
         ddDom.fps.textContent = String(fpsValue);
         ddHeap = heapText(ddDom.heap, ddHeap);
     }
     wireToggle('dd-mode-toggle', 'dd-mode-label', 'running (retains O(N))', 'paused (sketch only)', (on) => { ddOracleOn = on; });
-    function ddRebuild() { ddWorld = createDdWorld(ddDelta, ddThr); ddAlloc.sketchCount = 0; ddAlloc.oracleCount = 0; ddHPtr = 0; ddHFilled = 0; ddDom.mem.textContent = (DD_SKETCH_BYTES / 1024).toFixed(3) + ' KB'; ddLayout(); }
+    // The latched twins ALWAYS run beside the unlatched pair; the toggle only sets the display emphasis
+    // flag (G_LATCH_ON) -- no rebuild, no state reset, no forced reflow (the latched readouts stay live).
+    wireToggle('dd-latch-toggle', 'dd-latch-label', 'on (one fire per regime + re-arm at threshold/2)', 'off (1.x re-firing storm)', (on) => { ddLatch = on; ddWorld.latchOn = on; });
+    // No ddLayout() here: the mode/threshold sliders must NOT force a reflow (the canvas is re-sized on
+    // tab-switch / resize only). Rebuilding the world is enough; the next rAF draws at the current size.
+    function ddRebuild() { ddWorld = createDdWorld(ddDelta, ddThr, ddLatch); ddAlloc.sketchCount = 0; ddAlloc.oracleCount = 0; ddHPtr = 0; ddHFilled = 0; ddDom.mem.textContent = (DD_SKETCH_BYTES / 1024).toFixed(3) + ' KB'; }
     $('dd-thr').addEventListener('input', (e) => { ddThr = +e.target.value; $('dd-thr-v').textContent = String(ddThr); ddRebuild(); });
     $('dd-delta').addEventListener('input', (e) => { ddDelta = (+e.target.value) / 1000; $('dd-delta-v').textContent = ddDelta.toFixed(3); ddRebuild(); });
 
     // ====================================================================================
     // SCENE 07 -- SlidingDDSketch
     // ====================================================================================
-    let sldW = SLD_DEFAULT_W, sldAlpha = SLD_DEFAULT_ALPHA;
-    let sldWorld = createSldWorld(sldW, sldAlpha, SLD_DEFAULT_PANES);
+    let sldW = SLD_DEFAULT_W, sldAlpha = SLD_DEFAULT_ALPHA, sldMode = SLD_MODE_DEFAULT;
+    let sldWorld = createSldWorld(sldW, sldAlpha, SLD_DEFAULT_PANES, sldMode);
     const sldAlloc = createAllocState();
     let sldOracleOn = true;
     const sldCanvas = $('sld-canvas');
@@ -1651,7 +2046,10 @@
         const f = sldWorld.flat;
         // value axis: log-scaled over the observed range (read via hoisted index arrays -- no per-frame literals)
         let vmax = 1; for (let i = 0; i < 3; i++) { const e = f[SLD_EST_IDX[i]], tv = f[SLD_TRUE_IDX[i]]; if (e > vmax) vmax = e; if (tv > vmax) vmax = tv; }
-        const rowH = sdGH / 3;
+        // D6: carve a bottom strip for the B+1 pane / covered-span / TRUE-window schematic.
+        const SLD_STRIP_H = 26;
+        const rowsH = sdGH - SLD_STRIP_H - 6;
+        const rowH = rowsH / 3;
         for (let r = 0; r < 3; r++) {
             const y = sdGY + r * rowH + 4, bh = rowH - 12;
             g.fillStyle = COL_FAINT; g.fillText(SLD_QLAB[r], PAD, y + bh * 0.5 + 3);
@@ -1665,11 +2063,42 @@
             g.fillStyle = rgbaq(ACCENT_RGB, 0.85); g.fillRect(sdGX, y, ew, bh);
             if (t > 0) { const tX = sdGX + sdGW * (t / vmax); g.fillStyle = rgbaq(MAGENTA_RGB, 0.95); g.fillRect(tX - 1, y - 1, 2, bh + 2); }
         }
+        // D6 B+1 pane strip: the sketch keeps B+1 panes so the covered span [W, W+W/B] ALWAYS covers the
+        // full window W. Draw B+1 pane cells across the covered span; bracket the covered span (violet) and
+        // the TRUE (now-W, now] window (amber) over it, with the STRADDLING oldest pane (magenta) sticking
+        // out past the true edge on the left. No layout read; the strip maps time -> x by pane geometry.
+        const B = sldWorld.panes | 0, W = sldWorld.W, pw = sldWorld.pw, cov = W + pw;
+        const sy = sdGY + rowsH + 6, sh = SLD_STRIP_H - 12;
+        const cellW = sdGW / (B + 1);
+        // pane cells (B+1). Cell 0 (leftmost, oldest) is the straddling pane -- highlighted magenta.
+        for (let c = 0; c <= B; c++) {
+            const cx = sdGX + c * cellW;
+            const straddle = c === 0;
+            g.fillStyle = straddle ? rgbaq(MAGENTA_RGB, 0.22) : rgbaq(STALE_RGB, 0.14);
+            g.fillRect(cx + 0.5, sy, cellW - 1, sh);
+        }
+        // covered-span bracket (violet): the FULL B+1-pane span [W, W+W/B].
+        g.strokeStyle = rgbaq(ACCENT_RGB, 0.9); g.lineWidth = 1.5;
+        g.strokeRect(sdGX + 0.5, sy - 0.5, sdGW - 1, sh + 1);
+        // TRUE (now-W, now] window bracket (amber): W wide, anchored at now (right edge). Its left edge
+        // (now-W) falls INSIDE the straddling oldest pane, so the oldest pane sticks out past it on the left.
+        const trueLeft = sdGX + (cov - W) / cov * sdGW;   // = pw/cov * sdGW into the strip
+        g.strokeStyle = rgbaq(AMBER_RGB, 0.95); g.lineWidth = 2;
+        g.beginPath(); g.moveTo(trueLeft, sy - 2); g.lineTo(trueLeft, sy + sh + 2);
+        g.moveTo(sdGX + sdGW, sy - 2); g.lineTo(sdGX + sdGW, sy + sh + 2); g.stroke();
+        g.lineWidth = 1;
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM;
+        g.fillText('B+1 panes: violet = covered [W, W+W/B], amber = true (now-W, now]; magenta = straddling oldest pane', sdGX, sy + sh + 10);
     }
     function sldWitDraw(g, w, h) { if (!g) return; g.clearRect(0, 0, w, h); drawGauge(g, 8, h * 0.5, w - 16, h * 0.5, sldWorld.flat[Q_FRAC]); }
-    const sldDom = { big: $('sld-p99-big'), aS: $('sld-alloc-sketch'), aO: $('sld-alloc-oracle'), p50: $('sld-p50'), p90: $('sld-p90'), p99: $('sld-p99'), rel: $('sld-relerr'), frac: $('sld-frac'), count: $('sld-count'), coll: $('sld-collapsed'), skb: $('sld-sketch-kb'), okb: $('sld-oracle-kb'), fps: $('sld-fps'), heap: $('sld-heap'), mem: $('sld-mem') };
+    const sldDom = { big: $('sld-p99-big'), aS: $('sld-alloc-sketch'), aO: $('sld-alloc-oracle'), p50: $('sld-p50'), p90: $('sld-p90'), p99: $('sld-p99'), rel: $('sld-relerr'), frac: $('sld-frac'), count: $('sld-count'), coll: $('sld-collapsed'), skb: $('sld-sketch-kb'), okb: $('sld-oracle-kb'), fps: $('sld-fps'), heap: $('sld-heap'), mem: $('sld-mem'),
+        cov: $('sld-cov'), trueW: $('sld-truew'), cursor: $('sld-cnt-cursor'), range: $('sld-range'), rejected: $('sld-rejected') };
     let sldHeap = -1;
-    function sldFmt(v) { return Number.isNaN(v) ? 'NaN' : v.toFixed(2); }
+    function sldFmt(v) { return Number.isNaN(v) ? 'n/a' : v.toFixed(2); }
+    // NaN fails closed to "n/a" (never "NaN%"/"NaN x") -- null is not zero (oracle off / resume hold / empty window).
+    function sldPct(v) { return Number.isNaN(v) ? 'n/a' : (v * 100).toFixed(2) + '%'; }
+    // class-write guard: only touch className when it actually changes (no per-tick className churn).
+    let sldLastFracCls = '', sldLastCurCls = '', sldLastCollCls = '';
     function sldTick() {
         renderSldPrep(sldWorld, sldAlloc);
         const f = sldWorld.flat;
@@ -1677,22 +2106,48 @@
         sldDom.p50.textContent = sldFmt(f[Q_P50]) + ' / ' + sldFmt(f[Q_P50T]);
         sldDom.p90.textContent = sldFmt(f[Q_P90]) + ' / ' + sldFmt(f[Q_P90T]);
         sldDom.p99.textContent = sldFmt(f[Q_P99]) + ' / ' + sldFmt(f[Q_P99T]);
-        sldDom.rel.textContent = (f[Q_MAXREL] * 100).toFixed(2) + '%';
-        const fr = f[Q_FRAC]; sldDom.frac.textContent = fr.toFixed(2) + 'x'; sldDom.frac.className = fr <= 1 ? 'v inband' : 'v outband';
-        sldDom.count.textContent = String(f[Q_COUNT] | 0) + ' / ' + String(f[Q_EDGE] | 0);
-        const coll = f[Q_COLLAPSED] === 1; sldDom.coll.textContent = coll ? 'yes' : 'no'; sldDom.coll.className = coll ? 'v outband' : 'v inband';
+        sldDom.rel.textContent = sldPct(f[Q_MAXREL]);
+        const fr = f[Q_FRAC];
+        sldDom.frac.textContent = Number.isNaN(fr) ? 'n/a' : fr.toFixed(2) + 'x';
+        const frCls = Number.isNaN(fr) ? 'v' : (fr <= 1 ? 'v inband' : 'v outband');
+        if (frCls !== sldLastFracCls) { sldDom.frac.className = frCls; sldLastFracCls = frCls; }
+        sldDom.count.textContent = String(f[Q_COUNT] | 0) + ' / ' + (Number.isNaN(f[Q_EDGE]) ? 'n/a' : String(f[Q_EDGE] | 0));
+        const coll = f[Q_COLLAPSED] === 1; sldDom.coll.textContent = coll ? 'yes' : 'no';
+        const collCls = coll ? 'v outband' : 'v inband';
+        if (collCls !== sldLastCollCls) { sldDom.coll.className = collCls; sldLastCollCls = collCls; }
         sldDom.skb.textContent = (f[Q_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
         sldDom.okb.textContent = (f[Q_ORACLE_BYTES] / 1024).toFixed(1) + ' KB';
         sldDom.aS.textContent = String(f[Q_SKETCH_ALLOC] | 0);
         sldDom.aO.textContent = String(f[Q_ORACLE_ALLOC]);
+        // D6: the covered span [W, W+W/B], the F7 count() / true(W) cursor (>= 1), the true(W) count,
+        // strict / rangeMin / rangeMax, and the rejected counter. NaN rangeMin (no declared range) -> "off".
+        // NaN cursor / true(W) (oracle off / resume hold / empty window) fails closed to "n/a", neutral 'v'.
+        sldDom.cov.textContent = String(f[Q_COVMIN] | 0) + ' -> ' + String(f[Q_COVMAX] | 0);
+        sldDom.trueW.textContent = Number.isNaN(f[Q_TRUEW]) ? 'n/a' : String(f[Q_TRUEW] | 0);
+        const cur = f[Q_CNT_CURSOR];
+        sldDom.cursor.textContent = Number.isNaN(cur) ? 'n/a' : (Number.isFinite(cur) ? cur.toFixed(2) + 'x' : 'inf x');
+        const curCls = Number.isNaN(cur) ? 'v' : (cur >= 1 - 1e-9 ? 'v accent inband' : 'v outband');
+        if (curCls !== sldLastCurCls) { sldDom.cursor.className = curCls; sldLastCurCls = curCls; }
+        sldDom.range.textContent = Number.isNaN(f[Q_RANGEMIN])
+            ? (f[Q_STRICT] === 1 ? 'strict (span)' : 'off')
+            : ('strict [' + (f[Q_RANGEMIN] | 0) + ', ' + (f[Q_RANGEMAX] | 0) + ']');
+        sldDom.rejected.textContent = String(f[Q_REJECTED] | 0);
         sldDom.fps.textContent = String(fpsValue);
         sldHeap = heapText(sldDom.heap, sldHeap);
     }
-    wireToggle('sld-mode-toggle', 'sld-mode-label', 'running (O(W))', 'paused (sketch only)', (on) => { sldOracleOn = on; });
+    // Toggle sets the world field renderSldPrep reads; re-enabling stamps resumeNow so the accuracy /
+    // count gauges hold NaN ("n/a") until a full window W has refilled (no false gauge from a stale ring).
+    wireToggle('sld-mode-toggle', 'sld-mode-label', 'running (O(W))', 'paused (sketch only)', (on) => { sldOracleOn = on; sldWorld.oracleOn = on; if (on) sldWorld.resumeNow = sldWorld.now; });
     wireToggle('sld-stream-toggle', 'sld-stream-label', 'stream paused (sliding to empty)', 'streaming', (on) => { sldWorld.paused = on; });
-    function sldRebuild() { const p = sldWorld.paused; sldWorld = createSldWorld(sldW, sldAlpha, SLD_DEFAULT_PANES); sldWorld.paused = p; sldAlloc.sketchCount = 0; sldAlloc.oracleCount = 0; sldDom.mem.textContent = (sldWorld.sd.bytes / 1024).toFixed(1) + ' KB'; sldLayout(); }
+    // No sldLayout() here: the W/alpha sliders + mode select must NOT force a reflow (resize on tab-switch
+    // / window-resize only). Rebuilding the world is enough; the next rAF draws at the current canvas size.
+    function sldRebuild() { const p = sldWorld.paused; sldWorld = createSldWorld(sldW, sldAlpha, SLD_DEFAULT_PANES, sldMode); sldWorld.paused = p; sldWorld.oracleOn = sldOracleOn; sldAlloc.sketchCount = 0; sldAlloc.oracleCount = 0; sldDom.mem.textContent = (sldWorld.sd.bytes / 1024).toFixed(1) + ' KB'; }
     $('sld-w').addEventListener('input', (e) => { sldW = +e.target.value; $('sld-w-v').textContent = String(sldW); sldRebuild(); });
     $('sld-alpha').addEventListener('input', (e) => { sldAlpha = (+e.target.value) / 1000; $('sld-alpha-v').textContent = sldAlpha.toFixed(3); sldRebuild(); });
+    // D6 mode select {default, strict, range [1,20]} -- rebuilds through the shipped option door (fail-closed).
+    const SLD_MODE_LABELS = ['default', 'strict', 'range [1, 20]'];
+    const $sldModeV = $('sld-mode-v');
+    $('sld-mode').addEventListener('change', (e) => { sldMode = +e.target.value; $sldModeV.textContent = SLD_MODE_LABELS[sldMode]; sldRebuild(); });
 
     // ====================================================================================
     // SCENE 08 -- SlidingCountMin
@@ -1831,7 +2286,7 @@
         fpsFrames++;
         if (now - fpsLast >= 500) { fpsValue = Math.round(fpsFrames * 1000 / (now - fpsLast)); fpsLast = now; fpsFrames = 0; }
 
-        if (activeScene === 'eh') { if (!paused) ehStep(); ehDraw(); drawJank(ehJankCtx, EJW, EJH); ehWitDraw(ehWitCtx, EWW, EWH); drawSpaceBars(ehSpCtx, ESW, ESH, ehWorld.flat[E_SKETCH_BYTES], ehWorld.flat[E_RING_BYTES]); }
+        if (activeScene === 'eh') { if (!paused) ehStep(); ehDraw(); drawJank(ehJankCtx, EJW, EJH); ehWitDraw(ehWitCtx, EWW, EWH); drawSpaceBars(ehSpCtx, ESW, ESH, ehWorld.flat[E_SKETCH_BYTES], ehWorld.flat[E_RING_BYTES]); ehPoolDraw(ehPoolCtx, EPW, EPH); ehSumDraw(ehSumCtx, EUW, EUH); }
         else if (activeScene === 'ad') { if (!paused) adStep(); adDraw(); drawJank(adJankCtx, AJW, AJH); adWitDraw(adWitCtx, AWW, AWH); drawSpaceBars(adSpCtx, ASW, ASH, adWorld.flat[A_SKETCH_BYTES], adWorld.flat[A_ORACLE_BYTES]); }
         else if (activeScene === 'fd') { if (!paused) fdStep(); fdDraw(); drawJank(fdJankCtx, FJW, FJH); fdWitDraw(fdWitCtx, FWW, FWH); drawSpaceBars(fdSpCtx, FSW, FSH, fdWorld.flat[D_SKETCH_BYTES], fdWorld.flat[D_ARR_BYTES]); }
         else if (activeScene === 'hk') { if (!paused) hkStep(); hkDraw(); drawJank(hkJankCtx, HJW, HJH); hkWitDraw(hkWitCtx, HWW, HWH); drawSpaceBars(hkSpCtx, HSW, HSH, hkWorld.flat[H_SKETCH_BYTES], hkWorld.flat[H_MAP_BYTES]); }

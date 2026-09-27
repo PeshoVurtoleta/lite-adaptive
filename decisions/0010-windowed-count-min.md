@@ -153,7 +153,23 @@ NO-CLEAR-ON-ROTATE instead. This member closes the per-label-frequency gap on th
 `merge(other)` (the absolute pane alignment makes it a cell-by-cell pane add) remains a possible pure-append
 post-1.5.
 
-## No `total` getter (intentional asymmetry vs lite-sketch CountMinSketch, not a parity gap)
+## No `total` getter (SUPERSEDED in 1.8.0 by an exact per-pane Float64 total)
+
+**Amendment (1.8.0).** `total(w?)` now ships, and it is EXACT, not the disclosed over-estimate this
+section anticipated. The earlier reasoning below rejected the two ways of deriving the windowed grand
+total FROM THE GRID -- an `O(d*w*(panes+1))` full-grid scan, or one row's raw windowed cell sum (which
+CMS collisions make an OVER-estimate of the true total, not a usable headline). 1.8.0 does neither: it
+maintains a SEPARATE per-pane `Float64` running total (`_paneTotal`, `(panes+1)*8 B`), incremented by ONE
+floating-point add per `add` (`this._paneTotal[this._cur] += count`, placed AFTER the pane rotation so it
+lands in the live pane). `total(w?)` then sums that scalar over the SAME live panes as `estimate`
+(straddling oldest pane included), giving the exact windowed `N` over the covered span `[W, W + W/B]` in
+`O(B+1)`, 0 alloc. The collision-over-estimate objection does not apply because the number never comes
+from the grid at all -- it sums validated per-add `count`s, so it is exact until a pane's running total
+passes `2^53` (long after the `Uint32` cells saturate at `2^32-1`). The "hot-path bookkeeping the family
+does not pay for a value nothing consumes" objection is retired: `total()` is the `epsilon * N` denominator
+a consumer needs to turn the relative Count-Min guarantee into an absolute additive error bound, and the
+cost is a single measured fp add on the `add` hot body (still 0 B/op). The original 1.5.0 reasoning, kept
+for the record:
 
 lite-sketch's cumulative `CountMinSketch` exposes `get total()` because a lifetime accumulator has one
 well-defined scalar: the running sum of every `count` ever added. SlidingCountMin has no such scalar to
@@ -165,3 +181,27 @@ and computing it honestly would need either a SEPARATE running counter re-derive
 O(d*w*(panes+1)) full-grid scan on every call. Omitted BY DESIGN in 1.5.0, not an oversight; an
 approximate `total(w?)` (disclosed as an over-estimate, e.g. via one row's raw windowed sum) remains a
 possible additive follow-up alongside `merge`, same as any other post-1.5 pure append.
+
+## Amendment (1.8.0, F19) -- the hash path drops its boxable argument
+
+`SlidingCountMin` mirrors the HeavyKeeper MurmurHash3, and pre-F19 the `add` / `addFrom` / `estimate`
+hash inlined the key words into int32 LOCALS but PASSED the key low word `lo` (a HeapNumber for a key
+with bit 31 set: `2^31 .. 2^32-1`, `2^53-1`, `-2^31`) and the running state to `hkRound` / `hkFinal`
+as CALL ARGUMENTS -- and the per-row column derivation (`hkFinal((base ^ Math.imul(i, HK_ODD)) | 0)`)
+passed an int32 that can exceed `2^30`. When V8 left one such call un-inlined (deterministic under
+`--no-turbo-inlining`; flaky under CPU contention), a large-key `addFrom` boxed ~16 B/op. F19v2
+removes the boxable argument by HAND-INLINING the whole two-lane murmur + `fmix` and the per-row
+column derivation directly in the hot body, in register-resident int32 LOCALS: no `hkRound` /
+`hkFinal` sub-call remains on the SCM path, so no hash word crosses any call boundary and nothing can
+box, even under `--no-turbo-inlining`. Those locals carry the SAME `ToInt32` semantics `Math.imul` /
+`| 0` / the caller's `>>> 0` / `& mask` apply, so every column position, `estimate`, and `total` is
+BIT-IDENTICAL to the pre-fix code -- proven by the `SCMParity` differential vectors
+(`scm-1.7.0-vectors.json`), a 50k-op stream heavy on large / negative keys plus 400 `estimate(key, w)`
+probes, all equal to the argument-passing 1.7.0 output. Rejected (F19v1): parking each round in a
+module `Int32Array` scratch (`HK_RS`) so the helpers took no argument -- V8 could not scalar-replace
+that per-round memory round-trip and it cost ~59% on THIS hot path (the worst of the three classes,
+which is why the guard below exists), so it was reverted to inlined locals. Gated by the
+`noInlineLargeKey` group in `test/perf/AllocMatrix.test.mjs` (keys `2^31` / `2^32-1`; the same lanes
+read ~16 B/op against the pre-fix file) AND by `test/perf/HashThroughput.test.mjs`, an in-process A/B
+that times shipped `addFrom` against the frozen 1.7.0 baseline and fails RED above 1.15x (the F19v1
+round-trip reads ~1.59x here).

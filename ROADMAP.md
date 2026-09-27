@@ -6,7 +6,8 @@ complete at 1.0.0). See `RESEARCH.md` for the identity, the two witnesses (recen
 change response), the roster rationale (incl. the verdict on the inherited backlog), and the
 open questions. ASCII-only (`->`, `<=`, `x`, "epsilon", "alpha", "delta").
 
-> **NEXT (2026-09-24): H1 hardening -- v1.7.0, MINOR, hardening only** (section 7; audit record in
+> **NEXT (2026-09-26): the last session -- v1.8.0 additive API + the demo for 1.7.0 / 1.8.0 (section 8).**
+> 1.7.0 H1 hardening SHIPPED 2026-09-26. Previously: **H1 hardening -- v1.7.0, MINOR, hardening only** (section 7; audit record in
 > RESEARCH.md section 13; reproduction + session plan in 7.1 / 7.2). Then 1.8.0 = additive API (S1, S2).
 > The 1.6.0 final sweep found 4 High findings the shipped gates pass:
 > - `ExponentialHistogram` goes to `count() = NaN` on a dense explicit stream.
@@ -399,7 +400,7 @@ seeded PRNG, getters, a 0-alloc `clear`, and `merge` optional. **ADWIN.addFrom**
 
 ---
 
-## 7. H1 hardening -- v1.7.0 (final-sweep audit of 1.6.0, 2026-09-24)  [IN PROGRESS -- 1.7.0]
+## 7. H1 hardening -- v1.7.0 (final-sweep audit of 1.6.0, 2026-09-24)  [SHIPPED -- 1.7.0, published 2026-09-26]
 
 Baseline at audit (d37b271): `npm test` 368/368, `test:perf` 28/28, torture `ok` (exit 0), and
 every torture lane prints 0 B/op. Two parallel read-only audits covered (a) allocation + gate
@@ -633,5 +634,173 @@ be rebuilt from this table. F1-F15 each need only a few lines.
 **Cut line if time runs short:** steps 1-2 alone are a coherent, releasable 1.7.0 (the four Highs
 plus honest gates). Steps 3-5 then ship as 1.7.1, still hardening only. 1.8.0 stays the additive
 API release (S1, S2, the F6 readers).
+
+## 8. The last session -- v1.8.0 (additive API) + the demo for 1.7.0 / 1.8.0  [PLANNED]
+
+1.7.0 shipped the hardening. 1.8.0 ships the settled additive API, and the demo is brought up to
+date so that every 1.7.0 / 1.8.0 capability is VISIBLE and re-derived live (DEMO.md section 0: no
+hardcoded number, the demo frame path at 0 B/op). Rules: each step is planner -> coder -> reviewer ->
+qa; NO agent runs git commit / push / reset / stash (the maintainer commits); `npm run verify` stays
+green after every step.
+
+**Settle first (maintainer):** ALL SETTLED 2026-09-26 -- the maintainer accepted every lean: S9 latch as
+below; S10 = (a), ship `SlidingAggregate` as the tenth member (demo scene D9); S11 = measure the
+31-bit-Smi browser lane in Chromium via the demo page (D8).
+- S9 DriftDetector latch semantics. Lean: a `latch` option (default `false`, so 1.x behavior is
+  unchanged). With `latch: true` the detector fires ONCE per regime and re-arms when its statistic
+  falls back below `threshold / 2` (hysteresis) or on `clear()`. Plus getters `lastDriftIndex`
+  (item index of the last fire, NaN before any) and `lastDirection` (+1 / -1, NaN before any).
+  Both modes (PH and CUSUM). ADR 0007 amendment.
+- S10 lite-hud's F17 need (a time-window MEAN of skewed latencies). Options: (a) a tenth member,
+  `SlidingAggregate`: exact per-pane count / sum / min / max on the SCM / SDD B+1 pane ring,
+  covering [W, W + W/B], with no value-skew error; (b) defer, and lite-hud keeps its own pane ring.
+  Lean: (a), because it is the smallest correct answer to F17 and it reuses a proven substrate.
+- S11 N6 (31-bit-Smi browser lane): a measured headless-Chrome lane now, or record it as open. Lean:
+  measure it via the demo page (see D8), because the demo already runs the shipped file in Chromium.
+
+**1.8.0 library steps:**
+1. SlidingCountMin `total(w?)` -- an exact windowed N from a Float64 total per pane (+8 B/pane),
+   same w semantics as `estimate` (bad w -> NaN); the witness gates `total == exact N over the
+   covered span` and uses it for the eps x N bound.
+2. SlidingCountMin `estimateInto(keys, out, w?)` -- a batch 0-alloc reader over Float64Arrays (F6);
+   the last `gates:red` todo goes GREEN, so `gates:red` must exit 0 (the full exit criterion of 7).
+3. DriftDetector `latch` + `lastDriftIndex` + `lastDirection` (S9); the witness: one fire per regime
+   on the +10 step (vs 5000 today), direction correct on up / down steps, the default path
+   byte-identical (parity vectors).
+4. MOVED (maintainer, 2026-09-26): `SlidingAggregate` is its own MINOR in a dedicated session --
+   v1.9.0, section 9 (one feature per release: easier review, more npm traction).
+5. Watch item from 1.7.0: an HK addFrom lane read 16 B/op once in 1 of 3 `gates:red` runs; it did
+   not reproduce in 20 isolated runs or 3 later runs. Run `gates:red` 5x in step 6; a repeat is a
+   finding.
+
+**Progress (2026-09-26, uncommitted):** library steps DONE and reviewer-APPROVED.
+- SCM `total(w?)` + `estimateInto` (REJECTED once: an unset instance with a bad w returned 0, the
+  witness upper bound used the implementation's own total, the w argument was never exercised (an
+  ignore-w mutant passed 447/447), and the must-box control had been deleted -- all fixed and
+  mutant-proven). `gates:red` exits 0 with NO todo: the section-7 exit criterion is met.
+- DriftDetector `latch` (REJECTED 3x, each a real fail-open found by mutants or measurement: an
+  unconditional clamp that never re-armed on a gradual return; a PH re-arm that wiped the reference
+  so reversals were swallowed; a PH reference equal to the mean since clear() so a shift toward it was
+  lost). Final: PH resets its reference at a fire and CUSUM at re-arm; the clamp applies only above
+  threshold; 5 must-fail controls; parity with latch:false is bit-identical.
+- F19 (hash path, found by the watch-item investigation; REJECTED 3x -- toothless parity vectors, an
+  unproven --no-turbo-inlining flag, a +59% throughput regression from the Int32Array round-trip, and
+  a Proxy re-entrancy clobber in estimateInto): final form uses register int32 locals, no numeric
+  argument crosses a call, bit-identical output (378-field state diff vs HEAD), throughput flat
+  (in-process A/B guard: HK <= 1.08, SCM / SHLL <= 1.15, RED on the slow copy), and the
+  noInlineLargeKey gate is RED on a one-argument mutant.
+- Next: QA over the three, then the demo steps D1-D8 + D10.
+
+**Demo steps (all of it re-derived live from the shipped Adaptive.js; DEMO.md is updated first as
+the blueprint, then kernels.mjs / index.html / Demo.test.mjs):**
+- D1 Scene 01 EH: a `maxCount` control, and a pool gauge showing the live population vs the EXACT
+  ceiling `k * (2^levels - 1)` and the capacity / bytes. A "dense 10 kHz" preset with a W-sized pool:
+  the tagged overflow throw is caught and shown as a fail-closed banner (1.6.0 showed NaN). An F17
+  toggle (skewed / spike values): the `sum()` error cursor inside the STATED bound `straddle / 2`,
+  next to the old `<= eps` line visibly failing.
+- D2 Scene 02 ADWIN: an absolute-offset slider (0 .. 1.7e12) with identical behavior (F9), and a
+  "big jump then +1" preset: the later shift is detected (F18). Draw the live-window range R and a
+  ghost of the 1.6.0 global range to show why 1.6.0 went deaf.
+- D3 Scene 04 HeavyKeeper: a key-magnitude toggle (small / >= 2^31 / negative) with the Truth Panel
+  allocation counter pinned at 0 through `addFrom` (F3), and a weight up to 2^32-1 with the
+  saturation shown (F10).
+- D4 Scene 05 SlidingHyperLogLog: a query-rate slider (count() every frame vs rarely); two twins show
+  identical `overflows` (F8 purity).
+- D5 Scene 06 DriftDetector: the 1.8.0 latch toggle -- one marker per regime with `lastDirection`
+  arrows, vs the unlatched re-firing.
+- D6 Scene 07 SlidingDDSketch: the B+1 pane strip with the covered span [W, W + W/B] vs the true
+  window (F7), and the in-tab oracle moved to the TRUE window (count >= true(W) cursor). A strict /
+  `range` toggle with a declared band, rejected-value counter and rangeMin / rangeMax (F2). The
+  render path uses `quantileInto` at 0 B/call (F5).
+- D7 Scene 08 SlidingCountMin: a `total(w)` readout and the eps x N band computed from it; the
+  render reads through `estimateInto` (0 alloc).
+- D8 Truth Panel: a "contracts" line (a bad sub-window reads NaN; a typo'd option shows the
+  did-you-mean) and, for S11, a Chromium-only key-magnitude allocation readout (keys in
+  [2^30, 2^31) are HeapNumbers on 31-bit-Smi builds) -- labeled secondary, like the heap readout.
+- D9 MOVED to v1.9.0 (section 9): the SlidingAggregate scene ships with the member.
+- D10 Demo.test.mjs: faithfulness (every displayed number equals the shipped getter or reader),
+  frame path 0 B/op with each new control engaged, the idle-slide proof for the new scene, and the
+  reviewer's DEMO AUDIT (no forced reflow, cached DOM lookups, pointer events).
+
+**Demo progress (2026-09-27, uncommitted):** P0 blueprint + golden DONE. P1 (EH D1 + ADWIN D2) and
+P2 (HK D3 + SHLL D4) reviewer-APPROVED after 3 rounds each. Every round-1/2 rejection was the same
+class: 0-B/op claims gated by `measureAllocs`, which cannot see a transient HeapNumber. Fixed for good
+by the shared pinned-semi-space probe `demo/DemoProbe.mjs` (steady = min over windows 1..n-1, must-box
++ noop controls) -- it caught a real 192 B/call HK render box (a >= 2^31 key into `Map.get`) that
+measureAllocs read as 0. The other repeats: fail-open demo knobs, oracle-off NaN writes living in the
+untested *Tick handler, and forced reflow from *Layout() in rebuild handlers. QA over P1+P2 (22
+cases in `demo/Demo.qa.test.mjs`, 8/8 mutants killed) found 2 more: the HK 2^32 banner showed the
+demo's guard text, not the library's F10 message (now delegated to the library), and the SHLL
+render cost is bimodal (below).
+
+**OPEN library finding -- maintainer decision (found by the demo probe, 2026-09-27):**
+`SlidingHyperLogLog.count()` costs 16 B/call STABLE, plus 16 B more when the caller is not
+Turbofan-optimized (32 B in ~40% of fresh processes). Scratch bisect (reviewer, pinned probe):
+- the stable 16 B is INSIDE count(), in the estimator tail (`Adaptive.js` ~3196-3199: slTau / the
+  k-loop / slSigma / Math.round), only on non-degenerate registers; inlining slTau/slSigma, `| 0` on the
+  return, or dropping the k-loop each still read 16. The exact boxed value is not isolated.
+- the second 16 B is count()'s integer-valued double return materialized at the call boundary
+  (`return Math.round(...) | 0` -> 16 B in 8/8 runs).
+- this contradicts the library's own comment at `Adaptive.js` ~2891 ("so count() itself allocates
+  nothing") and any doc that says SHLL count() is exactly one 16 B boxed return.
+Options: (a) doc-only in 1.8.0 -- state "16-32 B per call, tier-dependent" and fix the ~2891 comment;
+(b) a `countInto(out, i)` 0-alloc reader in 1.9.0 alongside SlidingAggregate, after isolating the box;
+(c) both. The demo documents 16-32 B and gates it at [12, 40].
+**DECIDED (maintainer, 2026-09-27): option (c).** 1.8.0 is doc-truth only (the ~2891 comment fixed; the
+README F6 table / llms.txt / Adaptive.d.ts state 16-32 B per call; the `q_shll_count` library lane gates
+the band [12, 40]); the `countInto` 0-alloc reader lands in 1.9.0 (section 9).
+
+**Exit:** `npm run verify` green, `gates:red` exit 0 (no todo left), `demo` (full, not only
+demo:check) green, the reviewer approves the demo audit, `/release 1.8.0`, `/sync-card lite-adaptive`, and a
+note to lite-hud: M3 HK drop-in + M4 EH unblocked; latency means arrive with SlidingAggregate in 1.9.0.
+
+## 9. v1.9.0 -- SlidingAggregate (the tenth member), a dedicated session  [PLANNED]
+
+Settled S10 (a). Moved out of 1.8.0 by the maintainer (2026-09-26): one feature per minor. The plan
+is DONE (planner, 2026-09-26) and is the brief for that session:
+- `new SlidingAggregate(W, { panes })` -- a PURE APPEND after DecayedReservoir, ADR 0012, the SIXTH
+  additive post-1.0 member. The option door, typeof-first validation before allocation, the
+  subnormal-W guard, explicit / count mode locked at the first add.
+- A B+1 pane ring (a design-parity COPY of SlidingCountMin's _anchor / _advance / _clearPane, never
+  a shared helper). Per pane, stride 5 in one Float64Array: count, sum, Kahan comp, min, max. The
+  covered span is [W, W + W/B]: EXACT over it (count / min / max bit-exact; sum within
+  2 * 2^-53 * sum|v|, from branch-free Kahan per pane + a cold Neumaier across panes; mean = sum /
+  count). Rejected: per-pane offset-centring and plain `+=`.
+- HOT, 0 B/op: add / addFrom (stride-2 [now, value]) / advance / advanceFrom, with rotation bounded
+  to B+1 clears. COLD: count / sum / mean / min / max (w?) with the NaN query contract, and a 0-alloc
+  `into(out, w?)` render reader writing [count, sum, mean, min, max] (a wrong container throws).
+- bytes 1592 at defaults (33 x 5 x 8 + 33 x 8 + 8); 50 lite-hud channels = 79,600 B.
+- Gates: an exact covered-span oracle AND a true-window lane (count >= true(W)); B-pane and
+  no-clear-on-rotate controls REJECTED; a lite-hud lane (lognormal latencies, 50 instances) printed
+  next to the EH sum() skew failure (F17); torture incl. rotate-every-add; AllocMatrix N3 / N4;
+  JumpTiming +1e12 with a per-pane-loop control; perf gate at maxScavenges 0; QueryContract +
+  OptionDoors rows; a mutation test of every reader's `w`.
+- Demo: a SlidingAggregate scene (formerly D9) -- a lite-hud-shaped latency panel, the windowed
+  mean / min / max vs the exact oracle, next to the EH sum() skew failure.
+
+**Carried from the 1.8.0 doc-truth pass (findings decided in 1.8.0, fixed here):**
+- `SlidingHyperLogLog.countInto(out, i?)` -- a 0-alloc reader that writes the windowed distinct
+  estimate into a caller-owned `Float64Array` slot instead of returning a boxed double (finding A;
+  section 8 decided option (c)). Keep the plain `count()` as the lane's must-box control (16-32 B/op);
+  the `q_shll_count` band [12, 40] proves the probe sees the box today.
+- The latched-PH fire box (finding B): a behavior-change fix -- BOUND or RESET the running extremes
+  (`gP` / `mMin`) AT the fire so the accumulator no longer produces a fractional/large double that
+  boxes in the Maglev tier, WITH regenerated DDParity vectors (the fix changes the latched fire path,
+  so latch:false parity stays bit-identical but the latched vectors are re-pinned). Removes the
+  `dd_frame` / `dd_frame_nolatch` demo `todo` and the `q_shll_count`-adjacent `dd_latch_ph_fireheavy`
+  ceiling, gating latch:true PH at 0 B/op.
+- The never-re-arming PH accumulator DRIFT: in a fire-heavy never-re-arming stream the latched PH
+  accumulators (monotone `gP` / `mMin`) grow without bound and would eventually reach Infinity and trip
+  the `_guardFinite` throw. The bound/reset-at-fire fix above also caps the drift; add a torture lane
+  that drives millions of never-re-arming fires and asserts finite accumulators + no throw.
+- A `DriftDetector` `statisticInto(out)` / `meanInto(out)` 0-alloc reader: the demo render boxes ~48 B/tick
+  because six `_guardFinite` getters in one render function exceed V8's cumulative inlining budget and
+  three of them box their fractional returns. The `Into` siblings land the values in caller slots so the
+  render path is 0 B/tick (mirrors SDD `quantileInto` / SCM `estimateInto`).
+- Finish the demo passes P3-P5 (deferred from the 1.8.0 demo session): P3 = the DD / SDD blockers fixed
+  in the tree but not yet re-reviewed; P4 = the SCM D7 (`total(w)` readout + eps x N band) and D8
+  (contracts line + Chromium 31-bit-Smi key-magnitude readout) contracts; P5 = the S11 lane + the static
+  DEMO AUDIT test.
+- Exit: verify + gates:red green, /release 1.9.0, /sync-card, a lite-hud note (M4 latency means).
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

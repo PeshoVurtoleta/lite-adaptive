@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.7.0
+Version: 1.8.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -127,7 +127,10 @@ change). This completes the confirmed post-1.0 roadmap.
   key would box as plain arguments). `count(w?) -> number` is PURE (never mutates the rings; it only
   reads the oldest in-window entry per register), and runs Ertl's improved estimator (design-parity with lite-sketch,
   inline) -- standard error `1.04 / sqrt(m)` (guaranteed while `degraded === false`); `w` is an
-  optional sub-window in `(0, W]` (outside that range -> NaN, never throws -- F12). `query()` aliases
+  optional sub-window in `(0, W]` (outside that range -> NaN, never throws -- F12). The scratch keeps
+  count() free of ARRAY allocation, but it RETURNS a rounded double: count() boxes 16 B/call steady
+  (the estimator tail) and 32 B when the caller is not yet optimized (the boxed return). A 0-alloc
+  `countInto` reader is planned for 1.9.0. `query()` aliases
   `count()`. Keys are safe integers; on add a bad key / now / option throws [lite-adaptive] typeof-first
   (byte-identical no-op), while count(w) with a bad `w` reads NaN. Fully deterministic
   (no PRNG). Getters: `W` / `p` / `m` / `ringCap` / `seed` / `standardError` / `lastNow` / `mode` /
@@ -150,16 +153,42 @@ change). This completes the confirmed post-1.0 roadmap.
   a finite number > 0 (default 50, tune to the signal scale); `target` the FIXED in-control mean mu0
   the CUSUM test deviates from, a finite number of ANY sign, |target| <= 1e150 (target=0 is valid) --
   REQUIRED for DRIFT_CUSUM, FORBIDDEN for DRIFT_PH (a mismatch throws [lite-adaptive], never a silent
-  ignore). `add(x)` accepts a finite real with |x| <= DD_X_MAX (1e150, so the accumulators cannot
-  overflow -- the ADWIN finite-overflow lesson); `addFrom(buf, i) -> boolean` is the zero-box sibling
-  (reads `x = buf[i]` unboxed for a fractional x). `clear()` reuses the instance (keeps the config,
-  incl. target). Getters: `mode` / `delta` / `threshold` / `target` (the fixed CUSUM mu0, `undefined`
-  for PH) / `count` (items seen since the last reset) / `mean` (running mean) / `statistic` (the
-  current test statistic, >= 0, crosses `threshold` exactly when `add` fires). `mean` / `statistic`
-  throw [lite-adaptive] fail-closed on a non-finite accumulator; getters return 0 on empty. A bad
-  mode / delta / threshold / target / option / x throws [lite-adaptive] typeof-first (byte-identical
-  no-op). DDM / EDDM (Bernoulli error-bit + tri-state output) are deliberately OUT of this class -- a
-  future member.
+  ignore); `latch` a boolean (default false), 1.8.0. `add(x)` accepts a finite real with |x| <=
+  DD_X_MAX (1e150, so the accumulators cannot overflow -- the ADWIN finite-overflow lesson);
+  `addFrom(buf, i) -> boolean` is the zero-box sibling (reads `x = buf[i]` unboxed for a fractional
+  x). `clear()` reuses the instance (keeps the config, incl. target + latch). Getters: `mode` /
+  `delta` / `threshold` / `target` (the fixed CUSUM mu0, `undefined` for PH) / `latch` / `latched`
+  (currently latched?) / `lastDriftIndex` (0-based item index of the last fire, NaN before any) /
+  `lastDirection` (+1 / -1, NaN before any) / `count` (items seen since the last reset; with latch:true
+  PH resets it AT the fire -- the running mean IS the PH reference -- while CUSUM resets it at re-arm) / `mean`
+  (running mean) / `statistic` (the current test statistic, >= 0; with latch:false it crosses
+  `threshold` exactly when `add` fires; with latch:true it crosses on the ONE firing item, then while
+  latched sits at <= `threshold` -- clamped at `threshold` on a sustained shift, decaying toward
+  `threshold/2` on a return to baseline -- while `add` returns false until re-arm). `mean` /
+  `statistic` throw [lite-adaptive] fail-closed on a non-finite accumulator;
+  getters return 0 on empty (`lastDriftIndex` / `lastDirection` return NaN before any fire -- null is
+  not zero, and each boxes one double per read). LATCH (1.8.0, opt-in; default false is 1.x-identical
+  and bit-for-bit proven): with `latch: true` the detector fires ONCE per regime instead of on every
+  sustained item -- a fire latches (re-clamping the firing gap back to `threshold` ONLY while it is
+  still ABOVE `threshold`, so a SUSTAINED regime stays bounded and never spuriously re-arms; a gap
+  already <= `threshold`, e.g. a gradual return to baseline, is left to decay) and re-arms only when
+  the latched-direction gap falls below `threshold / 2` (hysteresis) or on `clear()`. An opposite-direction
+  crossing while latched flips direction and is REPORTED in BOTH modes; CUSUM (independent accumulators)
+  fires on the reversal item, PH (running-mean reference reset AT the fire, then kept across the re-arm,
+  so the reference tracks the post-shift level and the reversal delay does NOT grow with history)
+  re-arms first then rebuilds the opposite gap over a few items (measured ~3 past the true edge on a
+  +-10 step reversal, ~2 on +-30; up to +4 on the test lanes and +10 on a 0/10/20/10/0 staircase vs latch:false, 0 on a
+  long-history reversal -- measured, not a general bound). Trade: while latched every item routes through the cold fire path (lower throughput),
+  and (latch:true PH only) a latched fire can box one 16 B HeapNumber in V8's Maglev tier -- 0 B/op in
+  steady optimized code on realistic re-arming streams, ~2 B/op measured on a fire-heavy stream when a
+  per-window collection re-tiers the hot loop (latch:false and CUSUM stay 0 B/op; tracked for 1.9.0),
+  and a SECOND same-direction shift is not seen until re-arm (a monotone staircase 0/10/20/30 fires ONCE;
+  latch:false fires at each edge). A separate 1.x property (not a latch
+  defect): at the default delta 0.005, uniform +-2 noise false-alarms in BOTH modes (latch:true about
+  half as often) -- tune delta up for a quieter stream.
+  A bad mode / delta / threshold / target / latch / option / x throws [lite-adaptive] typeof-first
+  (byte-identical no-op). DDM / EDDM (Bernoulli error-bit + tri-state output) are deliberately OUT of
+  this class -- a future member.
 - `SlidingDDSketch` -- class. A zero-GC WINDOWED relative-error QUANTILE summary over the LAST W
   (Masson-Rim-Lee, "DDSketch", VLDB 2019, over a fixed-(B+1) pane ring; ADR 0008) -- the recency sibling of
   lite-sketch's cumulative DDSketch and the quantile complement of SlidingHyperLogLog. A ring of B+1
@@ -222,7 +251,7 @@ change). This completes the confirmed post-1.0 roadmap.
   the PRNG or the landmark). Deterministic given the seed. Getters: `k` / `halfLife` / `lambda` /
   `seed` / `size` / `mode` / `bytes`.
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.7.0'.
+- `VERSION` -- string, '1.8.0'.
 
 ## ExponentialHistogram
 
@@ -443,14 +472,17 @@ Negative controls: fdNoRescale (rebase without the C,Sv rescale -> diverges) and
                                  the fingerprint is replaced when count hits 0. Fail closed: a
                                  non-safe-integer key, or a weight that is not an integer in
                                  [1, 2^32-1], throws [lite-adaptive] (byte-identical no-op).
-- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX entry (F3 fixed): key = buf[i], weight =
+- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX entry (F3 + F19 fixed): key = buf[i], weight =
                                  buf[i+1] read UNBOXED from a packed [key, weight] Float64Array.
                                  0 B/op for ALL safe-integer keys AND weights (incl. >= 2^31 and
                                  the default seed): the numeric inputs route through fixed module
-                                 scratch slots, so nothing boxes at any call boundary. Plain
-                                 add(largeKey) still boxes the key at the argument boundary (a ~16 B
-                                 HeapNumber) -- use addFrom for large keys. Same validation + inline
-                                 accumulate as add().
+                                 scratch slots, and (F19v2) the MurmurHash3 murmur runs entirely in
+                                 register-resident int32 locals hand-inlined in the hot body, so
+                                 nothing boxes at any call boundary EVEN when V8 leaves a hash call
+                                 un-inlined (deterministic under --no-turbo-inlining; flaky under CPU
+                                 contention pre-F19). Plain add(largeKey) still boxes the key at the
+                                 argument boundary (a ~16 B HeapNumber) -- use addFrom for large keys.
+                                 Same validation + inline accumulate as add().
 - estimate(key) -> number        COLD; the max matching cell count (0 for an unseen but VALID key;
                                  a non-safe-integer key -> NaN, never throws -- F12).
 - forEach(fn) -> void            ALLOC-FREE iteration over the current top-k: fn(key, estimate).
@@ -567,24 +599,52 @@ value throws) and options = { delta (magnitude allowance / slack; a finite numbe
 default 0.005; delta=0 is a VALID setting, guarded as `!== undefined` not falsy), threshold (the
 PH lambda / CUSUM decision interval; a finite number > 0, default 50), target (the FIXED in-control
 mean mu0 the CUSUM test deviates from; a finite number of ANY sign, |target| <= 1e150, target=0
-valid -- REQUIRED for DRIFT_CUSUM, FORBIDDEN for DRIFT_PH) }. A bad mode / delta / threshold /
-target / option -- including a CUSUM without a target or a PH with one -- throws [lite-adaptive]
-typeof-first BEFORE any field init (fail-closed, never a silent ignore).
+valid -- REQUIRED for DRIFT_CUSUM, FORBIDDEN for DRIFT_PH), latch (a boolean, default false; latch: true needs threshold / 2 > 0 -- Number.MIN_VALUE throws; with
+DRIFT_CUSUM and delta 0 a signal exactly at target never re-arms, so use delta > 0 with latch;
+typeof-first, no truthy coercion) }. A bad mode / delta / threshold / target / latch / option --
+including a CUSUM without a target or a PH with one -- throws [lite-adaptive] typeof-first BEFORE
+any field init (fail-closed, never a silent ignore).
 
 - add(x) -> boolean         HOT, 0 B/op. Reject a non-finite x / a finite |x| > DD_X_MAX (1e150) on
                             the cold branch (byte-identical no-op), update the running mean (Welford),
-                            run the ONE mode branch, and on a fire call the O(1) reset. Returns true
-                            iff drift was detected on this item.
+                            run the ONE mode branch (its trip compare reads the mutable `_lvl`, so a
+                            latched item routes into the SAME fire branch -- no new hot branch), and
+                            on a fire call the cold `_fired()` (zero args -> no boxed double). Returns
+                            true iff drift was detected on this item.
 - addFrom(buf, i) -> boolean  HOT, 0 B/op ZERO-BOX sibling: reads x = buf[i] UNBOXED from a
                             Float64Array (for a FRACTIONAL x that add(x) would box). Same validation
                             + body as add.
 - clear() -> this           Reset all scalar state; keep the config (mode / delta / threshold /
-                            target). O(1).
-- mode / delta / threshold / target / count   Getters: the mode; the knobs; the fixed CUSUM mu0
-                            (`undefined` for PH); items seen since the last reset.
+                            target / latch). Re-arms latch and resets lastDriftIndex / lastDirection
+                            to NaN. O(1).
+- mode / delta / threshold / target / latch / count   Getters: the mode; the knobs; the fixed CUSUM
+                            mu0 (`undefined` for PH); the latch option; items seen since the last reset.
+- latched / lastDriftIndex / lastDirection   Getters (latch mode): whether currently latched; the
+                            0-based item index of the last fire (NaN before any); the last fire
+                            direction (+1 / -1, NaN before any). null is not zero; each boxes one
+                            double per read (F6).
 - mean / statistic          Getters: the running mean; the current test statistic (>= 0, how close to
-                            firing -- crosses threshold when add returns true). 0 on empty; THROW
+                            firing -- with latch:false crosses threshold when add returns true; with
+                            latch:true crosses on the one firing item, then sits at <= threshold while
+                            latched as add returns false). 0 on empty; THROW
                             [lite-adaptive] fail-closed if an accumulator ever went non-finite.
+
+LATCH (1.8.0, settle S9; default false is bit-for-bit 1.x behavior, proven by the DDParity vectors):
+with `latch: true` the detector fires ONCE per regime instead of on every sustained item. A fire
+LATCHES (re-clamping the firing gap back to threshold -- PH gP=mMin+th / gN=mMax-th, CUSUM gP=th /
+gN=th -- ONLY while the gap is still ABOVE threshold, so a SUSTAINED regime stays bounded and never
+spuriously re-arms; a gap already <= threshold, e.g. a gradual return to baseline, is left to decay)
+and re-arms only when the latched-direction gap falls below threshold/2 (hysteresis) or on clear().
+An OPPOSITE-direction crossing while latched flips direction and is REPORTED in BOTH modes. CUSUM's
+independent accumulators fire on the reversal's own item; PH KEEPS the running-mean reference across
+the re-arm (_n / _mean survive), so a sustained reversal re-arms first, then rebuilds the opposite gap
+against the preserved mean and fires a few items past the true edge (measured: PH(.005, 50) on
+0/+10/-10 fires 2005+ then 4005- -- ~5 items; on 0/+10/-30, 4002- -- ~2). Only a single-item jump
+whose opposite gap alone exceeds threshold fires on its own item. Direction: the larger gap wins,
+exact tie -> +1. Disclosed trade: while latched every item routes through the cold fire path (lower
+throughput -- latch state is NEVER moved into the hot body), and a SECOND same-direction shift is
+not seen until the regime ends and re-arms. Measured: CUSUM(0, .5, 8) on +10 x5000 fires 5000 times
+unlatched vs EXACTLY 1 latched (lastDriftIndex 0, lastDirection +1).
 
 Fail-closed domain (the ADWIN finite-overflow lesson): DD_X_MAX = 1e150 caps |x| so the accumulators
 can never be driven non-finite (each add moves them by ~2*DD_X_MAX; both bounded between resets;
@@ -760,11 +820,31 @@ throws [lite-adaptive] at the ctor door BEFORE any allocation. No `merge` in 1.5
                                  then MIN over rows. Returns a DOUBLE (a window sum can exceed 2^32). NEVER
                                  throws: 0 for an unseen but VALID key or an empty window; NaN for an
                                  out-of-domain key or a bad sub-window w (F12: 0 was a fail-open under-count
-                                 on an upper-bound sketch, and an invalid key was never seen 0 times). `w` an
+                                 on an upper-bound sketch, and an invalid key was never seen 0 times). The w
+                                 check PRECEDES the unset return -> an UNSET instance with a bad w also returns
+                                 NaN (fail-closed parity with estimateInto). `w` an
                                  optional sub-window in (0, W]. ALLOC (F6): a windowed count >= 2^31 boxes ONE
                                  ~16 B HeapNumber per call at a non-inlined call site (the honest return of a
-                                 large double); a count < 2^31 is a Smi, 0 B/call. The 1.8.0 `estimateInto`
-                                 slot reader is the 0-alloc render path.
+                                 large double); a count < 2^31 is a Smi, 0 B/call. `estimateInto` (below)
+                                 is the 0-alloc batch reader that replaces this boxed return on the render path.
+- total(w?) -> number            COLD, O(B+1), 0 B/call. The EXACT windowed item total N -- the eps x N
+                                 denominator a consumer needs for the additive error term -- summed from a
+                                 per-pane Float64 total over the SAME live panes as estimate (straddling
+                                 oldest pane included, so N covers the span [W, W + W/B]). EXACT, not
+                                 saturated: the cells clip at 2^32-1 but this Float64 total sums the
+                                 VALIDATED per-add count and the windowed sum across panes loses no unit until
+                                 2^53. NEVER throws (F12 parity): NaN for a bad sub-window w (the w check
+                                 PRECEDES the unset return, so an UNSET instance with a bad w also returns NaN),
+                                 0 when unset with a good/omitted w. `w` optional in (0, W].
+- estimateInto(keys, out, w?)    COLD, 0 B/op. The batch reader: keys / out caller-owned Float64Arrays
+  -> number                      (out.length >= keys.length, else a tagged Type/RangeError BEFORE any
+                                 write -- the container-type contract). Writes out[j] = estimate(keys[j], w)
+                                 for each key (NaN for an out-of-domain key, 0 for an unseen valid key /
+                                 empty window; a bad w fills every out[j] with NaN), returns keys.length. No
+                                 computed double crosses a non-inlined call, so it stays 0 B/op where scalar
+                                 estimate boxes a ~16 B HeapNumber for a count >= 2^31 (the F6 render path).
+                                 keys and out MAY be the SAME array (slot j read then written before j+1) but
+                                 must NOT PARTIALLY OVERLAP (an aliased non-zero offset gives wrong results).
 - advance(now) -> this           Move the window's reference time to `now` WITHOUT adding (the R11 idle
                                  slide, ADR 0009): rotate + clear stale panes via the private _advance so
                                  an idle stream slides to empty (estimate 0). EXPLICIT-time ONLY (count-
@@ -782,8 +862,9 @@ Windowed-frequency contract (the honesty anchor): the witness drives against an 
 and gates the ONE-SIDED bound true(W) <= est <= true(W+W/B) + epsilon*N on 100% of >= 2000 queries across
 >= 4 (W, eps) pairs + a churny key stream + advance-empties. Negative controls rejected by the same gate: a
 DROP-OLDEST-PANE variant (under-counts -> breaks the lower bound est >= true(W)) and a MIN-THEN-SUM variant
-(min over rows per pane, then sum -> wrong). Memory ~ (B+1) * d * w * 4 B + paneEnd + scratch; defaults ->
-~338 KB, never grows. ADR 0010 records the B+1 / keep-oldest one-sided-bound rationale, the rejected ECM-
+(min over rows per pane, then sum -> wrong). Memory ~ (B+1) * d * w * 4 B + paneEnd +
+a per-pane Float64 total (`_paneTotal`, +(B+1)*8 B, the exact `total()` N) + scratch; the default `new
+SlidingCountMin(60000)` is 338468 B (was 338204 B before `total`), never grows. ADR 0010 records the B+1 / keep-oldest one-sided-bound rationale, the rejected ECM-
 sketch alternative, the absolute pane alignment, sum-then-min, per-pane conservative update, Uint32
 saturation + `saturated`, the W-not-capped resolution, and the lite-sketch byte-parity note.
 
@@ -889,8 +970,8 @@ One rule: a query that RETURNS a fractional or large double boxes ONE ~16 B Heap
 at a non-inlined call site; the `xxxInto` / `forEach` readers are the 0-alloc render path. So on a
 10-15 Hz render loop use `SlidingDDSketch.quantileInto` (0 B/call) not `quantile` (16 B/call), and
 `HeavyKeeper.forEach` / `topKInto` (0 B/call) not `topK`. `SlidingCountMin.estimate` boxes 16 B/call
-only when the windowed count is >= 2^31 (a Smi-range count returns 0 B/call; the 1.8.0 `estimateInto`
-is the slot reader that fixes it). `ExponentialHistogram.sum()` and `HeavyKeeper.estimate` box only in
+only when the windowed count is >= 2^31 (a Smi-range count returns 0 B/call; `estimateInto` is the
+0-alloc batch reader that fixes it). `ExponentialHistogram.sum()` and `HeavyKeeper.estimate` box only in
 the early JIT tier (steady state 0). `count()` and integer-count returns are Smis, 0 B/call.
 
 ## The time source + the bucket pool (ADR 0001)

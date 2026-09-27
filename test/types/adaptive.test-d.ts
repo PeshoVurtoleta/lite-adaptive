@@ -346,7 +346,18 @@ const ddTarget: number | undefined = dd.target;   // the fixed CUSUM mu0, or und
 const ddCount: number = dd.count;
 const ddMean: number = dd.mean;
 const ddStat: number = dd.statistic;
+const ddLatch: boolean = dd.latch;
+const ddLatched: boolean = dd.latched;
+const ddLastIdx: number = dd.lastDriftIndex;   // NaN before any fire
+const ddLastDir: number = dd.lastDirection;    // +1 / -1, NaN before any fire
 void ddMode; void ddDelta; void ddThreshold; void ddTarget; void ddCount; void ddMean; void ddStat;
+void ddLatch; void ddLatched; void ddLastIdx; void ddLastDir;
+
+// latch is a boolean option
+const ddLatchOpts: DriftDetectorOptions = { latch: true };
+void ddLatchOpts;
+const ddLatched2 = new DriftDetector(DRIFT_CUSUM, { target: 0, latch: true });
+void ddLatched2;
 
 // add returns a boolean (drift detected?)
 const ddDrift: boolean = dd.add(3.14);
@@ -383,6 +394,9 @@ new DriftDetector(DRIFT_PH, { threshold: '50' });
 
 // @ts-expect-error -- unknown option key.
 new DriftDetector(DRIFT_PH, { lambda: 50 });
+
+// @ts-expect-error -- latch option must be a boolean.
+new DriftDetector(DRIFT_PH, { latch: 1 });
 
 // @ts-expect-error -- add value must be a number.
 dd.add('x');
@@ -522,6 +536,18 @@ const cmEst: number = cm.estimate(42);
 const cmEstW: number = cm.estimate(42, 500);
 void cmEst; void cmEstW;
 
+// total returns a number (the exact windowed N), with an optional sub-window
+const cmTotal: number = cm.total();
+const cmTotalW: number = cm.total(500);
+void cmTotal; void cmTotalW;
+
+// estimateInto is a batch 0-alloc reader over Float64Arrays; returns n written
+const cmKeys = new Float64Array([42, 7, 9]);
+const cmOut = new Float64Array(3);
+const cmInto: number = cm.estimateInto(cmKeys, cmOut);
+const cmIntoW: number = cm.estimateInto(cmKeys, cmOut, 500);
+void cmInto; void cmIntoW;
+
 const cmCleared: SlidingCountMin = cm.clear();
 void cmCleared;
 
@@ -563,6 +589,15 @@ cm.advanceFrom([1], 0);
 
 // @ts-expect-error -- estimate key must be a number.
 cm.estimate('42');
+
+// @ts-expect-error -- total sub-window must be a number.
+cm.total('500');
+
+// @ts-expect-error -- estimateInto keys must be a Float64Array.
+cm.estimateInto([42], cmOut);
+
+// @ts-expect-error -- estimateInto out must be a Float64Array.
+cm.estimateInto(cmKeys, [0]);
 
 // @ts-expect-error -- a readonly getter is not assignable.
 cm.saturated = 0;

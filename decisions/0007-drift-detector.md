@@ -161,7 +161,11 @@ typeof-first (a byte-identical no-op).
 
 ## Space + defaults
 
-O(1) SPACE: six scalars (`_n`, `_mean`, `_gP`, `_gN`, `_mMin`, `_mMax`) -- no pool, no
+O(1) SPACE: six mutable core scalars (`_n`, `_mean`, `_gP`, `_gN`, `_mMin`, `_mMax`), the
+latch runtime (`_lDir` = latched direction, `_lvl` = the mutable trip level), the config
+(`_mode`, `_delta`, `_threshold`, `_target`, `_latch`, `_half` = threshold/2 precomputed),
+and ONE fixed instance `Float64Array(3)` (`_s` = [lifetime accepted-add counter,
+lastDriftIndex, lastDirection]) -- no pool, no growable
 TypedArray store at all (the lightest member; `grows` is a constant 0 in the perf gate).
 Defaults `delta = 0.005`, `threshold = 50` suit a signal of order ~1; scale `threshold` to
 the signal magnitude and the desired latency (`latency ~ threshold / (shift - delta)`).
@@ -181,3 +185,115 @@ reject: a HUGE-THRESHOLD detector (never detects -> fails the latency gate) and 
 (its statistic stays latched, so on the transient it keeps firing through the post-return tail ->
 fails the tail-quiet gate). The torture gate proves add (PH + CUSUM), addFrom, and clear are each
 0 B/op with `gc major = 0` (the CUSUM lanes construct with a target).
+
+## Amendment (1.8.0) -- the `latch` option + `lastDriftIndex` / `lastDirection` (settle S9)
+
+CONTEXT. The default (1.x) discipline RESETS on every fire, so a SUSTAINED regime re-fires on
+nearly every item -- measured 5000 alarms in 5000 items for `CUSUM(target 0, delta .5, threshold 8)`
+on a +10 step. A HUD drift marker (lite-hud M6) must fire ONCE per regime change, not once per item.
+Settle S9 (maintainer): add an OPT-IN `latch` (default `false`, so every 1.x stream is byte-identical)
+plus `lastDriftIndex` (the 0-based item index of the last fire, NaN before any) and `lastDirection`
+(+1 / -1, NaN before any), in BOTH modes.
+
+DECISION.
+- `latch: false` (default) keeps the exact 1.x auto-reset-on-fire semantics.
+- `latch: true`: a fire does NOT re-arm (the detector stays latched instead of auto-resetting). It
+  fires ONCE (the arming -> latched transition), LATCHES, and re-arms only when the latched-direction
+  gap falls back below `threshold / 2` (hysteresis) or on `clear()`. An OPPOSITE-direction gap
+  `> threshold` while STILL latched fires immediately, flips the direction, and stays latched -- for
+  CUSUM (independent accumulators) a sharp reversal is caught on its OWN item. For PH the running-mean
+  reference is reset AT the fire and `_rearm()` keeps the mean built since (see the amendment below),
+  so a sustained reversal is still REPORTED with the correct direction but not on its own item: the
+  latched gap collapses to `threshold/2` and re-arms, THEN the opposite gap rebuilds against the
+  post-shift mean over a few items (measured: `PH(.005, 50)` on `0/+10/-10` fires `2005+` then `4003-`
+  -- ~3 items past the true edge; on `0/+10/-30`, `4002-` -- ~2). Only a single-item jump whose
+  opposite gap alone exceeds `threshold` fires on its own item.
+
+WHY THE ACCUMULATOR RESET MOVES TO RE-ARM. In latch mode the ACCUMULATOR reset MOVES from fire time to
+re-arm time. A latched detector keeps accumulating; only when the regime demonstrably ends (the gap
+decays under `threshold/2`) does it `_reset()`/`_rearm()` and re-arm at `_lvl = threshold`. This gives
+clean one-fire-per-regime behavior with a Schmitt-trigger hysteresis band `[threshold/2, threshold]`
+that rejects chatter around the boundary. (PH's running-mean REFERENCE is the exception: it resets at
+the fire, not at re-arm -- see the `F-ph-latch` amendment below.)
+
+THE CLAMP (clamp-ONLY-above-threshold). On a latched item the firing-direction accumulator is
+re-clamped so the firing gap equals exactly `threshold` (PH: `gP = mMin + th` / `gN = mMax - th`;
+CUSUM: `gP = th` / `gN = th`) ONLY when the latched gap is still ABOVE `threshold`. Without any clamp
+a sustained regime drives the accumulator unbounded (and misreports the statistic; the `NoClampDD`
+witness control measures 47500 for a `+10 x5000` latched CUSUM statistic that must read exactly
+`threshold`). But clamping UNCONDITIONALLY was a fail-open bug: it re-inflated a SHRINKING gap back to
+`threshold` on every item, so a gradual return to baseline never fell to `threshold/2`, the detector
+never re-armed, and every later same-direction regime was silently missed (measured: `CUSUM(0,.5,8)`
+on `+10 x100`, `0 x5000`, `+10 x100` fired ONCE, statistic stuck at 8, instead of the correct 2 fires
+at 0 and 5100). The rule is therefore `if (latchedGap > threshold) clamp`: a SUSTAINED regime stays
+bounded and never spuriously re-arms, while a gap already `<= threshold` (a genuine return toward
+baseline) is LEFT to decay so it collapses past `threshold/2` and re-arms. This is the `F-latch-rearm`
+fix; the `NeverRearmDD` control (which suppresses `_reset()` while latched) is rejected by the new
+gradual-return witness lane.
+
+PH RESETS THE RUNNING-MEAN REFERENCE AT THE FIRE (`F-ph-latch`, amends `F-ph-latch-rearm`). PH
+deviates from the ONLINE running mean, so where the reference is reset is load-bearing. The correct
+discipline is 1.x's: reset `_n` / `_mean` AT the fire, so the reference restarts from the shifted
+level. In `_fired`, both the arming->latched fire and the opposite-direction re-fire run
+`if (ph) { this._n = 0; this._mean = 0; }` before the clamp (CUSUM does not: its test deviates from
+the FIXED `target`, and its accumulators reset only at re-arm). `_rearm()` then clears only the
+accumulators + running extremes + the latch and KEEPS `_n` / `_mean` -- but because the reference was
+already reset at the fire, by re-arm time those track the POST-SHIFT level (the running mean built
+SINCE the last fire), which is exactly the reference a later reversal must deviate from.
+
+An earlier attempt (`F-ph-latch-rearm`) reset the reference ONLY at re-arm and KEPT it across the
+fire, on the theory that preserving the mean was what let a reversal be reported. That was itself a
+FAIL-OPEN bug: with no reset at the fire the PH reference stayed the mean-since-`clear()` (the WHOLE
+history), so a shift TOWARD a level near that historical mean never rebuilt a gap past `threshold` and
+was never reported, and the reversal delay GREW WITHOUT BOUND with history. Measured pre-fix
+`PH(.005, 50)`: `0/+10/+5` fired ONCE (`2005+`, the `+5` reversal swallowed); `0x100k/+10x100k/+5x100k`
+fired ONCE (the reversal lost after a long up-regime); `0/+10/0/+10` reported the down edge at `4015`
+(10 items late and growing). Post-fix those fire correctly: `0/10/5` -> `2005+, 4014-`;
+`0x100k/10x100k/5x100k` -> `100005+, 200010-` (the down edge is bit-identical to `latch: false`, so the
+delay is bounded by the step geometry, not history); `0/10/0/10` -> `2005+, 4007-, 6007+`. The
+`PhNoFireResetDD` witness control (the pre-fix `_fired`, no reference reset at the fire) is REJECTED by
+both new lanes (1 fire, not 2); the `PhSwallowRevDD` control (re-arm via `_reset()`) stays REJECTED by
+the `0/10/-10` true-reversal lane. The disclosed trade: a PH reversal is reported a FEW ITEMS past the
+true edge (the latched gap must collapse and the opposite gap rebuild), not on its own item unless a
+single item jumps more than `threshold`. Measured delay vs the `latch: false` reference over the test
+lanes: `+4` items on the `0/10/5` down edge, typically `+2` (the 4-regime `0/10/0/10/0` stream), `0`
+on the long-history reversal, and `+10` on the staircase `0/10/20/10/0` down edge (15015 vs 15005) --
+a few items, measured, not a general bound. A separate 1.x property (NOT a latch defect): with the default
+`delta = 0.005`, uniform +-2 noise false-alarms in BOTH modes (order 10^2 fires over a 300k stream),
+with `latch: true` firing roughly half as often as `latch: false` since it collapses a fire-storm into
+re-arm cycles -- tune `delta` up to trade sensitivity for a quieter stream.
+
+DIRECTION. The LARGER gap wins (PH: `gP - mMin` vs `mMax - gN`; CUSUM: `gP` vs `gN`); an exact tie
+resolves to +1. On the arming->latched fire and on an opposite-direction re-fire, `lastDriftIndex`
+and `lastDirection` are recorded.
+
+HOT-PATH COST (the disclosed trade). The trip compare reads a mutable `_lvl` (armed: `threshold`;
+latched: `-Infinity`) INSTEAD of `_threshold`, so a latched item lands in the EXISTING fire branch
+with no new hot branch, and `latch: false` is OUTPUT-IDENTICAL to 1.7.0 (proven bit-for-bit by the
+DDParity differential vectors, cut from HEAD before the edit). The fire branch calls a zero-arg
+`_fired()` (no boxed double at the call boundary), and one `_s[0]++` accepted-add counter is stored
+into an instance `Float64Array(3)` slot (never boxes). The disclosed cost of latch:true: while
+LATCHED, `_lvl = -Infinity` routes EVERY item through the cold `_fired()` call, so latch:true
+throughput is lower than latch:false. This is deliberate -- latch state is NEVER moved into the hot
+body. The torture gate proves the three latched lanes (add PH, add CUSUM, addFrom) at 0 B/op.
+
+RE-ARM LEVEL. A latch needs `threshold / 2 > 0`; a threshold whose half underflows (Number.MIN_VALUE)
+throws at the door (QA-1.8.0-DD1: the floored CUSUM gap could never fall below 0, so it stayed latched
+forever). With `DRIFT_CUSUM` and `delta = 0` a signal EXACTLY at target never decays the statistic, so it
+stays latched until the signal moves below target -- disclosed; use `delta > 0` with a latch.
+
+DISCLOSED TRADE. Because a latched detector holds its fire until re-arm, a SECOND same-direction
+shift is NOT seen until the first regime ends (the gap decays under `threshold/2` and re-arms).
+This is the intended one-marker-per-regime behavior; a consumer that needs every escalation within
+one regime uses `latch: false`. A monotone STAIRCASE is the sharpest case: PH `0/10/20/30` fires ONCE
+(`latch: false` fires at each of the 3 edges), and with `0/10/20` held for 50k items the detector stays
+latched and never reports the 10->20 step (under the mean-since-fire reference the up gap decays
+very slowly, so it does not re-arm). `lastDriftIndex` / `lastDirection` box one double per read (F6),
+documented on the getters.
+
+WITNESS. A `ddLatch` lane prints MEASURED vs contract: CUSUM +10 x5000 is 5000 fires (latch:false)
+vs EXACTLY 1 (latch:true, `lastDriftIndex 0`, `lastDirection +1`, latched); an up-then-down stream
+is EXACTLY 2 fires at indices 0 / 2500 with directions +1 / -1; a stationary stream is 0 fires and
+`lastDriftIndex` NaN either way; a PH step fires once at the same item as its latch:false twin; a
+slow ramp fires strictly fewer times latched. NEGATIVE CONTROL: a reset-on-latched-fire subclass
+re-fires 5000 times and is REJECTED by the same "exactly one fire" gate.

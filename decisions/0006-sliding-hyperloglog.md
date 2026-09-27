@@ -158,3 +158,22 @@ and one never -- `overflows` EQUAL (measured 17294 == 17294) and `_stamps`/`_rho
 BYTE-IDENTICAL; a ring snapshot byte-identical across 100 consecutive `count()` calls;
 `count()` bit-identical to the frozen 1.6.0 golden at every query point on a non-overflowing
 stream (full + sub-window). The windowed-distinct witness still passes.
+
+## Amendment (1.8.0, F19) -- the hash path drops its boxable argument
+
+The two-lane MurmurHash3 in `add` / `addFrom` kept the key words in int32 LOCALS, but PASSED the low
+32-bit word `lo` (a HeapNumber for a key with bit 31 set) and the running state to `slRound` /
+`slFinal` as CALL ARGUMENTS. When V8 left one `slRound` call un-inlined -- deterministic under
+`--no-turbo-inlining`, flaky under CPU contention pre-F19 -- a large-key `addFrom` boxed 16 B/op.
+F19v2 removes the boxable argument by HAND-INLINING the whole two-lane murmur -- every round + the
+two `fmix` finalizers -- directly in the `add` / `addFrom` hot body, in register-resident int32
+LOCALS: no `slRound` / `slFinal` sub-call remains, so no hash word crosses any call boundary and
+nothing can box, even under `--no-turbo-inlining`. The register values `j` / `rho` are computed from
+those locals with the SAME `ToInt32` semantics `Math.imul` / `| 0` apply, so `j` / `rho` and every
+`count()` are BIT-IDENTICAL to 1.6.0 (`SHLLParity` still passes). Rejected (F19v1): parking each
+round in a module `Int32Array` scratch (`SL_RS`) so the helpers took no argument -- V8 could not
+scalar-replace that per-round memory round-trip and it cost ~55% on this hot path, so it was reverted
+to inlined locals. Gated by the `noInlineLargeKey` group in `test/perf/AllocMatrix.test.mjs`
+(now-scale AND epoch clocks x keys `2^31` / `2^53-1`; the same lanes read 16 B/op against the pre-fix
+file) AND by `test/perf/HashThroughput.test.mjs`, an in-process A/B that pins shipped `addFrom`
+throughput to <= 1.15x the frozen 1.7.0 baseline (a reintroduced round-trip reads ~1.37x -> RED).
