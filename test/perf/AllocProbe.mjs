@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
     DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin,
-    DecayedReservoir } from '../../Adaptive.js';
+    DecayedReservoir, SlidingAggregate } from '../../Adaptive.js';
 
 const SELF = fileURLToPath(import.meta.url);
 
@@ -268,6 +268,7 @@ function megamorphizeCallAdd() {
     const shll = new SlidingHyperLogLog(1000, { p: 10, seed: 5 });
     const scm = new SlidingCountMin(1000, { panes: 8, w: 128, d: 4, seed: 5 });
     const dd = new DriftDetector(DRIFT_PH);
+    const sa = new SlidingAggregate(1000, { panes: 8 });
     let t = 1e3, sink = 0;
     for (let i = 0; i < 3000; i++) {
         t += 1.5;
@@ -278,9 +279,10 @@ function megamorphizeCallAdd() {
         callAdd(shll, t, (i & 1023) + 1);        // SHLL key: a safe integer
         callAdd(scm, t, (i & 1023) + 1);         // SCM key: integer; count defaults to 1
         callAdd(dd, FRAC[i & 15], 0);            // DD.add(x): first arg only
+        callAdd(sa, t, FRAC[i & 15]);            // SA.add(now, value): both fractional
         sink += eh.bucketCount;
     }
-    return sink + fd.mode.length + dr.size;
+    return sink + fd.mode.length + dr.size + sa.panes;
 }
 
 /** kind: 'fd'/'eh'/'sdd' feed BOTH args fractional (2 boxes, ~32 B/op); 'dd' feeds a fractional +
@@ -458,6 +460,124 @@ function ddLatchPhFireheavy() {
         hot(s, n) { const dd = s.dd, buf = s.buf, pat = s.pat, acc = s.acc; let idx = s.ix[0] | 0; for (let i = 0; i < n; i++) { buf[0] = pat[idx & (PAT_N - 1)]; idx = (idx + 1) | 0; acc[0] += (dd.addFrom(buf, 0) ? 1 : 0) + (dd.latched ? 1 : 0); } s.ix[0] = idx; } };
 }
 
+// ===========================================================================
+// SlidingAggregate (1.9.0, ADR 0012) probe lanes. clk {now, epoch} x value {small int, fraction,
+// -1e149, 1e150} for addFrom; the event-heavy rotate-every-add epoch lanes; advance/advanceFrom/clear;
+// the scalar readers + into at monomorphic / polymorphic / megamorphic sites; and the two must-box
+// megamorphic controls (q_sa_mean_mega, sa_add_mega_rot). Every clock / value lives in a Float64Array
+// slot; sinks accumulate into a slot. ---
+// ===========================================================================
+
+// value tables: small int, fraction, -1e149, 1e150 (the SA_X_MAX cap boundary). All exact doubles.
+const SAVAL = {
+    small: (() => { const t = new Float64Array(16); for (let j = 0; j < 16; j++) t[j] = (j % 100) - 50; return t; })(),
+    frac: FRAC,
+    neg149: (() => { const t = new Float64Array(16); t.fill(-1e149); return t; })(),
+    max150: (() => { const t = new Float64Array(16); t.fill(1e150); return t; })(),
+};
+
+// SA addFrom over clock x value. Read UNBOXED from a Float64Array slot -> steady B/op <= 0.5.
+function saAF(ck, vk) {
+    return { setup() { const sa = new SlidingAggregate(1000, { panes: 8 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = clkStart(ck); const vals = SAVAL[vk];
+        for (let k = 0; k < 2000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = vals[k & 15]; sa.addFrom(buf, 0); } return { sa, buf, clk, vals, acc: new Float64Array(1) }; },
+        hot(s, n) { const sa = s.sa, buf = s.buf, clk = s.clk, vals = s.vals, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = vals[i & 15]; sa.addFrom(buf, 0); acc[0] += sa.lastNow; } } };
+}
+
+// EVENT-HEAVY: SA(32, {panes: 32}) -> pw = 1, epoch clock stepping +1.5, so EVERY addFrom rotates with a
+// NON-Smi now. The argument-free _advance() reads this._now, so no epoch double crosses a non-inlined
+// call -> steady B/op <= 0.5 (the 1.8.0 event-heavy lesson: a per-rotation box cannot hide here).
+function saAfEpochRot() {
+    return { setup() { const sa = new SlidingAggregate(32, { panes: 32 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        for (let k = 0; k < 400; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[k & 15]; sa.addFrom(buf, 0); } return { sa, buf, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const sa = s.sa, buf = s.buf, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[i & 15]; sa.addFrom(buf, 0); acc[0] += sa.lastNow; } } };
+}
+// EVENT-HEAVY: same pw=1 epoch rotate-every-op via advanceFrom (idle slide).
+function saAdvEpochRot() {
+    return { setup() { const sa = new SlidingAggregate(32, { panes: 32 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        buf[0] = clk[0]; buf[1] = 1; sa.addFrom(buf, 0);   // lock EXPLICIT + anchor
+        for (let k = 0; k < 400; k++) { clk[0] += 1.5; buf[0] = clk[0]; sa.advanceFrom(buf, 0); } return { sa, buf, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const sa = s.sa, buf = s.buf, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; buf[0] = clk[0]; sa.advanceFrom(buf, 0); acc[0] += sa.lastNow; } } };
+}
+// advance(now) at a monomorphic site: the fractional now is inlined (no box) -> 0. clk += 40 (pw=31.25) rotates.
+function saAdvance() {
+    return { setup() { const sa = new SlidingAggregate(1000, { panes: 32 }); const clk = new Float64Array(1); clk[0] = CLK_EPOCH; sa.add(clk[0], 1);
+        for (let k = 0; k < 400; k++) { clk[0] += 40; sa.advance(clk[0]); } return { sa, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const sa = s.sa, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 40; sa.advance(clk[0]); acc[0] += sa.lastNow; } } };
+}
+// advanceFrom: zero-box slot clock.
+function saAdvanceFrom() {
+    return { setup() { const sa = new SlidingAggregate(1000, { panes: 32 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH; buf[0] = clk[0]; buf[1] = 1; sa.addFrom(buf, 0);
+        for (let k = 0; k < 400; k++) { clk[0] += 40; buf[0] = clk[0]; sa.advanceFrom(buf, 0); } return { sa, buf, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const sa = s.sa, buf = s.buf, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 40; buf[0] = clk[0]; sa.advanceFrom(buf, 0); acc[0] += sa.lastNow; } } };
+}
+// clear(): reset + one re-seed add per op.
+function saClear() {
+    return { setup() { const sa = new SlidingAggregate(1000, { panes: 32 }); for (let k = 0; k < 400; k++) sa.add(k, (k % 100) - 50); return { sa, ix: new Float64Array(1), acc: new Float64Array(1) }; },
+        hot(s, n) { const sa = s.sa, ix = s.ix, acc = s.acc; let i = ix[0] | 0; for (let j = 0; j < n; j++) { sa.clear(); sa.add(i, (i % 100) - 50); i = (i + 1) | 0; acc[0] += (sa.mode === 'explicit' ? 1 : 0); } ix[0] = i; } };
+}
+
+// --- SA readers: scalar (monomorphic) + into (mono / poly4 / mega5) + must-box (mean-mega / add-mega-rot).
+// Populate an SA (or subclass) with fractional values so the readers return non-integral doubles.
+function mkSa(K) {
+    const s = new K(1000, { panes: 8 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+    for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = (k % 1000) * 0.5 - 250; s.addFrom(buf, 0); }
+    return s;
+}
+// empty SlidingAggregate subclasses: distinct maps for the polymorphic / megamorphic call sites.
+class SASubA extends SlidingAggregate {}
+class SASubB extends SlidingAggregate {}
+class SASubC extends SlidingAggregate {}
+class SASubD extends SlidingAggregate {}
+const SA_SHAPES4 = [SlidingAggregate, SASubA, SASubB, SASubC];        // <= 4 maps -> polymorphic
+const SA_SHAPES5 = [SlidingAggregate, SASubA, SASubB, SASubC, SASubD]; // 5 maps -> megamorphic
+// distinct call sites: callIntoP stays polymorphic (<=4 shapes ever); callIntoM / callMeanM go megamorphic.
+function callIntoP(o, out) { return o.into(out); }
+function callIntoM(o, out) { return o.into(out); }
+function callMeanM(o) { return o.mean(); }
+function megamorphizeInto(fn) { const out = new Float64Array(5); const insts = SA_SHAPES5.map(mkSa); let s = 0; for (let i = 0; i < 4000; i++) s += fn(insts[i % 5], out); return s; }
+function megamorphizeMean() { const insts = SA_SHAPES5.map(mkSa); let s = 0; for (let i = 0; i < 4000; i++) s += callMeanM(insts[i % 5]); return s; }
+
+// scalar reader (monomorphic site). count() returns a Smi-ish integer (~0 B); sum/mean/min/max return a
+// double (~16 B). Gated in the band [0, 16.5] (docs: "up to 16 B/call; use into()").
+function qSaScalar(kind) {
+    return { setup() { return { sa: mkSa(SlidingAggregate), acc: new Float64Array(1) }; },
+        hot(s, n) { const sa = s.sa, acc = s.acc;
+            if (kind === 'count') { for (let i = 0; i < n; i++) acc[0] += sa.count(); }
+            else if (kind === 'sum') { for (let i = 0; i < n; i++) acc[0] += sa.sum(); }
+            else if (kind === 'mean') { for (let i = 0; i < n; i++) acc[0] += sa.mean(); }
+            else if (kind === 'min') { for (let i = 0; i < n; i++) acc[0] += sa.min(); }
+            else { for (let i = 0; i < n; i++) acc[0] += sa.max(); } } };
+}
+// into at a MONOMORPHIC site: nothing is returned as a double (returns 5, a Smi) -> 0 B/op.
+function saIntoMono() {
+    return { setup() { const sa = mkSa(SlidingAggregate); const out = new Float64Array(5); return { sa, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const sa = s.sa, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { sa.into(out); acc[0] += out[0]; } } };
+}
+// into at a POLYMORPHIC site (4 subclass shapes): still inline-cacheable -> 0 B/op.
+function saIntoPoly4() {
+    return { setup() { const insts = SA_SHAPES4.map(mkSa); const out = new Float64Array(5); for (let i = 0; i < 4000; i++) callIntoP(insts[i & 3], out); return { insts, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const insts = s.insts, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { callIntoP(insts[i & 3], out); acc[0] += out[0]; } } };
+}
+// into at a MEGAMORPHIC site (5 subclass shapes): the this._now double-field read boxes ~16 B/op
+// (a family-wide V8 property, RE-SETTLED / logged for 1.10.0). INFORMATIONAL, gated in the band [12, 20].
+function saIntoMega5() {
+    return { setup() { megamorphizeInto(callIntoM); const insts = SA_SHAPES5.map(mkSa); const out = new Float64Array(5); return { insts, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const insts = s.insts, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { callIntoM(insts[i % 5], out); acc[0] += out[0]; } } };
+}
+// MUST-BOX control: mean() over 5 subclass maps boxes its fractional return AND the this._now read
+// (measured ~32 B). Gated >= 12 -- proves the probe sees the megamorphic box.
+function qSaMeanMega() {
+    return { setup() { megamorphizeMean(); const insts = SA_SHAPES5.map(mkSa); return { insts, acc: new Float64Array(1) }; },
+        hot(s, n) { const insts = s.insts, acc = s.acc; for (let i = 0; i < n; i++) acc[0] += callMeanM(insts[i % 5]); } };
+}
+// MUST-BOX control: fractional now + value through the megamorphic callAdd site on the rotate-every-add
+// (pw=1) SA shape. Both fractional args box at the megamorphic boundary (~32 B). Gated >= 12.
+function saAddMegaRot() {
+    return { setup() { megamorphizeCallAdd(); const sa = new SlidingAggregate(64, { panes: 64 }); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        for (let k = 0; k < 400; k++) { clk[0] += 1.5; callAdd(sa, clk[0], FRAC[k & 15]); } return { sa, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const sa = s.sa, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; callAdd(sa, clk[0], FRAC[i & 15]); acc[0] += sa.lastNow; } } };
+}
+
 export const LANES = {
     n1, noop,
     eh_addFrom, fd_addFrom, shll_addFrom, sd_addFrom, scm_addFrom, dr_addFrom,
@@ -523,6 +643,36 @@ export const LANES = {
     // boxes; latched-PH fire boxes in Maglev).
     q_shll_count: qShllCount(),
     dd_latch_ph_fireheavy: ddLatchPhFireheavy(),
+
+    // 1.9.0 SlidingAggregate (ADR 0012). addFrom matrix: clock x value, fresh + warmed.
+    sa_af_now_small: saAF('now', 'small'),
+    sa_af_now_frac: saAF('now', 'frac'),
+    sa_af_now_neg149: saAF('now', 'neg149'),
+    sa_af_now_max150: saAF('now', 'max150'),
+    sa_af_epoch_small: saAF('epoch', 'small'),
+    sa_af_epoch_frac: saAF('epoch', 'frac'),
+    sa_af_epoch_neg149: saAF('epoch', 'neg149'),
+    sa_af_epoch_max150: saAF('epoch', 'max150'),
+    // event-heavy rotate-every-add epoch lanes (pw=1): the zero-box-per-rotation floor.
+    sa_af_epoch_rot: saAfEpochRot(),
+    sa_adv_epoch_rot: saAdvEpochRot(),
+    // advance / advanceFrom / clear: 0 B/op.
+    sa_advance: saAdvance(),
+    sa_advanceFrom: saAdvanceFrom(),
+    sa_clear: saClear(),
+    // scalar readers (monomorphic site), band [0, 16.5].
+    q_sa_count: qSaScalar('count'),
+    q_sa_sum: qSaScalar('sum'),
+    q_sa_mean: qSaScalar('mean'),
+    q_sa_min: qSaScalar('min'),
+    q_sa_max: qSaScalar('max'),
+    // into: monomorphic + polymorphic-4 (<=0.5); megamorphic-5 (informational, band [12,20]).
+    sa_into_mono: saIntoMono(),
+    sa_into_poly4: saIntoPoly4(),
+    sa_into_mega5: saIntoMega5(),
+    // must-box controls (>= 12): mean over 5 maps; fractional add through the megamorphic callAdd site.
+    q_sa_mean_mega: qSaMeanMega(),
+    sa_add_mega_rot: saAddMegaRot(),
 };
 
 // ---------------------------------------------------------------------------
@@ -601,6 +751,15 @@ export function warmSiblings() {
     const drs = [new DecayedReservoir(8, 50, { seed: 1 }), new DecayedReservoir(64, 1e4, { seed: 2 })];
     clk[0] = 1.7e12;
     for (let i = 0; i < nOps; i++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[i & 15]; drs[i & 1].addFrom(buf, 0); }
+    // SlidingAggregate: other W / panes, addFrom + add + advance + a reader.
+    const sas = [new SlidingAggregate(200, { panes: 4 }), new SlidingAggregate(5000, { panes: 64 })];
+    const saOut = new Float64Array(5);
+    clk[0] = 1.7e12;
+    for (let i = 0; i < nOps; i++) {
+        clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[i & 15];
+        sas[i & 1].addFrom(buf, 0); sas[i & 1].add(clk[0] + 0.5, FRAC[i & 15] - 0.5);
+        if ((i & 63) === 0) { sas[i & 1].into(saOut); acc[0] += saOut[0] + sas[i & 1].mean(); }
+    }
     return acc[0];
 }
 

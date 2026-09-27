@@ -6,7 +6,8 @@ complete at 1.0.0). See `RESEARCH.md` for the identity, the two witnesses (recen
 change response), the roster rationale (incl. the verdict on the inherited backlog), and the
 open questions. ASCII-only (`->`, `<=`, `x`, "epsilon", "alpha", "delta").
 
-> **NEXT: v1.9.0 -- SlidingAggregate ONLY (section 9).** 1.8.0 (additive API) released 2026-09-27;
+> **NEXT: v1.10.0 -- H2 hardening (section 10; batch 1 of 10.1 is launch-ready).** v1.9.0 SlidingAggregate released 2026-09-27.
+> Previously NEXT: v1.9.0 -- SlidingAggregate ONLY (section 9). 1.8.0 (additive API) released 2026-09-27;
 > 1.7.0 H1 hardening shipped 2026-09-26. After 1.9.0: section 10 (v1.10.0, the zero-alloc readers +
 > the latched-PH fix, from the 1.8.0 doc-truth findings) and section 11 (the demo session, repo-only,
 > no npm release). One feature per minor (maintainer, 2026-09-26).
@@ -749,7 +750,7 @@ the band [12, 40]); the `countInto` 0-alloc reader lands in 1.9.0 (section 9).
 demo:check) green, the reviewer approves the demo audit, `/release 1.8.0`, `/sync-card lite-adaptive`, and a
 note to lite-hud: M3 HK drop-in + M4 EH unblocked; latency means arrive with SlidingAggregate in 1.9.0.
 
-## 9. v1.9.0 -- SlidingAggregate (the tenth member), a dedicated session  [PLANNED]
+## 9. v1.9.0 -- SlidingAggregate (the tenth member), a dedicated session  [SHIPPED -- 1.9.0, 2026-09-27]
 
 Settled S10 (a). Moved out of 1.8.0 by the maintainer (2026-09-26): one feature per minor. The plan
 is DONE (planner, 2026-09-26) and is the brief for that session:
@@ -797,9 +798,146 @@ is DONE (planner, 2026-09-26) and is the brief for that session:
   finding (SHLL count() was advertised 0 B/call and never measured).
 - Keep coder briefs small enough to finish in ~60 turns; split, don't resume three times.
 
-## 10. v1.10.0 -- zero-alloc readers + the latched-PH fix (from the 1.8.0 doc-truth findings)  [PLANNED]
+### 9.1 Executable plan (planner, 2026-09-27; coordinator-SETTLED the same day)
+
+Design record: `decisions/0012-sliding-aggregate.md`. SETTLED (binding; maintainer delegated the calls):
+- bytes = (B+1) x 48 = 1584 at defaults (NOT 1592: the brief's "+ 8" was a copied SCM `_idx` scratch SA
+  has no use for); 50 lite-hud channels = 79,200 B.
+- Sum bound `|sum - exact| <= (4u + O(N u^2)) * sum|v|`, u = 2^-53 (2u is not provable for this merge).
+  Gate at `4u * S1 * (1 + 2^-20)`.
+- `_advance()` / `_anchor()` take NO argument (read `this._now`) -- a deliberate divergence from the
+  literal SCM copy, for the zero-box law. SCM's own per-rotation `t` argument is logged for 1.10.0.
+- `value` REQUIRED in add (no default 1). Empty window: count 0, sum 0, mean / min / max NaN.
+- -0: no normalization; `<` / `>` ties keep the first value; the sign of a zero extreme is unspecified.
+- Retarget the stale "planned for 1.9.0" doc lines (countInto / latched PH) to 1.10.0 in this release.
+- RE-SETTLED after review (2026-09-27): `into` is gated <= 0.5 B/op at a monomorphic / polymorphic site
+  (<= 4 receiver shapes). At a MEGAMORPHIC site (5+ SlidingAggregate subclass shapes) the `this._now`
+  double-field read boxes (measured 16 B/call into, up to 32 B (measured 16 B in the AllocMatrix lane) for mean) -- a family-wide V8 property (SlidingCountMin
+  addFrom reads 32 B/op at 5 maps). Documented, printed as an informational lane, logged for 1.10.0. Not
+  fixed by a clock Float64Array in 1.9.0 (it would change the settled bytes and diverge from the family).
+- Type checks on new containers use `ArrayBuffer.isView(x) && x instanceof Float64Array` (a Proxy around a
+  Float64Array passes instanceof alone) and length checks are written `!(out.length >= 5)` (NaN-safe).
+  The same pattern in the older members is logged for 1.10.0.
+
+**API.** Consts `SA_KNOWN_OPTS {panes}`, `SA_DEFAULT_PANES 32`, `SA_PANES_MIN 2`, `SA_PANES_MAX 1024`,
+`SA_STRIDE 5`, `SA_X_MAX 1e150`, `SA_MIN_NORMAL 2.2250738585072014e-308` (2^-1022), `SA_CLOCK_SPAN 2^42`
+(added 2026-09-27 by the QA190 fix; see section 10.QA190).
+- `new SlidingAggregate(W, options?)`, validated in this order BEFORE any allocation: (1) W a number,
+  finite, > 0, else RangeError `[lite-adaptive] SlidingAggregate W must be a finite number > 0, got X`;
+  (2) `optDoor(options, SA_KNOWN_OPTS, 'SlidingAggregate')`; (3) panes an integer in [2, 1024], else
+  RangeError `... panes must be an integer in [2, 1024], got X`; (4) `W / panes` > 0 and finite, else
+  RangeError `... W is too small for panes=P (W / panes underflowed to X); use a larger W or fewer panes`;
+  (5) `W / panes >= SA_MIN_NORMAL` (a NORMAL double), else RangeError `... W / panes (X) is subnormal; the
+  pane grid cannot hold W exactly -- use a larger W or fewer panes`. The ctor precomputes
+  `this._nowMax = (W / panes) * 2^42` for the hot-path clock-domain compare.
+- `add(now, value) -> this` HOT: value check FIRST (`typeof value !== 'number' ||
+  !(value <= SA_X_MAX && value >= -SA_X_MAX)` -> TypeError `... add value must be a finite number with
+  |value| <= 1e150, got X`), then mode + time copied from SCM (`_badMode` / `_badNow` / `_badMonotone`,
+  same templates), then the clock-domain compare `!(t <= this._nowMax && t >= -this._nowMax)` ->
+  `_badNowRange` RangeError (QA190; count-mode checks `this._tick + 1` against `_nowMax` before committing),
+  then write: `this._now = t; if (t >= paneEnd[cur]) this._advance();` + 5 slot updates. `_advance` derives
+  the grid index `k = round(paneEnd[cur] / pw)` and writes each new pane end as `(k+1) * pw` (multiplication,
+  drift-free), not an accumulating `E += pw`.
+- `addFrom(buf, i)` stride 2 `[now, value]`, explicit-only, body duplicated (not delegated); bad handle ->
+  TypeError `... addFrom(buf, i) needs a Float64Array and an in-bounds integer index with i + 1 <
+  buf.length, got ...`.
+- `advance(now)` / `advanceFrom(buf, i)`: copy SCM (same templates), bounded to <= B+1 clears.
+- `count / sum / mean / min / max (w?) -> number` COLD, never throw: a bad w (non-number / NaN /
+  +-Infinity / <= 0 / > W) -> NaN, checked BEFORE the unset return; unset or covered count 0 -> count 0,
+  sum 0, mean / min / max NaN.
+- `into(out, w?) -> 5` (Smi): out not a Float64Array -> TypeError `... into(out, w?) out must be a
+  Float64Array, got X`; `out.length < 5` -> RangeError `... into out.length (N) must be >= 5`; bad w ->
+  out[0..4] = NaN; else writes `[count, sum, mean, min, max]`, merged into locals, written at the end.
+- `clear() -> this` resets + unlocks the mode, 0 alloc. Getters: `W`, `panes`, `mode`
+  ('unset' | 'explicit' | 'count'), `lastNow` (0 before the first add), `bytes`.
+
+**Tasks (one coder at a time, in order; each ~15 turns):**
+- T0 golden + parity gate BEFORE any edit: `test/differential/classes-1.8.0.sha256.json` (sha256 per
+  class body, `export class X` through its column-0 `}`, cut from `git show HEAD:Adaptive.js`) +
+  `test/differential/AppendParity.test.mjs` (recompute on the working tree; the diff regions are
+  exactly {header, optDoor docblock, append after DecayedReservoir}; an in-memory one-byte-flip control
+  must go RED).
+- T1 append part 1: banner + SA_* consts, ctor, `_initState` (fill(0) then the +Inf / -Inf sentinel
+  loop), getters, `_anchor()` / `_advance()` / `_clearPane(p)` (copied, no argument), all throwers.
+  Gate: `test/SlidingAggregate.test.js` (ctor, doors, subnormal W 5e-324 and 1e-320 @ panes 1024,
+  bytes 1584 at defaults and 144 at panes 2).
+- T2 add / addFrom / advance / advanceFrom. Gate: every reject is a byte-identical no-op (snapshot
+  diff); mode lock both ways; monotone now; a +1e12 advance leaves count 0 and mean NaN.
+- T3 count / sum / mean / min / max / into. Gate: unit tests vs an in-test BigInt oracle + a
+  QueryContract 'F12 SlidingAggregate' row (bad w -> NaN and pure on all 5; unset + bad w -> NaN; into
+  wrong container / short -> throws and pure; into bad w -> 5 NaN slots).
+- T4 header paragraph + optDoor docblock "all 10 ctors" (NOT VERSION); Adaptive.d.ts; OptionDoors rows
+  (12 doors; `{pnaes: 1}` -> did-you-mean "panes"; valid + adversarial rows). Gate: T0 green, npm test.
+- T5 witness SA section: A1-A3 below, per-reader sub-window lanes at W/4 and W/2, controls (BPaneSA,
+  NoClearSA, drop-oldest merge, plain-+= replica, plain-merge replica, ZeroClearSA), the lite-hud lane.
+  Gate: `WITNESS SlidingAggregate ok`, every control REJECTED.
+- T6 torture: track 'slidingaggregate'; lanes add (Smi), addFrom (epoch, fractional), rotate-every-add
+  (Smi, pw=1) + rotate-every-add addFrom (epoch), advance, advanceFrom, big-jump 1e12, into, clear,
+  retention; SA steps in the 4M HOT loop; reuseSa in the arrayBuffers loop; PerfGate saAddStream /
+  saAddFromStream / saMustFailAlloc. Gate: torture GATE ok.
+- T7 AllocProbe lanes + AllocMatrix rows (allocation plan below); JumpTiming SA lane + PerPaneLoopSA
+  (CTRL_JUMP calibrated so the control's p99 >= 5 ms). Gate: test:perf:matrix green with teeth.
+- T8 docs: README spine (TOC, What you get, `## SlidingAggregate` after DecayedReservoir, API + SA
+  constants table, Composability, Zero-GC row, Design decisions, Testing count, What this is not,
+  Ecosystem), llms.txt, CHANGELOG [Unreleased], ADR 0009 amendment line; retarget "planned for 1.9.0"
+  -> 1.10.0 (README ~648/~650, Adaptive.d.ts ~492-493/~554, llms.txt ~133/~184). Gate: ASCII + stray-tag
+  grep, `npm run verify`.
+
+**Assertions (oracle = the witness's own (t, v) list; grid pane end `pe = (floor(t/pw)+1) * pw`, live
+iff `pe > now - w`; sum = BigInt(v * 2^20), fail closed if not an integer; pw dyadic, e.g. W=1000 B=32):**
+- A1 covered span, >= 2000 queries x 4 (W, B) x {lognormal, signed, count mode}, 100%: count / min / max
+  `===` oracle; `|sum - exact| <= 4 * 2^-53 * S1 * (1 + 2^-20)`; `into` === each scalar reader. RED on:
+  no clear on rotate; Kahan removed (lane K: one pane `[2^53, 1000 x 1.0, -2^53]`); Neumaier removed
+  (lane N: pw=1, B=32, `+2^53` pane 0, `+1` panes 1..30, `-2^53` pane 31); empty-pane poisoning (a gap
+  > pw inside the window: all-positive -> min 0, all-negative -> max 0).
+- A2 true window, pw NOT dyadic (W=1000, B=30): count >= true(W), min <= trueMin, max >= trueMax on
+  100%. RED on: B-pane ring; straddling pane dropped.
+- A3 w by value, each reader incl. into, at W/4 and W/2 vs the sub-window oracle; the stream plants a max
+  spike and a min dip in [now-W, now-W/2). An ignore-w mutant on ANY single reader goes RED.
+- A4 contracts: mode lock both ways (snapshot unchanged); `new SlidingAggregate(5e-324)` throws
+  /underflowed/; an empty window reads mean / min / max NaN, count 0, sum 0.
+- A5 GC / retention: torture `{maxMajor: 0, maxPauseMs: 4}`; every SA measureAllocs lane 0 B/op;
+  tracker size back to 0; bytes 1584 and covered results identical over 10 clear/refill cycles;
+  arrayBuffers delta <= 0 over 500 reuse cycles; PerfGate maxScavenges 0 with saMustFailAlloc RED.
+- A6 JumpTiming: SA advance(+1e12)+add p99 < 1.0 ms; PerPaneLoopSA p99 >= 1.0 ms or the row prints NO TEETH.
+
+**Allocation plan (pinned semi-space probe, steady = min over windows 1..n-1):** add with Smi args 0;
+add with fractional args at a non-inlined caller 16-32 B (the documented N2 story; addFrom is the fix);
+addFrom <= 0.5 over clk {now, epoch} x value {small int, fraction, -1e149, 1e150}, fresh + warmed;
+advance / advanceFrom / clear 0; `into` <= 0.5 fresh + warmed AND through a megamorphic `callInto` site
+(5 empty SA subclasses). Scalar readers q_sa_count / sum / mean / min / max gated in the band [0, 16.5]
+(docs: "up to 16 B/call; use into()"). EVENT-HEAVY lanes <= 0.5: `sa_af_epoch_rot` (SA(32, {panes: 32})
+-> pw = 1; clk from 1.75e12 stepping +1.5 per addFrom, so EVERY add rotates with a non-Smi now) and
+`sa_adv_epoch_rot` (same via advanceFrom). Must-box controls >= 12: `q_sa_mean_mega` (callMean over 5
+subclass maps) and `sa_add_mega_rot` (fractional now + value through a megamorphic callAdd on the
+rotate-every-add shape); N1 stays the probe self-test.
+
+**lite-hud lane (witness, after the SA section):** 50 x `new SlidingAggregate(1000, {panes: 32})`, ms
+clock; channel ch gets `v = exp(ln 4 + 0.05 ch + z)` ms (mulberry32 + Box-Muller), quantized to 2^-20;
+inter-arrival `(1000/120) * (0.5 + r)` quantized to 2^-10; 30 s simulated (~3600 events / channel); a
+query every 16 ms through `into(OUT)`. HARD: count / min / max === oracle; sum within the A1 bound; mean
+within `(4u * S1 / n + u|mean|) * (1 + 2^-20)`; >= 2000 queries; sum of `sa.bytes` === 79,200. PRINTED in
+one block next to the EH F17 line: SA covered-span mean worstRel (assert <= 4.5e-16), SA vs true(W) mean
+worstRel (edge, informational), and ExponentialHistogram(1000, 0.01) fed the same streams: sum()/count()
+worstRel vs true(W) (the F17 failure) + EH memory.
+
+## 10. v1.10.0 -- H2 HARDENING (fail-open + allocation findings in shipped classes)  [PLANNED -- NEXT]
 
 One theme: every reader a render path needs is 0 B/call, and the latch path is 0 B/op under every tier.
+- NEW (review, 2026-09-27): family-wide megamorphic-site boxing. A double FIELD read (`this._now`) at a
+  call site that sees 5+ receiver shapes boxes (SA into 16 B, SA mean 32 B, SCM addFrom 32 B/op at 5 maps).
+  Measure every member at 5 maps; if worth fixing, move the clock into a Float64Array slot family-wide.
+- NEW (review, 2026-09-27): container checks across the family accept a Proxy around a Float64Array
+  (`instanceof` alone) and a NaN `length`; harden to `ArrayBuffer.isView` + `!(len >= n)`.
+- NEW (QA190, 2026-09-27): SlidingCountMin has the same pane-grid precision fail-open (QA190 F1/F2 repro:
+  `new SlidingCountMin(1e-3)`, `3x add(1.75e12, 7)` -> `estimate` 1); apply the SlidingAggregate domain
+  guard (reject `|now| > pw * 2^42` and a subnormal `W / panes` fail-closed, grid-index pane ends). Left
+  untouched in 1.9.0 per the PURE-APPEND scope; logged here for 1.10.0.
+- NEW (planner, 2026-09-27): SlidingCountMin passes the clock as an ARGUMENT to `_advance(t)` /
+  `_anchor(t)` (Adaptive.js ~5276 / ~5284 / ~5289 / ~5698). With an epoch-ms `t` a non-inlined call can
+  box once per ROTATION; the existing epoch lanes rotate ~every 83 adds, so a 16 B box averages ~0.19
+  B/op and passes the 0.5 gate. Add an event-heavy rotate-every-add epoch lane FIRST (measure), then fix
+  it the SlidingAggregate way (argument-free helpers reading `this._now`) if it boxes -- bit-identical.
 
 - `SlidingHyperLogLog.countInto(out, i?)` -- a 0-alloc reader that writes the windowed distinct
   estimate into a caller-owned `Float64Array` slot instead of returning a boxed double (finding A;
@@ -819,15 +957,239 @@ One theme: every reader a render path needs is 0 B/call, and the latch path is 0
   because six `_guardFinite` getters in one render function exceed V8's cumulative inlining budget and
   three of them box their fractional returns. The `Into` siblings land the values in caller slots so the
   render path is 0 B/tick (mirrors SDD `quantileInto` / SCM `estimateInto`).
-- SETTLE before code (maintainer): the latched-PH fix changes WHEN a latched PH fires on some streams
-  (bound vs reset the extremes at the fire). latch:false stays bit-identical. The planner measures both
-  options on the DDParity + demo streams and brings one recommendation with the fire-sequence diff.
+- SETTLED (coordinator, 2026-09-27): the latched-PH fix is chosen by the PRE-DECLARED rule in 10.1
+  section 3 -- no maintainer call needed. latch:false stays bit-identical (hard gate).
+- MOVED to 1.11.0 (one feature per minor): SHLL `countInto`, DD `statisticInto` / `meanInto` (brief in
+  10.1 section 8). 1.10.0 is hardening only.
 - Exit: verify + gates:red green (no todo), `/release 1.10.0`, `/sync-card`.
+
+### 10.1 Executable plan (planner, 2026-09-27; coordinator-SETTLED the same day)
+
+Read-only plan; every CONFIRM below is from code reading -- batch 1 executes and records every repro.
+Line numbers are the 1.9.0 working tree (`Adaptive.js:N`); re-locate by symbol if they drift.
+
+**SETTLED (coordinator; maintainer confirms or overrides on the ping):** MINOR 1.10.0, a hardening
+release like 1.7.0. R2 default below (count-mode bound, SA parity, remedy `clear()`). H2-5 is
+measure-and-document only. The DD option is chosen by the pre-declared rule (section 3).
+
+#### 1. Findings (confirm / refute)
+- H2-1 SCM pane-grid precision fail-open -- CONFIRMED. ctor guard only `>0 && finite` (~5154);
+  `_anchor(now)` ~5475; `_advance(t)` with `E += pw` ~5498; no clock bound in add / addFrom / advance /
+  advanceFrom. Repros: F1 `new SlidingCountMin(1e-3)`, 3x `add(1.75e12, 7)` -> `estimate(7) === 1`;
+  F2 `SCM(736, {panes:32})` at a 1e17 clock under-counts `total(W)`; F3 `SCM(1500*2**-1074,
+  {panes:1024})` builds today.
+- H2-1 SDD -- CONFIRMED (same code): ctor ~4140, `_anchor(now)` ~4406, `_advance(t)` ~4420, `E += pw`
+  ~4428. Same three repros via `count()`.
+- H2-1 EH / SHLL -- REFUTED (no pane grid; cutoff `fl(t - W)` matches a double-clock oracle; no drift).
+  FD / DR / ADWIN / HK have no grid. Doc note only.
+- H2-2 SCM / SDD pass `t` as an ARGUMENT to `_advance(t)` / `_anchor(t)` (SCM ~5296/5304/5309/5411/
+  5718/5752; SDD ~4306/4314/4319/4379/4383/4871/4874/4905/4908) -- a non-inlined call tags an epoch
+  double (~16 B per ROTATION); existing lanes rotate ~every 83 adds (~0.19 B/op, hidden). MEASURE first.
+- H2-3 DD latched PH -- CONFIRMED latent: latched `_fired` (~3823-3875) resets `_n/_mean` at the fire but
+  never re-centres gP / gN / mMin / mMax; `_clampGap(dir, ph, th)` (~3881) passes a double `th` as an
+  argument (zero-box law). On the fire-heavy wave (0x32 / 10x32, delta .005, th 5) mMax / mMin drift
+  ~0.078 per item (~7.8e6 at 1e8 items); Infinity unreachable (DD_X_MAX) but gap precision degrades.
+- H2-4 container gates -- CONFIRMED, 17 sites: `instanceof Float64Array` alone accepts a Proxy;
+  `x.length < n` lets NaN through. Replace with `ArrayBuffer.isView(x) && x instanceof Float64Array`,
+  `!(i+k < buf.length)`, `!(x.length >= n)`. Sites: EH addFrom ~687 / advanceFrom ~1013; ADWIN addFrom
+  ~1366; FD addFrom ~1832; HK addFrom ~2415 + topKInto ~2512; SHLL addFrom ~3096 / advanceFrom ~3323; DD
+  addFrom ~3726; SDD addFrom ~4351 / quantileInto ~4726 (both containers + `out.length < qs.length`) /
+  advanceFrom ~4888; SCM addFrom ~5383 (`i+2`) / estimateInto ~5628-5637 / advanceFrom ~5732; DR addFrom
+  ~6101 / sampleInto ~6214. SA already hardened, untouched.
+- H2-4b NEW -- every now / value check on a buffer read written `x !== x || x === Infinity || ...`
+  ACCEPTS `undefined` (a length-lying Float64Array subclass makes `buf[i]` undefined): DD / ADWIN end
+  with `_mean` NaN; EH / FD / DR / SHLL / SCM / SDD end with `_lastNow = undefined` (monotone guard off,
+  field turns Tagged). Replace with positive forms: now `!(now > -Infinity && now < Infinity)` (~701,
+  710, 1021, 1026, 1846, 1851, 3107, 3112, 3331, 3336, 4370, 4375, 4896, 4901, 5398, 5403, 5740, 5745,
+  6115, 6120); EH ~693 `!(v > 0 && v < Infinity)`; ADWIN ~1371 `!(x <= MAX && x >= -MAX)`; FD ~1838 /
+  SDD ~4356 / DR ~6107 `!(v > -Infinity && v < Infinity)`; DD ~3730 `!(x <= DD_X_MAX && x >= -DD_X_MAX)`.
+  Every number is accepted / rejected exactly as before; only `undefined` changes.
+- H2-5 megamorphic double-field boxing -- CONFIRMED (V8 property; only with 5+ subclass shapes at one
+  site). DECISION: measure and document (INFO lanes per class). The fix (a per-instance Float64Array
+  "state slab") changes `bytes` and rewrites every hot body -- logged for a later minor, out of scope.
+
+#### 2. Numeric domain (time-grid classes SCM, SDD; SA already guarded)
+- Per-class consts (design-parity copy, module-private, no new API): `SCM_CLOCK_SPAN` / `SLD_CLOCK_SPAN`
+  = 2^42; `SCM_MIN_NORMAL` / `SLD_MIN_NORMAL` = 2^-1022.
+- `nowMax = pw * 2^42` (pw = W / panes): at the bound ulp(now) <= pw * 2^-10, so `round(E/pw)` recovers
+  the grid index exactly and `(k+1)*pw` contains the true window. Min legal W for clock magnitude C:
+  `W >= panes * C / 2^42`. Count mode checks `tick + 1 <= nowMax` before committing. Subnormal rule:
+  `W / panes >= 2^-1022`. No new magnitude cap (pw > 4.09e295 -> nowMax Infinity -> existing finiteness).
+- Typical configs (32 panes): epoch-ms 1.75e12 with W=1000 (bound 1.374e14, legal ~to year 6300),
+  W=60000 (8.25e15), W=100 (1.374e13), W=1000 @ 1024 panes (4.295e12, to ~2106), W=16 (2.199e12, legal
+  until ~2039-09 -- disclose), W < 12.7 REJECTED today; epoch-us 1.75e15 with W=1e6 (1.374e17) and
+  W=1e5 legal, W=1e4 REJECTED (min 12,733 us); performance.now ms with W=16 (2.2e12, ~70 yr uptime),
+  W=1 (1.374e11, ~4.35 yr); count mode W=1000 (1.374e14 ticks), W=32 (4.398e12 ticks, ~5 days at 1e7
+  adds/s; remedy `clear()`).
+
+#### 3. Behavior changes (MINOR 1.10.0) and the DD rule
+1. SCM / SDD ctor: subnormal `W / panes` throws RangeError /subnormal/.
+2. SCM / SDD add / addFrom / advance / advanceFrom: `|now| > pw * 2^42` throws `_badNowRange` as a
+   byte-identical no-op (these inputs silently returned wrong answers before).
+3. SCM / SDD count mode throws once the tick passes `pw * 2^42` (R2 default: SA parity; `clear()`).
+4. SCM / SDD pane ends move from accumulated `E += pw` to the exact grid `(k+1)*pw`: bit-identical for a
+   dyadic pw; for a non-dyadic pw a boundary moves by at most the accumulated drift and now matches the
+   exact grid oracle.
+5. All 17 container gates: a Proxy / NaN-length subclass now throws. 6. addFrom / advanceFrom: an
+   `undefined` read now throws instead of corrupting state. 7. DD latch:true PH: accumulators re-centred
+   or bounded per the rule; latch:false and CUSUM (both latch modes) BIT-IDENTICAL; dd-1.7.0 vectors
+   unchanged (hard gate). 8. New error templates.
+- DD options (PH-only, inside latched `_fired`; latch:false cannot reach them): V0 argument-free
+  `_clampGap(dir)` (bit-identical; re-measure); V1 re-centre at the end of every latched entry (`gP -=
+  mMin; mMin = 0; gN -= mMax; mMax = 0`); V2 = V1 on fire items only; V3 = V1 only when max(|mMin|,
+  |mMax|) > th * 2^20 (bit-identical until it trips); V4 reset to canonical values at a fire.
+- PRE-DECLARED RULE. Gates: (a) dd-1.7.0 (8 replays) + cuLatch bit-identical; (b)
+  `dd_latch_ph_fireheavy` <= 0.5 B/op fresh + warmed, 3 runs, default flags; (c) diff = count of
+  differing (index, direction) fire events over phLatch / phSquare / phStep1 / phStep2 / phDemo vs 1.9.0;
+  (d) test/DriftDetector.test.js green incl. PH(.005, 50) on 0/+10/-10 firing exactly [2005+, 4003-] and
+  0/+10/-30 firing 4002-; (e) the drift lane (1e8 items) stays within the option's bound (V1/V2/V4:
+  2*th + 2*A = 30; V3: th*2^20 + 30) -- HEAD reads ~7.8e6, so it fails on the old code; (f) latched-PH
+  throughput >= 0.95 x HEAD. Apply: if V0 passes (b) ship V0 PLUS the option passing (a)+(d)+(e)+(f)
+  with the smallest (c), ties to V3; else ship the option passing (a)-(f) with the smallest (c); if none
+  passes (b), ship the (a)+(d)+(e)+(f) option with the smallest (c) as a drift-only fix, keep the <= 4
+  ceiling + the known limitation, and move the box to 1.11.0; if nothing passes (a)+(d)+(e), docs only.
+
+#### 4. Batches (one coder per batch, in order; each ~45 turns; report by turn ~45)
+
+**BATCH 1 -- baselines, measurement, red-first tests. Launch VERBATIM on the maintainer's ping.**
+Rules: read-only git only (status / diff / log / show) -- never commit / add / stash / checkout / reset /
+push; no `npm version` / `npm publish`; never touch package.json `version` or VERSION. Adaptive.js,
+Adaptive.d.ts and all docs stay BYTE-IDENTICAL in this batch (record `shasum -a 256 Adaptive.js` at step 0,
+re-check at the end). ASCII only (grep new files for non-ASCII and stray tool-call tags). node:test only,
+no new deps. Generators in the session scratchpad, never /tmp. Probe lanes keep clocks / values in
+Float64Array slots; every setup throws if its precondition does not hold.
+- Step 0 baseline: `git show HEAD:package.json | grep version`. If HEAD is 1.8.0 (1.9.0 uncommitted):
+  run `node --test test/differential/AppendParity.test.mjs` on the pristine tree (must pass -- proves the
+  nine 1.8.0 bodies equal 1.9.0), cut the nine goldens from `git show HEAD:Adaptive.js` into
+  `$SCRATCH/head/Adaptive.js` (+ a package.json `{"type":"module"}`), SlidingAggregate's from a pristine
+  working-tree copy. If HEAD is 1.9.0, cut all from HEAD. Write the baseline source + sha into every JSON
+  header.
+- T0 goldens: (a) `test/differential/classes-1.9.0.sha256.json` (sha256 of all 10 class bodies, the
+  AppendParity extractor: `export class X` through its column-0 `}`). (b) rewrite
+  `test/differential/AppendParity.test.mjs` as the 1.10.0 class-parity gate: SlidingAggregate body ===
+  its 1.9.0 sha; the nine others listed in `CHANGED_BY_DESIGN_1_10`, each mapped to the differential test
+  that covers it; keep the one-byte-flip control (must go RED); keep classes-1.8.0.sha256.json as
+  history. (c) `test/differential/grid-1.9.0-vectors.json` + `GridParity.test.mjs`:
+  `SCM(W, {panes:32, w:128, d:4, seed:7})` and `SDD(W, {alpha:.01, panes:32})`; configs D (dyadic) W in
+  {32, 1000, 60000} and N (non-dyadic) W=1000 @ 30 panes, W=1e4/3 @ 7 panes; stream now0 = 1.75e12, step
+  1.5 + 0.25*(j mod 7); SCM key (j*733 mod 97)+1; SDD value ((j*40503) mod 9973) + 0.5; 20000 adds; plus
+  one count-mode stream per class at W=1000. Record per add: SCM estimate of 4 probe keys, total(W),
+  total(W/2); SDD count(), count(W/2), quantile(.5), quantile(.99). Encode doubles as 16-hex IEEE bits.
+  D + count-mode = LIVE bit-identical gates; N = a printed diff report (not asserted). (d)
+  `test/differential/dd-1.9.0-latch-vectors.json` + a NEW describe block in DDParity.test.mjs (1.7.0
+  blocks untouched): per item fired, statistic, mean, count, lastDriftIndex, lastDirection; streams
+  cuLatch / phLatch (existing seeds + latch:true), phSquare (0x32 / 10x32, delta .005, th 5, 20k items),
+  phStep1 (0/+10/-10 x2000, delta .005, th 50), phStep2 (0/+10/-30 x2000), phDemo (the demo DD generator
+  if importable as a pure function, else 'skipped' with the reason). All LIVE. (e)
+  `test/differential/addfrom-1.9.0-vectors.json` + `AddFromParity.test.mjs`: EH(1000,.01), ADWIN(.1),
+  FD(1e9), HK(4,512,16,{seed:4}), SHLL(1000,{p:10,ringCap:8,seed:3}), DR(32,1e5,{seed:7}), DD PH + CUSUM;
+  5000 addFrom + 1000 advanceFrom where present; cheap readers every 50 ops. LIVE. Gate: `node --test
+  test/differential/` green on the pristine tree; each new file has a one-hex-digit-flip control that
+  goes RED.
+- T1 measurement lanes (`test/perf/AllocProbe.mjs` lane = `{setup() -> state, hot(s, n)}` in `LANES`;
+  `test/perf/AllocMatrix.test.mjs` row = `{lane, mode: 'fresh'|'warmed', label, expected, check}`):
+  `scm_af_epoch_rot` (SCM(32, {panes:32, w:128, d:4, seed:7}) -> pw 1; clock CLK_EPOCH +1.5; setup
+  asserts every op rotates), `scm_adv_epoch_rot` (via advanceFrom), `sdd_af_epoch_rot` /
+  `sdd_adv_epoch_rot` (SDD(32, {alpha:.01, panes:32}), value FRAC[i&15]+1), `scm_add_mega_rot` (MUST-BOX
+  >= 12, a copy of saAddMegaRot on the pw=1 SCM), `mega5_<cls>_af` for all 10 classes (4 empty subclasses
+  each + a dedicated megamorphized `callAFM(o, buf, i)`). Rows: event-heavy lane live at `<=0.5` if HEAD
+  reads <= 0.5, else `todo: 'H2-2 batch 2 (HEAD N B/op)'`; mega5 rows INFO band [m-4, m+4] around HEAD
+  value m. Run `npm run test:perf:matrix` 3x. Record `dd_latch_ph_fireheavy` over 5 runs (no gate).
+- T2 red-first tests: `test/Hardening110.test.js`; every fix-dependent case `{todo: 'H2-x batch N'}` and
+  must print `not ok ... # TODO` on the pristine tree (paste the TAP lines). H2-1 (SCM + SDD each): F1
+  must throw /\[lite-adaptive\]/ with the JSON snapshot unchanged (record the HEAD estimate / count); F2
+  (clock from 1e17, step 16*(1 + j mod 3)) must throw -- record the HEAD under-count over 500 queries vs
+  a double oracle (adds with t > now - W); F3 must throw /subnormal/. Legal positives (LIVE): every legal
+  row of section 2 (build, 3 adds, exact readout) + now = 0.999 * pw * 2^42 accepted. H2-4 / H2-4b, one
+  row per site: `new Proxy(new Float64Array(8), {})`, a NaNLen subclass and a LongLen subclass each throw
+  with the snapshot unchanged, and `dd.mean` stays finite after the attempt; rows already green on HEAD
+  stay LIVE. H2-3 (todo): phSquare, assert max |_gP|, |_gN|, |_mMin|, |_mMax| <= 30; record the HEAD
+  drift rate per item at 1e6 and 1e7 items.
+- Batch 1 gate: `npm test` green (todos allowed); `npm run test:perf:matrix` green; `node --expose-gc
+  test/torture.mjs` GATE ok; the Adaptive.js sha equals step 0; ASCII grep clean. REPORT every recorded
+  HEAD number -- they are the inputs of batches 2 and 4.
+
+**BATCH 2 -- SCM + SDD domain.** T3 SCM (SlidingCountMin only): consts; ctor MIN_NORMAL check + `this._nowMax
+= paneW * SCM_CLOCK_SPAN`; add / addFrom / advance / advanceFrom: count branch `t = this._tick + 1; if
+(!(t <= nowMax)) throw; this._tick = t`, explicit / unset branches `!(now <= nowMax && now >= -nowMax)`
+before any write; unset branches `this._now = t; this._anchor();`, rotate call `this._advance()`; replace
+`_anchor` / `_advance` with SA's argument-free grid-index body (keep SCM's `_clearPane`); `_badNowRange`
+copied from SA. T4 SDD: the same with the SLD_ prefix. Gates: H2-1 todos -> live green; GridParity D +
+count-mode bit-identical; GridParity N: every diff must be an add within n_rot * ulp(E) of a grid line AND
+equal the in-test `(floor(t/pw)+1)*pw` oracle, else STOP and report -- then re-pin N only to grid-1.10.0;
+SCMParity / SDDParity / F19 green; event-heavy rows todo -> live `<=0.5` (reverting to `_advance(t)` on a
+scratch copy goes RED if HEAD boxed); torture tracks `scm_rot_epoch` / `sdd_rot_epoch` 0 B/op; JumpTiming
+p99 < 1 ms; scratch A/B vs HEAD add / addFrom throughput >= 0.97 (median of 7); mega5 SCM / SDD bands
+re-cut at most once (disclose the delta).
+
+**BATCH 3 -- containers + value forms.** T5 the 17 container sites; T6 the H2-4b value forms. Gates:
+Hardening110 H2-4 rows live; AddFromParity + every differential test bit-identical; AllocMatrix N3 lanes
+<= 0.5; torture ok; scratch A/B per touched hot entry >= 0.97 (if short, try `instanceof && isView`
+order first; ship anyway with the measured ratio disclosed -- fail closed is law); reverting any one site
+on a scratch copy turns exactly its row RED.
+
+**BATCH 4 -- DriftDetector.** T7 build V0-V4 on scratch copies, run (a)-(f), write the decision table,
+apply the rule. T8 implement the chosen option in latched `_fired` / `_clampGap` only; re-pin the PH latch
+vectors to dd-1.10.0-latch-ph-vectors.json (keep the 1.9.0 file for the diff report); fireheavy row
+`<= 0.5` if (b) passed, else keep `<= 4`; torture lane `dd_latch_ph_drift`; the drift todo goes live with
+the option's bound.
+
+**QA pass (read-only boundary suite), BEFORE docs.** Domain edge (+-pw*2^42 and +-1 ulp), negative
+clocks, now = +-1.7e308 with W = 1e308; count mode at the tick bound + `clear()` reopens; subnormal at
+exactly panes*2^-1022; Proxy / NaN-length / LongLen on every site; latched PH reversal after a 1e7-item
+drift; the section 2 legal table.
+
+**BATCH 5 -- docs, then the revert-check.** T9: README (SCM + SDD precision-domain paragraphs, constants
+rows, container note, DD latch paragraph, test count), llms.txt, Adaptive.d.ts (JSDoc throws only), ADR
+amendments (SCM + SDD ADRs with a "Precision domain" section; 0007 with the chosen DD option; 0012 one line
+on family parity), CHANGELOG [Unreleased] Fixed / Changed / Known limitations (resolve the 1.8.0 DD entry
+per the rule), ROADMAP section 10 status. Never touch VERSION. T10: on scratch copies revert each fix and
+confirm its gate goes RED; record the list. Then `/release 1.10.0`, `/sync-card lite-adaptive`.
+
+#### 5. Assertions (oracle / the mutant that turns it RED)
+- A1 `SCM(1e-3).add(1.75e12, 7)` throws, snapshot unchanged; `SCM(1000)` 3x `add(1.75e12, 7)` ->
+  estimate 3 (exact count / drop the `_nowMax` check).
+- A2 `SCM(736, {panes:32})` with now in [0.99, 1) * 23 * 2^42: total(W) >= true(W) on 500/500 (double
+  true-window count / restore `E += pw`; if it stays green extend to 2^11 rotations near the edge).
+- A3 GridParity D bit-identical to the HEAD hex golden over 20000 adds x 5 configs (`k` for `k+1`).
+- A4 `scm_af_epoch_rot` / `sdd_af_epoch_rot` <= 0.5 B/op fresh + warmed; `scm_add_mega_rot` >= 12
+  (pinned probe, N1 >= 12 / `_advance(t)` if HEAD boxed).
+- A5 17 site rows throw with the snapshot unchanged; `dd.mean` finite after LongLen; AddFromParity
+  bit-identical (revert any one site to `instanceof` alone).
+- A6 torture `{maxMajor:0, maxPauseMs:4}` 0 B/op incl. new lanes; tracker back to 0 after 10 construct /
+  fill-10k / clear / drop cycles for SCM, SDD, DD; PerfGate maxScavenges 0 (a per-rotation
+  `new Float64Array(1)` in `_advance`).
+- A7 DD 1.7.0 vectors + cuLatch bit-identical; the drift lane under the option bound, HEAD ~7.8e6 at 1e8
+  (remove the re-centre, or apply it on latch:false).
+
+#### 6. Allocation plan
+New lanes: scm / sdd `_af` / `_adv_epoch_rot` (HEAD 16 if `_advance` not inlined, else 0 -> <= 0.5);
+`scm_add_mega_rot` must-box (~32, >= 12); `mega5_*_af` INFO ([m-4, m+4]; SCM ~32, may reach ~48 after
+`_nowMax`, disclosed); `dd_latch_ph_fireheavy` (<= 4 today -> <= 0.5 target per the rule). Controls: N1,
+sharedCallAdd (N2), q_scm_estimate_big (16), sa_add_mega_rot. Every existing lane unchanged.
+
+#### 7. Risks (none blocks; each has a default)
+R1 HEAD may still be 1.8.0 -> batch 1 step 0 bridges it (commit 1.9.0 first). R2 count-mode bound ->
+SA parity, `clear()`, disclosed. R3 small epoch-ms windows (W <= 16 legal only to ~2039, W < 12.7
+rejected) -> ship with a disclosure table. R4 non-dyadic pane-end diffs -> the batch 2 rule. R5
+throughput -> the batch 3 rule. R6 the DD box may survive every option -> the section 3 drift-only rule.
+
+#### 8. v1.11.0 readers brief (one feature per minor)
+`SlidingHyperLogLog.countInto(out, i = 0) -> 1` (Smi; writes the rounded windowed estimate).
+`DriftDetector.statisticInto(out, i = 0) -> 1` / `meanInto(out, i = 0) -> 1` (run `_guardFinite` first,
+fail closed, then write). Settle first: a DD `into(out) -> 5` writing [statistic, mean, count,
+lastDriftIndex, lastDirection] mirroring SA `into`, instead of / alongside. Container gate
+`ArrayBuffer.isView(out) && out instanceof Float64Array`, `!(i < out.length)`, `i` a non-negative integer;
+wrong input throws as a byte-identical no-op. Parity: slot `Object.is` the scalar reader on 10k queries
+incl. empty / NaN. Lanes `q_shll_countInto` / `q_dd_statisticInto` / `q_dd_meanInto` <= 0.5 fresh +
+warmed; plain `count()` stays the [12, 40] must-box control. The demo `dd_frame` todos become <= 0.5
+gates once the render reads the Into slots. QueryContract rows; mega5 INFO rows. Docs: d.ts, README,
+llms.txt, SHLL ADR + 0007 amendments, CHANGELOG. Readers only, no other behavior change.
 
 ## 11. The demo session (repo-only; no npm release)  [PLANNED]
 
 Finish demo/ for 1.7.0 -- 1.10.0. The tree already holds P0-P2 (APPROVED + QA'd) and P3 (the DD / SDD
-blockers fixed, NOT yet re-reviewed). Run after section 10, so the DD scene reads the new `Into`
+blockers fixed, NOT yet re-reviewed). Run after 1.11.0 (the readers), so the DD scene reads the new `Into`
 readers (render 0 B/tick) and the `dd_frame` `todo` becomes a real <= 0.5 gate.
 - P3: re-review the DD / SDD pass (it was rejected once; every blocker is fixed in the tree).
 - P4: SCM D7 (`total(w)` readout + the eps x N band from the ORACLE N; the render reads through

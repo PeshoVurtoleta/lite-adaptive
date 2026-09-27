@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    SlidingDDSketch, SlidingHyperLogLog, SlidingCountMin, HeavyKeeper,
+    SlidingDDSketch, SlidingHyperLogLog, SlidingCountMin, HeavyKeeper, SlidingAggregate,
 } from '../Adaptive.js';
 
 /** A stable structural snapshot of an instance's own state (typed arrays -> arrays, scalars verbatim). */
@@ -122,4 +122,40 @@ test('F12 HeavyKeeper: bad key -> NaN; unseen valid key -> 0; wrong container ->
     assertThrowsPure(hk, () => hk.topKInto([0, 0]), 'HK topKInto(non-F64)');
     assertThrowsPure(hk, () => hk.topKInto(new Float64Array(1)), 'HK topKInto(too short)');
     // bad q: N/A; bad w: N/A -- skipped explicitly.
+});
+
+test('F12 SlidingAggregate: bad w -> NaN on all 5 readers; into wrong container / short -> throw; ' +
+    'into bad w -> 5 NaN slots; unset + bad w -> NaN; no q / key axis', () => {
+    const sa = new SlidingAggregate(1000, { panes: 8 });
+    for (let i = 0; i < 200; i++) sa.add(i, (i % 13) - 6);
+    // bad w (a data VALUE) -> NaN on EVERY scalar reader, pure
+    for (const bad of [-1, 0, NaN, Infinity, -Infinity, 1e9, 'x']) {
+        assertNaNPure(sa, () => sa.count(bad), 'SA count(' + String(bad) + ')');
+        assertNaNPure(sa, () => sa.sum(bad), 'SA sum(' + String(bad) + ')');
+        assertNaNPure(sa, () => sa.mean(bad), 'SA mean(' + String(bad) + ')');
+        assertNaNPure(sa, () => sa.min(bad), 'SA min(' + String(bad) + ')');
+        assertNaNPure(sa, () => sa.max(bad), 'SA max(' + String(bad) + ')');
+    }
+    // WRONG CONTAINER TYPE (into) -> throw, state byte-identical
+    const saOut = new Float64Array(5);
+    assertThrowsPure(sa, () => sa.into([0, 0, 0, 0, 0]), 'SA into(non-F64)');
+    assertThrowsPure(sa, () => sa.into(new Float64Array(4)), 'SA into(out too short)');
+    // into: a bad w fills all 5 out slots with NaN (parity with the scalar readers); sa state pure
+    const bw = snap(sa);
+    const outW = new Float64Array(5);
+    assert.equal(sa.into(outW, -1), 5, 'SA into bad w -> returns 5');
+    assert.ok([...outW].every(Number.isNaN), 'SA into bad w -> all 5 NaN slots');
+    assert.equal(snap(sa), bw, 'SA into(bad w) left sa state byte-identical');
+    // UNSET + bad w: fail closed to NaN on every reader (the w check precedes the empty return).
+    const saU = new SlidingAggregate(1000, { panes: 8 });
+    assertNaNPure(saU, () => saU.count(-1), 'SA unset count(-1) -> NaN');
+    assertNaNPure(saU, () => saU.mean('x'), 'SA unset mean(non-number) -> NaN');
+    const uOut = new Float64Array(5);
+    assert.equal(saU.into(uOut, -1), 5, 'SA unset into bad w -> returns 5');
+    assert.ok([...uOut].every(Number.isNaN), 'SA unset into bad w -> all 5 NaN slots');
+    // UNSET + good w: count 0 / sum 0, mean / min / max NaN (empty, never fail-open)
+    assert.equal(saU.count(), 0, 'SA unset count() -> 0');
+    assert.equal(saU.sum(), 0, 'SA unset sum() -> 0');
+    assert.ok(Number.isNaN(saU.mean()) && Number.isNaN(saU.min()) && Number.isNaN(saU.max()), 'SA unset mean/min/max NaN');
+    // bad q: N/A; bad key: N/A -- skipped explicitly.
 });

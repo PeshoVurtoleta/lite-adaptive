@@ -126,3 +126,13 @@ add competing for its slot, is not capacity pressure and never counts as an over
 `count()` self-filters by `_now`, so a bare `advance` still slides an idle stream to 0 -- the
 `SHLLFrozen` negative control (an advance that never updates `_now`) is still REJECTED by the
 idle-slide gate, so advancing the clock is still the load-bearing part.
+
+## Amendment (1.9.0, ADR 0012) -- SlidingAggregate ships advance / advanceFrom
+
+SlidingAggregate (the fourth TIME-windowed member, a B+1 pane ring) ships `advance(now)` /
+`advanceFrom(buf, i)` from the start under this same contract: EXPLICIT-time only (a COUNT-locked
+instance throws, an UNSET instance locks EXPLICIT and anchors), monotone `now`, a rejected advance a
+BYTE-IDENTICAL no-op, 0 B/op. Its body rotates + clears stale panes via the private `_advance` (the
+SlidingDDSketch pattern, bounded to B+1 clears), so an idle window slides to empty (count 0, mean / min /
+max NaN).
+

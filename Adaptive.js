@@ -188,6 +188,26 @@
  * The remaining classes (ExponentialHistogram, ForwardDecay, ADWIN, DecayedReservoir,
  * SlidingDDSketch) stay BYTE-IDENTICAL.
  *
+ * v1.9.0 adds SlidingAggregate (ADR 0012): EXACT windowed count / sum / mean / min / max over the
+ * COVERED span [w, w + W/B] (which always CONTAINS the last w) in FIXED preallocated space -- the
+ * exact-aggregate member the family lacked (ExponentialHistogram's
+ * sum() error is bounded by half the straddling bucket, not epsilon, so it fails on a skewed stream;
+ * SlidingDDSketch answers quantiles, SlidingCountMin per-key counts). A ring of B+1 panes of width W/B
+ * (the SlidingCountMin ring, COPIED verbatim so SCM's bytes cannot move), each a stride-5 Float64 slot
+ * [count, sum, kcomp, min, max]; add(now, value) / the zero-box stride-2 addFrom(buf, i) fold the value
+ * into the current pane (count += 1, a branch-free Kahan compensated sum, min / max by comparison), and
+ * crossing a pane boundary rotates + clears it to IDENTITY sentinels (count/sum/kcomp 0, min +Infinity,
+ * max -Infinity -- never fill(0), 0 B/op). count / sum / mean / min / max (w?) and the 0-alloc into(out, w?)
+ * merge the live, NON-EMPTY panes (the straddling oldest pane kept) with Neumaier over {s_p, -c_p}: count /
+ * min / max are bit-exact and |sum - exact| <= (4u + O(N u^2)) * sum|v|, u = 2^-53. An empty covered window
+ * reads count 0, sum 0, mean / min / max NaN. value is REQUIRED (|value| <= 1e150); the rotate / anchor
+ * helpers take NO argument (read this._now, the zero-box law -- no epoch-ms double crosses a non-inlined
+ * call). advance() / advanceFrom() slide an idle window. The SIXTH additive post-1.0 member: a PURE
+ * APPEND -- the nine prior classes (ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper,
+ * SlidingHyperLogLog, DriftDetector, SlidingDDSketch, SlidingCountMin, DecayedReservoir) stay
+ * BYTE-IDENTICAL; only this header + VERSION change above the append point plus the appended
+ * SlidingAggregate class (and its SA_* consts).
+ *
  * ASCII-only source (no Unicode; the two exceptions the suite allows are unused
  * here). Zero runtime deps; node:test only.
  *
@@ -195,7 +215,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.8.0';
+export const VERSION = '1.9.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -270,7 +290,7 @@ function optLev(a, b) {
  * inherit `constructor` / `toString`, so `{constructor: 1}` would slip through -- the F13 bug). An
  * unknown key throws a tagged RangeError with a Levenshtein <= 2 did-you-mean hint (skipped for keys
  * over 63 chars). Never allocates on the accept path; the reject path is a throw, so its allocation
- * is irrelevant. Called by all 9 ctors and the two `withAccuracy` factories (R6: every door is the
+ * is irrelevant. Called by all 10 ctors and the two `withAccuracy` factories (R6: every door is the
  * same door).
  * @param {object|undefined} options
  * @param {object} known    a null-proto set of the legal keys (`key in known`).
@@ -6263,5 +6283,736 @@ export class DecayedReservoir {
     _badFn(fn) {
         throw new TypeError(
             '[lite-adaptive] DecayedReservoir.forEach(fn) needs a function, got ' + String(fn));
+    }
+}
+
+// ===========================================================================
+// SlidingAggregate (ADR 0012) -- exact windowed count / sum / mean / min / max
+// ===========================================================================
+//
+// The EXACT windowed aggregate the family lacked: over the COVERED span [w, w + W/B]
+// (which always CONTAINS the last w), count / sum / mean / min / max in FIXED memory.
+// A ring of B+1 preallocated panes of width W/B
+// (the SlidingCountMin ring, COPIED verbatim -- never a shared helper, so SCM's bytes
+// and behavior cannot move). Per-pane state is stride 5 in one Float64Array:
+// [count, sum, kcomp, min, max]. Hot: count += 1; a branch-free Kahan compensated sum
+// (y = v - c; t = s + y; c = (t - s) - y; s = t); min / max by < / >. A query merges the
+// LIVE, NON-EMPTY panes (paneEnd > now - w) with Neumaier over the terms {s_p, -c_p}, so
+// the covered span [w, w + W/B] always CONTAINS the true window (the straddling oldest
+// pane is KEPT). count / min / max are bit-exact; the sum error is bounded by
+// |sum - exact| <= (4u + O(N u^2)) * sum|v|, u = 2^-53 (ADR 0012). A cleared pane holds
+// the IDENTITY sentinels count 0, sum 0, kcomp 0, min +Infinity, max -Infinity (never
+// fill(0) over the stride), and every merge skips count === 0; a covered count of 0
+// returns NaN from mean / min / max (null is not zero) and 0 from count / sum.
+//
+// Time model: EXPLICIT (a monotone `now`) or COUNT mode (add(undefined, v)); the mode
+// locks at the first add and a switch throws. addFrom / advance / advanceFrom are
+// EXPLICIT-only (ADR 0009). The rotate / anchor helpers take NO argument and read
+// this._now (the zero-box law -- no epoch-ms double crosses a non-inlined call). value
+// is REQUIRED (no default of 1); a finite real with |value| <= 1e150 (SA_X_MAX). The
+// SIXTH additive post-1.0 member: a PURE APPEND -- the nine prior classes stay
+// BYTE-IDENTICAL; only this append plus (per /release) the header + VERSION change.
+
+/** Frozen marker of the known SlidingAggregate ctor option keys -- an unknown key is a throw. */
+const SA_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { panes: true }));
+/** Default pane count B (the ring holds B+1 panes; edge error is W / panes). */
+const SA_DEFAULT_PANES = 32;
+/** Smallest pane count B (a 2-pane ring still keeps a straddling oldest pane). */
+const SA_PANES_MIN = 2;
+/** Largest pane count B (bytes = (B+1)*48; at 1024 -> 49,200 B, the memory ceiling). */
+const SA_PANES_MAX = 1024;
+/** Per-pane stride in the Float64 store: [count, sum, kcomp, min, max]. */
+const SA_STRIDE = 5;
+/**
+ * SA_X_MAX -- the value magnitude cap (the same cap as DD_X_MAX). |value| <= 1e150 keeps
+ * |sum| <= n * 1e150 finite for any physically reachable n and every Kahan / Neumaier
+ * intermediate finite. Without it two adds of 1e308 would poison a pane to Infinity / NaN
+ * silently until it rotated out (fail-open). An over-cap value throws, a byte-identical no-op.
+ */
+const SA_X_MAX = 1e150;
+/**
+ * SA_MIN_NORMAL -- the smallest NORMAL double (2^-1022). W / panes must land here or above: a SUBNORMAL
+ * pane width has fewer than 52 significand bits, so the grid line (k+1)*pw no longer round-trips and
+ * (B+1)*pw can fall BELOW W -- the ring then under-covers the true window (fail-open, QA190 F3). The
+ * ctor rejects a subnormal pane width fail-closed BEFORE any allocation.
+ */
+const SA_MIN_NORMAL = 2.2250738585072014e-308;
+/**
+ * SA_CLOCK_SPAN -- the clock-precision domain (2^42). The pane grid is EXACT only while ulp(now) is far
+ * below the pane width: at |now| = pw * 2^42, ulp(now) <= pw * 2^-10, so a grid line resolves to <=
+ * pw/1024 and (floor(now/pw)+1)*pw still CONTAINS the true window. Past it the double clock cannot
+ * represent the grid (QA190 F1/F2: the window collapses or under-covers, fail-open). add / addFrom /
+ * advance / advanceFrom reject |now| > pw * 2^42 fail-closed BEFORE any state write; count mode applies
+ * the same bound to its integer tick. Precomputed once per instance as this._nowMax = pw * 2^42.
+ */
+const SA_CLOCK_SPAN = 4398046511104;   // 2^42
+
+/**
+ * SlidingAggregate -- EXACT windowed count / sum / mean / min / max over the COVERED span
+ * [w, w + W/B] (which always CONTAINS the last w) in
+ * FIXED preallocated space (ADR 0012). A ring of B+1 panes of width W/B (the SlidingCountMin
+ * ring, copied), each a stride-5 slot [count, sum, kcomp, min, max]. add(now, value) folds the
+ * value into the current pane (count += 1, branch-free Kahan sum, min / max by comparison);
+ * crossing a pane boundary rotates to the next pane and clears it to identity sentinels (0 B/op,
+ * a bounded while-loop capped at B+1). A reader merges the live, non-empty panes with Neumaier.
+ *
+ * Guarantee over the covered span [w, w + W/B] (the straddling oldest pane is KEPT), u = 2^-53:
+ *   - count, min and max are bit-exact (the sign of a zero extreme is unspecified);
+ *   - |sum - exact| <= (4u + O(N u^2)) * sum|v|; mean = sum / count (one more rounding).
+ *
+ * Time model: EXPLICIT (monotone `now`) or COUNT (add(undefined, value)); the mode locks at the
+ * first add and a switch throws. addFrom / advance / advanceFrom are EXPLICIT-only. The rotate /
+ * anchor helpers take NO argument (read this._now) -- the zero-box law.
+ *
+ * Precision domain (ADR 0012): exact containment needs the double clock to RESOLVE the pane grid,
+ * i.e. ulp(now) << pw. Two rules enforce it fail-closed. (1) W / panes must be a NORMAL double: a
+ * subnormal pane width loses significand bits, so (B+1)*pw can fall below W and the ring under-covers
+ * -- the ctor throws. (2) |now| (and the count-mode tick) must be <= pw * 2^42 (SA_CLOCK_SPAN); at
+ * the bound ulp(now) <= pw * 2^-10, so the grid line (floor(now/pw)+1)*pw still CONTAINS the true
+ * window. add / addFrom / advance / advanceFrom reject a larger clock BEFORE any state write (rebase
+ * the clock, e.g. performance.now(), or use a larger W).
+ *
+ * Fail closed: a bad W / panes / option, or a subnormal W / panes, throws [lite-adaptive] at the ctor
+ * door BEFORE any allocation; add rejects a non-number / NaN / +-Infinity / over-cap value, a mode
+ * switch, a non-finite / decreasing `now`, or a `now` outside the clock-precision domain -- value-first,
+ * a BYTE-IDENTICAL no-op (all validation precedes any state write); the readers never throw. null is
+ * not zero.
+ */
+export class SlidingAggregate {
+    /**
+     * @param {number} W the window size; a finite number > 0.
+     * @param {{panes?: number}} [options] panes = B, an integer in [2, 1024] (default 32).
+     */
+    constructor(W, options) {
+        // 1. W: a finite number > 0, BEFORE any allocation or option read.
+        if (typeof W !== 'number' || !(W > 0) || !Number.isFinite(W)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingAggregate W must be a finite number > 0, got ' + String(W));
+        }
+        // 2. the shared cold option door (R6), with the class label.
+        optDoor(options, SA_KNOWN_OPTS, 'SlidingAggregate');
+        // 3. panes: an integer in [2, 1024].
+        const panes = (options !== undefined && options.panes !== undefined) ? options.panes : SA_DEFAULT_PANES;
+        if (typeof panes !== 'number' || !Number.isInteger(panes) || panes < SA_PANES_MIN || panes > SA_PANES_MAX) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingAggregate panes must be an integer in [2, 1024], got ' + String(panes));
+        }
+        // 4. W / panes must stay a finite positive pane width (a subnormal W underflows to 0 -> no
+        //    pane ever live; fail closed BEFORE alloc rather than fail open on a NaN grid).
+        const paneW = W / panes;
+        if (!(paneW > 0) || !Number.isFinite(paneW)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingAggregate W is too small for panes=' + panes +
+                ' (W / panes underflowed to ' + paneW + '); use a larger W or fewer panes');
+        }
+        // 5. the pane width must be a NORMAL double: a subnormal pw loses significand bits, so the grid
+        //    line (k+1)*pw no longer round-trips and (B+1)*pw can fall below W -> under-cover (QA190 F3).
+        //    Fail closed BEFORE alloc (the `!(>=)` form also rejects a NaN paneW, though step 4 caught it).
+        if (!(paneW >= SA_MIN_NORMAL)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingAggregate W / panes (' + paneW + ') is subnormal; the pane grid ' +
+                'cannot hold W exactly -- use a larger W or fewer panes');
+        }
+
+        this._W = W;
+        this._panes = panes;         // B (getter returns this); the ring holds B+1 panes
+        this._ring = panes + 1;      // B + 1
+        this._paneW = paneW;         // per-pane time width (the disclosed edge error); guarded normal above
+        this._nowMax = paneW * SA_CLOCK_SPAN;   // |now| clock-precision bound (pw * 2^42); one field compare on the hot path
+        this._store = new Float64Array(this._ring * SA_STRIDE);   // (B+1) x [count, sum, kcomp, min, max]
+        this._paneEnd = new Float64Array(this._ring);             // per-pane EXCLUSIVE upper time bound
+        this._bytes = this._store.byteLength + this._paneEnd.byteLength;   // (B+1) * 48
+
+        this._initState();
+    }
+
+    /** @private Reset all pane state + time mode to the empty window. Reused by clear(). 0 alloc. */
+    _initState() {
+        this._store.fill(0);
+        this._paneEnd.fill(0);
+        // Identity sentinels per pane: count / sum / kcomp already 0; min = +Infinity, max = -Infinity
+        // (never fill(0) over the stride -- an all-positive window would then read min 0).
+        const store = this._store, ring = this._ring;
+        for (let p = 0; p < ring; p++) {
+            const base = p * SA_STRIDE;
+            store[base + 3] = Infinity;    // min identity
+            store[base + 4] = -Infinity;   // max identity
+        }
+        this._cur = 0;               // current (newest) pane index in the ring
+        this._mode = MODE_UNSET;     // time mode, locked at the first add
+        this._tick = 0;              // count-mode logical clock
+        this._lastNow = 0;           // explicit-mode monotone guard (init value never compared)
+        this._now = 0;               // the last applied t (query cutoff = now - W)
+    }
+
+    /** Window size W. O(1). */
+    get W() { return this._W; }
+    /** The pane count B (edge error is W / panes; the ring holds B+1 panes). O(1). */
+    get panes() { return this._panes; }
+    /** The locked time mode: 'unset' | 'explicit' | 'count'. O(1). */
+    get mode() {
+        return this._mode === MODE_EXPLICIT ? 'explicit' : this._mode === MODE_COUNT ? 'count' : 'unset';
+    }
+    /** The last applied time t (0 before the first add). O(1). */
+    get lastNow() { return this._now; }
+    /** A fixed memory figure in bytes ((B+1) * 48: the stride store + paneEnd). O(1). */
+    get bytes() { return this._bytes; }
+
+    /**
+     * Add one observation of `value` at `now`. HOT, 0 B/op INCLUDING pane rotation + clear.
+     *
+     * Time modes (LOCKED at the first add, a switch throws):
+     *   - EXPLICIT: add(now, value). `now` a finite number, strictly NON-DECREASING across calls.
+     *   - COUNT: add(undefined, value). The member auto-increments an internal tick per add.
+     *
+     * `value` is REQUIRED (no default): a finite real with |value| <= 1e150 (SA_X_MAX). A non-number,
+     * NaN, +-Infinity or over-cap value throws [lite-adaptive] (value-first, a BYTE-IDENTICAL no-op).
+     * `now` (and the count-mode tick) must be within the clock-precision domain, |now| <= pw * 2^42
+     * (SA_CLOCK_SPAN); a larger clock throws [lite-adaptive] BEFORE any state write (rebase or use a larger W).
+     * @param {number} [now]  the monotone time (omit for count mode).
+     * @param {number} value  a finite real, |value| <= 1e150.
+     * @returns {SlidingAggregate} this
+     */
+    add(now, value) {
+        // 1. validate value FIRST (value-first), before ANY state mutation. The `!(<=&&>=)` form fails
+        //    closed on NaN and +-Infinity by construction.
+        if (typeof value !== 'number' || !(value <= SA_X_MAX && value >= -SA_X_MAX)) return this._badValue(value);
+        // 2. resolve + lock the time mode (no mutation until every value + time check has passed).
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            if (now !== undefined) return this._badMode('count', 'explicit');
+            t = this._tick + 1;
+            if (!(t <= this._nowMax)) return this._badNowRange(t);   // tick past pw * 2^42 -> fail closed
+            this._tick = t;
+        } else if (mode === MODE_EXPLICIT) {
+            if (now === undefined) return this._badMode('explicit', 'count');
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badNow(now);
+            }
+            if (now < this._lastNow) return this._badMonotone(now);
+            if (!(now <= this._nowMax && now >= -this._nowMax)) return this._badNowRange(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now === undefined) {
+                t = this._tick + 1;
+                if (!(t <= this._nowMax)) return this._badNowRange(t);
+                this._mode = MODE_COUNT;
+                this._tick = t;
+                this._now = t;
+                this._anchor();
+            } else {
+                if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                    return this._badNow(now);
+                }
+                if (!(now <= this._nowMax && now >= -this._nowMax)) return this._badNowRange(now);
+                this._mode = MODE_EXPLICIT;
+                t = now;
+                this._lastNow = now;
+                this._now = t;
+                this._anchor();
+            }
+        }
+        this._now = t;
+        // 3. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
+        if (t >= this._paneEnd[this._cur]) this._advance();
+        // 4. fold the value into the current pane's stride slot: count, branch-free Kahan sum, min, max.
+        const base = this._cur * SA_STRIDE, store = this._store;
+        store[base] += 1;
+        const s = store[base + 1], c = store[base + 2];
+        const y = value - c;
+        const tt = s + y;
+        store[base + 2] = (tt - s) - y;
+        store[base + 1] = tt;
+        if (value < store[base + 3]) store[base + 3] = value;   // min (identity +Infinity; ties keep first)
+        if (value > store[base + 4]) store[base + 4] = value;   // max (identity -Infinity; ties keep first)
+        return this;
+    }
+
+    /**
+     * Add from a caller-owned PACKED stride-2 `[now, value]` Float64Array entry. HOT, 0 B/op -- the
+     * ZERO-BOX entry: `now = buf[i]`, `value = buf[i+1]` are read UNBOXED, avoiding the ~16 B HeapNumber
+     * each would box as a plain argument at a non-inlined call boundary. EXPLICIT-time ONLY (addFrom
+     * always carries a `now`): a COUNT-locked instance rejects it and the first addFrom locks EXPLICIT.
+     * Identical validation, throws, byte-identical-no-op-on-reject and stride writes as add(now, value);
+     * the body is DUPLICATED (not delegated) to keep add's hot body byte-identical.
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now, `buf[i+1]` = value.
+     * @param {number} i the base index of the [now, value] pair (0, 2, 4, ...).
+     * @returns {SlidingAggregate} this
+     */
+    addFrom(buf, i) {
+        // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        // ArrayBuffer.isView rejects a Proxy that forwards instanceof; the bound is NaN-safe (!(i+1<len)).
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i + 1 < buf.length)) return this._badBuf(buf, i);
+        const now = buf[i];         // UNBOXED Float64Array reads -- the whole point (no argument box).
+        const value = buf[i + 1];   // packed [now, value]
+        // 1. validate value FIRST (a Float64Array read is always a number, so no typeof branch).
+        if (!(value <= SA_X_MAX && value >= -SA_X_MAX)) return this._badValue(value);
+        // 2. addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify EXPLICIT.
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (now < this._lastNow) return this._badMonotone(now);
+            if (!(now <= this._nowMax && now >= -this._nowMax)) return this._badNowRange(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (!(now <= this._nowMax && now >= -this._nowMax)) return this._badNowRange(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._now = t;
+            this._anchor();
+        }
+        this._now = t;
+        // 3. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
+        if (t >= this._paneEnd[this._cur]) this._advance();
+        // 4. fold the value into the current pane (DUPLICATED from add()).
+        const base = this._cur * SA_STRIDE, store = this._store;
+        store[base] += 1;
+        const s = store[base + 1], c = store[base + 2];
+        const y = value - c;
+        const tt = s + y;
+        store[base + 2] = (tt - s) - y;
+        store[base + 1] = tt;
+        if (value < store[base + 3]) store[base + 3] = value;
+        if (value > store[base + 4]) store[base + 4] = value;
+        return this;
+    }
+
+    /**
+     * Advance the window's reference time to `now` WITHOUT adding a value (the R11 idle slide). It moves
+     * `_now` forward and runs the SAME bounded pane rotate-and-clear an add would (the private `_advance`),
+     * so an idle stream still rotates stale panes out and the readers keep sliding to empty with no traffic.
+     * EXPLICIT-time ONLY (parity with addFrom): a COUNT-locked instance throws; an UNSET instance locks
+     * EXPLICIT (and anchors the pane ring around `now`). Monotone: `now` finite and >= lastNow. A rejected
+     * advance is a BYTE-IDENTICAL no-op. Bounded (<= B+1 clears), 0 B/op.
+     * @param {number} now the monotone time (finite, >= the last now).
+     * @returns {SlidingAggregate} this
+     */
+    advance(now) {
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            if (!(now <= this._nowMax && now >= -this._nowMax)) return this._badNowRange(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
+                return this._badAdvanceNow(now);
+            }
+            if (!(now <= this._nowMax && now >= -this._nowMax)) return this._badNowRange(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._now = t;
+            this._anchor();
+        }
+        this._now = t;
+        if (t >= this._paneEnd[this._cur]) this._advance();   // rotate + clear stale panes (bounded).
+        return this;
+    }
+
+    /**
+     * Advance the window's reference time from a caller-owned Float64Array (`now = buf[i]`, read UNBOXED).
+     * The ZERO-BOX sibling of advance(now) -- identical mode / monotone / rotate body, EXPLICIT-time only.
+     * Fail closed BEFORE any read (typeof-first): a non-Float64Array `buf`, or a non-integer / negative /
+     * out-of-range `i` (needs `i < buf.length`) throws [lite-adaptive].
+     * @param {Float64Array} buf a caller-owned Float64Array; `buf[i]` = now.
+     * @param {number} i the index of the `now` scalar.
+     * @returns {SlidingAggregate} this
+     */
+    advanceFrom(buf, i) {
+        // ArrayBuffer.isView rejects a Proxy that forwards instanceof; the bound is NaN-safe (!(i<len)).
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i < buf.length)) return this._badAdvanceBuf(buf, i);
+        const now = buf[i];   // UNBOXED Float64Array read (always a number -> no typeof branch).
+        let t;
+        const mode = this._mode;
+        if (mode === MODE_COUNT) {
+            return this._badAdvanceMode('count', 'explicit');
+        } else if (mode === MODE_EXPLICIT) {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            if (!(now <= this._nowMax && now >= -this._nowMax)) return this._badNowRange(now);
+            t = now;
+            this._lastNow = now;
+        } else {
+            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (!(now <= this._nowMax && now >= -this._nowMax)) return this._badNowRange(now);
+            this._mode = MODE_EXPLICIT;
+            t = now;
+            this._lastNow = now;
+            this._now = t;
+            this._anchor();
+        }
+        this._now = t;
+        if (t >= this._paneEnd[this._cur]) this._advance();
+        return this;
+    }
+
+    /** Reset to the empty window; reuse every array (also unlocks the mode). 0 alloc. @returns {SlidingAggregate} this */
+    clear() {
+        this._initState();
+        return this;
+    }
+
+    /**
+     * The EXACT number of observations over the COVERED span [w, w + W/B] (which always CONTAINS the
+     * last w; the default is the full window W). COLD, O(B+1); NEVER throws. Summed over the LIVE panes
+     * (paneEnd > now - effW, the straddling oldest pane included), skipping empty (count === 0) panes. A
+     * bad `w` (non-number / NaN / +-Infinity / <= 0 / > W) returns NaN, checked BEFORE the empty return;
+     * unset or a covered count of 0 returns 0 (the empty count is exactly 0). null is not zero. Boxes its
+     * return once at a monomorphic / polymorphic site (up to 16 B/call; up to 32 B at a megamorphic site
+     * -- use into() on a render path).
+     * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
+     * @returns {number}
+     */
+    count(w) {
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) return NaN;
+            effW = w;
+        }
+        const B = this._ring, store = this._store, paneEnd = this._paneEnd;
+        const cut = this._now - effW;
+        let count = 0;
+        for (let p = 0; p < B; p++) {
+            if (!(paneEnd[p] > cut)) continue;
+            const pc = store[p * SA_STRIDE];
+            if (pc === 0) continue;
+            count += pc;
+        }
+        return count;
+    }
+
+    /**
+     * The windowed SUM over the covered window, Neumaier-merged over the live, non-empty panes' terms
+     * {s_p, -c_p} (each pane carries a Kahan-compensated (sum, kcomp)). COLD, O(B+1); NEVER throws.
+     * |sum - exact| <= (4u + O(N u^2)) * sum|v|, u = 2^-53. A bad `w` returns NaN (before the empty
+     * return); unset or a covered count of 0 returns 0 (the empty sum is exactly 0). Boxes once (up to
+     * 16 B/call; up to 32 B at a megamorphic site).
+     * @param {number} [w] an optional sub-window in (0, W].
+     * @returns {number}
+     */
+    sum(w) {
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) return NaN;
+            effW = w;
+        }
+        const B = this._ring, store = this._store, paneEnd = this._paneEnd;
+        const cut = this._now - effW;
+        let s = 0, c = 0;
+        for (let p = 0; p < B; p++) {
+            if (!(paneEnd[p] > cut)) continue;
+            const base = p * SA_STRIDE;
+            if (store[base] === 0) continue;
+            let t1 = store[base + 1], y = s + t1;             // Neumaier add of s_p
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s;
+            s = y;
+            t1 = -store[base + 2]; y = s + t1;                // Neumaier add of -c_p
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s;
+            s = y;
+        }
+        return s + c;
+    }
+
+    /**
+     * The windowed MEAN = sum / count over the covered window (one more rounding on top of sum's bound).
+     * COLD, O(B+1); NEVER throws. A bad `w` returns NaN; unset or a covered count of 0 returns NaN
+     * (the mean of nothing is undefined -- null is not zero). Boxes once (up to 16 B/call; up to 32 B at
+     * a megamorphic site).
+     * @param {number} [w] an optional sub-window in (0, W].
+     * @returns {number}
+     */
+    mean(w) {
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) return NaN;
+            effW = w;
+        }
+        const B = this._ring, store = this._store, paneEnd = this._paneEnd;
+        const cut = this._now - effW;
+        let count = 0, s = 0, c = 0;
+        for (let p = 0; p < B; p++) {
+            if (!(paneEnd[p] > cut)) continue;
+            const base = p * SA_STRIDE;
+            const pc = store[base];
+            if (pc === 0) continue;
+            count += pc;
+            let t1 = store[base + 1], y = s + t1;
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s;
+            s = y;
+            t1 = -store[base + 2]; y = s + t1;
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s;
+            s = y;
+        }
+        return count === 0 ? NaN : (s + c) / count;
+    }
+
+    /**
+     * The windowed MIN over the covered window (bit-exact; the sign of a zero extreme is unspecified). COLD,
+     * O(B+1); NEVER throws. A bad `w` returns NaN; unset or a covered count of 0 returns NaN. Boxes once
+     * (up to 16 B/call; up to 32 B at a megamorphic site).
+     * @param {number} [w] an optional sub-window in (0, W].
+     * @returns {number}
+     */
+    min(w) {
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) return NaN;
+            effW = w;
+        }
+        const B = this._ring, store = this._store, paneEnd = this._paneEnd;
+        const cut = this._now - effW;
+        let count = 0, mn = Infinity;
+        for (let p = 0; p < B; p++) {
+            if (!(paneEnd[p] > cut)) continue;
+            const base = p * SA_STRIDE;
+            if (store[base] === 0) continue;
+            count += store[base];
+            const pmn = store[base + 3];
+            if (pmn < mn) mn = pmn;
+        }
+        return count === 0 ? NaN : mn;
+    }
+
+    /**
+     * The windowed MAX over the covered window (bit-exact; the sign of a zero extreme is unspecified). COLD,
+     * O(B+1); NEVER throws. A bad `w` returns NaN; unset or a covered count of 0 returns NaN. Boxes once
+     * (up to 16 B/call; up to 32 B at a megamorphic site).
+     * @param {number} [w] an optional sub-window in (0, W].
+     * @returns {number}
+     */
+    max(w) {
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) return NaN;
+            effW = w;
+        }
+        const B = this._ring, store = this._store, paneEnd = this._paneEnd;
+        const cut = this._now - effW;
+        let count = 0, mx = -Infinity;
+        for (let p = 0; p < B; p++) {
+            if (!(paneEnd[p] > cut)) continue;
+            const base = p * SA_STRIDE;
+            if (store[base] === 0) continue;
+            count += store[base];
+            const pmx = store[base + 4];
+            if (pmx > mx) mx = pmx;
+        }
+        return count === 0 ? NaN : mx;
+    }
+
+    /**
+     * Batch reader: write [count, sum, mean, min, max] over the covered window into a caller-owned
+     * Float64Array -- the render-loop sibling of the scalar readers (no computed double is RETURNED). It
+     * is 0 B/call at a monomorphic / polymorphic site (<= 4 receiver shapes); at a MEGAMORPHIC site (5+
+     * SlidingAggregate subclass shapes) the `this._now` clock-field read boxes, measured 16 B/call for
+     * into (32 B for the scalar readers) -- a family-wide V8 property, logged for 1.10.0. Merges the live,
+     * non-empty panes into LOCALS (count + a Neumaier
+     * (s, c) + min + max) and writes out[0..4] only at the very end. Returns 5 (the slot count, a Smi).
+     *
+     * Fail closed BEFORE any read (typeof-first): a non-Float64Array `out` -> TypeError; out.length < 5
+     * -> RangeError. A bad `w` writes 5 NaN slots (checked BEFORE the empty return, parity with the
+     * scalar readers). Unset or a covered count of 0 writes count 0, sum 0, mean / min / max NaN.
+     * @param {Float64Array} out a caller-owned Float64Array, out.length >= 5.
+     * @param {number} [w] an optional sub-window in (0, W].
+     * @returns {number} 5
+     */
+    into(out, w) {
+        // ArrayBuffer.isView rejects a Proxy that forwards instanceof; the length check is NaN-safe.
+        if (!(ArrayBuffer.isView(out) && out instanceof Float64Array)) {
+            throw new TypeError(
+                '[lite-adaptive] SlidingAggregate.into(out, w?) out must be a Float64Array, got ' + String(out));
+        }
+        if (!(out.length >= 5)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingAggregate.into out.length (' + out.length + ') must be >= 5');
+        }
+        let effW = this._W;
+        if (w !== undefined) {
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
+                out[0] = NaN; out[1] = NaN; out[2] = NaN; out[3] = NaN; out[4] = NaN;
+                return 5;
+            }
+            effW = w;
+        }
+        const B = this._ring, store = this._store, paneEnd = this._paneEnd;
+        const cut = this._now - effW;
+        let count = 0, s = 0, c = 0, mn = Infinity, mx = -Infinity;
+        for (let p = 0; p < B; p++) {
+            if (!(paneEnd[p] > cut)) continue;
+            const base = p * SA_STRIDE;
+            const pc = store[base];
+            if (pc === 0) continue;
+            count += pc;
+            let t1 = store[base + 1], y = s + t1;             // Neumaier add of s_p
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s;
+            s = y;
+            t1 = -store[base + 2]; y = s + t1;                // Neumaier add of -c_p
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s;
+            s = y;
+            const pmn = store[base + 3];
+            if (pmn < mn) mn = pmn;
+            const pmx = store[base + 4];
+            if (pmx > mx) mx = pmx;
+        }
+        if (count === 0) {
+            out[0] = 0; out[1] = 0; out[2] = NaN; out[3] = NaN; out[4] = NaN;
+            return 5;
+        }
+        const sum = s + c;
+        out[0] = count;
+        out[1] = sum;
+        out[2] = sum / count;
+        out[3] = mn;
+        out[4] = mx;
+        return 5;
+    }
+
+    /**
+     * @private Anchor the pane ring around the first `now` (this._now; grid-aligned to W/panes -- ABSOLUTE
+     * alignment). The current pane (index 0) covers the grid cell containing `now`; predecessors go backward
+     * by one pane width each. Argument-free (reads this._now, the zero-box law). Cold, 0 alloc.
+     */
+    _anchor() {
+        const B = this._ring, pw = this._paneW, now = this._now;
+        const E = (Math.floor(now / pw) + 1) * pw;   // EXCLUSIVE upper bound of the current pane
+        this._cur = 0;
+        this._paneEnd[0] = E;
+        let e = E, idx = 0;
+        for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; }
+    }
+
+    /**
+     * @private Rotate the ring forward so the current pane covers this._now, clearing each pane it rotates
+     * onto (to identity sentinels). Capped at B+1 rotations (a now-jump of k panes clears min(k, B+1) panes,
+     * NEVER loops k -- skipping >= B+1 panes clears them ALL, then re-anchors around this._now). Argument-free
+     * (reads this._now, the zero-box law). 0 alloc. Called only when this._now crossed the current boundary.
+     */
+    _advance() {
+        const pw = this._paneW, B = this._ring, t = this._now;
+        let cur = this._cur;
+        // Grid index of the current pane end (E = k*pw exactly for an integer k in the legal clock
+        // domain, |now| <= pw * 2^42, where ulp(E) <= pw * 2^-10 so the division round-trips). Each new
+        // pane end is (k+1)*pw by MULTIPLICATION -- drift-free and bit-identical to the anchor / oracle's
+        // (floor(t/pw)+1)*pw -- rather than an accumulating `E += pw`, whose per-step rounding drifts by
+        // up to ~pw near the domain edge and can drop a live pane (QA190 F2, fail-open).
+        let k = Math.round(this._paneEnd[cur] / pw);
+        let E = this._paneEnd[cur];
+        let rot = 0;
+        while (t >= E && rot < B) {
+            cur++; if (cur === B) cur = 0;
+            this._clearPane(cur);
+            k += 1;
+            E = k * pw;
+            this._paneEnd[cur] = E;
+            rot++;
+        }
+        if (t >= E) {
+            // jumped >= B+1 pane widths: every pane cleared above -> grid-re-anchor around t.
+            const newE = (Math.floor(t / pw) + 1) * pw;
+            this._paneEnd[cur] = newE;
+            let e = newE, idx = cur;
+            for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; }
+        }
+        this._cur = cur;
+    }
+
+    /** @private Clear one pane's stride-5 slot to the identity sentinels (count/sum/kcomp 0, min +Inf, max -Inf). 0 alloc. */
+    _clearPane(p) {
+        const base = p * SA_STRIDE, store = this._store;
+        store[base] = 0;             // count
+        store[base + 1] = 0;         // sum
+        store[base + 2] = 0;         // kcomp (Kahan compensation)
+        store[base + 3] = Infinity;  // min identity
+        store[base + 4] = -Infinity; // max identity
+    }
+
+    /** @private Cold thrower for a bad value (non-number / NaN / +-Infinity / over-cap). */
+    _badValue(v) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingAggregate add value must be a finite number with |value| <= 1e150, got ' + String(v));
+    }
+
+    /** @private Cold thrower for a mode switch after the mode locked. */
+    _badMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingAggregate mode is locked to ' + locked +
+            ' at the first add; got a ' + attempted + '-mode add');
+    }
+
+    /** @private Cold thrower for a non-finite `now`. */
+    _badNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingAggregate add now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone `now`. */
+    _badMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingAggregate add now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /**
+     * @private Cold thrower for a `now` (or count-mode tick) outside the clock-precision domain
+     * (|now| > pw * 2^42). Fail closed BEFORE any state write -- past this bound the double clock cannot
+     * represent the pane grid, so the covered span would silently under-cover the true window (QA190 F1/F2).
+     */
+    _badNowRange(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingAggregate now (' + String(now) + ') is too large for the pane width (' +
+            this._paneW + '); |now| must be <= pw * 2^42 (' + this._nowMax +
+            ')' + (this._mode === MODE_COUNT ? ', including the count-mode tick,' : '') +
+            ' -- rebase the clock (e.g. performance.now()) or use a larger W');
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingAggregate.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+    }
+
+    /** @private Cold thrower for an advance mode switch (advance is EXPLICIT-only). */
+    _badAdvanceMode(locked, attempted) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingAggregate mode is locked to ' + locked +
+            '; advance() is an ' + attempted + '-time op');
+    }
+
+    /** @private Cold thrower for a non-finite advance `now`. */
+    _badAdvanceNow(now) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingAggregate advance now must be a finite number, got ' + String(now));
+    }
+
+    /** @private Cold thrower for a non-monotone advance `now`. */
+    _badAdvanceMonotone(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingAggregate advance now must be non-decreasing: got ' + String(now) +
+            ' after ' + String(this._lastNow));
+    }
+
+    /** @private Cold thrower for a bad advanceFrom buffer/index. */
+    _badAdvanceBuf(buf, i) {
+        throw new TypeError(
+            '[lite-adaptive] SlidingAggregate.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
+            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
     }
 }

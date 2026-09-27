@@ -1,0 +1,38 @@
+{
+  "ExponentialHistogram": {
+    "sha256": "6276f9efc7e944e8a6d7531cff985d2af5702435e73c6ff14d4040dfdb18681d",
+    "bytes": 34320
+  },
+  "ADWIN": {
+    "sha256": "8c49323981a96129bb00a94565c9d0426570ffb15286d7c191f3f11c5c00f152",
+    "bytes": 23555
+  },
+  "ForwardDecay": {
+    "sha256": "08c2b2a1a31ff7a7f25910849f200e713444bc5b185c1f34385994ffe22b2627",
+    "bytes": 15802
+  },
+  "HeavyKeeper": {
+    "sha256": "163bacb1d3096bf3774120d0b2843ee8ba40ee710b8a02eecfb6b581ebe343a4",
+    "bytes": 23806
+  },
+  "SlidingHyperLogLog": {
+    "sha256": "ba8fee99dd7c759c2204cf70b0d828b0bf176d25312dc199fb4489a48c3e5801",
+    "bytes": 27434
+  },
+  "DriftDetector": {
+    "sha256": "5831a577d438e1fb828234522f11b4845572bea4bc796f8710601ac699391491",
+    "bytes": 25884
+  },
+  "SlidingDDSketch": {
+    "sha256": "66c9aa82e5c5b2b52548ee1d38c4fa1964e322878811a471e3950249ad5025df",
+    "bytes": 48179
+  },
+  "SlidingCountMin": {
+    "sha256": "18e0e964d0627c0df481da094a6f1aac7c24ebfc5396577f9ca976ee7ec820e7",
+    "bytes": 42319
+  },
+  "DecayedReservoir": {
+    "sha256": "8c02e0752e070aba759a8d7f791fd8083bcb47837b465f2526e286eff00dbbc8",
+    "bytes": 18259
+  }
+}

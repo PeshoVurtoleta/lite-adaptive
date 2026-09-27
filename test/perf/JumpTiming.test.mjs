@@ -24,7 +24,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
-import { ForwardDecay, SlidingDDSketch, SlidingCountMin, DecayedReservoir } from '../../Adaptive.js';
+import { ForwardDecay, SlidingDDSketch, SlidingCountMin, DecayedReservoir, SlidingAggregate } from '../../Adaptive.js';
 
 const JUMP = 1e12;
 const TRIALS = 200;
@@ -59,6 +59,27 @@ class PerPaneLoopScm extends SlidingCountMin {
         let cur = this._cur;
         let E = this._paneEnd[cur];
         while (t >= E) {                 // NO `rot < B` cap: one iteration per skipped pane
+            cur++; if (cur === B) cur = 0;
+            this._clearPane(cur);
+            E += pw;
+            this._paneEnd[cur] = E;
+        }
+        this._cur = cur;
+    }
+}
+
+/**
+ * The naive per-pane rotation for SlidingAggregate: loops ONCE PER SKIPPED PANE with NO cap. SA's
+ * `_advance()` takes NO argument (reads this._now), so the override is argument-free too. SA's
+ * `_clearPane` is O(1) (5 stride slots, not an O(d*w) fill), so it needs a LARGER jump than the SCM
+ * control to blow the budget -- CTRL_JUMP is calibrated so the control p99 >= 5 ms (measured ~10 ms).
+ */
+class PerPaneLoopSA extends SlidingAggregate {
+    _advance() {
+        const pw = this._paneW, B = this._ring, t = this._now;
+        let cur = this._cur;
+        let E = this._paneEnd[cur];
+        while (t >= E) {                 // NO `rot < B` cap
             cur++; if (cur === B) cur = 0;
             this._clearPane(cur);
             E += pw;
@@ -109,6 +130,30 @@ test('hugeJump', async (t) => {
         const r = timeSteps((i) => { now += JUMP; sd.advance(now); sd.add(now, (i & 63) + 0.5); });
         results.push(['SDD advance(+1e12)+add', r, 1.0]);
         assert.ok(r.p99 < 1.0, 'SDD huge-jump p99 ' + r.p99.toFixed(4) + ' ms >= 1.0 ms (jump path is not O(B))');
+    });
+
+    // --- SA advance(now + 1e12) + add: the O(B) capped path (argument-free _advance). HARD p99 < 1.0 ms. ---
+    await t.test('SA advance(now + 1e12) + add: p99 < 1.0 ms', () => {
+        const sa = new SlidingAggregate(1000, { panes: 8 });
+        let now = 1000;
+        sa.add(now, 5);                               // lock EXPLICIT mode
+        const r = timeSteps((i) => { now += JUMP; sa.advance(now); sa.add(now, (i & 63) - 32); });
+        results.push(['SA advance(+1e12)+add', r, 1.0]);
+        assert.ok(r.p99 < 1.0, 'SA huge-jump p99 ' + r.p99.toFixed(4) + ' ms >= 1.0 ms (jump path is not O(B))');
+    });
+
+    // --- CONTROL: PerPaneLoopSA MUST FAIL the p99 gate. CTRL_JUMP calibrated so p99 >= 5 ms (teeth). ---
+    await t.test('PerPaneLoopSA advance + add MUST FAIL (naive O(jump) rotation, p99 >= 5 ms)', () => {
+        // paneW = 1000/8 = 125; a 1e9 jump clears ~8e6 panes per trial (each an O(1) sentinel write) ->
+        // ~10 ms measured, well over both the 1.0 ms shipped budget and the 5 ms teeth threshold, while the
+        // shipped SA does the SAME jump in O(B). (A full +1e12 jump here would not terminate.)
+        const CTRL_JUMP = 1e9;
+        const sa = new PerPaneLoopSA(1000, { panes: 8 });
+        let now = 1000;
+        sa.add(now, 5);
+        const r = timeSteps((i) => { now += CTRL_JUMP; sa.advance(now); sa.add(now, (i & 63) - 32); }, 40, 10);
+        results.push(['PerPaneLoopSA(+1e9)', r, 5.0]);
+        assert.ok(r.p99 >= 5.0, 'PerPaneLoopSA p99 ' + r.p99.toFixed(4) + ' ms < 5.0 ms -- the naive loop did NOT blow the budget (control has no teeth)');
     });
 
     // --- CONTROL: the naive per-pane loop MUST FAIL the same p99 < 1.0 ms gate. ---

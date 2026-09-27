@@ -6,6 +6,85 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-27
+
+The sixth additive post-1.0 member (`SlidingAggregate`, ADR 0012) -- a PURE APPEND. All nine prior classes
+(`ExponentialHistogram`, `ADWIN`, `ForwardDecay`, `HeavyKeeper`, `SlidingHyperLogLog`, `DriftDetector`,
+`SlidingDDSketch`, `SlidingCountMin`, `DecayedReservoir`) are BYTE-IDENTICAL (a per-class sha256 gate,
+`test/differential/AppendParity.test.mjs`); outside the append only the file header, the optDoor docblock
+count and the `VERSION` const change. MINOR bump (new API, no break). Gates: npm test 581/581; torture 0 B/op
+on all 61 lanes (0 major GC); test:perf 33/33; test:perf:matrix 127/127; witness ok incl. the lite-hud lane;
+gates:red exit 0; 40/40 reviewer mutants killed.
+
+### Added
+
+- **`SlidingAggregate` -- EXACT windowed count / sum / mean / min / max over the last `W`, in fixed
+  memory (ADR 0012).** The aggregate the family lacked: `ExponentialHistogram.sum()` is bounded by the
+  oldest straddling bucket's POPULATION, not its value mass, so it fails on a skewed stream (F17), while
+  `SlidingDDSketch` answers quantiles and `SlidingCountMin` per-key counts. `SlidingAggregate` keeps a
+  ring of **B+1 preallocated panes** of width `W / B` (the `SlidingCountMin` ring, COPIED verbatim --
+  never a shared helper, so that member's bytes and behavior cannot move), each a stride-5 `Float64Array`
+  slot `[count, sum, kcomp, min, max]`.
+  - `new SlidingAggregate(W, { panes })` -- `W` a finite number `> 0`; `panes` the pane count `B`, an
+    integer in `[2, 1024]` (default 32; the ring holds `B + 1`). Throws `[lite-adaptive]` typeof-first,
+    before any allocation; a `W` too small for `panes` (`W / panes` underflows to 0), or a `W / panes`
+    that is a SUBNORMAL double (the pane grid cannot hold `W` exactly -- QA190 F3), throws before
+    allocation.
+  - `add(now, value)` / the zero-box stride-2 `addFrom(buf, i)` (`[now, value]`) -- HOT, 0 B/op incl. the
+    pane rotate + clear. EXPLICIT mode (a finite, non-decreasing `now`) or COUNT mode
+    (`add(undefined, value)`, auto-tick); the mode locks at the first add (a switch throws). Each add does
+    `count += 1`, a branch-free Kahan compensated sum (`y = v - c; t = s + y; c = (t - s) - y; s = t`),
+    and min / max by comparison on the current pane. `value` is **REQUIRED** (no default of 1 -- a
+    forgotten latency must fail closed): a finite real with `|value| <= 1e150` (`SA_X_MAX`, the same cap as
+    `DriftDetector`'s `DD_X_MAX`, so `|sum| <= n * 1e150` and every Kahan / Neumaier intermediate stays
+    finite). A non-number / `NaN` / `+-Infinity` / over-cap value throws `[lite-adaptive]` value-first (a
+    byte-identical no-op).
+  - **Clock-precision domain (fail-closed; QA190 F1/F2).** Exact containment needs the double clock to
+    resolve the pane grid (`ulp(now) << pw`), so `|now|` (and the count-mode tick) must be `<= pw * 2^42`
+    (`SA_CLOCK_SPAN`); at the bound `ulp(now) <= pw * 2^-10`, so `(floor(now/pw)+1)*pw` still CONTAINS the
+    true window. `add` / `addFrom` / `advance` / `advanceFrom` reject a larger clock with
+    `RangeError [lite-adaptive]` BEFORE any state write (one field compare against `this._nowMax = pw * 2^42`
+    precomputed in the ctor -- rebase the clock, e.g. `performance.now()`, or use a larger `W`). Pane ends
+    are computed by multiplication from the grid index (`(k+1) * pw`), not an accumulating `E += pw` that
+    drifts near the domain edge. Generous for real clocks: epoch-ms (`W=1000, B=32`) allows
+    `|now| <= 1.37e14`, epoch-us (`W=1e6`) `<= 1.37e17`, `performance.now()` (`W=16`) `<= 2.2e12` ms.
+  - `advance(now)` / `advanceFrom(buf, i)` -- built in from the start (R11 idle-slide; ADR 0009 amended):
+    rotate + clear stale panes with no value added, EXPLICIT-time only, monotone, 0 B/op.
+  - `count(w?)` / `sum(w?)` / `mean(w?)` / `min(w?)` / `max(w?)` / `into(out, w?)` -- COLD readers that
+    Neumaier-merge the LIVE, non-empty panes (the straddling oldest pane KEPT) over `{s_p, -c_p}`. Over
+    the COVERED span `[w, w + W/B]` (which always CONTAINS the true window) `count`, `min` and `max` are
+    **BIT-EXACT** and `|sum - exact| <= (4u + O(N u^2)) * sum|v|`, `u = 2^-53` (Kahan per pane `2u`, Higham
+    ASNA eq. 4.8; the Neumaier merge over the `2(B+1)` terms adds `2u`); `mean = sum / count`. An empty
+    covered window reads `count` 0, `sum` 0, `mean` / `min` / `max` `NaN` (a cleared pane holds identity
+    sentinels `min +Infinity` / `max -Infinity`, never `fill(0)`; null is not zero). A bad sub-window `w`
+    (outside `(0, W]`) returns `NaN` and never throws; `into(out)` writes `[count, sum, mean, min, max]`
+    into a caller `Float64Array` (length `>= 5`) and is **0 B/call** at a monomorphic / polymorphic site
+    (16 B/call at a megamorphic site of 5+ subclass shapes -- a family-wide V8 clock-field box, logged for
+    1.10.0). The scalar readers box their return once (up to 16 B/call; up to 32 B at a megamorphic site)
+    -- use `into()` on a render path. A wrong CONTAINER type (a non-`Float64Array` `out`, or `out.length
+    < 5`) throws.
+  - `clear()`; getters `W` / `panes` / `mode` / `lastNow` / `bytes` (`= (B + 1) * 48`; **1584 B** at the
+    default `B = 32`, independent of `W`, never grows; 50 lite-hud channels = 79,200 B).
+  - MEASURED (the honesty anchor, ADR 0012): against a lite-hud lane of 50 lognormal-ms channels,
+    `SlidingAggregate` vs its covered span is EXACT (mean worst relative error **0**) where
+    `ExponentialHistogram` vs the true window is **1.27e-1** off and vs SlidingAggregate's covered span is
+    **2.62e-1** off. Against a TRUE `(now - W, now]` oracle the mean's worst relative error at the pane
+    edge is **8.61e-3** at 32 panes and **2.93e-3** at 128 panes (the worst single case ~0.35, dominated by
+    lognormal outliers in near-empty windows). The witness gates the merged count / sum / mean / min / max
+    against an exact covered-span oracle (BigInt over quantized values) and a true-window lane, with a
+    mutation test of `w` for every reader; controls REJECTED by the same gates: a B-pane ring, no clear on
+    rotate, a dropped straddling pane, Kahan removed, Neumaier removed, empty-pane `fill(0)` poisoning.
+    `add` / `addFrom` / `advance` / `advanceFrom` / `clear` are torture-gated at 0 B/op (0 major GC),
+    including EVENT-HEAVY rotate-every-add epoch-clock lanes and a +1e12 `advance` + `add` jump
+    (p99 < 0.005 ms) with a per-pane-loop control.
+
+### Changed
+
+- **The `SlidingHyperLogLog.countInto` reader, the latched-PH allocation fix, and the `DriftDetector`
+  `Into` readers are retargeted from 1.9.0 to 1.10.0** (README, `llms.txt`, `Adaptive.d.ts` JSDoc). 1.9.0
+  is `SlidingAggregate` only (one feature per minor); the three previously "planned / tracked for 1.9.0"
+  items move to the next minor.
+
 ## [1.8.0] - 2026-09-27
 
 The additive-API release (ROADMAP section 8). MINOR bump: `DriftDetector` gains the opt-in `latch`

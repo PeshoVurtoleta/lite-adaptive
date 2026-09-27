@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.8.0
+Version: 1.9.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -51,7 +51,14 @@ over ForwardDecay weights, 2005/2009; ADR 0011) -- the sampling complement to Fo
 gives decayed AGGREGATES exactly, DecayedReservoir gives a decayed SAMPLE from which the caller
 computes ANY statistic. It is a SAMPLE, not a hard window, so (like ForwardDecay) it has NO advance().
 It is a PURE APPEND: the eight prior classes stay BYTE-IDENTICAL (only the file header + VERSION
-change). This completes the confirmed post-1.0 roadmap.
+change). This completed the confirmed post-1.0 roadmap. v1.9.0 adds SlidingAggregate (EXACT windowed
+count / sum / mean / min / max over the last W, in FIXED memory; ADR 0012) -- the aggregate the family
+lacked: ExponentialHistogram's sum() is bounded by the oldest bucket's POPULATION (not its value mass),
+so it fails on a skewed stream (F17), while SlidingAggregate keeps a ring of B+1 panes each holding a
+branch-free Kahan-compensated (count, sum, kcomp, min, max) and Neumaier-merges the live panes at query.
+Over the covered span [w, w + W/B] count / min / max are BIT-EXACT and |sum - exact| <= (4u + O(N u^2)) *
+sum|v| (u = 2^-53). The SIXTH additive post-1.0 member; a PURE APPEND: the nine prior classes stay
+BYTE-IDENTICAL (only the file header + VERSION change).
 
 ## Exports (from the single main file Adaptive.js)
 
@@ -130,7 +137,7 @@ change). This completes the confirmed post-1.0 roadmap.
   optional sub-window in `(0, W]` (outside that range -> NaN, never throws -- F12). The scratch keeps
   count() free of ARRAY allocation, but it RETURNS a rounded double: count() boxes 16 B/call steady
   (the estimator tail) and 32 B when the caller is not yet optimized (the boxed return). A 0-alloc
-  `countInto` reader is planned for 1.9.0. `query()` aliases
+  `countInto` reader is planned for 1.10.0. `query()` aliases
   `count()`. Keys are safe integers; on add a bad key / now / option throws [lite-adaptive] typeof-first
   (byte-identical no-op), while count(w) with a bad `w` reads NaN. Fully deterministic
   (no PRNG). Getters: `W` / `p` / `m` / `ringCap` / `seed` / `standardError` / `lastNow` / `mode` /
@@ -181,7 +188,7 @@ change). This completes the confirmed post-1.0 roadmap.
   long-history reversal -- measured, not a general bound). Trade: while latched every item routes through the cold fire path (lower throughput),
   and (latch:true PH only) a latched fire can box one 16 B HeapNumber in V8's Maglev tier -- 0 B/op in
   steady optimized code on realistic re-arming streams, ~2 B/op measured on a fire-heavy stream when a
-  per-window collection re-tiers the hot loop (latch:false and CUSUM stay 0 B/op; tracked for 1.9.0),
+  per-window collection re-tiers the hot loop (latch:false and CUSUM stay 0 B/op; tracked for 1.10.0),
   and a SECOND same-direction shift is not seen until re-arm (a monotone staircase 0/10/20/30 fires ONCE;
   latch:false fires at each edge). A separate 1.x property (not a latch
   defect): at the default delta 0.005, uniform +-2 noise false-alarms in BOTH modes (latch:true about
@@ -250,8 +257,34 @@ change). This completes the confirmed post-1.0 roadmap.
   throws `[lite-adaptive]` typeof-first (a rejected add is a byte-identical no-op that does NOT advance
   the PRNG or the landmark). Deterministic given the seed. Getters: `k` / `halfLife` / `lambda` /
   `seed` / `size` / `mode` / `bytes`.
+- `SlidingAggregate` -- class. A zero-GC EXACT WINDOWED count / sum / mean / min / max over the LAST W
+  in FIXED preallocated space (ADR 0012) -- the aggregate the family lacked (ExponentialHistogram's
+  `sum()` is bounded by the oldest bucket's POPULATION, not its value mass, and fails on a skewed stream
+  -- F17). A ring of B+1 panes of width W/B (the SlidingCountMin ring, COPIED verbatim -- never a shared
+  helper), each a stride-5 Float64 slot `[count, sum, kcomp, min, max]`. `add(now, value) -> this` (count
+  mode via `add(undefined, value)`) does count += 1, a branch-free Kahan compensated sum
+  (`y = v - c; t = s + y; c = (t - s) - y; s = t`), and min / max by `<` / `>` on the CURRENT pane,
+  rotating + clearing stale panes (identity sentinels min +Infinity / max -Infinity, never fill(0)) as
+  `now` advances -- 0 B/op incl. rotation. `addFrom(buf, i)` is the zero-box stride-2 `[now, value]`
+  entry (read UNBOXED); `advance(now)` / `advanceFrom(buf, i)` slide an idle window (R11); all EXPLICIT-
+  time only (the rotate / anchor helpers take NO argument and read `this._now` -- the zero-box law). The
+  readers `count(w?)` / `sum(w?)` / `mean(w?)` / `min(w?)` / `max(w?)` / `into(out, w?)` merge the LIVE,
+  non-empty panes (the straddling oldest pane KEPT) with Neumaier over `{s_p, -c_p}`: over the covered
+  span `[w, w + W/B]` (which always CONTAINS the last w) count / min / max are BIT-EXACT and
+  `|sum - exact| <= (4u + O(N u^2)) * sum|v|`, u = 2^-53 (Kahan per pane 2u + the merge 2u). `mean = sum /
+  count`. An empty covered window reads count 0, sum 0, mean / min / max NaN (null is not zero). `value`
+  is REQUIRED (no default of 1 -- a forgotten latency fails closed): a finite real with |value| <= 1e150
+  (SA_X_MAX); a non-number / NaN / +-Infinity / over-cap value throws [lite-adaptive] value-first (a
+  byte-identical no-op). Precision domain (QA190): W / panes must be a NORMAL double (subnormal -> ctor
+  throws) and |now| (and the count-mode tick) must be <= pw * 2^42 (SA_CLOCK_SPAN) -- a larger clock throws
+  [lite-adaptive] before any write (rebase, or use a larger W). `into(out)` writes `[count, sum, mean, min, max]` 0-alloc at a monomorphic /
+  polymorphic site (16 B/call at a megamorphic site of 5+ subclass shapes -- a family-wide V8 clock-field
+  box, logged for 1.10.0); the scalar readers box their return once (up to 16 B/call; 32 B at a
+  megamorphic site) -- use into() on a render path. A bad query VALUE (a `w` outside (0, W]) returns NaN,
+  never throws; a wrong CONTAINER type (into's `out` not a Float64Array or length < 5) throws. Getters:
+  `W` / `panes` / `mode` / `lastNow` / `bytes` (= (B+1) * 48; 1584 B at B=32, 50 channels = 79,200 B).
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.8.0'.
+- `VERSION` -- string, '1.9.0'.
 
 ## ExponentialHistogram
 
@@ -937,6 +970,96 @@ well-defined (no NaN, no ambiguous ties, membership deterministic across seeds).
 A-Res + log-space-forward-decay-key choice, the order-preserving-rebase proof, the seeded-PRNG choice,
 the advance()-excluded rationale, the raw-sample-only surface, the min-forest reuse, and the rejected
 alternatives (A-ExpJ skip-sampling; a hard-window sample; bundled convenience aggregates).
+
+## SlidingAggregate (ADR 0012)
+
+EXACT windowed count / sum / mean / min / max over the LAST W, in FIXED preallocated space -- the
+aggregate the rest of the family could not give. ExponentialHistogram's `sum()` is bounded by the oldest
+straddling bucket's POPULATION (2^Lmax / 2), not its value mass, so on a skewed value stream it fails
+(F17: worst 15.8% heavy tail, ~2504% on a spike); SlidingDDSketch answers quantiles, SlidingCountMin
+per-key counts. SlidingAggregate is the EXACT-AGGREGATE corner on the time axis.
+
+Window model (ADR 0012): B+1 preallocated panes of width W/B (the SlidingCountMin ring, COPIED verbatim
+-- never a shared helper, so SCM's bytes and behavior cannot move), held in a ring. Per-pane state is
+stride 5 in one Float64Array: `[count, sum, kcomp, min, max]`. add() folds into the CURRENT pane
+(count += 1; a branch-free Kahan compensated sum `y = v - c; t = s + y; c = (t - s) - y; s = t`; min /
+max by `<` / `>`), rotating to the next pane and CLEARING it to identity sentinels (count/sum/kcomp 0,
+min +Infinity, max -Infinity -- NEVER fill(0) over the stride, or an all-positive window would read
+min 0) as `now` crosses a pane boundary. A `now` jump of k panes clears min(k, B+1) panes, never loops k
+(the SlidingCountMin bounded-rotation discipline). The query merges the LIVE, non-empty panes (paneEnd >
+now - w, INCLUDING the straddling oldest pane) with Neumaier over the terms `{s_p, -c_p}`. The straddling
+oldest pane is KEPT, so the covered span is [w, w + W/B]: always the FULL window, over-covered by at most
+one pane width W/B and NEVER under-covered (dropping it would under-cover [w - W/B, w)).
+
+Guarantee over the covered span [w, w + W/B], u = 2^-53:
+- count, min and max are BIT-EXACT (a +-0 tie keeps the first value seen);
+- `|sum - exact| <= (4u + O(N u^2)) * sum|v|` -- Kahan per pane contributes 2u (Higham ASNA eq. 4.8), the
+  Neumaier merge over the 2(B+1) terms adds 2u. A 2u bound is NOT provable for this merge (even a one-pane
+  window pays Kahan's 2u plus the final s + c rounding);
+- `mean = sum / count` (one more rounding). Rejected: plain += (loses every 1.0 behind a 2^53); per-pane
+  offset-centring (an extra hot field + a re-centre branch, and it still needs compensation).
+
+Value domain: `value` is REQUIRED (no default of 1 -- a forgotten latency must fail closed). A finite
+real with |value| <= 1e150 (SA_X_MAX, the same cap as DD_X_MAX), so |sum| <= n * 1e150 stays finite for
+any physically reachable n and every Kahan / Neumaier intermediate stays finite. A non-number / NaN /
++-Infinity / over-cap value throws TypeError [lite-adaptive] value-first (a byte-identical no-op).
+
+Time model: EXPLICIT (a monotone `now`) or COUNT mode (add(undefined, value)); the mode locks at the
+first add and a switch throws. addFrom / advance / advanceFrom are EXPLICIT-only (ADR 0009). The rotate /
+anchor helpers take NO argument and read `this._now`, so no epoch-ms double crosses a non-inlined call --
+gated by a rotate-every-add epoch-clock lane (SlidingCountMin passes `t` as an argument to _advance(t) /
+_anchor(t); its per-rotation cost with an epoch clock is unmeasured, logged for 1.10.0, untouched here).
+
+Precision domain (ADR 0012, amended by QA190): exact containment needs ulp(now) << pw. (1) pw = W / panes
+must be a NORMAL double (>= 2^-1022, SA_MIN_NORMAL): a subnormal pw loses significand bits so (B+1)*pw can
+fall below W and the ring under-covers -- the ctor throws [lite-adaptive] before allocating. (2) |now| (and
+the count-mode tick) must be <= pw * 2^42 (SA_CLOCK_SPAN): at the bound ulp(now) <= pw * 2^-10 so the grid
+line (floor(now/pw)+1)*pw still CONTAINS the true window; past it the window collapses (QA190 F1) or
+under-covers (F2). add / addFrom / advance / advanceFrom reject a larger clock with RangeError
+[lite-adaptive] BEFORE any state write (one field compare `!(t <= nowMax && t >= -nowMax)`, nowMax = pw *
+2^42 precomputed in the ctor) -- rebase the clock (performance.now(), or subtract an epoch) or use a larger
+W. Pane ends are computed by multiplication from the grid index ((k+1)*pw), not an accumulating E += pw that
+drifts near the edge. Generous for real clocks: epoch-ms (W=1000, B=32) allows |now| <= 1.37e14, epoch-us
+(W=1e6) <= 1.37e17, performance.now() (W=16) <= 2.2e12 ms.
+
+Constructor: `new SlidingAggregate(W, options?)` where options = { panes (B; an integer in [2, 1024],
+default 32 -- the ring holds B+1) }. A bad W / panes / option throws [lite-adaptive] at the ctor door
+BEFORE any allocation; a W too small for panes (W / panes underflows to 0), or a W / panes that is a
+SUBNORMAL double, throws before allocation.
+
+- add(now, value) -> this        HOT, 0 B/op incl. pane rotate + clear. EXPLICIT (finite, non-decreasing
+                                 `now`) or COUNT (add(undefined, value), auto-tick). value REQUIRED,
+                                 finite, |value| <= 1e150. Value + time validated BEFORE any state write.
+- addFrom(buf, i) -> this        HOT, 0 B/op ZERO-BOX stride-2: now = buf[i], value = buf[i+1] read
+                                 UNBOXED. EXPLICIT-time only. Same validation + body (duplicated) as add.
+- advance(now) -> this           Move the reference time to `now` WITHOUT adding a value (R11 idle-slide,
+                                 ADR 0009): rotate + clear stale panes via the private _advance so an idle
+                                 window slides to empty. EXPLICIT-time ONLY, monotone; bounded, 0 B/op.
+- advanceFrom(buf, i) -> this    The ZERO-BOX sibling of advance(now): now = buf[i] read UNBOXED (needs
+                                 `i < buf.length`), same rotate body, EXPLICIT-only.
+- count(w?) -> number            COLD, O(B+1). EXACT count over the covered span (0 on empty; NaN on a bad
+                                 w in (0, W]). Boxes once (up to 16 B/call; up to 32 B at a megamorphic
+                                 site).
+- sum(w?) -> number              COLD, O(B+1). Neumaier-merged windowed sum (0 on empty; NaN on a bad w).
+- mean(w?) -> number             COLD, O(B+1). sum / count (NaN on empty; NaN on a bad w).
+- min(w?) / max(w?) -> number    COLD, O(B+1). Bit-exact windowed min / max (NaN on empty; NaN on a bad w).
+- into(out, w?) -> number        COLD, 0 B/call render path: write `[count, sum, mean, min, max]` into a
+                                 caller Float64Array (length >= 5), return 5. NaN slots on a bad w. A
+                                 wrong CONTAINER type (a non-Float64Array `out` -> TypeError, out.length
+                                 < 5 -> RangeError) throws BEFORE any write. 0 B/call at a monomorphic /
+                                 polymorphic site; 16 B/call at a megamorphic site of 5+ subclass shapes.
+- clear() -> this                0-alloc reset (reuse both arrays; unlocks the mode).
+- W / panes / mode / lastNow / bytes   Getters: the window, the pane count B, the locked mode, the last
+                                 applied time, the fixed memory figure ((B+1) * 48; 1584 B at B=32).
+
+Exact-aggregate contract (the honesty anchor, ADR 0012): the witness gates the merged count / sum / mean /
+min / max against an EXACT covered-span oracle (BigInt over quantized values) and a true-window lane, plus
+a mutation test of `w` for every reader. Negative controls REJECTED by the same gates: a B-pane ring, no
+clear on rotate, a dropped straddling pane, Kahan removed, Neumaier removed, empty-pane fill(0) poisoning.
+A lite-hud lane (50 lognormal-ms channels) prints next to the EH F17 failure: SlidingAggregate vs its
+covered span is EXACT (worst rel 0) where EH vs the true window is 12.7% off. Allocation: torture 0 B/op
+with 0 major GC; pinned-probe lanes incl. EVENT-HEAVY rotate-every-add epoch lanes (the 1.8.0 lesson: a
+per-event box hides in an average over quiet adds); a +1e12 JumpTiming lane with a per-pane-loop control.
 
 ## advance() / idle-slide (ADR 0009)
 

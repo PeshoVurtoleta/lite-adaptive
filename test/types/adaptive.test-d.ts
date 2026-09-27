@@ -7,7 +7,8 @@
 
 import {
     ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
-    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin, DecayedReservoir, VERSION,
+    DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin, DecayedReservoir,
+    SlidingAggregate, VERSION,
 } from '../../Adaptive.js';
 import type {
     ExponentialHistogramMode, ExponentialHistogramOptions, ADWINOptions,
@@ -15,7 +16,7 @@ import type {
     SlidingHyperLogLogMode, SlidingHyperLogLogOptions,
     DriftDetectorMode, DriftDetectorOptions,
     SlidingDDSketchMode, SlidingDDSketchOptions,
-    SlidingCountMinOptions, DecayedReservoirOptions,
+    SlidingCountMinOptions, DecayedReservoirOptions, SlidingAggregateOptions,
 } from '../../Adaptive.js';
 
 // VERSION is a string.
@@ -662,3 +663,63 @@ dr.advance(500);
 
 // @ts-expect-error -- a readonly getter is not assignable.
 dr.size = 0;
+
+// --- SlidingAggregate --------------------------------------------------------
+const sa = new SlidingAggregate(1000);
+const sa2 = new SlidingAggregate(60000, { panes: 64 });
+
+// add / addFrom / advance / advanceFrom are chainable, return this; count mode via undefined now
+const saChained: SlidingAggregate = sa.add(1, 3.5).add(2, -1.5);
+const saCounted: SlidingAggregate = sa2.add(undefined, 7);
+void saChained; void saCounted;
+
+const saBuf = new Float64Array([1, 3.5]);
+const saFrom: SlidingAggregate = sa2.addFrom(saBuf, 0).addFrom(saBuf, 0);
+const saAdv: SlidingAggregate = sa2.advance(100).advanceFrom(saBuf, 0);
+void saFrom; void saAdv;
+
+// scalar readers return number; each takes an optional sub-window w
+const saScalars: number = sa.count() + sa.sum() + sa.mean() + sa.min() + sa.max() +
+    sa.count(500) + sa.sum(500) + sa.mean(500) + sa.min(500) + sa.max(500);
+void saScalars;
+
+// into writes 5 slots into a caller-owned Float64Array and returns the count written
+const saOut = new Float64Array(5);
+const saInto: number = sa.into(saOut);
+const saInto2: number = sa.into(saOut, 500);
+void saInto; void saInto2;
+
+const saCleared: SlidingAggregate = sa.clear();
+void saCleared;
+
+// getters
+const saMode: 'unset' | 'explicit' | 'count' = sa.mode;
+const saNums: number = sa.W + sa.panes + sa.lastNow + sa.bytes;
+void saMode; void saNums;
+
+const saOpts: SlidingAggregateOptions = { panes: 8 };
+void saOpts;
+
+// @ts-expect-error -- W must be a number.
+new SlidingAggregate('1000');
+
+// @ts-expect-error -- panes option must be a number.
+new SlidingAggregate(1000, { panes: '32' });
+
+// @ts-expect-error -- unknown option key.
+new SlidingAggregate(1000, { W: 500 });
+
+// @ts-expect-error -- add value is required (not optional).
+sa.add(1);
+
+// @ts-expect-error -- add value must be a number.
+sa.add(1, 'x');
+
+// @ts-expect-error -- addFrom buf must be a Float64Array.
+sa.addFrom([1, 3.5], 0);
+
+// @ts-expect-error -- into out must be a Float64Array.
+sa.into([0, 0, 0, 0, 0]);
+
+// @ts-expect-error -- a readonly getter is not assignable.
+sa.bytes = 0;

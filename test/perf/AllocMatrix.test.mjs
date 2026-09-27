@@ -25,7 +25,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { runLane, LANES, assertSemiSpacePinned } from './AllocProbe.mjs';
+import { SlidingAggregate } from '../../Adaptive.js';
 
 assertSemiSpacePinned();                 // fail closed if the semi-space flags are not pinned
 process.env.LITE_MATRIX = '1';           // children skip the 8N scavenge sweep (matrix gates on B/op)
@@ -274,4 +276,156 @@ test('noInlineLargeKey', async (t) => {
     printTable('F19 noInlineLargeKey (--no-turbo-inlining; steady B/op <= 0.5; pre-fix boxed 16-32):', rows,
         (r) => (r._steady <= 0.5 ? 'GREEN' : 'NEW FINDING'));
     for (const r of rows) await emit(t, r, gate);
+});
+
+// ===========================================================================
+// 1.9.0 SlidingAggregate (ADR 0012): the addFrom matrix (clock x value), the event-heavy rotate-every-add
+// epoch lanes, advance / advanceFrom / clear, all steady B/op <= 0.5.
+// ===========================================================================
+test('saAllocMatrix', async (t) => {
+    const gate = (steady) => (steady <= 0.5 ? null : 'steady ' + steady + ' B/op > 0.5 (a box on a zero-box SA path)');
+    const rows = [
+        // addFrom: clock {now, epoch} x value {small int, fraction, -1e149, 1e150}, fresh.
+        { lane: 'sa_af_now_small', mode: 'fresh', label: 'SA addFrom now small-int', expected: '<=0.5' },
+        { lane: 'sa_af_now_frac', mode: 'fresh', label: 'SA addFrom now fraction', expected: '<=0.5' },
+        { lane: 'sa_af_now_neg149', mode: 'fresh', label: 'SA addFrom now -1e149', expected: '<=0.5' },
+        { lane: 'sa_af_now_max150', mode: 'fresh', label: 'SA addFrom now 1e150 (cap)', expected: '<=0.5' },
+        { lane: 'sa_af_epoch_small', mode: 'fresh', label: 'SA addFrom epoch small-int', expected: '<=0.5' },
+        { lane: 'sa_af_epoch_frac', mode: 'fresh', label: 'SA addFrom epoch fraction', expected: '<=0.5' },
+        { lane: 'sa_af_epoch_neg149', mode: 'fresh', label: 'SA addFrom epoch -1e149', expected: '<=0.5' },
+        { lane: 'sa_af_epoch_max150', mode: 'fresh', label: 'SA addFrom epoch 1e150 (cap)', expected: '<=0.5' },
+        // warmed (polymorphic call sites): a representative sample of clock x value.
+        { lane: 'sa_af_epoch_frac', mode: 'warmed', label: 'SA addFrom epoch fraction (warm)', expected: '<=0.5' },
+        { lane: 'sa_af_epoch_max150', mode: 'warmed', label: 'SA addFrom epoch 1e150 (warm)', expected: '<=0.5' },
+        { lane: 'sa_af_now_frac', mode: 'warmed', label: 'SA addFrom now fraction (warm)', expected: '<=0.5' },
+        // EVENT-HEAVY rotate-every-add epoch lanes (pw=1): the zero-box-per-rotation floor.
+        { lane: 'sa_af_epoch_rot', mode: 'fresh', label: 'SA addFrom epoch ROTATE-every-add', expected: '<=0.5' },
+        { lane: 'sa_af_epoch_rot', mode: 'warmed', label: 'SA addFrom epoch ROTATE (warm)', expected: '<=0.5' },
+        { lane: 'sa_adv_epoch_rot', mode: 'fresh', label: 'SA advanceFrom epoch ROTATE-every-op', expected: '<=0.5' },
+        { lane: 'sa_adv_epoch_rot', mode: 'warmed', label: 'SA advanceFrom epoch ROTATE (warm)', expected: '<=0.5' },
+        // advance / advanceFrom / clear: 0.
+        { lane: 'sa_advance', mode: 'fresh', label: 'SA advance(now)', expected: '<=0.5' },
+        { lane: 'sa_advanceFrom', mode: 'fresh', label: 'SA advanceFrom(buf,i)', expected: '<=0.5' },
+        { lane: 'sa_clear', mode: 'fresh', label: 'SA clear()', expected: '<=0.5' },
+    ];
+    await measureGroup(rows);
+    printTable('SA allocMatrix (addFrom clock x value + event-heavy rotate + advance/clear; steady <= 0.5):',
+        rows, (r) => (r._steady <= 0.5 ? 'GREEN' : 'NEW FINDING'));
+    for (const r of rows) await emit(t, r, gate);
+});
+
+// ===========================================================================
+// SA readers: scalar count/sum/mean/min/max at a monomorphic site (band [0, 16.5]); into at a
+// monomorphic + polymorphic-4 site (<= 0.5); into at a MEGAMORPHIC-5 site (INFORMATIONAL, band [12, 20]
+// -- documents the this._now megamorphic-field box, RE-SETTLED / logged for 1.10.0).
+// ===========================================================================
+test('saReaders', async (t) => {
+    const gate = (steady) => (steady <= 0.5 ? null : 'steady ' + steady + ' B/op > 0.5 (a box on the 0-alloc reader path)');
+    const scalarBand = (steady) => (steady >= 0 && steady <= 16.5 ? null :
+        'steady ' + steady + ' B/op outside [0, 16.5] (docs: up to 16 B/call; use into())');
+    const megaBand = (steady) => (steady >= 12 && steady <= 20 ? null :
+        'steady ' + steady + ' B/op outside [12, 20] (< 12: the probe went blind to the megamorphic this._now box; > 20: a second box regressed)');
+    const rows = [
+        { lane: 'q_sa_count', mode: 'fresh', label: 'SA count() [mono]', expected: '[0,16.5]', check: scalarBand },
+        { lane: 'q_sa_sum', mode: 'fresh', label: 'SA sum() [mono]', expected: '[0,16.5]', check: scalarBand },
+        { lane: 'q_sa_mean', mode: 'fresh', label: 'SA mean() [mono]', expected: '[0,16.5]', check: scalarBand },
+        { lane: 'q_sa_min', mode: 'fresh', label: 'SA min() [mono]', expected: '[0,16.5]', check: scalarBand },
+        { lane: 'q_sa_max', mode: 'fresh', label: 'SA max() [mono]', expected: '[0,16.5]', check: scalarBand },
+        { lane: 'sa_into_mono', mode: 'fresh', label: 'SA into() [monomorphic]', expected: '<=0.5', check: gate },
+        { lane: 'sa_into_poly4', mode: 'fresh', label: 'SA into() [polymorphic 4]', expected: '<=0.5', check: gate },
+        { lane: 'sa_into_mega5', mode: 'fresh', label: 'SA into() [megamorphic 5, INFO]', expected: '[12,20]', check: megaBand },
+    ];
+    await measureGroup(rows);
+    printTable('SA readers (scalar [0,16.5]; into mono/poly4 <=0.5; into mega5 [12,20] documents the box):',
+        rows, (r) => (r.check(r._steady, r._first) === null ? 'GREEN' : 'NEW FINDING'));
+    for (const r of rows) await emit(t, r, r.check);
+});
+
+// ===========================================================================
+// SA must-box controls (>= 12): mean() over 5 subclass maps (megamorphic return + this._now box), and a
+// fractional now + value through the megamorphic callAdd site on the rotate-every-add shape. Both prove
+// the probe SEES the box -- the teeth for the SA 0-alloc lanes above.
+// ===========================================================================
+test('saMustBox', async (t) => {
+    const teeth = (steady) => (steady >= 12 ? null :
+        'steady ' + steady + ' B/op < 12 (the must-box control did NOT box -- the SA alloc lanes have no teeth)');
+    const rows = [
+        { lane: 'q_sa_mean_mega', mode: 'fresh', label: 'SA mean() megamorphic (5 maps) [must-box]', expected: '>=12', check: teeth },
+        { lane: 'sa_add_mega_rot', mode: 'fresh', label: 'SA add() megamorphic rotate [must-box]', expected: '>=12', check: teeth },
+    ];
+    await measureGroup(rows);
+    printTable('SA must-box controls (>= 12 B/op -- the megamorphic boxing teeth):', rows,
+        (r) => (r._steady >= 12 ? 'GREEN (teeth)' : 'NO TEETH'));
+    for (const r of rows) await emit(t, r, r.check);
+});
+
+// ===========================================================================
+// isView guard A/B (informational, NOT gated): the new container check is
+// `ArrayBuffer.isView(buf) && buf instanceof Float64Array`. Measure the throughput cost of the extra
+// ArrayBuffer.isView call vs a byte-identical replica whose only difference is `buf instanceof
+// Float64Array` alone. In-process A/B (like HashThroughput): print the ratio only.
+// ===========================================================================
+
+// A faithful in-file replica of the SlidingAggregate hot fold + pane ring, with TWO addFrom variants that
+// differ ONLY by the isView guard -- so the timing ratio isolates exactly that check's cost.
+class ReplicaSA {
+    constructor(W, panes) {
+        this._W = W; this._panes = panes; this._ring = panes + 1; this._pw = W / panes;
+        this._store = new Float64Array(this._ring * 5); this._paneEnd = new Float64Array(this._ring);
+        for (let p = 0; p < this._ring; p++) { this._store[p * 5 + 3] = Infinity; this._store[p * 5 + 4] = -Infinity; }
+        this._cur = 0; this._mode = 0; this._now = 0; this._last = 0;
+    }
+    _anchor() { const B = this._ring, pw = this._pw, now = this._now; const E = (Math.floor(now / pw) + 1) * pw; this._cur = 0; this._paneEnd[0] = E; let e = E, idx = 0; for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; } }
+    _clearPane(p) { const b = p * 5; this._store[b] = 0; this._store[b + 1] = 0; this._store[b + 2] = 0; this._store[b + 3] = Infinity; this._store[b + 4] = -Infinity; }
+    _advance() { const pw = this._pw, B = this._ring, t = this._now; let cur = this._cur, E = this._paneEnd[cur], rot = 0; while (t >= E && rot < B) { cur++; if (cur === B) cur = 0; this._clearPane(cur); E += pw; this._paneEnd[cur] = E; rot++; } if (t >= E) { const nE = (Math.floor(t / pw) + 1) * pw; this._paneEnd[cur] = nE; let e = nE, idx = cur; for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; } } this._cur = cur; }
+    _fold(now, value) {
+        let t;
+        if (this._mode === 1) { t = now; this._last = now; } else { this._mode = 1; t = now; this._last = now; this._now = t; this._anchor(); }
+        this._now = t; if (t >= this._paneEnd[this._cur]) this._advance();
+        const b = this._cur * 5, store = this._store; store[b] += 1; const s = store[b + 1], c = store[b + 2]; const y = value - c, tt = s + y; store[b + 2] = (tt - s) - y; store[b + 1] = tt;
+        if (value < store[b + 3]) store[b + 3] = value; if (value > store[b + 4]) store[b + 4] = value;
+    }
+    // GUARDED: the shipped check (ArrayBuffer.isView + instanceof).
+    addFromGuard(buf, i) {
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' || !Number.isInteger(i) || i < 0 || !(i + 1 < buf.length)) return this;
+        const now = buf[i], value = buf[i + 1]; if (!(value <= 1e150 && value >= -1e150)) return this; this._fold(now, value); return this;
+    }
+    // PLAIN: instanceof alone (the pre-hardening check) -- the only difference from addFromGuard.
+    addFromPlain(buf, i) {
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' || !Number.isInteger(i) || i < 0 || !(i + 1 < buf.length)) return this;
+        const now = buf[i], value = buf[i + 1]; if (!(value <= 1e150 && value >= -1e150)) return this; this._fold(now, value); return this;
+    }
+}
+
+// Direct-call runners (NOT `sa[method]()` -- a computed-property dispatch would confound the ratio).
+function runGuardAB(N, WARM, clk) {
+    const sa = new ReplicaSA(1000, 32); const buf = new Float64Array(2); clk[0] = 1.75e12;
+    for (let i = 0; i < WARM; i++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((i % 200) * 0.25) - 25; sa.addFromGuard(buf, 0); }
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((i % 200) * 0.25) - 25; sa.addFromGuard(buf, 0); }
+    return performance.now() - t0;
+}
+function runPlainAB(N, WARM, clk) {
+    const sa = new ReplicaSA(1000, 32); const buf = new Float64Array(2); clk[0] = 1.75e12;
+    for (let i = 0; i < WARM; i++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((i % 200) * 0.25) - 25; sa.addFromPlain(buf, 0); }
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((i % 200) * 0.25) - 25; sa.addFromPlain(buf, 0); }
+    return performance.now() - t0;
+}
+
+test('saIsViewGuardAB', () => {
+    const N = 4000000, WARM = 400000;
+    const clk = new Float64Array(1);
+    // interleave plain/guard reps to average out drift, take the min of each (least-noisy run).
+    let guard = Infinity, plain = Infinity;
+    for (let rep = 0; rep < 5; rep++) {
+        plain = Math.min(plain, runPlainAB(N, WARM, clk));
+        guard = Math.min(guard, runGuardAB(N, WARM, clk));
+    }
+    const ratio = guard / plain;
+    console.log('');
+    console.log('  isView guard A/B (ReplicaSA addFrom, ' + N + ' ops, min of 5 reps) -- INFORMATIONAL, not gated:');
+    console.log('    plain (instanceof only) = ' + plain.toFixed(1) + ' ms;  guarded (isView + instanceof) = ' + guard.toFixed(1) +
+        ' ms;  ratio = ' + ratio.toFixed(3) + (ratio > 1.10 ? '  <-- OVER 1.10 (reported to maintainer)' : '  (<= 1.10, negligible)'));
+    // NOT gated (per T7): the ratio is printed only, never asserted.
 });

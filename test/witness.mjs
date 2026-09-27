@@ -10,7 +10,7 @@
 
 import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
     DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin, DecayedReservoir,
-    VERSION } from '../Adaptive.js';
+    SlidingAggregate, VERSION } from '../Adaptive.js';
 
 const WS = [64, 1000, 65536];
 const EPS = [0.5, 0.1, 0.01];
@@ -2656,11 +2656,540 @@ console.log('');
 console.log('WITNESS DecayedReservoir negative controls (no-decay + no-forest rejected) ' +
     (drControlsOk ? 'ok' : 'FAIL'));
 
+// ===========================================================================
+// EXACT-AGGREGATE Witness -- SlidingAggregate (ADR 0012). The exact-honesty anchor on the recency
+// axis: count / min / max are BIT-EXACT and sum is Neumaier-tight over the covered span, so drive it on
+// evolving streams and compare EVERY reader to a BigInt oracle built ONLY from the witness's own (t, v)
+// list (values quantized to 2^-20; the oracle fails closed if v*2^20 is not an integer, and never reads
+// the implementation's output). A1: covered span (grid pane end pe = (floor(t/pw)+1)*pw, live iff
+// pe > now - w), count/min/max === oracle, |sum - exact| <= 4u*S1*(1+2^-20). A2: the TRUE window
+// (now-w, now] is CONTAINED, so count >= true(W), min <= trueMin, max >= trueMax. A3: sub-windows W/4,
+// W/2 with a planted spike/dip. Six witness-local replica controls (a B-pane ring, no clear, a
+// drop-oldest merge, plain-+= per pane, plain cross-pane merge, fill(0) sentinels) MUST be rejected by
+// the same gates. ASCII-only.
+// ===========================================================================
+
+const SA_Q20 = 2 ** 20;
+const SA_U = 2 ** -53;
+function saQ20(x) { return Math.round(x * SA_Q20) / SA_Q20; }
+function saPe(t, pw) { return (Math.floor(t / pw) + 1) * pw; }
+
+/** Oracle over the covered SPAN (grid): a value is covered iff its pane end > now - w. */
+function saOracleSpan(ev, n, pw, now, w) {
+    const cut = now - w;
+    let count = 0, mn = Infinity, mx = -Infinity, sumK = 0n, s1 = 0;
+    for (let i = 0; i < n; i++) {
+        const t = ev[i * 2], v = ev[i * 2 + 1];
+        if (!(saPe(t, pw) > cut)) continue;
+        const k = Math.round(v * SA_Q20);
+        if (Math.abs(k / SA_Q20 - v) > 1e-9) throw new Error('SA oracle: value not a clean 2^-20 multiple: ' + v);
+        count += 1; sumK += BigInt(k); s1 += Math.abs(v);
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    return { count, mn, mx, exact: Number(sumK) / SA_Q20, s1 };
+}
+
+/** Oracle over the TRUE window (now - w, now] (uses the real add time, not the pane grid). */
+function saOracleTrue(ev, n, now, w) {
+    const cut = now - w;
+    let count = 0, mn = Infinity, mx = -Infinity, sumK = 0n;
+    for (let i = 0; i < n; i++) {
+        const t = ev[i * 2], v = ev[i * 2 + 1];
+        if (!(t > cut)) continue;
+        count += 1; sumK += BigInt(Math.round(v * SA_Q20));
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    return { count, mn, mx, exact: Number(sumK) / SA_Q20 };
+}
+
+// --- a FAITHFUL witness-local replica; each control flips exactly one method (never touches Adaptive.js).
+class RefSA {
+    constructor(W, panes) {
+        this._W = W; this._panes = panes; this._ring = panes + this.ringExtra(); this._pw = W / panes;
+        this._store = new Float64Array(this._ring * 5); this._paneEnd = new Float64Array(this._ring);
+        this.reset();
+    }
+    ringExtra() { return 1; }                                  // B+1 (BPaneSA -> 0)
+    sentinel(b) { this._store[b + 3] = Infinity; this._store[b + 4] = -Infinity; }  // ZeroClearSA -> 0, 0
+    reset() {
+        this._store.fill(0);
+        for (let p = 0; p < this._ring; p++) this.sentinel(p * 5);
+        this._cur = 0; this._mode = 0; this._now = 0; this._last = 0; this._tick = 0;
+    }
+    clearPane(p) { const b = p * 5; this._store[b] = 0; this._store[b + 1] = 0; this._store[b + 2] = 0; this.sentinel(b); }  // NoClearSA -> {}
+    fold(b, v) {                                               // PlainSumSA -> plain +=
+        this._store[b] += 1;
+        const s = this._store[b + 1], c = this._store[b + 2];
+        const y = v - c, t = s + y;
+        this._store[b + 2] = (t - s) - y; this._store[b + 1] = t;
+        if (v < this._store[b + 3]) this._store[b + 3] = v;
+        if (v > this._store[b + 4]) this._store[b + 4] = v;
+    }
+    anchor() {
+        const B = this._ring, pw = this._pw, now = this._now;
+        const E = (Math.floor(now / pw) + 1) * pw;
+        this._cur = 0; this._paneEnd[0] = E;
+        let e = E, idx = 0;
+        for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; }
+    }
+    advance() {
+        const pw = this._pw, B = this._ring, t = this._now;
+        let cur = this._cur, E = this._paneEnd[cur], rot = 0;
+        while (t >= E && rot < B) { cur++; if (cur === B) cur = 0; this.clearPane(cur); E += pw; this._paneEnd[cur] = E; rot++; }
+        if (t >= E) {
+            const nE = (Math.floor(t / pw) + 1) * pw; this._paneEnd[cur] = nE;
+            let e = nE, idx = cur;
+            for (let s = 1; s < B; s++) { idx--; if (idx < 0) idx = B - 1; e -= pw; this._paneEnd[idx] = e; }
+        }
+        this._cur = cur;
+    }
+    add(now, value) {
+        let t;
+        if (this._mode === 2) { t = ++this._tick; }
+        else if (this._mode === 1) { t = now; this._last = now; }
+        else {
+            if (now === undefined) { this._mode = 2; t = ++this._tick; } else { this._mode = 1; t = now; this._last = now; }
+            this._now = t; this.anchor();
+        }
+        this._now = t;
+        if (t >= this._paneEnd[this._cur]) this.advance();
+        this.fold(this._cur * 5, value);
+        return this;
+    }
+    // read merges the live, non-empty panes; DropOldestSA / PlainMergeSA override this.
+    read(w) {
+        const cut = this._now - w;
+        let count = 0, s = 0, c = 0, mn = Infinity, mx = -Infinity;
+        for (let p = 0; p < this._ring; p++) {
+            if (!(this._paneEnd[p] > cut)) continue;
+            const b = p * 5, pc = this._store[b]; if (pc === 0) continue;
+            count += pc;
+            let t1 = this._store[b + 1], y = s + t1;
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s; s = y;
+            t1 = -this._store[b + 2]; y = s + t1;
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s; s = y;
+            if (this._store[b + 3] < mn) mn = this._store[b + 3];
+            if (this._store[b + 4] > mx) mx = this._store[b + 4];
+        }
+        return { count, sum: count === 0 ? 0 : s + c, mn: count === 0 ? NaN : mn, mx: count === 0 ? NaN : mx };
+    }
+}
+class BPaneSA extends RefSA { ringExtra() { return 0; } }                            // B panes (no straddler)
+class NoClearSA extends RefSA { clearPane() {} }                                      // never clear a rotated pane
+class ZeroClearSA extends RefSA { sentinel(b) { this._store[b + 3] = 0; this._store[b + 4] = 0; } }  // fill(0)
+class PlainSumSA extends RefSA {
+    fold(b, v) { this._store[b] += 1; this._store[b + 1] += v; if (v < this._store[b + 3]) this._store[b + 3] = v; if (v > this._store[b + 4]) this._store[b + 4] = v; }
+}
+class PlainMergeSA extends RefSA {
+    read(w) {
+        const cut = this._now - w;
+        let count = 0, s = 0, mn = Infinity, mx = -Infinity;
+        for (let p = 0; p < this._ring; p++) {
+            if (!(this._paneEnd[p] > cut)) continue;
+            const b = p * 5, pc = this._store[b]; if (pc === 0) continue;
+            count += pc; s += this._store[b + 1] - this._store[b + 2];   // plain cross-pane +=, no Neumaier
+            if (this._store[b + 3] < mn) mn = this._store[b + 3];
+            if (this._store[b + 4] > mx) mx = this._store[b + 4];
+        }
+        return { count, sum: count === 0 ? 0 : s, mn: count === 0 ? NaN : mn, mx: count === 0 ? NaN : mx };
+    }
+}
+class DropOldestSA extends RefSA {
+    read(w) {
+        const cut = this._now - w;
+        let oldest = Infinity;
+        for (let p = 0; p < this._ring; p++) if (this._paneEnd[p] > cut && this._store[p * 5] !== 0 && this._paneEnd[p] < oldest) oldest = this._paneEnd[p];
+        let count = 0, s = 0, c = 0, mn = Infinity, mx = -Infinity;
+        for (let p = 0; p < this._ring; p++) {
+            if (!(this._paneEnd[p] > cut)) continue;
+            const b = p * 5, pc = this._store[b]; if (pc === 0) continue;
+            if (this._paneEnd[p] === oldest) continue;          // drop the straddling oldest live pane
+            count += pc;
+            let t1 = this._store[b + 1], y = s + t1;
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s; s = y;
+            t1 = -this._store[b + 2]; y = s + t1;
+            if (Math.abs(s) >= Math.abs(t1)) c += (s - y) + t1; else c += (t1 - y) + s; s = y;
+            if (this._store[b + 3] < mn) mn = this._store[b + 3];
+            if (this._store[b + 4] > mx) mx = this._store[b + 4];
+        }
+        return { count, sum: count === 0 ? 0 : s + c, mn: count === 0 ? NaN : mn, mx: count === 0 ? NaN : mx };
+    }
+}
+
+console.log('');
+console.log('EXACT-AGGREGATE Witness -- SlidingAggregate v' + VERSION + ' (ADR 0012, (B+1)-pane ring): ' +
+    'windowed count / sum / mean / min / max vs a BigInt covered-span oracle (count/min/max bit-exact; ' +
+    '|sum - exact| <= 4u*S1*(1 + 2^-20))');
+console.log('');
+console.log('  A1 covered span (>= 2000 queries x 4 (W,B) x {lognormal, signed, count}):');
+console.log('  W        B      shape        queries  cntViol  minmaxViol  sumViol  intoViol  status');
+console.log('  -------  -----  -----------  -------  -------  ----------  -------  --------  ------');
+
+let saOk = true, saQueries = 0;
+// deterministic stream generators (all values quantized to 2^-20).
+function saGen(shape, seed) {
+    const r = mulberry32(seed);
+    if (shape === 0) return () => saQ20(Math.exp(1.0 + 1.2 * gaussFrom(r)));          // lognormal (positive, skewed)
+    if (shape === 1) return () => saQ20((gaussFrom(r) * 40));                          // signed N(0, 40)
+    return () => saQ20(4 + (r() * 20));                                                // count-mode values in [4, 24]
+}
+for (const [W, panes] of [[1024, 32], [1000, 32], [2000, 40], [512, 16]]) {
+    const pw = W / panes;
+    for (const shape of [0, 1, 2]) {
+        const sa = new SlidingAggregate(W, { panes });
+        const gen = saGen(shape, 20260927 + W * 7 + shape);
+        const ev = new Float64Array(3200 * 2);
+        let n = 0, t = 0;
+        const OUT = new Float64Array(5);
+        let cntViol = 0, minmaxViol = 0, sumViol = 0, intoViol = 0, q = 0;
+        for (let i = 0; i < 3000; i++) {
+            const v = gen();
+            if (shape === 2) { sa.add(undefined, v); ev[n * 2] = n + 1; }              // count mode: tick = n+1
+            else { t += 1 + Math.floor(mulberry32(i + seedFor(W, shape))() * 5); sa.add(t, v); ev[n * 2] = t; }
+            ev[n * 2 + 1] = v; n++;
+            if (i >= 100 && (i % 13) === 0) {
+                const now = sa.lastNow;
+                const o = saOracleSpan(ev, n, pw, now, W);
+                if (sa.count(W) !== o.count) cntViol++;
+                if (o.count > 0 && (!Object.is(sa.min(W), o.mn) || !Object.is(sa.max(W), o.mx))) minmaxViol++;
+                const bound = 4 * SA_U * o.s1 * (1 + 2 ** -20) + 4 * SA_U;
+                if (o.count > 0 && Math.abs(sa.sum(W) - o.exact) > bound) sumViol++;
+                sa.into(OUT, W);
+                if (!(Object.is(OUT[0], sa.count(W)) && Object.is(OUT[1], sa.sum(W)) &&
+                      Object.is(OUT[2], sa.mean(W)) && Object.is(OUT[3], sa.min(W)) && Object.is(OUT[4], sa.max(W)))) intoViol++;
+                q++;
+            }
+        }
+        saQueries += q;
+        const cellOk = cntViol === 0 && minmaxViol === 0 && sumViol === 0 && intoViol === 0;
+        if (!cellOk) saOk = false;
+        const shapeName = shape === 0 ? 'lognormal' : shape === 1 ? 'signed' : 'count-mode';
+        console.log('  ' + nStr(W).padEnd(7) + '  ' + String(panes).padEnd(5) + '  ' + shapeName.padEnd(11) + '  ' +
+            String(q).padEnd(7) + '  ' + String(cntViol).padStart(7) + '  ' + String(minmaxViol).padStart(10) + '  ' +
+            String(sumViol).padStart(7) + '  ' + String(intoViol).padStart(8) + '  ' + (cellOk ? 'ok' : 'FAIL'));
+    }
+}
+
+// A2: the TRUE window (now-w, now] is CONTAINED by the covered span (non-dyadic pw, W=1000, B=30).
+let saTrueOk = true;
+{
+    const W = 1000, panes = 30, pw = W / panes;   // pw = 33.333... (non-dyadic)
+    const sa = new SlidingAggregate(W, { panes });
+    const r = mulberry32(31337);
+    const ev = new Float64Array(4000 * 2);
+    let n = 0, t = 0, cntUnder = 0, minOver = 0, maxUnder = 0, q = 0;
+    for (let i = 0; i < 4000; i++) {
+        t += 1 + Math.floor(r() * 3);
+        const v = saQ20(gaussFrom(r) * 25);
+        sa.add(t, v); ev[n * 2] = t; ev[n * 2 + 1] = v; n++;
+        if (i >= 200 && (i % 15) === 0) {
+            const now = sa.lastNow, tr = saOracleTrue(ev, n, now, W);
+            if (!(sa.count(W) >= tr.count)) cntUnder++;
+            if (tr.count > 0 && !(sa.min(W) <= tr.mn)) minOver++;
+            if (tr.count > 0 && !(sa.max(W) >= tr.mx)) maxUnder++;
+            q++;
+        }
+    }
+    saQueries += q;
+    saTrueOk = cntUnder === 0 && minOver === 0 && maxUnder === 0;
+    if (!saTrueOk) saOk = false;
+    console.log('');
+    console.log('  A2 true-window containment (W=1000, B=30, non-dyadic pw=' + pw.toFixed(3) + ', ' + q + ' queries): ' +
+        'count >= true(W) viol=' + cntUnder + ', min <= trueMin viol=' + minOver + ', max >= trueMax viol=' + maxUnder +
+        ' -> ' + (saTrueOk ? 'ok' : 'FAIL'));
+}
+
+// A3: sub-windows W/4 and W/2 with a planted max spike + min dip in [now-W, now-W/2).
+let saSubOk = true;
+{
+    const W = 800, panes = 16, pw = W / panes;   // pw = 50
+    const sa = new SlidingAggregate(W, { panes });
+    const ev = new Float64Array(2000 * 2);
+    let n = 0, t = 0;
+    const r = mulberry32(9001);
+    // fill the OLD half [now-W, now-W/2): ordinary values plus a spike + dip that W/2 and W/4 must EXCLUDE.
+    for (let i = 0; i < 300; i++) { t += 1; const v = saQ20(gaussFrom(r) * 5); sa.add(t, v); ev[n * 2] = t; ev[n * 2 + 1] = v; n++; }
+    const spikeT = t + 1; sa.add(spikeT, 999); ev[n * 2] = spikeT; ev[n * 2 + 1] = 999; n++;
+    const dipT = t + 2; sa.add(dipT, -999); ev[n * 2] = dipT; ev[n * 2 + 1] = -999; n++;
+    t += 2;
+    // then the RECENT half: enough time so the spike/dip fall into [now-W, now-W/2).
+    for (let i = 0; i < 500; i++) { t += 1; const v = saQ20(gaussFrom(r) * 5); sa.add(t, v); ev[n * 2] = t; ev[n * 2 + 1] = v; n++; }
+    const now = sa.lastNow;
+    const OUT = new Float64Array(5);
+    let perReader = { count: 0, sum: 0, mean: 0, min: 0, max: 0, into: 0 };
+    for (const w of [W / 4, W / 2, W]) {
+        const o = saOracleSpan(ev, n, pw, now, w);
+        if (sa.count(w) !== o.count) perReader.count++;
+        const bound = 4 * SA_U * o.s1 * (1 + 2 ** -20) + 4 * SA_U;
+        if (o.count > 0 && Math.abs(sa.sum(w) - o.exact) > bound) perReader.sum++;
+        if (o.count > 0 && Math.abs(sa.mean(w) - o.exact / o.count) > bound / o.count + SA_U * Math.abs(o.exact / o.count) * 2) perReader.mean++;
+        if (o.count > 0 && !Object.is(sa.min(w), o.mn)) perReader.min++;
+        if (o.count > 0 && !Object.is(sa.max(w), o.mx)) perReader.max++;
+        sa.into(OUT, w);
+        if (!(Object.is(OUT[0], sa.count(w)) && Object.is(OUT[3], sa.min(w)) && Object.is(OUT[4], sa.max(w)))) perReader.into++;
+        saQueries += 1;
+    }
+    // the spike/dip must be OUT at W/2 and W/4, but IN at full W (proves the sub-window is load-bearing).
+    const excludedOk = sa.max(W / 2) < 999 && sa.min(W / 2) > -999 && sa.max(W) === 999 && sa.min(W) === -999;
+    saSubOk = perReader.count === 0 && perReader.sum === 0 && perReader.mean === 0 && perReader.min === 0 &&
+        perReader.max === 0 && perReader.into === 0 && excludedOk;
+    if (!saSubOk) saOk = false;
+    console.log('  A3 sub-window per-reader violations (w in {W/4, W/2, W}): count=' + perReader.count + ' sum=' + perReader.sum +
+        ' mean=' + perReader.mean + ' min=' + perReader.min + ' max=' + perReader.max + ' into=' + perReader.into +
+        '; spike/dip excluded at W/2 = ' + excludedOk + ' -> ' + (saSubOk ? 'ok' : 'FAIL'));
+}
+
+// self-check: the faithful RefSA replica == the shipped SlidingAggregate slot-for-slot on a stream.
+{
+    const W = 1000, panes = 32;
+    const sa = new SlidingAggregate(W, { panes }), ref = new RefSA(W, panes);
+    const r = mulberry32(4242);
+    let t = 0, match = true;
+    for (let i = 0; i < 5000; i++) {
+        t += 1 + Math.floor(r() * 4); const v = saQ20(gaussFrom(r) * 30);
+        sa.add(t, v); ref.add(t, v);
+        if (i % 250 === 0) {
+            const rd = ref.read(W);
+            if (sa.count(W) !== rd.count || !Object.is(sa.min(W), rd.mn) || !Object.is(sa.max(W), rd.mx) ||
+                Math.abs(sa.sum(W) - rd.sum) > 1e-6) match = false;
+        }
+    }
+    if (!match) saOk = false;
+    console.log('');
+    console.log('  self-check: faithful RefSA replica == shipped SlidingAggregate -> ' + (match ? 'ok' : 'FAIL'));
+}
+
+const saEnough = saQueries >= 2000;
+if (!saEnough) saOk = false;
+console.log('  total queries=' + saQueries + ' (>= 2000 required: ' + (saEnough ? 'ok' : 'FAIL') + ')');
+console.log('');
+console.log('WITNESS SlidingAggregate (exact windowed count/min/max; Neumaier-tight sum over the covered span) ' +
+    (saOk ? 'ok' : 'FAIL'));
+
+// --- SlidingAggregate NEGATIVE CONTROLS: the ring, the clear, the merge and the sentinels are load-bearing.
+console.log('');
+console.log('NEGATIVE CONTROLS -- a broken SlidingAggregate MUST be rejected by the same gates:');
+let saControlsOk = true;
+
+// helper: run a control replica on a stream, comparing to the true-window / span oracle.
+function saRunTrue(Ctor, W, panes, seed, nAdds) {
+    const pw = W / panes, s = new Ctor(W, panes), r = mulberry32(seed);
+    const ev = new Float64Array(nAdds * 2);
+    let n = 0, t = 0, cntUnder = 0, q = 0;
+    for (let i = 0; i < nAdds; i++) {
+        t += 1 + Math.floor(r() * 3); const v = saQ20(gaussFrom(r) * 20);
+        s.add(t, v); ev[n * 2] = t; ev[n * 2 + 1] = v; n++;
+        if (i >= 200 && (i % 15) === 0) { const tr = saOracleTrue(ev, n, s._now, W); if (!(s.read(W).count >= tr.count)) cntUnder++; q++; }
+    }
+    return { cntUnder, q };
+}
+
+// (1) B-PANE RING: no straddling pane -> the oldest live mass rotates out early -> count < true(W).
+{
+    const r = saRunTrue(BPaneSA, 1000, 30, 555, 4000);
+    const rejected = r.cntUnder > 0;
+    if (!rejected) saControlsOk = false;
+    console.log('  B-pane ring (B, not B+1): count < true(W) on ' + r.cntUnder + '/' + r.q +
+        ' -> ' + (rejected ? 'REJECTED (under-covers, ok)' : 'NOT rejected (FAIL)'));
+}
+// (2) DROP-OLDEST MERGE: the query drops the straddling oldest live pane -> under-covers -> count < true(W).
+{
+    const r = saRunTrue(DropOldestSA, 1000, 30, 777, 4000);
+    const rejected = r.cntUnder > 0;
+    if (!rejected) saControlsOk = false;
+    console.log('  drop-oldest merge: count < true(W) on ' + r.cntUnder + '/' + r.q +
+        ' -> ' + (rejected ? 'REJECTED (under-covers, ok)' : 'NOT rejected (FAIL)'));
+}
+// (3) NO-CLEAR-ON-ROTATE: a pane rotated back keeps stale mass -> count OVER the covered-span oracle.
+{
+    const W = 512, panes = 16, pw = W / panes;
+    const s = new NoClearSA(W, panes), r = mulberry32(1234);
+    const ev = new Float64Array(6000 * 2); let n = 0, t = 0, over = 0, q = 0;
+    for (let i = 0; i < 6000; i++) {                                     // 6000 adds >> ring -> wraps many times
+        t += 1 + Math.floor(r() * 3); const v = saQ20(2 + r() * 4);
+        s.add(t, v); ev[n * 2] = t; ev[n * 2 + 1] = v; n++;
+        if (i >= 300 && (i % 20) === 0) { const o = saOracleSpan(ev, n, pw, s._now, W); if (s.read(W).count > o.count) over++; q++; }
+    }
+    const rejected = over > 0;
+    if (!rejected) saControlsOk = false;
+    console.log('  no-clear-on-rotate: count > covered-span oracle on ' + over + '/' + q +
+        ' -> ' + (rejected ? 'REJECTED (stale mass over-counts, ok)' : 'NOT rejected (FAIL)'));
+}
+// (4) ZERO-CLEAR SENTINELS: fill(0) instead of +-Infinity -> an all-positive stream reads min 0 < trueMin.
+{
+    const W = 8, panes = 8;
+    const s = new ZeroClearSA(W, panes);
+    s.add(0.5, 3.5); s.add(5.5, 7.25);              // all positive, a gap > pw between them
+    const rd = s.read(W);
+    const rejected = rd.mn === 0 && 0 < 3.5;         // poisoned min 0 is below the true positive minimum
+    if (!rejected) saControlsOk = false;
+    console.log('  fill(0) sentinels: all-positive covered min=' + rd.mn + ' (true 3.5) ' +
+        '-> ' + (rejected ? 'REJECTED (min poisoned to 0, ok)' : 'NOT rejected (FAIL)'));
+}
+// (5) PLAIN-+= PER PANE (lane K): one pane [2^53, 1000 x 1.0, -2^53] -> plain sum 0, exact 1000.
+{
+    const good = new SlidingAggregate(1e9, { panes: 4 }), bad = new PlainSumSA(1e9, 4);
+    good.add(0, 2 ** 53); bad.add(0, 2 ** 53);
+    for (let i = 0; i < 1000; i++) { good.add(0, 1.0); bad.add(0, 1.0); }
+    good.add(0, -(2 ** 53)); bad.add(0, -(2 ** 53));
+    const goodOk = good.sum() === 1000, badRejected = Math.abs(bad.read(good.W).sum - 1000) > 1;
+    if (!(goodOk && badRejected)) saControlsOk = false;
+    console.log('  lane K (plain-+= per pane): shipped sum=' + good.sum() + ' (exact 1000, ' + (goodOk ? 'ok' : 'FAIL') +
+        '); plain-+= sum=' + bad.read(good.W).sum + ' -> ' + (badRejected ? 'REJECTED (Kahan load-bearing, ok)' : 'NOT rejected (FAIL)'));
+}
+// (6) PLAIN CROSS-PANE MERGE (lane N): +2^53, thirty +1, -2^53 over 32 panes -> plain merge 0, exact 30.
+{
+    const W = 32, panes = 32;
+    const good = new SlidingAggregate(W, { panes }), bad = new PlainMergeSA(W, panes);
+    good.add(0.5, 2 ** 53); bad.add(0.5, 2 ** 53);
+    for (let p = 1; p <= 30; p++) { good.add(p + 0.5, 1.0); bad.add(p + 0.5, 1.0); }
+    good.add(31.5, -(2 ** 53)); bad.add(31.5, -(2 ** 53));
+    const goodOk = good.sum() === 30, badRejected = Math.abs(bad.read(W).sum - 30) > 1;
+    if (!(goodOk && badRejected)) saControlsOk = false;
+    console.log('  lane N (plain cross-pane merge): shipped sum=' + good.sum() + ' (exact 30, ' + (goodOk ? 'ok' : 'FAIL') +
+        '); plain-merge sum=' + bad.read(W).sum + ' -> ' + (badRejected ? 'REJECTED (Neumaier load-bearing, ok)' : 'NOT rejected (FAIL)'));
+}
+console.log('');
+console.log('WITNESS SlidingAggregate negative controls (B-pane + drop-oldest + no-clear + fill(0) + ' +
+    'plain-+= + plain-merge rejected) ' + (saControlsOk ? 'ok' : 'FAIL'));
+
+// --- lite-hud lane: 50 lognormal latency channels vs the exact oracle, next to the EH F17 sum() failure.
+console.log('');
+console.log('lite-hud lane -- 50 SlidingAggregate(1000, {panes: 32}) latency channels (lognormal ms, ' +
+    'quantized 2^-20), queried through into(OUT) every 16 ms; next to the ExponentialHistogram F17 sum() skew:');
+// THE GUARANTEE (verdict): SlidingAggregate's lite-hud contract is an EXACT mean (and count / min / max)
+// over the COVERED SPAN [W, W + W/panes] -- see (c) below, worstRel ~ 0. It is NOT a bit-exact mean over
+// the TRUE last-W window: the covered span is wider by one pane (W/panes), so a hard-window comparison
+// (b) shows a residual that is purely the pane edge -- and `panes` is the knob that shrinks it (panes 32
+// -> panes 128 cuts the edge 4x, (b) below). To be like-for-like, every reader is also scored against the
+// SAME covered span it could legitimately claim: (a) EH mean vs true(W), (d) EH mean vs SA's covered span.
+let saHudOk = true;
+{
+    const CH = 50, W = 1000, panes = 32, panesFine = 128, pw = W / panes, LN4 = Math.log(4), HORIZON = 30000, QUERY_MS = 16;
+    const sas = [], sasFine = [], ehs = [], evs = [], ns = [], adds = [], oleft = [];
+    let bytesTotal = 0;
+    for (let ch = 0; ch < CH; ch++) {
+        const sa = new SlidingAggregate(W, { panes }); sas.push(sa); bytesTotal += sa.bytes;
+        sasFine.push(new SlidingAggregate(W, { panes: panesFine }));   // panes 128: the edge shrinks to W/128
+        ehs.push(new ExponentialHistogram(W, 0.01));
+        // pre-generate this channel's events over [0, HORIZON].
+        const rV = mulberry32(1000 + ch), rT = mulberry32(9000 + ch);
+        const ev = []; let t = 0;
+        while (t < HORIZON) {
+            t += saQ20smallGap(rT);                                   // inter-arrival (1000/120)*(0.5+r), q 2^-10
+            if (t >= HORIZON) break;
+            const v = saQ20(Math.exp(LN4 + 0.05 * ch + gaussFrom(rV)));
+            ev.push(t, v);
+        }
+        evs.push(Float64Array.from(ev)); ns.push(ev.length / 2); adds.push(0); oleft.push(0);
+    }
+    const OUT = new Float64Array(5), OUTF = new Float64Array(5);
+    let queries = 0, cntViol = 0, minmaxViol = 0, sumViol = 0, meanViol = 0;
+    // like-for-like worst relative errors of the MEAN (a)-(d):
+    let ehMeanTrueWorst = 0;      // (a) EH mean vs true(W) mean
+    let saMeanTrue32Worst = 0;    // (b) SA mean vs true(W) mean, panes 32
+    let saMeanTrue128Worst = 0;   // (b) SA mean vs true(W) mean, panes 128 (edge W/128)
+    let saMeanTrue32Sum = 0, saMeanTrue128Sum = 0, bSteady = 0;   // (b) AVERAGE rel error (shows the systematic edge)
+    let saMeanCoveredWorst = 0;   // (c) SA mean vs its own covered-span truth (exact)
+    let ehMeanCoveredWorst = 0;   // (d) EH mean vs SA's covered-span truth
+    for (let T = QUERY_MS; T <= HORIZON; T += QUERY_MS) {
+        const cut = T - W;
+        for (let ch = 0; ch < CH; ch++) {
+            const ev = evs[ch], nEv = ns[ch], sa = sas[ch], saF = sasFine[ch], eh = ehs[ch];
+            let p = adds[ch];
+            while (p < nEv && ev[p * 2] <= T) { const tt = ev[p * 2], vv = ev[p * 2 + 1]; sa.add(tt, vv); saF.add(tt, vv); eh.add(tt, vv); p++; }
+            adds[ch] = p;
+            sa.advance(T); saF.advance(T); eh.advance(T);
+            sa.into(OUT, W); saF.into(OUTF, W);
+            // oracle over the covered span (grid, panes 32), using a left pointer to skip long-expired events.
+            // The quantized integers k and their windowed sums stay well below 2^53 for this lognormal-ms
+            // domain (<= ~150 covered events x ~7e9), so a Number accumulator is EXACT here (BigInt is used
+            // in the A1/A2/A3 oracles where the lane K/N magnitudes make it load-bearing).
+            let L = oleft[ch]; while (L < p && saPe(ev[L * 2], pw) <= cut) L++; oleft[ch] = L;
+            let count = 0, mn = Infinity, mx = -Infinity, sumK = 0, s1 = 0;
+            let tcount = 0, tsumK = 0;
+            for (let i = L; i < p; i++) {
+                const tt = ev[i * 2], vv = ev[i * 2 + 1], k = Math.round(vv * SA_Q20);
+                if (saPe(tt, pw) > cut) { count++; sumK += k; s1 += Math.abs(vv); if (vv < mn) mn = vv; if (vv > mx) mx = vv; }
+                if (tt > cut) { tcount++; tsumK += k; }
+            }
+            queries++;
+            if (count === 0) { continue; }
+            const exact = sumK / SA_Q20, oMean = exact / count;   // covered-span (panes 32) truth
+            if (OUT[0] !== count) cntViol++;
+            if (!Object.is(OUT[3], mn) || !Object.is(OUT[4], mx)) minmaxViol++;
+            const bound = 4 * SA_U * s1 * (1 + 2 ** -20) + 4 * SA_U;
+            if (Math.abs(OUT[1] - exact) > bound) sumViol++;
+            const meanBound = (4 * SA_U * s1 / count + SA_U * Math.abs(oMean)) * (1 + 2 ** -20);
+            if (Math.abs(OUT[2] - oMean) > meanBound) meanViol++;
+            // (c) SA mean vs its own covered-span truth is EXACT at EVERY query (incl. the fill-in phase).
+            const cRel = Math.abs(OUT[2] - oMean) / Math.abs(oMean);
+            if (cRel > saMeanCoveredWorst) saMeanCoveredWorst = cRel;
+            // The (a)/(b)/(d) worst-rel figures are over STEADY windows (T >= W): before T = W the window is
+            // only partially filled and every reader (even a hard-window one) covers the same sparse data, so
+            // the pane edge -- the thing (b) is meant to isolate -- is not yet the dominant difference.
+            if (T >= W) {
+                // (d) EH mean vs the SAME covered-span truth SA claims:
+                const ehCnt = eh.count(), ehMean = ehCnt > 0 ? eh.sum() / ehCnt : NaN;
+                if (ehCnt > 0) {
+                    const dRel = Math.abs(ehMean - oMean) / Math.abs(oMean);
+                    if (dRel > ehMeanCoveredWorst) ehMeanCoveredWorst = dRel;
+                }
+                if (tcount > 0) {
+                    const trueMean = tsumK / SA_Q20 / tcount;
+                    // (b) SA mean vs true(W) mean, panes 32 and panes 128:
+                    const b32 = Math.abs(OUT[2] - trueMean) / Math.abs(trueMean);
+                    if (b32 > saMeanTrue32Worst) saMeanTrue32Worst = b32;
+                    const b128 = Math.abs(OUTF[2] - trueMean) / Math.abs(trueMean);
+                    if (b128 > saMeanTrue128Worst) saMeanTrue128Worst = b128;
+                    saMeanTrue32Sum += b32; saMeanTrue128Sum += b128; bSteady++;
+                    // (a) EH mean vs true(W) mean:
+                    if (ehCnt > 0) {
+                        const aRel = Math.abs(ehMean - trueMean) / Math.abs(trueMean);
+                        if (aRel > ehMeanTrueWorst) ehMeanTrueWorst = aRel;
+                    }
+                }
+            }
+        }
+    }
+    const bytesOk = bytesTotal === 79200;
+    const enoughQ = queries >= 2000;
+    const hardOk = cntViol === 0 && minmaxViol === 0 && sumViol === 0 && meanViol === 0;
+    const relOk = saMeanCoveredWorst <= 4.5e-16;
+    saHudOk = bytesOk && enoughQ && hardOk && relOk;
+    if (!saHudOk) saOk = false;   // fold into the section verdict
+    console.log('  channels=' + CH + '  sum(sa.bytes)=' + bytesTotal + ' B (== 79,200: ' + (bytesOk ? 'ok' : 'FAIL') + ')' +
+        '  queries=' + queries + ' (>= 2000: ' + (enoughQ ? 'ok' : 'FAIL') + ')');
+    console.log('  HARD count/min/max === oracle (viol ' + cntViol + '/' + minmaxViol + '), sum within bound (viol ' +
+        sumViol + '), mean within bound (viol ' + meanViol + ') -> ' + (hardOk ? 'ok' : 'FAIL'));
+    const bAvg32 = bSteady ? saMeanTrue32Sum / bSteady : 0, bAvg128 = bSteady ? saMeanTrue128Sum / bSteady : 0;
+    console.log('  the GUARANTEE: an EXACT mean over the covered span [W, W + W/panes]; `panes` is the edge knob (W/panes).');
+    console.log('  (a) EH   mean worstRel vs true(W) mean            = ' + ehMeanTrueWorst.toExponential(2));
+    console.log('  (b) SA   mean vs true(W) mean (pure pane edge): panes 32 avg=' + bAvg32.toExponential(2) +
+        ' worst=' + saMeanTrue32Worst.toExponential(2) + ';  panes 128 avg=' + bAvg128.toExponential(2) +
+        ' worst=' + saMeanTrue128Worst.toExponential(2));
+    console.log('      the AVERAGE edge shrinks ~' + (bAvg128 > 0 ? (bAvg32 / bAvg128).toFixed(1) : 'n/a') +
+        'x from panes 32 -> 128 (systematic ~W/panes); worst is tail-dominated by lognormal outliers, not the edge.');
+    console.log('  (c) SA   mean worstRel vs its covered-span truth  = ' + saMeanCoveredWorst.toExponential(2) +
+        ' (<= 4.5e-16: ' + (relOk ? 'ok' : 'FAIL') + ', EXACT)');
+    console.log('  (d) EH   mean worstRel vs SA covered-span truth   = ' + ehMeanCoveredWorst.toExponential(2) +
+        '  -- EH cannot match the exact mean on the skewed stream (the F17 sum() skew)');
+    console.log('');
+    console.log('WITNESS SlidingAggregate lite-hud lane (50 channels, 79,200 B, covered-span mean worstRel <= 4.5e-16) ' + (saHudOk ? 'ok' : 'FAIL'));
+}
+
+// quantized inter-arrival helper for the lite-hud lane: (1000/120)*(0.5 + r), quantized to 2^-10.
+function saQ20smallGap(r) { return Math.round((1000 / 120) * (0.5 + r()) * 1024) / 1024; }
+// per-lane deterministic time-step seed (keeps A1 reproducible without nesting mulberry32 in the hot loop).
+function seedFor(W, shape) { return 555000 + W * 13 + shape * 7; }
+
 const all = ok && controlsOk && adOk && adControlsOk && adOffsetOk && (adRecoverOk && adControlHasTeeth) && fdOk && fdTeethOk && fdControlsOk && hkOk && hkControlsOk &&
     slOk && slControlsOk && slPureOk && ddOk && ddControlsOk && ddLatchOk && ddLatchCtrlOk && sdOk && sdControlsOk && isOk && isControlsOk &&
-    scmOk && scmControlsOk && drOk && drControlsOk;
+    scmOk && scmControlsOk && drOk && drControlsOk && saOk && saControlsOk && saHudOk;
 console.log('');
 console.log('WITNESS lite-adaptive (ExponentialHistogram + ADWIN + ForwardDecay + HeavyKeeper + ' +
-    'SlidingHyperLogLog + DriftDetector + SlidingDDSketch + SlidingCountMin + DecayedReservoir) ' +
+    'SlidingHyperLogLog + DriftDetector + SlidingDDSketch + SlidingCountMin + DecayedReservoir + SlidingAggregate) ' +
     (all ? 'ok' : 'FAIL'));
 if (!all) process.exitCode = 1;

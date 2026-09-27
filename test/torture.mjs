@@ -23,7 +23,7 @@ async function main() {
     const { createLeakTracker } = await import('@zakkster/lite-leak');
     const { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
         DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin,
-        DecayedReservoir } = await import('../Adaptive.js');
+        DecayedReservoir, SlidingAggregate } = await import('../Adaptive.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -104,6 +104,16 @@ async function main() {
             dr.sampleInto(drbuf); dr.forEach(noop);   // cold reads (0 alloc)
             dr.clear();
             tracker.track(dr, noop, 'decayedreservoir', { audit: true });
+
+            const sa = new SlidingAggregate(1000, { panes: 16 });
+            // a rolling explicit-time value stream over a full, churning window -> pane rotate + clear +
+            // Kahan fold; fractional values exercise the compensated sum.
+            let sat = 0;
+            for (let k = 0; k < 4096; k++) sa.add(sat++, (k % 500) * 0.5 - 125);
+            sa.count(); sa.sum(); sa.mean(); sa.min(); sa.max();   // cold scalar readers (box once, cold)
+            const saAO = new Float64Array(5); sa.into(saAO); sa.into(saAO, 500);   // cold 0-alloc reader
+            sa.clear();
+            tracker.track(sa, noop, 'slidingaggregate', { audit: true });
         }
         return tracker.size();
     }
@@ -1247,6 +1257,179 @@ async function main() {
         if (drRet.bytes !== drRetBytes0) drRetOk = false;
     }
 
+    // ---- phase 2a-terdecies: SlidingAggregate -- add (Smi) + addFrom (epoch, fractional) + a
+    // ROTATE-EVERY-ADD lane (Smi, pw=1) + a ROTATE-EVERY-ADD addFrom (epoch, the event-heavy zero-box
+    // per-rotation lane, the 1.8.0 lesson) + advance / advanceFrom + a BIG-JUMP (1e12) advance + into
+    // (monomorphic site) + clear + retention. All 0 B/op. ----
+    // SlidingAggregate add: explicit-time SMI now + SMI value over a full, churning window so every measured
+    // add periodically crosses a pane boundary (rotate + clear + Kahan fold must be 0-alloc). Primed.
+    const saAdd = new SlidingAggregate(1000, { panes: 32 });
+    let saT = 0;
+    for (let k = 0; k < 4000; k++) saAdd.add(saT++, (k % 100) - 50);
+    let saSink = 0;
+    const saStep = () => {
+        saAdd.add(saT, (saT % 100) - 50);
+        saT = (saT + 1) | 0;
+        saSink = (saSink + saAdd.lastNow) | 0;   // observe state (defeat DCE)
+    };
+    const saRes = measureAllocs(saStep, { iterations: 100000, batches: 8 });
+    const saBpc = saRes.bytesPerCall === null ? 0 : saRes.bytesPerCall;
+    const saBytes = Math.max(0, Math.round(saBpc));
+    const saOk = saBytes === 0;
+
+    // SlidingAggregate addFrom: epoch-ms now (non-Smi double) + a FRACTIONAL value read UNBOXED from a
+    // packed stride-2 [now, value] Float64Array -- the gated zero-box floor (a plain-arg add would box both).
+    const saFrom = new SlidingAggregate(1000, { panes: 32 });
+    const SABUF = new Float64Array(2);
+    let safNow = 1.75e12, safI = 0;
+    for (let k = 0; k < 4000; k++) { safNow += 1.5; SABUF[0] = safNow; SABUF[1] = (k % 200) * 0.25 - 25; saFrom.addFrom(SABUF, 0); }
+    let saFromSink = 0;
+    const saFromStep = () => {
+        safNow += 1.5; SABUF[0] = safNow; SABUF[1] = (safI % 200) * 0.25 - 25;   // fractional value, epoch now
+        saFrom.addFrom(SABUF, 0);
+        safI = (safI + 1) | 0;
+        saFromSink = (saFromSink + saFrom.lastNow) | 0;
+    };
+    const saFromRes = measureAllocs(saFromStep, { iterations: 100000, batches: 8 });
+    const saFromBpc = saFromRes.bytesPerCall === null ? 0 : saFromRes.bytesPerCall;
+    const saFromBytes = Math.max(0, Math.round(saFromBpc));
+    const saFromOk = saFromBytes === 0;
+
+    // SlidingAggregate ROTATE-EVERY-ADD (Smi): W = panes = 64 -> pw = 1 and now += 1 per add, so EVERY
+    // measured add crosses a boundary -> _advance rotates + clears a pane (the identity-sentinel spike) every call.
+    const saRot = new SlidingAggregate(64, { panes: 64 });
+    let saRotT = 0;
+    for (let k = 0; k < 400; k++) saRot.add(saRotT++, (k % 50) - 25);
+    let saRotSink = 0;
+    const saRotStep = () => {
+        saRot.add(saRotT, (saRotT % 50) - 25);   // now += 1 -> rotate every add
+        saRotT = (saRotT + 1) | 0;
+        saRotSink = (saRotSink + saRot.lastNow) | 0;
+    };
+    const saRotRes = measureAllocs(saRotStep, { iterations: 100000, batches: 8 });
+    const saRotBpc = saRotRes.bytesPerCall === null ? 0 : saRotRes.bytesPerCall;
+    const saRotBytes = Math.max(0, Math.round(saRotBpc));
+    const saRotOk = saRotBytes === 0;
+
+    // SlidingAggregate ROTATE-EVERY-ADD addFrom (EVENT-HEAVY epoch): pw = 1 and an epoch-ms clock stepped
+    // +1.5 per addFrom, so EVERY add rotates with a NON-Smi `now`. The argument-free _advance() reads
+    // this._now, so no epoch double crosses a non-inlined call -- this lane is the teeth for that (the 1.8.0
+    // lesson: a per-rotation box hides in an average over quiet adds; here every add rotates).
+    const saRotFrom = new SlidingAggregate(64, { panes: 64 });
+    const SAROTBUF = new Float64Array(2);
+    let sarfNow = 1.75e12, sarfI = 0;
+    for (let k = 0; k < 400; k++) { sarfNow += 1.5; SAROTBUF[0] = sarfNow; SAROTBUF[1] = (k % 40) * 0.5 - 10; saRotFrom.addFrom(SAROTBUF, 0); }
+    let saRotFromSink = 0;
+    const saRotFromStep = () => {
+        sarfNow += 1.5; SAROTBUF[0] = sarfNow; SAROTBUF[1] = (sarfI % 40) * 0.5 - 10;   // epoch now, rotate every add
+        saRotFrom.addFrom(SAROTBUF, 0);
+        sarfI = (sarfI + 1) | 0;
+        saRotFromSink = (saRotFromSink + saRotFrom.lastNow) | 0;
+    };
+    const saRotFromRes = measureAllocs(saRotFromStep, { iterations: 100000, batches: 8 });
+    const saRotFromBpc = saRotFromRes.bytesPerCall === null ? 0 : saRotFromRes.bytesPerCall;
+    const saRotFromBytes = Math.max(0, Math.round(saRotFromBpc));
+    const saRotFromOk = saRotFromBytes === 0;
+
+    // SlidingAggregate advance: slide the pane ring forward (rotate + clear stale panes), re-primed each call.
+    const saAdv = new SlidingAggregate(1000, { panes: 32 });
+    let saAdvT = 0;
+    for (let k = 0; k < 4000; k++) saAdv.add(saAdvT++, (k % 100) - 50);
+    let saAdvSink = 0;
+    const saAdvStep = () => {
+        saAdv.add(saAdvT, (saAdvT % 100) - 50);   // re-prime
+        saAdvT += 3;
+        saAdv.advance(saAdvT);                     // pane-ring slide
+        saAdvSink = (saAdvSink + saAdv.lastNow) | 0;
+    };
+    const saAdvRes = measureAllocs(saAdvStep, { iterations: 100000, batches: 8 });
+    const saAdvBpc = saAdvRes.bytesPerCall === null ? 0 : saAdvRes.bytesPerCall;
+    const saAdvBytes = Math.max(0, Math.round(saAdvBpc));
+    const saAdvOk = saAdvBytes === 0;
+
+    // SlidingAggregate advanceFrom: ZERO-BOX epoch-ms clock + stride-2 re-prime, pane slide.
+    const saAvf = new SlidingAggregate(1000, { panes: 32 });
+    const SAAVBUF = new Float64Array(2);
+    let saAvfNow = 1.75e12, saAvfI = 0;
+    for (let k = 0; k < 4000; k++) { SAAVBUF[0] = saAvfNow; SAAVBUF[1] = (k % 100) - 50; saAvf.addFrom(SAAVBUF, 0); saAvfNow += 1.5; }
+    let saAvfSink = 0;
+    const saAvfStep = () => {
+        SAAVBUF[0] = saAvfNow; SAAVBUF[1] = (saAvfI % 100) - 50; saAvf.addFrom(SAAVBUF, 0);
+        saAvfNow += 4.5; SAAVBUF[0] = saAvfNow; saAvfI = (saAvfI + 1) | 0;
+        saAvf.advanceFrom(SAAVBUF, 0);
+        saAvfSink = (saAvfSink + saAvf.lastNow) | 0;
+    };
+    const saAvfRes = measureAllocs(saAvfStep, { iterations: 100000, batches: 8 });
+    const saAvfBpc = saAvfRes.bytesPerCall === null ? 0 : saAvfRes.bytesPerCall;
+    const saAvfBytes = Math.max(0, Math.round(saAvfBpc));
+    const saAvfOk = saAvfBytes === 0;
+
+    // SlidingAggregate into (monomorphic site): [count, sum, mean, min, max] written into a caller-owned
+    // Float64Array must be 0-alloc (nothing is RETURNED, so nothing boxes) EVEN with fractional values
+    // (the Neumaier merge lands in out slots). `into` is SA-only, so this call site is monomorphic.
+    const saInto = new SlidingAggregate(1000, { panes: 32 });
+    let saIntoT = 0;
+    for (let k = 0; k < 4000; k++) saInto.add(saIntoT++, (k % 1000) * 0.5 - 250);   // fractional -> exercises Neumaier
+    const SA_OUT = new Float64Array(5);
+    let saIntoSink = 0;
+    const saIntoStep = () => {
+        saInto.into(SA_OUT);
+        saIntoSink = (saIntoSink + (SA_OUT[0] > 0 ? 1 : 0)) | 0;   // observe (defeat DCE)
+    };
+    const saIntoRes = measureAllocs(saIntoStep, { iterations: 50000, batches: 8 });
+    const saIntoBpc = saIntoRes.bytesPerCall === null ? 0 : saIntoRes.bytesPerCall;
+    const saIntoBytes = Math.max(0, Math.round(saIntoBpc));
+    const saIntoOk = saIntoRes.bytesPerCall !== null && saIntoBytes === 0;   // null bytesPerCall FAILS closed
+
+    // SlidingAggregate clear(): re-fill between clears so every measured clear() resets non-trivial live state.
+    const saClear = new SlidingAggregate(1000, { panes: 32 });
+    for (let k = 0; k < 4000; k++) saClear.add(k, (k % 100) - 50);
+    let saClearSink = 0, saClearI = 0;
+    const saClearStep = () => {
+        saClear.clear();
+        saClear.add(saClearI, (saClearI % 100) - 50);   // re-seed live state
+        saClearI = (saClearI + 1) | 0;
+        saClearSink = (saClearSink + (saClear.mode === 'explicit' ? 1 : 0)) | 0;
+    };
+    const saClearRes = measureAllocs(saClearStep, { iterations: 20000, batches: 8 });
+    const saClearBpc = saClearRes.bytesPerCall === null ? 0 : saClearRes.bytesPerCall;
+    const saClearBytes = Math.max(0, Math.round(saClearBpc));
+    const saClearOk = saClearBytes === 0;
+
+    // SlidingAggregate BIG-JUMP advance: refill near capacity, then jump 1e12 in ONE advance -> the
+    // grid-re-anchor branch (clears all B+1 panes via the bounded loop, then re-anchors) each call.
+    const saBig = new SlidingAggregate(1000, { panes: 32 });
+    let saBigSink = 0;
+    const saBigStep = () => {
+        // Rebase the clock every step (clear + re-seed near 0) so the +1e12 single-call jump stays INSIDE
+        // the clock-precision domain (|now| <= pw * 2^42 = 1.374e14) instead of accumulating to ~2e16 over
+        // the run -- the exact rebase the fail-closed domain guard documents. The jump still exercises the
+        // grid-re-anchor branch (all B+1 panes cleared, then re-anchored) and empties the window each call.
+        saBig.clear();
+        let t = 0;
+        for (let k = 0; k < 300; k++) { saBig.add(t, (k % 100) - 50); t += 1000 / 300; }
+        t += 1e12;                            // ASTRONOMICAL single-call jump (in-domain): grid-re-anchor branch
+        saBig.advance(t);
+        saBigSink = (saBigSink + saBig.lastNow) | 0;
+    };
+    const saBigRes = measureAllocs(saBigStep, { iterations: 5000, batches: 4 });
+    const saBigBpc = saBigRes.bytesPerCall === null ? 0 : saBigRes.bytesPerCall;
+    const saBigBytes = Math.max(0, Math.round(saBigBpc));
+    const saBigOk = saBigBytes === 0 && saBig.count() === 0;   // the jump must ALSO empty the window
+
+    // SlidingAggregate retention: bytes constant + count returns to baseline over 10 clear/refill cycles.
+    const saRet = new SlidingAggregate(1000, { panes: 16 });
+    const saRetBytes0 = saRet.bytes;
+    let saRetBase = -1, saRetOk = true;
+    for (let cyc = 0; cyc < 10; cyc++) {
+        saRet.clear();
+        for (let k = 0; k < 2000; k++) saRet.add(k, (k % 100) - 50);
+        const c = saRet.count();
+        if (saRetBase < 0) saRetBase = c;
+        else if (c !== saRetBase) saRetOk = false;
+        if (saRet.bytes !== saRetBytes0) saRetOk = false;
+    }
+
     // ---- phase 2b: GC budget over a long hot run (millions of add + reshaping ops) ----
     const gc = new GcProfiler().start();
     const HOT = 4000000;
@@ -1260,6 +1443,7 @@ async function main() {
         ehAdvStep(); ehAvfStep(); slAdvStep(); slAvfStep(); sdAdvStep(); sdAvfStep();
         scmStep(); scmPlainStep(); scmRotStep(); scmFromStep(); scmEstStep(); scmAdvStep(); scmAvfStep();
         drStep(); drRebStep(); drFromStep(); drSampStep();
+        saStep(); saFromStep(); saRotStep(); saRotFromStep(); saAdvStep(); saAvfStep(); saIntoStep();
     }
     // big-jump lanes are heavier per call (a window-refill inside the step) -- run them separately,
     // outside the 4M-iteration HOT loop, at their own (already-measured) iteration count above; fold
@@ -1273,7 +1457,9 @@ async function main() {
         ehBigSink + slBigSink + sdBigSink +
         scmSink + scmPlainSink + scmRotSink + scmFromSink + scmEstSink + scmAdvSink + scmAvfSink +
         scmClearSink + scmBigSink +
-        drSink + drRebSink + drFromSink + drBoxedSink + drSampSink + drClearSink;
+        drSink + drRebSink + drFromSink + drBoxedSink + drSampSink + drClearSink +
+        saSink + saFromSink + saRotSink + saRotFromSink + saAdvSink + saAvfSink + saIntoSink +
+        saClearSink + saBigSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -1288,9 +1474,11 @@ async function main() {
     const reuseSd = new SlidingDDSketch(2048, { alpha: 0.01, panes: 16 });
     const reuseScm = new SlidingCountMin(2048, { panes: 16, w: 128, d: 4, seed: 14 });
     const reuseDr = new DecayedReservoir(32, 100000, { seed: 16 });
+    const reuseSa = new SlidingAggregate(2048, { panes: 16 });
+    const SA_REUSE_OUT = new Float64Array(5);
     globalThis.gc();
     const abBefore = process.memoryUsage().arrayBuffers;
-    let reuseSlT = 0, reuseSdT = 0, reuseScmT = 0, reuseDrT = 0;
+    let reuseSlT = 0, reuseSdT = 0, reuseScmT = 0, reuseDrT = 0, reuseSaT = 0;
     for (let c = 0; c < 500; c++) {
         for (let k = 0; k < 8192; k++) reuse.add();     // full window -> expire + cascade
         reuse.count();
@@ -1314,6 +1502,9 @@ async function main() {
         for (let k = 0; k < 8192; k++) reuseDr.add(reuseDrT++, (k * 2654435761) % 3000);  // A-Res draw + forest sift + rebase
         reuseDr.sampleInto(DRSAMP);
         reuseDr.clear();                                // reuse the columns, no new store
+        for (let k = 0; k < 8192; k++) reuseSa.add(reuseSaT++, (k % 1000) * 0.5 - 250);  // pane rotate + clear + Kahan fold
+        reuseSa.into(SA_REUSE_OUT);
+        reuseSa.clear();                                // reuse the arrays, no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -1331,6 +1522,7 @@ async function main() {
         ehBigOk && slBigOk && sdBigOk && hugeOk &&
         scmOk && scmPlainOk && scmRotOk && scmFromOk && scmEstOk && scmTotOk && scmIntoOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
         drOk && drRebOk && drFromOk && drSampOk && drClearOk && drRetOk &&
+        saOk && saFromOk && saRotOk && saRotFromOk && saAdvOk && saAvfOk && saIntoOk && saClearOk && saBigOk && saRetOk &&
         report.ok && abOk;
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -1387,7 +1579,16 @@ async function main() {
         drRebBytes + ' B/op (DecayedReservoir add rebase-heavy) ' +
         drFromBytes + ' B/op (DecayedReservoir addFrom fractional) ' +
         drSampBytes + ' B/op (DecayedReservoir sampleInto) ' +
-        drClearBytes + ' B/op (DecayedReservoir clear)' +
+        drClearBytes + ' B/op (DecayedReservoir clear) ' +
+        saBytes + ' B/op (SlidingAggregate add Smi) ' +
+        saFromBytes + ' B/op (SlidingAggregate addFrom epoch fractional) ' +
+        saRotBytes + ' B/op (SlidingAggregate rotate-every-add Smi) ' +
+        saRotFromBytes + ' B/op (SlidingAggregate rotate-every-add addFrom epoch) ' +
+        saAdvBytes + ' B/op (SlidingAggregate advance) ' +
+        saAvfBytes + ' B/op (SlidingAggregate advanceFrom) ' +
+        saIntoBytes + ' B/op (SlidingAggregate into) ' +
+        saClearBytes + ' B/op (SlidingAggregate clear) ' +
+        saBigBytes + ' B/op (SlidingAggregate big-jump advance)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta +
         ' diag: add-boxed-fractional EH=' + ehBoxedBytes + ' B/op FD=' + fdBoxedBytes +
@@ -1451,6 +1652,16 @@ async function main() {
         if (!drSampOk) console.error('  alloc ' + drSampBytes + ' B/op DecayedReservoir sampleInto (raw ' + drSampBpc + ')');
         if (!drClearOk) console.error('  alloc ' + drClearBytes + ' B/op DecayedReservoir clear (raw ' + drClearBpc + ')');
         if (!drRetOk) console.error('  retention: DecayedReservoir bytes/size drifted over clear/refill cycles');
+        if (!saOk) console.error('  alloc ' + saBytes + ' B/op SlidingAggregate add (raw ' + saBpc + ')');
+        if (!saFromOk) console.error('  alloc ' + saFromBytes + ' B/op SlidingAggregate addFrom (raw ' + saFromBpc + ')');
+        if (!saRotOk) console.error('  alloc ' + saRotBytes + ' B/op SlidingAggregate rotate-every-add (raw ' + saRotBpc + ')');
+        if (!saRotFromOk) console.error('  alloc ' + saRotFromBytes + ' B/op SlidingAggregate rotate-every-add addFrom (raw ' + saRotFromBpc + ')');
+        if (!saAdvOk) console.error('  alloc ' + saAdvBytes + ' B/op SlidingAggregate advance (raw ' + saAdvBpc + ')');
+        if (!saAvfOk) console.error('  alloc ' + saAvfBytes + ' B/op SlidingAggregate advanceFrom (raw ' + saAvfBpc + ')');
+        if (!saIntoOk) console.error('  alloc ' + saIntoBytes + ' B/op SlidingAggregate into (raw ' + saIntoBpc + ')');
+        if (!saClearOk) console.error('  alloc ' + saClearBytes + ' B/op SlidingAggregate clear (raw ' + saClearBpc + ')');
+        if (!saBigOk) console.error('  alloc ' + saBigBytes + ' B/op SlidingAggregate big-jump advance (raw ' + saBigBpc + ') or not emptied');
+        if (!saRetOk) console.error('  retention: SlidingAggregate bytes/count drifted over clear/refill cycles');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

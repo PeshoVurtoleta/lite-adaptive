@@ -490,7 +490,7 @@ export class SlidingHyperLogLog {
      * omitted queries the full window W. null is not zero. The scratch keeps count() free of ARRAY
      * allocation, but it RETURNS a rounded double: it boxes 16 B/call steady (the estimator tail) and
      * 32 B when the caller is not yet optimized (the boxed return). A 0-alloc `countInto` reader is
-     * planned for 1.9.0. See the README F6 alloc table.
+     * planned for 1.10.0. See the README F6 alloc table.
      */
     count(w?: number): number;
 
@@ -551,7 +551,7 @@ export interface DriftDetectorOptions {
  * accumulator reset that re-arms happens later, when the gap falls back to threshold/2. One honest
  * caveat: a latch:true PH latched fire can box one 16 B HeapNumber in V8's Maglev tier -- 0 B/op in
  * steady optimized code on realistic re-arming streams, ~2 B/op measured on a fire-heavy stream when a
- * per-window collection re-tiers the hot loop (tracked for 1.9.0). The mode is
+ * per-window collection re-tiers the hot loop (tracked for 1.10.0). The mode is
  * load-bearing via its reference: PH self-references the
  * online mean (adaptive), CUSUM references a fixed mu0 (classic SPC) -- they genuinely diverge.
  * The item-based, scalar, fixed-scalar-state complement to ADWIN's adaptive window: no pool (pure
@@ -1011,5 +1011,136 @@ export class DecayedReservoir {
     /** The locked time mode. */
     readonly mode: 'unset' | 'explicit' | 'count';
     /** The fixed memory figure in bytes. */
+    readonly bytes: number;
+}
+
+export interface SlidingAggregateOptions {
+    /** The pane count B (default 32); an integer in [2, 1024]. Edge error is W / panes; the ring holds B+1 panes. */
+    panes?: number;
+}
+
+/**
+ * SlidingAggregate -- EXACT windowed count / sum / mean / min / max over the COVERED span [w, w + W/B]
+ * (which always CONTAINS the last w) in FIXED
+ * preallocated space (ADR 0012). A ring of B+1 panes of width W/B (the SlidingCountMin ring, copied),
+ * each a stride-5 slot [count, sum, kcomp, min, max]. `add(now, value)` / the zero-box stride-2
+ * `addFrom(buf, i)` fold the value into the current pane (count += 1, a branch-free Kahan compensated
+ * sum, min / max by comparison); crossing a pane boundary rotates + clears it to identity sentinels
+ * (count/sum/kcomp 0, min +Infinity, max -Infinity -- never fill(0), 0 B/op). The readers merge the
+ * live, NON-EMPTY panes (the straddling oldest pane kept) with Neumaier over {s_p, -c_p}: count / min /
+ * max are bit-exact and |sum - exact| <= (4u + O(N u^2)) * sum|v|, u = 2^-53. An empty covered window
+ * reads count 0, sum 0, mean / min / max NaN (null is not zero). `value` is REQUIRED (a finite real,
+ * |value| <= 1e150). Time model: EXPLICIT (a monotone `now`) or COUNT (`add(undefined, value)`); the
+ * mode locks at the first add and a switch throws. `addFrom` / `advance` / `advanceFrom` are
+ * EXPLICIT-only. Precision domain (ADR 0012): exact containment needs ulp(now) << pw, so W / panes must
+ * be a NORMAL double (a subnormal pane width is rejected at the ctor) and |now| (and the count-mode tick)
+ * must be <= pw * 2^42 (SA_CLOCK_SPAN); a larger clock throws [lite-adaptive] BEFORE any state write
+ * (rebase, e.g. performance.now(), or use a larger W). `into(out, w?)` and the scalar readers are 0 B/call at a monomorphic / polymorphic site
+ * (<= 4 receiver shapes); at a MEGAMORPHIC site (5+ SlidingAggregate subclass shapes) the `this._now`
+ * clock-field read boxes -- measured 16 B/call for `into`, up to 32 B for the scalar readers (a family-wide
+ * V8 property, logged for 1.10.0). New containers are checked with `ArrayBuffer.isView(x) && x instanceof
+ * Float64Array` (a Proxy over a Float64Array passes instanceof alone) and length checks are NaN-safe.
+ */
+export class SlidingAggregate {
+    /**
+     * @param W        the window size; a finite number > 0.
+     * @param options  see SlidingAggregateOptions. A bad W / panes / option throws [lite-adaptive]
+     *                 typeof-first, before any allocation (an unknown key gets a did-you-mean hint, F13);
+     *                 a W too small for `panes` (W / panes underflows to 0), or a W / panes that is a
+     *                 SUBNORMAL double (the pane grid cannot hold W exactly), throws before allocation.
+     */
+    constructor(W: number, options?: SlidingAggregateOptions);
+
+    /**
+     * Add one observation of `value` at `now`. HOT, 0 B/op incl. pane rotation + clear. EXPLICIT mode (a
+     * finite, non-decreasing `now`) or COUNT mode via `add(undefined, value)` (auto-tick); the mode locks
+     * at the first add (a switch throws). `value` is REQUIRED (a finite real, |value| <= 1e150). Fail
+     * closed: a non-number / NaN / +-Infinity / over-cap value, a mode switch, a non-finite / decreasing
+     * `now`, or a `now` (or count-mode tick) outside the clock-precision domain |now| <= pw * 2^42
+     * (SA_CLOCK_SPAN) throws [lite-adaptive] (value-first, a byte-identical no-op).
+     */
+    add(now: number | undefined, value: number): this;
+
+    /**
+     * Add from a caller-owned PACKED stride-2 `[now, value]` Float64Array (`buf[i]` = now,
+     * `buf[i+1]` = value). HOT, 0 B/op -- the ZERO-BOX entry (reads both UNBOXED). EXPLICIT-time only.
+     * Same validation / byte-identical-no-op-on-reject as `add`. Throws [lite-adaptive] on a
+     * non-Float64Array `buf` or an out-of-range `i` (needs `i + 1 < buf.length`).
+     */
+    addFrom(buf: Float64Array, i: number): this;
+
+    /**
+     * Advance the window's reference time to `now` WITHOUT adding a value (the R11 idle slide). Runs the
+     * same bounded pane rotate-and-clear an add would. EXPLICIT-time only: a COUNT-locked instance
+     * throws, an UNSET instance locks EXPLICIT + anchors; monotone `now` >= lastNow. A rejected advance is
+     * a byte-identical no-op. 0 B/op.
+     */
+    advance(now: number): this;
+
+    /**
+     * Advance from a caller-owned Float64Array (`now = buf[i]`, read UNBOXED) -- the zero-box sibling of
+     * `advance`. EXPLICIT-time only. Throws [lite-adaptive] on a non-Float64Array `buf` or an
+     * out-of-range `i` (needs `i < buf.length`).
+     */
+    advanceFrom(buf: Float64Array, i: number): this;
+
+    /**
+     * The EXACT observation count over the COVERED span [w, w + W/B] (which always CONTAINS the last w;
+     * the default is the full window W). COLD, NEVER throws. A bad `w` (non-number / NaN / +-Infinity /
+     * <= 0 / > W) returns NaN; unset or an empty covered window returns 0. Boxes its return once at a
+     * monomorphic / polymorphic site (up to 16 B/call; up to 32 B at a megamorphic site -- use `into`).
+     */
+    count(w?: number): number;
+
+    /**
+     * The windowed SUM (Neumaier-merged over the live, non-empty panes). COLD, NEVER throws.
+     * |sum - exact| <= (4u + O(N u^2)) * sum|v|, u = 2^-53. A bad `w` returns NaN; unset or an empty
+     * covered window returns 0 (the empty sum is exactly 0). Boxes once.
+     */
+    sum(w?: number): number;
+
+    /**
+     * The windowed MEAN = sum / count. COLD, NEVER throws. A bad `w` returns NaN; unset or an empty
+     * covered window returns NaN (the mean of nothing is undefined). Boxes once.
+     */
+    mean(w?: number): number;
+
+    /**
+     * The windowed MIN (bit-exact; the sign of a zero extreme is unspecified). COLD, NEVER throws. A bad `w`
+     * returns NaN; unset or an empty covered window returns NaN. Boxes once (up to 16 B/call; 32 B at a
+     * megamorphic site).
+     */
+    min(w?: number): number;
+
+    /**
+     * The windowed MAX (bit-exact; the sign of a zero extreme is unspecified). COLD, NEVER throws. A bad `w`
+     * returns NaN; unset or an empty covered window returns NaN. Boxes once (up to 16 B/call; 32 B at a
+     * megamorphic site).
+     */
+    max(w?: number): number;
+
+    /**
+     * Write [count, sum, mean, min, max] over the covered window into a caller-owned Float64Array. It is
+     * 0 B/call at a monomorphic / polymorphic site (<= 4 receiver shapes); at a MEGAMORPHIC site (5+
+     * SlidingAggregate subclass shapes) the `this._now` clock-field read boxes 16 B/call (logged for
+     * 1.10.0). Returns 5 (the slot count). Throws [lite-adaptive] on a non-Float64Array `out` (TypeError,
+     * a Proxy over a Float64Array is rejected via ArrayBuffer.isView) or `out.length < 5` (RangeError,
+     * NaN-safe); a bad `w` writes 5 NaN slots; unset or an empty covered window writes count 0, sum 0,
+     * mean / min / max NaN.
+     */
+    into(out: Float64Array, w?: number): number;
+
+    /** Reset to the empty window; reuse both arrays (0-alloc) and unlock the mode. */
+    clear(): this;
+
+    /** The window size W. */
+    readonly W: number;
+    /** The pane count B (edge error is W / panes; the ring holds B+1 panes). */
+    readonly panes: number;
+    /** The locked time mode. */
+    readonly mode: 'unset' | 'explicit' | 'count';
+    /** The last applied time t (0 before the first add). */
+    readonly lastNow: number;
+    /** The fixed memory figure in bytes ((B+1) * 48). */
     readonly bytes: number;
 }

@@ -12,7 +12,7 @@
 import { zgcSuite } from '@zakkster/lite-perf-gate';
 import { ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper, SlidingHyperLogLog,
     DriftDetector, DRIFT_PH, DRIFT_CUSUM, SlidingDDSketch, SlidingCountMin,
-    DecayedReservoir } from '../../Adaptive.js';
+    DecayedReservoir, SlidingAggregate } from '../../Adaptive.js';
 
 const W = 1000;
 const EPS = 0.01;
@@ -794,6 +794,93 @@ const drMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/** Zero-alloc counter for SlidingAggregate: the stride store's byte length -- fixed at construction. */
+function growsSa(s) { return s.sa._store.buffer.byteLength; }
+
+/**
+ * SlidingAggregate add on an explicit-time SMI value stream: count += 1, the branch-free Kahan
+ * compensated sum, min / max by comparison + the pane rotate/clear, over a full, churning window so every
+ * measured add periodically crosses a pane boundary (rotate + clear to identity sentinels stays flat + 0 old-gen).
+ */
+const saAddStream = {
+    name: 'SlidingAggregate add explicit-time Smi (Kahan fold + pane rotate/clear)',
+    setup() {
+        const sa = new SlidingAggregate(1000, { panes: 8 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) sa.add(t++, (k % 100) - 50);
+        return { sa, t, sink: 0 };
+    },
+    hot(s, n) {
+        const sa = s.sa;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            sa.add(t, (t % 100) - 50);
+            t = (t + 1) | 0;
+            sink = (sink + sa.panes) | 0;   // observe state via a Smi getter (defeat DCE); never read the epoch double lastNow here -- a double getter return can box (F6), which would measure the harness, not addFrom
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsSa(s) }; },
+};
+
+/**
+ * SlidingAggregate addFrom on a packed stride-2 [now, value] Float64Array with an epoch-ms `now` (a
+ * non-Smi double) AND a fractional value, both read UNBOXED -- the zero-box entry (a plain-arg add would
+ * box both). Same Kahan fold + pane rotate/clear; must stay flat + 0 old-gen. The argument-free _advance()
+ * reads this._now, so no epoch double crosses a non-inlined call.
+ */
+const saAddFromStream = {
+    name: 'SlidingAggregate addFrom epoch-ms stride-2 [now,value] fractional (zero-box + pane rotate/clear)',
+    setup() {
+        const sa = new SlidingAggregate(1000, { panes: 8 });
+        const buf = new Float64Array(2);
+        const clk = new Float64Array(1); clk[0] = 1.75e12;   // epoch-ms clock in a slot, never a JS local
+        for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = (k % 200) * 0.25 - 25; sa.addFrom(buf, 0); }
+        return { sa, buf, clk, i: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const sa = s.sa, buf = s.buf, clk = s.clk;
+        let i = s.i | 0, sink = s.sink | 0;
+        for (let j = 0; j < n; j++) {
+            clk[0] += 1.5;
+            buf[0] = clk[0]; buf[1] = (i % 200) * 0.25 - 25;
+            sa.addFrom(buf, 0);
+            i = (i + 1) | 0;
+            sink = (sink + sa.panes) | 0;   // Smi getter only (see saAddStream)
+        }
+        s.i = i | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: growsSa(s) }; },
+};
+
+/**
+ * The teeth for the SlidingAggregate lane: add + a fresh escaping array per op -- it MUST trip the gate,
+ * proving the SlidingAggregate scenarios' flat result is a real 0-alloc measurement.
+ */
+const saMustFailAlloc = {
+    name: 'SlidingAggregate add + a fresh escaping array per op (MUST allocate)',
+    setup() {
+        const sa = new SlidingAggregate(1000, { panes: 8 });
+        let t = 0;
+        for (let k = 0; k < 4000; k++) sa.add(t++, (k % 100) - 50);
+        return { sa, t, leak: null, sink: 0 };
+    },
+    hot(s, n) {
+        const sa = s.sa;
+        let t = s.t | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            sa.add(t, (t % 100) - 50);
+            t = (t + 1) | 0;
+            const arr = new Array(64);
+            arr[0] = t;
+            s.leak = arr;
+            sink = (sink + arr[0]) | 0;
+        }
+        s.t = t | 0; s.sink = sink | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 /**
  * N1 (ROADMAP 7 N1): the calibrated must-fail control -- boxes EXACTLY ONE 16 B HeapNumber per op.
  * A Float64Array-slot clock steps by 1.0 from 0.5, so every value is x.5 (never integral, never a
@@ -843,9 +930,9 @@ zgcSuite({
         addCountStream, addTimeStream, adwinDriftStream, fdAddStream, addFromStream, fdAddFromStream,
         hkAddStream, hkAddFromStream, slAddStream, slAddCountStream, slAddFromStream,
         ddPhStream, ddCusumStream, sdAddStream, sdAddFromStream, scmAddStream, scmAddFromStream,
-        drAddStream, drAddFromStream,
+        drAddStream, drAddFromStream, saAddStream, saAddFromStream,
     ],
     mustFail: [n1OneBoxControl, hkPlainAddLargeKeyControl, mustFailAlloc, fdMustFailAlloc,
         hkMustFailAlloc, slMustFailAlloc, ddMustFailAlloc, sdMustFailAlloc, scmMustFailAlloc,
-        drMustFailAlloc],
+        drMustFailAlloc, saMustFailAlloc],
 });
