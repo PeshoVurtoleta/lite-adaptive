@@ -21,7 +21,7 @@ function mulberry32(seed) {
 // version pin (the 8th pin -> 8 VERSION pins total)
 // ---------------------------------------------------------------------------
 test('VERSION is 1.7.0 (DecayedReservoir milestone)', () => {
-    assert.equal(VERSION, '1.9.0');
+    assert.equal(VERSION, '1.10.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -564,20 +564,26 @@ test('estimateInto == estimate slot-for-slot INCLUDING the unset + bad-w case (f
     for (let k = 0; k < keys.length; k++) assert.ok(Number.isNaN(out[k]), 'unset into bad-w slot ' + k + ' -> NaN');
 });
 
-// review (F19v2): a Proxy typed array passes `instanceof Float64Array` and its get trap can run user
-// code mid-loop; estimateInto must never leave a shared hash slot live across that read.
-test('estimateInto is correct when keys is a Proxy whose get trap re-enters other sketches', async () => {
+// 1.10.0 H2-4: a Proxy typed array passes `instanceof Float64Array` but its get trap can run user code
+// mid-loop -- the re-entrancy hazard is now closed AT THE DOOR: a Proxy container is rejected before a
+// single element is read, so no trap ever fires and the throw is a byte-identical no-op.
+test('estimateInto with a Proxy keys whose get trap re-enters other sketches is rejected (1.10.0 H2-4)', async () => {
     const { HeavyKeeper } = await import('../Adaptive.js');
     const a = new SlidingCountMin(1000, { panes: 8, w: 256, d: 4, seed: 7 });
     const other = new SlidingCountMin(1000, { panes: 8, w: 256, d: 4, seed: 99 });
     const hk = new HeavyKeeper(4, 64, 4, { seed: 3 });
     const raw = new Float64Array(97);
     for (let j = 0; j < 97; j++) { raw[j] = (j * 7919) - 40000 + (j % 3 === 0 ? 2 ** 40 : 0); a.add(1, raw[j], 1 + (j % 5)); other.add(1, raw[j] + 1, 3); }
-    const keys = new Proxy(raw, { get(tgt, prop) { if (typeof prop === 'string' && /^\d+$/.test(prop)) { other.estimate(5); hk.add(2 ** 40 + 3, 1); } const v = Reflect.get(tgt, prop); return typeof v === 'function' ? v.bind(tgt) : v; } });
+    let traps = 0;
+    const keys = new Proxy(raw, { get(tgt, prop) { if (typeof prop === 'string' && /^\d+$/.test(prop)) { traps++; other.estimate(5); hk.add(2 ** 40 + 3, 1); } const v = Reflect.get(tgt, prop); return typeof v === 'function' ? v.bind(tgt) : v; } });
     assert.ok(keys instanceof Float64Array, 'the Proxy passes the container check');
-    const out = new Float64Array(97);
-    a.estimateInto(keys, out);
-    let bad = 0;
-    for (let j = 0; j < 97; j++) if (!Object.is(out[j], a.estimate(raw[j]))) bad++;
-    assert.equal(bad, 0, 'estimateInto == estimate on every key despite re-entrant user code');
+    const out = new Float64Array(97).fill(-7);
+    const snap = (o) => { const s = {}; for (const k of Object.keys(o)) { const v = o[k]; s[k] = ArrayBuffer.isView(v) ? Array.from(v) : v; } return s; };
+    const before = snap(a);
+    assert.throws(() => a.estimateInto(keys, out),
+        (e) => e instanceof TypeError && /^\[lite-adaptive\] SlidingCountMin\.estimateInto\(keys, out, w\?\) keys must be a Float64Array/.test(e.message),
+        'a Proxy keys container throws the tagged TypeError');
+    assert.equal(traps, 0, 'the rejection fired before any element was read -- the get trap never ran');
+    assert.deepEqual(snap(a), before, 'instance state is byte-identical after the rejection');
+    for (let j = 0; j < 97; j++) assert.equal(out[j], -7, 'out slot ' + j + ' untouched');
 });

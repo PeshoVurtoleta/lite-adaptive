@@ -6,6 +6,123 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-09-28
+
+The H2 HARDENING release (ROADMAP section 10; fail-open + allocation findings in the shipped classes).
+NOT a pure append: `SlidingCountMin`, `SlidingDDSketch` and `DriftDetector` change in place. MINOR bump:
+behavior changes are limited to inputs that previously produced a WRONG or corrupt answer (an
+out-of-precision clock, a Proxy / length-lying container, an `undefined` buffer read) plus the
+grid-exact pane-end move (bit-identical for a dyadic pane width). Valid inputs behave byte-identically,
+except the pane-end grid correction for a NON-dyadic pane width (the old accumulated `E += pw` drifted up to
+450 ulp) and the latched Page-Hinkley `statistic` after its first accumulator re-centre (past ~th * 2^20;
+more accurate, fire history identical on every tested stream). Gates: npm test 817/817; torture 0 B/op on
+every lane (0 major GC); test:perf 33/33; test:perf:matrix 149/149; witness ok; gates:red exit 0.
+
+### Fixed
+
+- **H2-1 -- `SlidingCountMin` and `SlidingDDSketch` fail CLOSED on a clock outside the pane-grid precision
+  domain (was a silent under-count / collapsed window).** Exact pane containment needs the double clock to
+  resolve the pane grid (`ulp(now) << pw`, `pw = W / panes`), so `|now|` (and the count-mode tick) must be
+  `<= pw * 2^42` (`SCM_CLOCK_SPAN` / `SLD_CLOCK_SPAN`); at the bound `ulp(now) <= pw * 2^-10`, so the grid
+  line `(floor(now/pw) + 1) * pw` still CONTAINS the true window. Before this, a large epoch clock at a
+  small `W` silently mis-answered: `new SlidingCountMin(1e-3)` then `add(1.75e12, 7)` x3 read `estimate 1`
+  (not 3), and the same shape collapsed a `SlidingDDSketch` window. `add` / `addFrom` / `advance` /
+  `advanceFrom` now reject a larger clock with a `RangeError [lite-adaptive]` BEFORE any state write (one
+  field compare against `this._nowMax = pw * 2^42`, precomputed in the ctor -- rebase the clock, e.g.
+  `performance.now()`, or use a larger `W`). A SUBNORMAL pane width (`W / panes < 2^-1022`,
+  `SCM_MIN_NORMAL` / `SLD_MIN_NORMAL`) is rejected at construction (it under-covers `W`). Generous for real
+  clocks (32 panes): epoch-ms allows `|now| <= 1.37e14` at `W = 1000`, `8.25e15` at `W = 60000`; `W = 16`
+  epoch-ms is legal until ~2039-09 (disclosed) and `W < 12.7` epoch-ms is rejected today; epoch-us allows
+  `1.37e17` at `W = 1e6` (`W = 1e4` rejected, min 12,733 us). Gates: `test/Hardening110.test.js` H2-1,
+  `test/differential/GridParity.test.mjs`.
+- **H2-1 (behavior change) -- `SlidingCountMin` / `SlidingDDSketch` pane ends are computed on the exact grid
+  `(k+1) * pw`, not an accumulating `E += pw`.** For a DYADIC pane width `pw` the two are bit-identical
+  (GridParity D + count-mode replay bit-identical to the 1.9.0 goldens over 20000 adds x 5 configs). For a
+  NON-DYADIC `pw` the accumulator drifted (HEAD drifted up to 450 ulp on the non-dyadic configs); the grid
+  form now matches the exact `(floor(t/pw)+1)*pw` oracle at every boundary.
+- **H2-3 -- `DriftDetector` `latch: true` PH accumulators no longer drift without bound, and the latched
+  fire no longer boxes (resolves both 1.8.0 Known limitations).** On an infinite same-direction stream the
+  running `gP` / `mMin` (and `gN` / `mMax`) drifted monotonically (~0.078/item on a square wave) toward
+  `Infinity`. The chosen fix is V0 + V3 (ROADMAP 10.1 pre-declared rule): `_clampGap(dir)` is now
+  argument-free (it reads `this._mode` / `this._threshold` from slots instead of taking the mode /
+  threshold doubles across a non-inlined call boundary -- V0), so the fire-heavy latched-PH lane measures
+  **0 B/op** fresh AND warmed and the `dd_latch_ph_fireheavy` gate tightens from `<= 4` to `<= 0.25`; and
+  a GATED re-centre (V3) runs after the arming, opposite-fire and sustained branches of the latched cold
+  `_fired()`: once `max(|mMin|, |mMax|) > threshold * DD_RECENTRE_SPAN` (`2^20`) it subtracts the running
+  min/max off the accumulators (`gP -= mMin; mMin = 0; gN -= mMax; mMax = 0`), bounding all four to
+  `threshold * 2^20 + 30` (`ulp(threshold * 2^20)` stays far below `threshold`, so the bound costs no fire
+  accuracy; it fires ~98 per 100k items on the torture drift lane). The re-arm branch is untouched
+  (`_rearm` already zeroes the accumulators). **Public output is IDENTICAL to 1.9.0 UNTIL the first
+  re-centre** (which trips only past a ~`threshold * 2^20` accumulator magnitude -- far beyond any parity
+  series, so the 1.9.0 latched-PH golden vectors and the 1.7.0 vectors stay green with no re-pin). **After
+  a re-centre trips**, `statistic` is *more accurate* (1.9.0's unbounded accumulators suffer catastrophic
+  cancellation that the bounded re-centred accumulators avoid) and a re-arm at an *exact* `threshold / 2`
+  tie may resolve differently; `fired`, `mean`, `count`, `lastDriftIndex` and `lastDirection` stay
+  bit-identical, and the fire history is identical on the tested streams. `latch: false` and CUSUM (both
+  latch modes) are bit-identical to 1.9.0. New gates: `test/Hardening110.test.js` H2-3,
+  `test/Hardening110.qa.test.js` P2, and a `dd_latch_ph_drift` torture lane.
+- **H2-4 -- every container guard rejects a Proxy-over-`Float64Array` and a NaN-length view (fail-closed),
+  under a HOT/COLD threat model that keeps the zero-GC hot path (SETTLED 2026-09-28).** All 20 `addFrom` /
+  `advanceFrom` / Into sites now verify the type with `ArrayBuffer.isView(x) && x instanceof Float64Array`
+  (a Proxy passes `instanceof` alone but not `isView`) and use NaN-safe bounds `!(i + k < n)`. HOT entry
+  points (`addFrom` / `advanceFrom`) read `x.length` ONCE into the index bound: a caller-defined subclass
+  `length` getter is the caller's own code and may run at most once per call (documented). COLD render
+  readers (`into` / `estimateInto` / `quantileInto` / `topKInto` / `sampleInto`) read the length through
+  the intrinsic `%TypedArray%.prototype.length` getter (`TA_LEN`, captured at module init), so a lying or
+  re-entrant `length` is ignored and never runs and a benign subclass is accepted with correct results.
+  A valid `Float64Array` argument behaves byte-identically. Gates: `test/Hardening110.qa.test.js` (C1-C9)
+  and `test/TrapFreeReject.test.js` (H34 rows).
+- **H2-4b -- a length-lying `Float64Array` subclass no longer slips an `undefined` buffer read past the
+  hot-path value / `now` guards (fail-closed).** Every `addFrom` / `advanceFrom` value and `now` check
+  written `x !== x || x === Infinity || x === -Infinity || ...` ACCEPTED `undefined` (a subclass whose
+  `length` getter lies makes `buf[i]` return `undefined`), which drove `DriftDetector` / `ADWIN` `_mean`
+  to `NaN` and left `_lastNow = undefined` (monotone guard off) on `ExponentialHistogram`, `ForwardDecay`,
+  `DecayedReservoir`, `SlidingHyperLogLog`, `SlidingDDSketch`. Replaced each with the positive form
+  (`!(now > -Infinity && now < Infinity)`, `!(v > 0 && v < Infinity)`, `!(x <= ADWIN_X_MAX && x >= -ADWIN_X_MAX)`,
+  `!(v > -Infinity && v < Infinity)`, `!(x <= DD_X_MAX && x >= -DD_X_MAX)`): every finite / non-finite
+  NUMBER is accepted or rejected exactly as before (byte-identical no-op on reject, reaching the same
+  thrower), only `undefined` now fails closed. `SlidingCountMin` / `SlidingDDSketch` `now` checks were
+  already safe (their `nowMax` range form rejects `undefined`); `SlidingAggregate` untouched.
+- **H2-6 -- a rejected mutating call is now a byte-identical no-op even when the bad argument is a Proxy
+  (or any object with `toString` / `valueOf` / `Symbol.toPrimitive`).** About 125 throw sites built the
+  reject message as `'...got ' + String(userArg)`; `String()` on such an object RUNS caller code AFTER the
+  guard has already decided to reject, so a re-entrant trap could mutate the same instance --
+  `SlidingCountMin`, `SlidingAggregate` and `DriftDetector` threw the tagged error yet left `total` /
+  `count` advanced (the reject was not the no-op the contract promises). Added one cold module-private
+  `describeArg(x)` helper (`typeof` + `ArrayBuffer.isView` never fire a Proxy trap; `String` only on a
+  primitive) and replaced every `String(userArg)` in a throw message with it. **Number reject messages
+  stay byte-identical**; an object / function / typed-array view is named inertly (`'an object'` /
+  `'a function'` / `'a typed-array view'`). Family-wide, every class (`SlidingAggregate` included). New
+  gate `test/TrapFreeReject.test.js` drives every validating method of all ten classes (ctors + both
+  `withAccuracy` factories) with a hostile Proxy and asserts the reject fires no caller code and mutates
+  nothing.
+
+### Changed
+
+- **`SlidingCountMin` / `SlidingDDSketch` ctors precompute `this._nowMax = pw * 2^42`** and their
+  `_anchor` / `_advance` helpers are now argument-free (they read `this._now` and compute pane ends from
+  the grid index), matching `SlidingAggregate`. No new public API; no `bytes` change.
+- **Hot-path throughput is flat.** An in-process A/B vs 1.9.0 measures hot `addFrom` at 0.98-1.01x across
+  the family, except `ExponentialHistogram` at ~0.95x (from the stricter positive-form `now` check, H2-4b);
+  latched-PH throughput is 0.98x of 1.9.0.
+- **The `SlidingHyperLogLog.countInto` reader and the `DriftDetector` `statisticInto` / `meanInto` readers
+  move to 1.11.0** (README, `llms.txt`, `Adaptive.d.ts` JSDoc). 1.10.0 is hardening only, one feature per
+  minor; the latched-PH fix that shared their 1.9.0->1.10.0 retarget ships here (H2-3).
+
+### Known limitations
+
+- **`SlidingHyperLogLog.count(w?)` is NOT 0 B/call.** It keeps its Ertl multiplicity scratch (no ARRAY
+  allocation) but RETURNS a rounded double: a stable **16 B/call** in the estimator tail even under
+  Turbofan, plus another **16 B** when the caller is not yet optimized (16-32 B/call). The `q_shll_count`
+  lane gates it in the documented band `[12, 40]` B/op. The 0-alloc `countInto` reader is planned for
+  1.11.0 (the zero-alloc readers minor).
+- **H2-5 -- a scalar reader that RETURNS a double boxes one 16 B HeapNumber at a MEGAMORPHIC call site
+  (5+ receiver subclass shapes).** This is a V8 property (a double FIELD read across such a site boxes),
+  not a fix in reach without moving every hot body onto a per-instance state slab (which changes `bytes`);
+  logged for a later minor, measure-and-document only. Per-class INFO lanes record it: `mega5` reads
+  `SlidingCountMin` 49 B/op and `SlidingDDSketch` 70.5 B/op at 5 maps. The `into` / `estimateInto` /
+  `quantileInto` / `forEach` / `sampleInto` readers stay 0 B/call and are the render path.
+
 ## [1.9.0] - 2026-09-27
 
 The sixth additive post-1.0 member (`SlidingAggregate`, ADR 0012) -- a PURE APPEND. All nine prior classes
@@ -283,7 +400,9 @@ gates:red exit 0.
   A new `dd_latch_ph_fireheavy` lane gates it at a documented ceiling `<= 4` B/op (a regression to a
   per-add box `>= 16` fails). A related latent concern: in the never-re-arming case the latched PH
   accumulators drift without bound (monotone `gP` / `mMin`), which would eventually reach Infinity and
-  trip the `_guardFinite` throw. Both are tracked for 1.9.0 (ROADMAP 8 / 9).
+  trip the `_guardFinite` throw. **RESOLVED in 1.10.0 (H2-3):** the argument-free `_clampGap(dir)` (V0)
+  removes the box (fire-heavy latched-PH is 0 B/op fresh and warmed) and the gated re-centre (V3) bounds
+  all four accumulators to `threshold * 2^20 + 30`.
 
 ## [1.7.0] - 2026-09-26
 

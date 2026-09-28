@@ -219,3 +219,26 @@ sub-window `w` (`<= 0`, `> W`, NaN, non-number) returns NaN for BOTH `quantile` 
 (`quantile` -> NaN, `count()` -> 0). A wrong CONTAINER type stays a programming error: `quantileInto`
 with a non-Float64Array `qs`/`out` or an `out` shorter than `qs` still THROWS. `SlidingHyperLogLog`
 `count(badW)` and `SlidingCountMin` `estimate(k, badW)` move to the same NaN contract in step 4 (1.7.0).
+
+## Amendment (1.10.0) -- clock-precision domain (H2-1)
+
+The pane grid is exact only while the double clock resolves it: `ulp(now) << pw`, `pw = W / panes`.
+Before 1.10.0 there was no clock bound, so a large epoch clock at a small `W` silently collapsed the
+window -- `new SlidingDDSketch(1e-3)` then `add(1.75e12, ...)` lost the low bits of `floor(now / pw)`
+and the pane-end arithmetic, so a value added on the same tick read out of an empty window.
+
+DECISION (design-parity with SlidingAggregate / SlidingCountMin -- the family shares this guard;
+module-private consts, no new API):
+
+- `SLD_CLOCK_SPAN = 2^42`, `SLD_MIN_NORMAL = 2^-1022`.
+- The ctor precomputes `this._nowMax = pw * 2^42`. `add` / `addFrom` / `advance` / `advanceFrom` reject
+  `|now| > pw * 2^42` (count mode: the next tick past `pw * 2^42`) with a `RangeError [lite-adaptive]`
+  made BEFORE any state write (a byte-identical no-op). At the bound `ulp(now) <= pw * 2^-10`, so the
+  grid line `(floor(now/pw)+1)*pw` still CONTAINS the true window.
+- A SUBNORMAL pane width (`W / panes < 2^-1022`) is rejected at construction (it under-covers `W`).
+- Pane ends are computed from the grid index (`(k+1)*pw`), not an accumulating `E += pw`. Bit-identical
+  for a dyadic `pw`; for a non-dyadic `pw` the grid form removes the accumulator drift.
+
+Min legal `W` for a clock magnitude `C` is `panes * C / 2^42` (32 panes: epoch-ms `1.37e14` at `W=1000`,
+`8.25e15` at `W=60000`; `W=16` epoch-ms legal until ~2039-09, `W < 12.7` rejected; epoch-us `1.37e17` at
+`W=1e6`, `W=1e4` rejected). Remedy: rebase the clock or use a larger `W`.

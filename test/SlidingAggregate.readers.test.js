@@ -227,11 +227,18 @@ test('T3 into: wrong container throws (TypeError), short throws (RangeError), ba
     const proxy = new Proxy(new Float64Array(5), {});
     assert.equal(proxy instanceof Float64Array, true, 'sanity: the proxy fools instanceof');
     assert.throws(() => sa.into(proxy), TypeError, 'proxy out rejected (isView fails closed)');
-    // a Float64Array subclass whose length getter returns NaN -> the NaN-safe !(len >= 5) rejects it.
-    class NaNLen extends Float64Array { get length() { return NaN; } }
+    // H34 (container-length threat model, SETTLED 2026-09-28): into() is a COLD reader -- it reads the
+    // length through the intrinsic %TypedArray%.length getter (TA_LEN), so a benign NaN-length subclass
+    // over a valid 8-slot backing is ACCEPTED (TA_LEN reads 8, not NaN) and its own length getter is
+    // NEVER invoked. The result is byte-identical to a plain 8-slot Float64Array.
+    let getterCalls = 0;
+    class NaNLen extends Float64Array { get length() { getterCalls++; return NaN; } }
     const nanLen = new NaNLen(8);
     assert.ok(Number.isNaN(nanLen.length), 'sanity: subclass length reads NaN');
-    assert.throws(() => sa.into(nanLen), /into out\.length \(NaN\) must be >= 5/, 'NaN-length out rejected');
+    getterCalls = 0;
+    assert.equal(sa.into(nanLen), 5, 'NaN-length subclass out ACCEPTED (cold reader reads TA_LEN=8)');
+    assert.equal(getterCalls, 0, 'the subclass length getter is never invoked (intrinsic TA_LEN)');
+    assert.equal(nanLen[0], 1, 'count landed in slot 0'); assert.equal(nanLen[1], 5, 'sum landed in slot 1');
     const out = new Float64Array(5);
     assert.equal(sa.into(out, -1), 5, 'bad w still returns 5');
     for (let i = 0; i < 5; i++) assert.ok(Number.isNaN(out[i]), 'bad w -> NaN slot ' + i);

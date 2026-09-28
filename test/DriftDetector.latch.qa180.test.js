@@ -174,29 +174,25 @@ test('ADVERSARIAL: a HUGE threshold (1e300) never fires on a +-1e150 stream; get
     }
 });
 
-test('ADVERSARIAL: a RE-ENTRANT write -- addFrom through a Proxy buffer whose get trap calls add() on the SAME instance', () => {
+// 1.10.0 H2-4: a re-entrant write through an addFrom Proxy buffer whose get trap calls add() on the
+// SAME instance is now impossible -- the Proxy buffer is rejected before buf[i] is read, so the trap
+// never runs and addFrom is a byte-identical no-op.
+test('ADVERSARIAL: addFrom through a Proxy buffer whose get trap re-enters add() on the SAME instance is rejected (1.10.0 H2-4)', () => {
     for (const [name, m, ex] of MODES) {
         const a = mk(m, ex, { latch: true, threshold: 10 });
-        const b = mk(m, ex, { latch: true, threshold: 10 });
-        const raw = new Float64Array(1);
+        const raw = new Float64Array([7]);
+        let traps = 0;
         const buf = new Proxy(raw, { get(t, p) {
-            if (p === '0') a.add(-2);                         // re-entrant write BEFORE the value is returned
+            if (p === '0') { traps++; a.add(-2); }            // would be a re-entrant write BEFORE the value is returned
             const v = Reflect.get(t, p); return typeof v === 'function' ? v.bind(t) : v; } });
         assert.ok(buf instanceof Float64Array);
-        const seq = [...block(1, 40), ...block(40, 40)];
-        let mism = 0, anyFire = 0;
-        for (const x of seq) {
-            raw[0] = x;
-            const ra = a.addFrom(buf, 0);                     // = the OUTER item's fire (inner add's fire is its own)
-            b.add(-2);
-            const rb = b.add(x);
-            if (ra !== rb || !Object.is(a.lastDriftIndex, b.lastDriftIndex) || !Object.is(a.lastDirection, b.lastDirection) ||
-                a.latched !== b.latched) mism++;
-            if (rb) anyFire++;
-        }
-        assert.equal(mism, 0, name + ' state == the explicit (add(-2), add(x)) sequence after every item');
-        assert.ok(!Number.isNaN(a.lastDriftIndex), name + ' the stream did fire');
-        assert.ok(Object.is(a.lastDriftIndex, b.lastDriftIndex) && Object.is(a.statistic, b.statistic), name);
+        const snap = (o) => { const s = {}; for (const k of Object.keys(o)) { const v = o[k]; s[k] = ArrayBuffer.isView(v) ? Array.from(v) : v; } return s; };
+        const before = snap(a);
+        assert.throws(() => a.addFrom(buf, 0),
+            (e) => e instanceof TypeError && /^\[lite-adaptive\] DriftDetector\.addFrom\(buf, i\)/.test(e.message),
+            name + ' a Proxy buffer throws the tagged TypeError');
+        assert.equal(traps, 0, name + ' the get trap never ran -- rejection precedes the buf[i] read');
+        assert.deepEqual(snap(a), before, name + ' instance state is byte-identical after the rejection');
     }
 });
 

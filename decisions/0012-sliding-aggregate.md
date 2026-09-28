@@ -111,3 +111,11 @@ GC; pinned-probe lanes incl. EVENT-HEAVY rotate-every-add epoch lanes (the 1.8.0
 hides in an average over quiet adds); JumpTiming +1e12 with a per-pane-loop control.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
+
+## Amendment (1.10.0) -- family parity on the clock-precision domain
+
+SlidingAggregate's clock-precision domain guard (`|now| <= pw * 2^42`, subnormal `pw` rejected,
+grid-index pane ends) is now shared: in 1.10.0 SlidingCountMin (`SCM_CLOCK_SPAN` / `SCM_MIN_NORMAL`) and
+SlidingDDSketch (`SLD_CLOCK_SPAN` / `SLD_MIN_NORMAL`) adopt the same guard and the same argument-free
+`_advance()` / `_anchor()` reading `this._now` (H2-1; ADRs 0010 / 0008). The three windowed-pane members
+now fail closed identically on an out-of-precision clock.

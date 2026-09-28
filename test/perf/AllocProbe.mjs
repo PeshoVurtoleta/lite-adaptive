@@ -578,6 +578,96 @@ function saAddMegaRot() {
         hot(s, n) { const sa = s.sa, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; callAdd(sa, clk[0], FRAC[i & 15]); acc[0] += sa.lastNow; } } };
 }
 
+// ===========================================================================
+// 1.10.0 H2 hardening probe lanes (batch 1, T1). Event-heavy pw=1 rotate-every-op lanes for SCM/SDD
+// (the H2-2 argument-tagging measurement: SCM/SDD pass `t` to _advance(t)/_anchor(t), so a rotation
+// may tag an epoch double), a must-box SCM copy of saAddMegaRot, and mega5_<cls>_af for all ten
+// classes (H2-5 megamorphic double-field boxing, INFO). Every clock/key/value lives in a Float64Array
+// slot; sinks accumulate into a slot; each setup throws if its rotate-every-op precondition fails.
+// ===========================================================================
+
+// SCM(32, {panes:32, w:128, d:4, seed:7}) -> pw = 1; epoch clock +1.5 rotates EVERY add. The setup
+// asserts _cur advances on each of a handful of warm ops (fail closed if it does not rotate).
+function scmAfEpochRot() {
+    return { setup() { const scm = new SlidingCountMin(32, { panes: 32, w: 128, d: 4, seed: 7 }); const buf = new Float64Array(3); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        buf[0] = clk[0]; buf[1] = 1; buf[2] = 1; scm.addFrom(buf, 0);   // lock explicit + anchor
+        let moved = 0; for (let k = 0; k < 8; k++) { const before = scm._cur; clk[0] += 1.5; buf[0] = clk[0]; buf[1] = (k & 1023) + 1; buf[2] = 1; scm.addFrom(buf, 0); if (scm._cur !== before) moved++; }
+        if (moved < 8) throw new Error('scm_af_epoch_rot setup: expected a rotation every op (pw=1), only ' + moved + '/8 moved');
+        return { scm, buf, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const scm = s.scm, buf = s.buf, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = (i & 1023) + 1; buf[2] = 1; scm.addFrom(buf, 0); acc[0] += scm.saturated; } } };
+}
+// SCM pw=1 rotate-every-op via advanceFrom (idle slide).
+function scmAdvEpochRot() {
+    return { setup() { const scm = new SlidingCountMin(32, { panes: 32, w: 128, d: 4, seed: 7 }); const buf = new Float64Array(3); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        buf[0] = clk[0]; buf[1] = 1; buf[2] = 1; scm.addFrom(buf, 0);   // lock explicit + anchor
+        const ab = new Float64Array(1); let moved = 0; for (let k = 0; k < 8; k++) { const before = scm._cur; clk[0] += 1.5; ab[0] = clk[0]; scm.advanceFrom(ab, 0); if (scm._cur !== before) moved++; }
+        if (moved < 8) throw new Error('scm_adv_epoch_rot setup: expected a rotation every op (pw=1), only ' + moved + '/8 moved');
+        return { scm, ab, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const scm = s.scm, ab = s.ab, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; ab[0] = clk[0]; scm.advanceFrom(ab, 0); acc[0] += scm.lastNow; } } };
+}
+// SDD(32, {alpha:.01, panes:32}) -> pw = 1; epoch clock +1.5 rotates EVERY add. value FRAC[i&15]+1.
+function sddAfEpochRot() {
+    return { setup() { const sd = new SlidingDDSketch(32, { alpha: 0.01, panes: 32 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        buf[0] = clk[0]; buf[1] = 1; sd.addFrom(buf, 0);   // lock explicit + anchor
+        let moved = 0; for (let k = 0; k < 8; k++) { const before = sd._cur; clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[k & 15] + 1; sd.addFrom(buf, 0); if (sd._cur !== before) moved++; }
+        if (moved < 8) throw new Error('sdd_af_epoch_rot setup: expected a rotation every op (pw=1), only ' + moved + '/8 moved');
+        return { sd, buf, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const sd = s.sd, buf = s.buf, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[i & 15] + 1; sd.addFrom(buf, 0); acc[0] += (sd.collapsed ? 1 : 0); } } };
+}
+// SDD pw=1 rotate-every-op via advanceFrom (idle slide).
+function sddAdvEpochRot() {
+    return { setup() { const sd = new SlidingDDSketch(32, { alpha: 0.01, panes: 32 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        buf[0] = clk[0]; buf[1] = 1; sd.addFrom(buf, 0);   // lock explicit + anchor
+        const ab = new Float64Array(1); let moved = 0; for (let k = 0; k < 8; k++) { const before = sd._cur; clk[0] += 1.5; ab[0] = clk[0]; sd.advanceFrom(ab, 0); if (sd._cur !== before) moved++; }
+        if (moved < 8) throw new Error('sdd_adv_epoch_rot setup: expected a rotation every op (pw=1), only ' + moved + '/8 moved');
+        return { sd, ab, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const sd = s.sd, ab = s.ab, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; ab[0] = clk[0]; sd.advanceFrom(ab, 0); acc[0] += sd.lastNow; } } };
+}
+// MUST-BOX (>= 12): the pw=1 SCM copy of saAddMegaRot. A fractional now through the megamorphic
+// callAdd site boxes at the boundary; the key is a Smi. Proves the SCM event-heavy lanes have teeth.
+function scmAddMegaRot() {
+    return { setup() { megamorphizeCallAdd(); const scm = new SlidingCountMin(32, { panes: 32, w: 128, d: 4, seed: 7 }); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+        for (let k = 0; k < 400; k++) { clk[0] += 1.5; callAdd(scm, clk[0], (k & 1023) + 1); } return { scm, clk, acc: new Float64Array(1) }; },
+        hot(s, n) { const scm = s.scm, clk = s.clk, acc = s.acc; for (let i = 0; i < n; i++) { clk[0] += 1.5; callAdd(scm, clk[0], (i & 1023) + 1); acc[0] += scm.saturated; } } };
+}
+
+// --- H2-5 mega5: 5 distinct receiver maps (base + 4 empty subclasses) at ONE shared addFrom site.
+// A megamorphic `o.addFrom(buf, i)` cannot inline; the callee's `this._now` (or first-field) double
+// read then boxes ~16 B/op (a V8 property, family-wide). INFORMATIONAL -- band [m-4, m+4] around the
+// measured HEAD value m. `callAFM` is the single shared site; each config fills buf per its layout. ---
+function callAFM(o, buf, i) { return o.addFrom(buf, i); }
+/** 5 distinct constructors (Base + 4 fresh empty subclasses) -> 5 maps -> the site goes megamorphic. */
+function shapes5(Base) { class MA extends Base {} class MB extends Base {} class MC extends Base {} class MD extends Base {} return [Base, MA, MB, MC, MD]; }
+// per-class mega5 addFrom config: make(Ctor)->instance; fill(buf, clk, i)->writes the op's slots.
+const MEGA5_CFG = {
+    eh: { base: ExponentialHistogram, make: (C) => new C(1000, 0.01), width: 2, clk: CLK_EPOCH, fill(buf, clk, i) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[i & 15] + 1; } },
+    adwin: { base: ADWIN, make: (C) => new C(0.1), width: 1, clk: 0, fill(buf, clk, i) { buf[0] = FRAC[i & 15] + ((i >> 9) & 1) * 10; } },
+    fd: { base: ForwardDecay, make: (C) => new C(1e9), width: 2, clk: CLK_EPOCH, fill(buf, clk, i) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[i & 15]; } },
+    hk: { base: HeavyKeeper, make: (C) => new C(4, 512, 16, { seed: 4 }), width: 2, clk: 0, fill(buf, clk, i) { buf[0] = (i & 1023) + 1; buf[1] = (i & 7) + 1; } },
+    shll: { base: SlidingHyperLogLog, make: (C) => new C(1000, { p: 10, ringCap: 8, seed: 3 }), width: 2, clk: CLK_EPOCH, fill(buf, clk, i) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((i * 2654435761) >>> 0) % 5000; } },
+    dd: { base: DriftDetector, make: (C) => new C(DRIFT_PH, { delta: 0.005, threshold: 5 }), width: 1, clk: 0, fill(buf, clk, i) { buf[0] = FRAC[i & 15] + ((i >> 9) & 1) * 10; } },
+    sdd: { base: SlidingDDSketch, make: (C) => new C(1000, { alpha: 0.01, panes: 8 }), width: 2, clk: CLK_EPOCH, fill(buf, clk, i) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[i & 15] + 1; } },
+    scm: { base: SlidingCountMin, make: (C) => new C(1000, { panes: 8, w: 128, d: 4, seed: 7 }), width: 3, clk: CLK_EPOCH, fill(buf, clk, i) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = (i & 1023) + 1; buf[2] = 1; } },
+    dr: { base: DecayedReservoir, make: (C) => new C(32, 1e5, { seed: 7 }), width: 2, clk: CLK_EPOCH, fill(buf, clk, i) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[i & 15]; } },
+    sa: { base: SlidingAggregate, make: (C) => new C(1000, { panes: 8 }), width: 2, clk: CLK_EPOCH, fill(buf, clk, i) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[i & 15]; } },
+};
+function mega5AF(kind) {
+    const cfg = MEGA5_CFG[kind];
+    return {
+        setup() {
+            const ctors = shapes5(cfg.base);
+            const insts = ctors.map((C) => cfg.make(C));
+            const buf = new Float64Array(cfg.width);
+            const clk = new Float64Array(1); clk[0] = cfg.clk;
+            // megamorphize the callAFM site across all 5 maps (drive each with its own monotone clock).
+            for (let i = 0; i < 4000; i++) { cfg.fill(buf, clk, i); callAFM(insts[i % 5], buf, 0); }
+            return { insts, buf, clk, acc: new Float64Array(1) };
+        },
+        hot(s, n) { const insts = s.insts, buf = s.buf, clk = s.clk, acc = s.acc, fill = cfg.fill;
+            for (let i = 0; i < n; i++) { fill(buf, clk, i); callAFM(insts[i % 5], buf, 0); acc[0] += 1; } },
+    };
+}
+
 export const LANES = {
     n1, noop,
     eh_addFrom, fd_addFrom, shll_addFrom, sd_addFrom, scm_addFrom, dr_addFrom,
@@ -673,6 +763,24 @@ export const LANES = {
     // must-box controls (>= 12): mean over 5 maps; fractional add through the megamorphic callAdd site.
     q_sa_mean_mega: qSaMeanMega(),
     sa_add_mega_rot: saAddMegaRot(),
+
+    // 1.10.0 H2 hardening (batch 1, T1). SCM/SDD event-heavy pw=1 rotate-every-op (H2-2 measurement);
+    // the must-box SCM copy of saAddMegaRot; mega5_<cls>_af for all ten classes (H2-5, INFO).
+    scm_af_epoch_rot: scmAfEpochRot(),
+    scm_adv_epoch_rot: scmAdvEpochRot(),
+    sdd_af_epoch_rot: sddAfEpochRot(),
+    sdd_adv_epoch_rot: sddAdvEpochRot(),
+    scm_add_mega_rot: scmAddMegaRot(),
+    mega5_eh_af: mega5AF('eh'),
+    mega5_adwin_af: mega5AF('adwin'),
+    mega5_fd_af: mega5AF('fd'),
+    mega5_hk_af: mega5AF('hk'),
+    mega5_shll_af: mega5AF('shll'),
+    mega5_dd_af: mega5AF('dd'),
+    mega5_sdd_af: mega5AF('sdd'),
+    mega5_scm_af: mega5AF('scm'),
+    mega5_dr_af: mega5AF('dr'),
+    mega5_sa_af: mega5AF('sa'),
 };
 
 // ---------------------------------------------------------------------------

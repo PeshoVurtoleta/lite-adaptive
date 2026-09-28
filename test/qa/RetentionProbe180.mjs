@@ -15,6 +15,7 @@ const CYCLES = 10, PER = 50;
 const keys = new Float64Array(64), out = new Float64Array(64), buf = new Float64Array(3);
 for (let j = 0; j < 64; j++) keys[j] = (j & 1 ? 2 ** 31 + j : -(2 ** 31) - j) + (j % 3 === 0 ? 2 ** 40 : 0);
 const sink = new Float64Array(1);
+let rejects = 0;   // count of tagged estimateInto(Proxy) rejections (expected: CYCLES * PER)
 
 function cycle(c) {
     for (let k = 0; k < PER; k++) {
@@ -25,8 +26,11 @@ function cycle(c) {
         }
         sink[0] += scm.total() + scm.total(250) + scm.estimateInto(keys, out) + out[5];
         scm.estimateInto(keys, out, 500);
+        // 1.10.0 H2-4: a Proxy container is rejected at the door -- count the tagged throws so the parent
+        // gate proves the rejection is real (and a byte-identical no-op that leaks nothing).
         const px = new Proxy(keys, { get(t, p) { const v = Reflect.get(t, p); return typeof v === 'function' ? v.bind(t) : v; } });
-        scm.estimateInto(px, out);
+        try { scm.estimateInto(px, out); }
+        catch (e) { if (e instanceof TypeError && /^\[lite-adaptive\] SlidingCountMin\.estimateInto/.test(e.message)) rejects++; }
         sink[0] += out[1];
         tracker.track(scm, noop, 'scm', { audit: true });
         scm.clear();
@@ -66,4 +70,4 @@ for (let g = 0; g < 20 && live > 0; g++) { globalThis.gc(); await sleep(25); liv
 const findings = tracker.audit().length;
 const steady = heap.slice(1);   // cycle 0 = warm-up (JIT code, lazily-built shared tables)
 const spread = Math.max(...steady) - Math.min(...steady);
-console.log(JSON.stringify({ live, findings, tracked: CYCLES * PER * 4, heap, spread, sinkFinite: Number.isFinite(sink[0]) }));
+console.log(JSON.stringify({ live, findings, tracked: CYCLES * PER * 4, heap, spread, rejects, expectRejects: CYCLES * PER, sinkFinite: Number.isFinite(sink[0]) }));

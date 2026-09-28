@@ -594,6 +594,48 @@ async function main() {
     const ddFromLBytes = Math.max(0, Math.round(ddFromLBpc));
     const ddFromLOk = ddFromLBytes === 0;
 
+    // DriftDetector add PH latch RE-CENTRE (v1.10.0 T8). A fire-heavy latched-PH lane on a fast-drift
+    // signal so the gated PH re-centre (gP -= mMin; mMin = 0; gN -= mMax; mMax = 0) executes INSIDE
+    // the measured loop, not just its branch test. A tiny threshold (0.01) makes the re-centre span
+    // th*2^20 ~ 10486, and a sawtooth ramp (2048-item rise) drives gN/mMax across it ~98x per 100k
+    // items (~2 per 2048-item ramp; measured, matches the prior record) -- steady through every batch.
+    // The re-centre body must allocate NOTHING (0 B/op). Signal
+    // is read UNBOXED from a precomputed Float64Array pattern via addFrom. A raw-accumulator drop
+    // counter (mMax/mMin snapping from past half-span to 0, read from the object's own fields -- not a
+    // library hook) proves the re-centre truly FIRED inside the measured window; count > 0 is required,
+    // so a disabled re-centre (mMax climbs, never snaps) fails the lane instead of passing on 0 B/op.
+    const DD_DRIFT_PAT_N = 2048;
+    const DD_DRIFT_PAT = new Float64Array(DD_DRIFT_PAT_N);
+    for (let p = 0; p < DD_DRIFT_PAT_N; p++) DD_DRIFT_PAT[p] = p * 0.02;   // rise 0 -> ~40.94, then wrap
+    const DD_DRIFT_HALFSPAN = 0.01 * 1048576 * 0.5;   // (th * DD_RECENTRE_SPAN) / 2 -- the snap threshold
+    const ddDrift = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 0.01, latch: true });
+    const DDDBUF = new Float64Array(1);
+    const DDDPREV = new Float64Array(2);   // [prevMMax, prevMMin] in typed slots so no fractional double is boxed
+    let ddDriftI = 0;
+    let ddDriftRecentres = 0;
+    for (let k = 0; k < 40000; k++) { DDDBUF[0] = DD_DRIFT_PAT[ddDriftI & (DD_DRIFT_PAT_N - 1)]; ddDrift.addFrom(DDDBUF, 0); ddDriftI++; }
+    let ddDriftSink = 0;
+    const ddDriftStep = () => {
+        DDDBUF[0] = DD_DRIFT_PAT[ddDriftI & (DD_DRIFT_PAT_N - 1)];   // fast-drift sawtooth -> re-centre fires
+        const cut = ddDrift.addFrom(DDDBUF, 0);
+        // raw accumulator drop: an mMax/mMin that had climbed past half the span then snapped to 0 WHILE
+        // STILL LATCHED is a re-centre (the test's OWN before/after read of the object field, no library
+        // hook). The still-latched guard is what makes it re-centre-SPECIFIC: a re-arm / reset also zeroes
+        // mMax on this sawtooth's wrap, but it UNLATCHES (_lDir -> 0), so latched is false then and is not
+        // counted -- a disabled re-centre reads 0 here and fails the lane (proven by the no-re-centre copy).
+        if (ddDrift.latched && ddDrift._mMax === 0 && DDDPREV[0] > DD_DRIFT_HALFSPAN) ddDriftRecentres = (ddDriftRecentres + 1) | 0;
+        if (ddDrift.latched && ddDrift._mMin === 0 && DDDPREV[1] < -DD_DRIFT_HALFSPAN) ddDriftRecentres = (ddDriftRecentres + 1) | 0;
+        DDDPREV[0] = ddDrift._mMax; DDDPREV[1] = ddDrift._mMin;
+        ddDriftI = (ddDriftI + 1) | 0;
+        ddDriftSink = (ddDriftSink + (cut ? 1 : 0) + (ddDrift.latched ? 1 : 0) + (ddDrift.count & 255)) | 0;   // observe (defeat DCE)
+    };
+    const ddDriftRes = measureAllocs(ddDriftStep, { iterations: 100000, batches: 8 });
+    const ddDriftBpc = ddDriftRes.bytesPerCall === null ? 0 : ddDriftRes.bytesPerCall;
+    const ddDriftBytes = Math.max(0, Math.round(ddDriftBpc));
+    // fail closed on an unmeasured lane (bytesPerCall === null must not pass) AND require the re-centre to
+    // have actually fired inside the measured loop (count > 0), so a disabled re-centre cannot pass here.
+    const ddDriftOk = ddDriftRes.bytesPerCall !== null && ddDriftBytes === 0 && ddDriftRecentres > 0;
+
     // ---- phase 2a-septies: SlidingDDSketch -- add (log-bucket key + pane rotate/clear + collapse) +
     // the ZERO-BOX addFrom on FRACTIONAL [now, value] + quantile + quantileInto + clear. ----
     // SlidingDDSketch add: an explicit-time SMI `now` + positive value over a full, churning window so
@@ -947,10 +989,13 @@ async function main() {
         const dt1 = performance.now() - t1;
         if (slH.count() !== 0 || dt1 >= 50) hugeOk = false;
 
+        // 1.10.0: SlidingDDSketch bounds the clock to pw*2^42 (W=1000, panes=32 -> nowMax = 1.374e14),
+        // so this astronomical single-call jump stays IN-DOMAIN at 1e14 (~3e12 pane-widths -- still far
+        // past B, so the bounded rotate-then-re-anchor branch runs and must NOT scan the jump).
         const sdH = new SlidingDDSketch(1000, { alpha: 0.01, panes: 32 });
         for (let t = 0; t < 4000; t++) sdH.add(t, (t % 100) + 1);
         const t2 = performance.now();
-        sdH.advance(1e15);
+        sdH.advance(1e14);
         const dt2 = performance.now() - t2;
         if (sdH.count() !== 0 || !Number.isNaN(sdH.quantile(0.5)) || dt2 >= 50) hugeOk = false;
     }
@@ -1006,6 +1051,48 @@ async function main() {
     const scmRotBpc = scmRotRes.bytesPerCall === null ? 0 : scmRotRes.bytesPerCall;
     const scmRotBytes = Math.max(0, Math.round(scmRotBpc));
     const scmRotOk = scmRotBytes === 0;
+
+    // SlidingCountMin ROTATE-EVERY-ADD addFrom (EVENT-HEAVY epoch): pw = 64/64 = 1 and an epoch-ms clock
+    // stepped +1.5 per addFrom, so EVERY add rotates + clears a pane with a NON-Smi `now` read UNBOXED
+    // from a packed stride-3 [now, key, count] Float64Array. The argument-free _advance() reads this._now,
+    // so no epoch double crosses a non-inlined call -- this lane is the teeth for that (a per-rotation box
+    // hides in an average over quiet adds; here every add rotates). 1.75e12 + 1.5 * 100000 stays well
+    // under nowMax = pw * 2^42 = 4.398e12, so every add is in the clock-precision domain.
+    const scmRotFrom = new SlidingCountMin(64, { panes: 64, w: 64, d: 3, seed: 6 });
+    const SCMROTBUF = new Float64Array(3);
+    let scmrfNow = 1.75e12, scmrfI = 0;
+    for (let k = 0; k < 400; k++) { scmrfNow += 1.5; SCMROTBUF[0] = scmrfNow; SCMROTBUF[1] = ((k * 2654435761) >>> 0) % 2000; SCMROTBUF[2] = (k & 7) + 1; scmRotFrom.addFrom(SCMROTBUF, 0); }
+    let scmRotFromSink = 0;
+    const scmRotFromStep = () => {
+        scmrfNow += 1.5; SCMROTBUF[0] = scmrfNow; SCMROTBUF[1] = ((scmrfI * 2654435761) >>> 0) % 2000; SCMROTBUF[2] = (scmrfI & 7) + 1;   // epoch now, rotate every add
+        scmRotFrom.addFrom(SCMROTBUF, 0);
+        scmrfI = (scmrfI + 1) | 0;
+        scmRotFromSink = (scmRotFromSink + scmRotFrom.saturated) | 0;   // observe state (defeat DCE)
+    };
+    const scmRotFromRes = measureAllocs(scmRotFromStep, { iterations: 100000, batches: 8 });
+    const scmRotFromBpc = scmRotFromRes.bytesPerCall === null ? 0 : scmRotFromRes.bytesPerCall;
+    const scmRotFromBytes = Math.max(0, Math.round(scmRotFromBpc));
+    const scmRotFromOk = scmRotFromBytes === 0;
+
+    // SlidingDDSketch ROTATE-EVERY-ADD addFrom (EVENT-HEAVY epoch): pw = 64/64 = 1 and an epoch-ms clock
+    // stepped +1.5 per addFrom, so EVERY add rotates + clears a pane with a NON-Smi `now` read UNBOXED
+    // from a packed stride-2 [now, value] Float64Array (the same argument-free _advance() zero-box teeth
+    // as SCM above). 1.75e12 + 1.5 * 100000 stays under nowMax = pw * 2^42 = 4.398e12 (in-domain).
+    const sddRotFrom = new SlidingDDSketch(64, { alpha: 0.01, panes: 64 });
+    const SDDROTBUF = new Float64Array(2);
+    let sdrfNow = 1.75e12, sdrfI = 0;
+    for (let k = 0; k < 400; k++) { sdrfNow += 1.5; SDDROTBUF[0] = sdrfNow; SDDROTBUF[1] = ((k * 40503) % 9973) + 0.5; sddRotFrom.addFrom(SDDROTBUF, 0); }
+    let sddRotFromSink = 0;
+    const sddRotFromStep = () => {
+        sdrfNow += 1.5; SDDROTBUF[0] = sdrfNow; SDDROTBUF[1] = ((sdrfI * 40503) % 9973) + 0.5;   // epoch now, rotate every add
+        sddRotFrom.addFrom(SDDROTBUF, 0);
+        sdrfI = (sdrfI + 1) | 0;
+        sddRotFromSink = (sddRotFromSink + (sddRotFrom.collapsed ? 1 : 0)) | 0;   // observe state (defeat DCE)
+    };
+    const sddRotFromRes = measureAllocs(sddRotFromStep, { iterations: 100000, batches: 8 });
+    const sddRotFromBpc = sddRotFromRes.bytesPerCall === null ? 0 : sddRotFromRes.bytesPerCall;
+    const sddRotFromBytes = Math.max(0, Math.round(sddRotFromBpc));
+    const sddRotFromOk = sddRotFromBytes === 0;
 
     // SlidingCountMin addFrom: epoch-ms now (non-Smi double) + key + count read UNBOXED from a packed
     // stride-3 [now, key, count] Float64Array -- the gated zero-box floor (a plain-arg add would box all).
@@ -1125,9 +1212,14 @@ async function main() {
     let scmBigT = 0;
     for (let k = 0; k < 300; k++) { scmBig.add(scmBigT, ((k * 40503) >>> 0) % 5000); scmBigT += 1000 / 300; }
     let scmBigSink = 0;
+    // 1.10.0: the clock is bounded to pw*2^42 (W=1000, panes=32 -> nowMax = 1.374e14), so the jump
+    // cannot accumulate unbounded across iterations. clear() + refill each step (0 alloc) resets the
+    // monotone clock, then a single 1e12 jump (< nowMax) still forces the grid-re-anchor branch.
     const scmBigStep = () => {
+        scmBig.clear();
+        scmBigT = 0;
         for (let k = 0; k < 300; k++) { scmBig.add(scmBigT, ((k * 40503) >>> 0) % 5000); scmBigT += 1000 / 300; }
-        scmBigT += 1e12;                       // ASTRONOMICAL jump: forces the grid-re-anchor branch
+        scmBigT += 1e12;                       // ASTRONOMICAL jump (< nowMax): forces the grid-re-anchor branch
         scmBig.advance(scmBigT);
         scmBigSink = (scmBigSink + scmBig.saturated) | 0;
     };
@@ -1516,11 +1608,11 @@ async function main() {
         addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk &&
         hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk && slCountOk &&
         ddPhOk && ddCuOk && ddFromOk && ddClearOk &&
-        ddPhLOk && ddCuLOk && ddFromLOk &&
+        ddPhLOk && ddCuLOk && ddFromLOk && ddDriftOk &&
         sdOk && sdFromOk && sdStrictOk && sdRangeOk && sdReancOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk &&
         ehAdvOk && ehAvfOk && slAdvOk && slAvfOk && sdAdvOk && sdAvfOk && advRetOk &&
         ehBigOk && slBigOk && sdBigOk && hugeOk &&
-        scmOk && scmPlainOk && scmRotOk && scmFromOk && scmEstOk && scmTotOk && scmIntoOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
+        scmOk && scmPlainOk && scmRotOk && scmRotFromOk && sddRotFromOk && scmFromOk && scmEstOk && scmTotOk && scmIntoOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
         drOk && drRebOk && drFromOk && drSampOk && drClearOk && drRetOk &&
         saOk && saFromOk && saRotOk && saRotFromOk && saAdvOk && saAvfOk && saIntoOk && saClearOk && saBigOk && saRetOk &&
         report.ok && abOk;
@@ -1550,6 +1642,7 @@ async function main() {
         ddPhLBytes + ' B/op (DriftDetector add PH latch) ' +
         ddCuLBytes + ' B/op (DriftDetector add CUSUM latch) ' +
         ddFromLBytes + ' B/op (DriftDetector addFrom latch) ' +
+        ddDriftBytes + ' B/op (DriftDetector latch PH re-centre) ' +
         sdBytes + ' B/op (SlidingDDSketch add + pane rotate + collapse) ' +
         sdFromBytes + ' B/op (SlidingDDSketch addFrom fractional) ' +
         sdStrictBytes + ' B/op (SlidingDDSketch strict add span re-anchor) ' +
@@ -1567,6 +1660,8 @@ async function main() {
         scmBytes + ' B/op (SlidingCountMin add + pane rotate + conservative) ' +
         scmPlainBytes + ' B/op (SlidingCountMin add conservative:false) ' +
         scmRotBytes + ' B/op (SlidingCountMin rotate-every-add) ' +
+        scmRotFromBytes + ' B/op (SlidingCountMin rotate-every-add addFrom epoch) ' +
+        sddRotFromBytes + ' B/op (SlidingDDSketch rotate-every-add addFrom epoch) ' +
         scmFromBytes + ' B/op (SlidingCountMin addFrom stride-3) ' +
         scmEstBytes + ' B/op (SlidingCountMin estimate sum-then-min) ' +
         scmTotBytes + ' B/op (SlidingCountMin total per-pane N) ' +
@@ -1618,6 +1713,7 @@ async function main() {
         if (!ddCuOk) console.error('  alloc ' + ddCuBytes + ' B/op DriftDetector add CUSUM (raw ' + ddCuBpc + ')');
         if (!ddFromOk) console.error('  alloc ' + ddFromBytes + ' B/op DriftDetector addFrom (raw ' + ddFromBpc + ')');
         if (!ddClearOk) console.error('  alloc ' + ddClearBytes + ' B/op DriftDetector clear (raw ' + ddClearBpc + ')');
+        if (!ddDriftOk) console.error('  alloc ' + ddDriftBytes + ' B/op DriftDetector latch PH re-centre (raw ' + ddDriftBpc + ', measured=' + (ddDriftRes.bytesPerCall !== null) + ', recentres=' + ddDriftRecentres + ')');
         if (!sdOk) console.error('  alloc ' + sdBytes + ' B/op SlidingDDSketch add (raw ' + sdBpc + ')');
         if (!sdFromOk) console.error('  alloc ' + sdFromBytes + ' B/op SlidingDDSketch addFrom (raw ' + sdFromBpc + ')');
         if (!sdStrictOk) console.error('  alloc ' + sdStrictBytes + ' B/op SlidingDDSketch strict add (raw ' + sdStrictBpc + ')');
@@ -1637,6 +1733,8 @@ async function main() {
         if (!scmOk) console.error('  alloc ' + scmBytes + ' B/op SlidingCountMin add (raw ' + scmBpc + ')');
         if (!scmPlainOk) console.error('  alloc ' + scmPlainBytes + ' B/op SlidingCountMin add conservative:false (raw ' + scmPlainBpc + ')');
         if (!scmRotOk) console.error('  alloc ' + scmRotBytes + ' B/op SlidingCountMin rotate-every-add (raw ' + scmRotBpc + ')');
+        if (!scmRotFromOk) console.error('  alloc ' + scmRotFromBytes + ' B/op SlidingCountMin rotate-every-add addFrom epoch (raw ' + scmRotFromBpc + ')');
+        if (!sddRotFromOk) console.error('  alloc ' + sddRotFromBytes + ' B/op SlidingDDSketch rotate-every-add addFrom epoch (raw ' + sddRotFromBpc + ')');
         if (!scmFromOk) console.error('  alloc ' + scmFromBytes + ' B/op SlidingCountMin addFrom (raw ' + scmFromBpc + ')');
         if (!scmEstOk) console.error('  alloc ' + scmEstBytes + ' B/op SlidingCountMin estimate (raw ' + scmEstBpc + ')');
         if (!scmTotOk) console.error('  alloc ' + scmTotBytes + ' B/op SlidingCountMin total (raw ' + scmTotBpc + ')');

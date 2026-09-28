@@ -19,7 +19,7 @@ function mulberry32(seed) {
 // version pin
 // ---------------------------------------------------------------------------
 test('VERSION is 1.7.0 (DecayedReservoir milestone)', () => {
-    assert.equal(VERSION, '1.9.0');
+    assert.equal(VERSION, '1.10.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -618,7 +618,7 @@ test('an astronomically large now jump is bounded (capped at panes rotations, no
     const s = new SlidingDDSketch(1000, { panes: 32 });
     for (let t = 1; t <= 1000; t++) s.add(t, 100);
     const t0 = performance.now();
-    s.add(1e15, 999);   // a jump of ~1e12 pane-widths -- must NOT loop that many times
+    s.add(1e14, 999);   // ~3e12 pane-widths (still within the clock domain pw*2^42) -- must NOT loop that many times
     const elapsed = performance.now() - t0;
     assert.ok(elapsed < 50, 'a bounded rotate must not scale with the jump size, took ' + elapsed + 'ms');
     assert.equal(s.count(), 1, 'only the new value survives an all-panes-expired jump');

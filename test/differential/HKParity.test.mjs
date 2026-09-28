@@ -152,9 +152,12 @@ test('HK F3 parity: fail-closed throw messages (weight text per 1.7.0 F10; estim
         { fn: () => hk.add(5, -2), msg: '[lite-adaptive] HeavyKeeper weight must be an integer in [1, 4294967295], got -2' },
         { fn: () => hk.add(5, 1.5), msg: '[lite-adaptive] HeavyKeeper weight must be an integer in [1, 4294967295], got 1.5' },
         { fn: () => hk.add(5, 2 ** 32), msg: '[lite-adaptive] HeavyKeeper weight must be an integer in [1, 4294967295], got 4294967296' },
-        { fn: () => hk.addFrom([0, 1], 0), msg: '[lite-adaptive] HeavyKeeper.addFrom(buf, i) needs a Float64Array and an in-bounds integer index with i + 1 < buf.length, got 0,1, 0' },
-        { fn: () => hk.addFrom(buf, 1), msg: '[lite-adaptive] HeavyKeeper.addFrom(buf, i) needs a Float64Array and an in-bounds integer index with i + 1 < buf.length, got ' + String(buf) + ', 1' },
-        { fn: () => hk.addFrom(buf, -1), msg: '[lite-adaptive] HeavyKeeper.addFrom(buf, i) needs a Float64Array and an in-bounds integer index with i + 1 < buf.length, got ' + String(buf) + ', -1' },
+        // H2-6: a non-number container arg is now named inertly via describeArg (never String(), which
+        // runs a Proxy trap / toString AFTER the reject). An Array is 'an object', a typed array is
+        // 'a typed-array view'. The NUMBER messages above (key / weight) stay byte-identical.
+        { fn: () => hk.addFrom([0, 1], 0), msg: '[lite-adaptive] HeavyKeeper.addFrom(buf, i) needs a Float64Array and an in-bounds integer index with i + 1 < buf.length, got an object, 0' },
+        { fn: () => hk.addFrom(buf, 1), msg: '[lite-adaptive] HeavyKeeper.addFrom(buf, i) needs a Float64Array and an in-bounds integer index with i + 1 < buf.length, got a typed-array view, 1' },
+        { fn: () => hk.addFrom(buf, -1), msg: '[lite-adaptive] HeavyKeeper.addFrom(buf, i) needs a Float64Array and an in-bounds integer index with i + 1 < buf.length, got a typed-array view, -1' },
     ];
     for (const t of table) {
         assert.throws(t.fn, (e) => { assert.equal(e.message, t.msg); return true; }, 'message: ' + t.msg);

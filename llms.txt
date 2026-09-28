@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.9.0
+Version: 1.10.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -137,7 +137,7 @@ BYTE-IDENTICAL (only the file header + VERSION change).
   optional sub-window in `(0, W]` (outside that range -> NaN, never throws -- F12). The scratch keeps
   count() free of ARRAY allocation, but it RETURNS a rounded double: count() boxes 16 B/call steady
   (the estimator tail) and 32 B when the caller is not yet optimized (the boxed return). A 0-alloc
-  `countInto` reader is planned for 1.10.0. `query()` aliases
+  `countInto` reader is planned for 1.11.0. `query()` aliases
   `count()`. Keys are safe integers; on add a bad key / now / option throws [lite-adaptive] typeof-first
   (byte-identical no-op), while count(w) with a bad `w` reads NaN. Fully deterministic
   (no PRNG). Getters: `W` / `p` / `m` / `ringCap` / `seed` / `standardError` / `lastNow` / `mode` /
@@ -186,9 +186,6 @@ BYTE-IDENTICAL (only the file header + VERSION change).
   re-arms first then rebuilds the opposite gap over a few items (measured ~3 past the true edge on a
   +-10 step reversal, ~2 on +-30; up to +4 on the test lanes and +10 on a 0/10/20/10/0 staircase vs latch:false, 0 on a
   long-history reversal -- measured, not a general bound). Trade: while latched every item routes through the cold fire path (lower throughput),
-  and (latch:true PH only) a latched fire can box one 16 B HeapNumber in V8's Maglev tier -- 0 B/op in
-  steady optimized code on realistic re-arming streams, ~2 B/op measured on a fire-heavy stream when a
-  per-window collection re-tiers the hot loop (latch:false and CUSUM stay 0 B/op; tracked for 1.10.0),
   and a SECOND same-direction shift is not seen until re-arm (a monotone staircase 0/10/20/30 fires ONCE;
   latch:false fires at each edge). A separate 1.x property (not a latch
   defect): at the default delta 0.005, uniform +-2 noise false-alarms in BOTH modes (latch:true about
@@ -257,8 +254,8 @@ BYTE-IDENTICAL (only the file header + VERSION change).
   throws `[lite-adaptive]` typeof-first (a rejected add is a byte-identical no-op that does NOT advance
   the PRNG or the landmark). Deterministic given the seed. Getters: `k` / `halfLife` / `lambda` /
   `seed` / `size` / `mode` / `bytes`.
-- `SlidingAggregate` -- class. A zero-GC EXACT WINDOWED count / sum / mean / min / max over the LAST W
-  in FIXED preallocated space (ADR 0012) -- the aggregate the family lacked (ExponentialHistogram's
+- `SlidingAggregate` -- class. A zero-GC EXACT WINDOWED count / sum / mean / min / max over the covered
+  span [w, w+W/B] (which always CONTAINS the last w) in FIXED preallocated space (ADR 0012) -- the aggregate the family lacked (ExponentialHistogram's
   `sum()` is bounded by the oldest bucket's POPULATION, not its value mass, and fails on a skewed stream
   -- F17). A ring of B+1 panes of width W/B (the SlidingCountMin ring, COPIED verbatim -- never a shared
   helper), each a stride-5 Float64 slot `[count, sum, kcomp, min, max]`. `add(now, value) -> this` (count
@@ -279,12 +276,12 @@ BYTE-IDENTICAL (only the file header + VERSION change).
   throws) and |now| (and the count-mode tick) must be <= pw * 2^42 (SA_CLOCK_SPAN) -- a larger clock throws
   [lite-adaptive] before any write (rebase, or use a larger W). `into(out)` writes `[count, sum, mean, min, max]` 0-alloc at a monomorphic /
   polymorphic site (16 B/call at a megamorphic site of 5+ subclass shapes -- a family-wide V8 clock-field
-  box, logged for 1.10.0); the scalar readers box their return once (up to 16 B/call; 32 B at a
-  megamorphic site) -- use into() on a render path. A bad query VALUE (a `w` outside (0, W]) returns NaN,
+  box; H2-5, measured and documented in 1.10.0, the fix deferred to a later minor); the scalar readers box
+  their return once (up to 16 B/call; 32 B at a megamorphic site) -- use into() on a render path. A bad query VALUE (a `w` outside (0, W]) returns NaN,
   never throws; a wrong CONTAINER type (into's `out` not a Float64Array or length < 5) throws. Getters:
   `W` / `panes` / `mode` / `lastNow` / `bytes` (= (B+1) * 48; 1584 B at B=32, 50 channels = 79,200 B).
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.9.0'.
+- `VERSION` -- string, '1.10.0'.
 
 ## ExponentialHistogram
 
@@ -677,7 +674,13 @@ whose opposite gap alone exceeds threshold fires on its own item. Direction: the
 exact tie -> +1. Disclosed trade: while latched every item routes through the cold fire path (lower
 throughput -- latch state is NEVER moved into the hot body), and a SECOND same-direction shift is
 not seen until the regime ends and re-arms. Measured: CUSUM(0, .5, 8) on +10 x5000 fires 5000 times
-unlatched vs EXACTLY 1 latched (lastDriftIndex 0, lastDirection +1).
+unlatched vs EXACTLY 1 latched (lastDriftIndex 0, lastDirection +1). v1.10.0 adds a gated PH re-centre
+(subtract the running min/max off the accumulators once |mMin| or |mMax| > threshold*2^20) so an infinite
+same-direction latched regime keeps |gP|,|gN|,|mMin|,|mMax| <= threshold*2^20 + 30. Output is identical to
+1.x UNTIL the first re-centre trips; after it, statistic is MORE accurate (1.x drifts unbounded and suffers
+catastrophic cancellation at a large-magnitude reversal, which the bounded accumulators avoid) and a re-arm
+at an exact threshold/2 tie may resolve differently, while fired/mean/count/lastDriftIndex/lastDirection
+stay bit-identical.
 
 Fail-closed domain (the ADWIN finite-overflow lesson): DD_X_MAX = 1e150 caps |x| so the accumulators
 can never be driven non-finite (each add moves them by ~2*DD_X_MAX; both bounded between resets;
@@ -748,6 +751,18 @@ Constructor: `new SlidingDDSketch(W, options?)` where options = { alpha (a numbe
 <= SLD_MAX_BINS bins -> DERIVES strict) }. A declared `range` with `strict: false` is a contradiction and
 throws. A bad W / alpha / strict / panes / range / option throws [lite-adaptive] at the ctor door BEFORE
 any allocation.
+
+Precision domain (fail-closed, 1.10.0; shares the guard with SlidingCountMin): exact pane containment needs
+ulp(now) << pw (pw = W / panes), so |now| (and the count-mode tick) must be <= pw * 2^42 (SLD_CLOCK_SPAN);
+at the bound ulp(now) <= pw * 2^-10 so the grid line (floor(now/pw)+1)*pw still CONTAINS the true window.
+add / addFrom / advance / advanceFrom reject a larger clock with RangeError [lite-adaptive] BEFORE any state
+write (one field compare vs pw * 2^42, precomputed in the ctor); pane ends are computed from the grid index
+((k+1)*pw), never an accumulating E += pw that drifts near the edge. A subnormal pw (W / panes < 2^-1022,
+SLD_MIN_NORMAL) is rejected at construction. Min legal W for a clock magnitude C is panes * C / 2^42.
+Generous for real clocks (32 panes): epoch-ms |now| <= 1.37e14 at W=1000, 8.25e15 at W=60000; W=16 epoch-ms
+legal until ~2039-09 (disclosed), W < 12.7 epoch-ms REJECTED today; epoch-us 1.37e17 at W=1e6 (W=1e4
+REJECTED, min 12,733 us). Before 1.10.0 a large epoch clock at a small W silently collapsed the window
+(new SlidingDDSketch(1e-3); add(1.75e12, ...)); it now fails closed -- rebase the clock or use a larger W.
 
 - add(now, value) -> this        HOT, 0 B/op incl. pane rotate + clear. EXPLICIT mode: a finite,
                                  non-decreasing `now`. COUNT mode: add(undefined, value) auto-ticks (W in
@@ -839,6 +854,18 @@ overrides delta), panes (B; an integer in [2, 1024], default 32 -- the ring hold
 integer, default shared), conservative (a boolean, default true -- null is not true) }. Defaults ->
 d=5, w=512, panes=32 -> ~338 KB. A bad W / epsilon / delta / w / d / panes / seed / conservative / option
 throws [lite-adaptive] at the ctor door BEFORE any allocation. No `merge` in 1.5.0 (deferred).
+
+Precision domain (fail-closed, 1.10.0; shares the guard with SlidingDDSketch): exact pane containment needs
+ulp(now) << pw (pw = W / B), so |now| (and the count-mode tick) must be <= pw * 2^42 (SCM_CLOCK_SPAN); at
+the bound ulp(now) <= pw * 2^-10 so the grid line (floor(now/pw)+1)*pw still CONTAINS the true window. add /
+addFrom / advance / advanceFrom reject a larger clock with RangeError [lite-adaptive] BEFORE any state write
+(one field compare vs pw * 2^42, precomputed in the ctor); pane ends are computed from the grid index
+((k+1)*pw), never an accumulating E += pw that drifts near the edge. A subnormal pw (W / B < 2^-1022,
+SCM_MIN_NORMAL) is rejected at construction. Min legal W for a clock magnitude C is B * C / 2^42. Generous
+for real clocks (32 panes): epoch-ms |now| <= 1.37e14 at W=1000, 8.25e15 at W=60000; W=16 epoch-ms legal
+until ~2039-09 (disclosed), W < 12.7 epoch-ms REJECTED today; epoch-us 1.37e17 at W=1e6 (W=1e4 REJECTED, min
+12,733 us). Before 1.10.0 a large epoch clock at a small W silently under-counted (new SlidingCountMin(1e-3);
+add(1.75e12, 7) x3 -> estimate 1, not 3); it now fails closed -- rebase the clock or use a larger W.
 
 - add(now, key, count?) -> this  HOT, 0 B/op incl. pane rotate + clear. EXPLICIT mode: a finite,
                                  non-decreasing `now`. COUNT mode: add(undefined, key, count?) auto-ticks
@@ -973,7 +1000,8 @@ alternatives (A-ExpJ skip-sampling; a hard-window sample; bundled convenience ag
 
 ## SlidingAggregate (ADR 0012)
 
-EXACT windowed count / sum / mean / min / max over the LAST W, in FIXED preallocated space -- the
+EXACT windowed count / sum / mean / min / max over the covered span [w, w+W/B] (which always CONTAINS the
+last w), in FIXED preallocated space -- the
 aggregate the rest of the family could not give. ExponentialHistogram's `sum()` is bounded by the oldest
 straddling bucket's POPULATION (2^Lmax / 2), not its value mass, so on a skewed value stream it fails
 (F17: worst 15.8% heavy tail, ~2504% on a spike); SlidingDDSketch answers quantiles, SlidingCountMin
@@ -992,7 +1020,7 @@ oldest pane is KEPT, so the covered span is [w, w + W/B]: always the FULL window
 one pane width W/B and NEVER under-covered (dropping it would under-cover [w - W/B, w)).
 
 Guarantee over the covered span [w, w + W/B], u = 2^-53:
-- count, min and max are BIT-EXACT (a +-0 tie keeps the first value seen);
+- count, min and max are BIT-EXACT (the sign of a zero extreme is unspecified);
 - `|sum - exact| <= (4u + O(N u^2)) * sum|v|` -- Kahan per pane contributes 2u (Higham ASNA eq. 4.8), the
   Neumaier merge over the 2(B+1) terms adds 2u. A 2u bound is NOT provable for this merge (even a one-pane
   window pays Kahan's 2u plus the final s + c rounding);
@@ -1007,8 +1035,8 @@ any physically reachable n and every Kahan / Neumaier intermediate stays finite.
 Time model: EXPLICIT (a monotone `now`) or COUNT mode (add(undefined, value)); the mode locks at the
 first add and a switch throws. addFrom / advance / advanceFrom are EXPLICIT-only (ADR 0009). The rotate /
 anchor helpers take NO argument and read `this._now`, so no epoch-ms double crosses a non-inlined call --
-gated by a rotate-every-add epoch-clock lane (SlidingCountMin passes `t` as an argument to _advance(t) /
-_anchor(t); its per-rotation cost with an epoch clock is unmeasured, logged for 1.10.0, untouched here).
+gated by a rotate-every-add epoch-clock lane. (In 1.10.0 SlidingCountMin and SlidingDDSketch adopted the
+same argument-free _advance() / _anchor() reading this._now, so their per-rotation epoch cost is 0 B/op too.)
 
 Precision domain (ADR 0012, amended by QA190): exact containment needs ulp(now) << pw. (1) pw = W / panes
 must be a NORMAL double (>= 2^-1022, SA_MIN_NORMAL): a subnormal pw loses significand bits so (B+1)*pw can
@@ -1096,6 +1124,19 @@ at a non-inlined call site; the `xxxInto` / `forEach` readers are the 0-alloc re
 only when the windowed count is >= 2^31 (a Smi-range count returns 0 B/call; `estimateInto` is the
 0-alloc batch reader that fixes it). `ExponentialHistogram.sum()` and `HeavyKeeper.estimate` box only in
 the early JIT tier (steady state 0). `count()` and integer-count returns are Smis, 0 B/call.
+
+## Container arguments -- the HOT / COLD threat model (H2-4, 1.10.0)
+
+Every method that takes a caller-owned Float64Array verifies the type with `ArrayBuffer.isView(x) && x
+instanceof Float64Array` (a Proxy passes instanceof alone but not isView) and NaN-safe bounds (`!(i + k <
+n)`). The two halves differ on the LENGTH read. A HOT entry point (addFrom / advanceFrom, per item) reads
+`x.length` ONCE into the index bound -- a caller-defined subclass length getter may run at most once per
+call (the caller's own code; the zero-GC hot path is the product). A COLD render reader (into /
+estimateInto / quantileInto / topKInto / sampleInto) reads the length through the intrinsic
+%TypedArray%.prototype.length getter (TA_LEN, captured at module init), so a lying or re-entrant length is
+ignored and never runs and a benign subclass is accepted with correct results. A valid Float64Array behaves
+byte-identically. Reject messages use a cold describeArg(x) (typeof + isView, never a trap; String only on a
+primitive), so a rejected call runs no caller code and mutates nothing (H2-6, ~125 sites).
 
 ## The time source + the bucket pool (ADR 0001)
 

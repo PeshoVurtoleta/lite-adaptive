@@ -548,10 +548,14 @@ export interface DriftDetectorOptions {
  * return true EXACTLY on the detecting item (0 B/op with latch:false and in CUSUM). With latch:false a
  * fire resets the accumulators + running mean so the NEXT shift is caught; with latch:true a fire
  * LATCHES (fires once per regime), PH resetting its running-mean reference AT the fire while the
- * accumulator reset that re-arms happens later, when the gap falls back to threshold/2. One honest
- * caveat: a latch:true PH latched fire can box one 16 B HeapNumber in V8's Maglev tier -- 0 B/op in
- * steady optimized code on realistic re-arming streams, ~2 B/op measured on a fire-heavy stream when a
- * per-window collection re-tiers the hot loop (tracked for 1.10.0). The mode is
+ * accumulator reset that re-arms happens later, when the gap falls back to threshold/2. A latch:true PH
+ * fire is now 0 B/op (fresh AND warmed): `_clampGap` reads the mode / threshold from instance slots
+ * instead of taking them as arguments across a non-inlined call boundary. On an infinite same-direction
+ * regime the latched PH accumulators are kept bounded (|gP|,|gN|,|mMin|,|mMax| <= threshold * 2^20 + 30)
+ * by a gated re-centre. Public output is identical to 1.x until the first re-centre trips (past a
+ * ~threshold * 2^20 accumulator magnitude); after it, statistic is MORE accurate (no catastrophic
+ * cancellation of the unbounded 1.x accumulators) and a re-arm at an exact threshold/2 tie may resolve
+ * differently, while fired / mean / count / lastDriftIndex / lastDirection stay bit-identical. The mode is
  * load-bearing via its reference: PH self-references the
  * online mean (adaptive), CUSUM references a fixed mu0 (classic SPC) -- they genuinely diverge.
  * The item-based, scalar, fixed-scalar-state complement to ADWIN's adaptive window: no pool (pure
@@ -683,6 +687,8 @@ export class SlidingDDSketch {
      * @param W       window size; a finite number > 0 (items in count mode, or the `now`-unit span).
      * @param options { alpha?, strict?, panes?, range? }; an unknown key throws [lite-adaptive] with a did-you-mean hint (F13).
      * Throws [lite-adaptive] on a bad W / alpha / strict / panes / range / option BEFORE any allocation.
+     * @throws RangeError [lite-adaptive] if the derived pane width `W / panes` is a SUBNORMAL double
+     *   (`< 2^-1022`, SLD_MIN_NORMAL): a subnormal pane grid under-covers W (1.10.0, fail-closed).
      */
     constructor(W: number, options?: SlidingDDSketchOptions);
 
@@ -728,6 +734,9 @@ export class SlidingDDSketch {
      * (`add(undefined, value)`) for COUNT mode (auto-ticks; W is then in items). `value` must be a
      * finite number >= 0 (negatives / out-of-indexable throw). Throws [lite-adaptive] on a bad value,
      * a mode switch, or a non-finite / decreasing `now` (a byte-identical no-op).
+     * @throws RangeError [lite-adaptive] if `|now|` (or the count-mode tick) is outside the clock-precision
+     *   domain `<= pw * 2^42` (pw = W / panes, SLD_CLOCK_SPAN); the reject is a byte-identical no-op made
+     *   BEFORE any state write (1.10.0). Rebase the clock or use a larger W.
      */
     add(now: number | undefined, value: number): this;
 
@@ -737,6 +746,8 @@ export class SlidingDDSketch {
      * a count-locked instance throws, the first addFrom locks EXPLICIT mode. Same validation /
      * byte-identical-no-op-on-reject as `add`. Throws [lite-adaptive] on a non-Float64Array `buf` or a
      * non-integer / out-of-range `i`.
+     * @throws RangeError [lite-adaptive] if `now` is outside the clock-precision domain `<= pw * 2^42`
+     *   (SLD_CLOCK_SPAN); a byte-identical no-op made BEFORE any state write (1.10.0).
      */
     addFrom(buf: Float64Array, i: number): this;
 
@@ -747,6 +758,8 @@ export class SlidingDDSketch {
      * last add -- an idle stream empties to NaN / 0. HOT, 0 B/op. EXPLICIT-time only (a count-locked
      * instance throws; the first advance locks EXPLICIT + anchors the panes). Monotone: a `now` less
      * than the last applied time throws [lite-adaptive] (byte-identical no-op of quantile state).
+     * @throws RangeError [lite-adaptive] if `now` is outside the clock-precision domain `<= pw * 2^42`
+     *   (SLD_CLOCK_SPAN); a byte-identical no-op made BEFORE any state write (1.10.0).
      */
     advance(now: number): this;
 
@@ -754,6 +767,8 @@ export class SlidingDDSketch {
      * The ZERO-BOX sibling of `advance(now)`: reads `now = buf[i]` UNBOXED from a Float64Array.
      * Same validation / throws / EXPLICIT-only lock as `advance`. Throws [lite-adaptive] on a
      * non-Float64Array `buf` or out-of-range `i`.
+     * @throws RangeError [lite-adaptive] if `now` is outside the clock-precision domain `<= pw * 2^42`
+     *   (SLD_CLOCK_SPAN); a byte-identical no-op made BEFORE any state write (1.10.0).
      */
     advanceFrom(buf: Float64Array, i: number): this;
 
@@ -824,6 +839,8 @@ export class SlidingCountMin {
      * @param options  see SlidingCountMinOptions. A bad W / epsilon / delta / w / d / panes / seed /
      *           option throws [lite-adaptive] typeof-first, before any allocation (an unknown key gets
      *           a did-you-mean hint, F13).
+     * @throws RangeError [lite-adaptive] if the derived pane width `W / panes` is a SUBNORMAL double
+     *   (`< 2^-1022`, SCM_MIN_NORMAL): a subnormal pane grid under-covers W (1.10.0, fail-closed).
      */
     constructor(W: number, options?: SlidingCountMinOptions);
 
@@ -842,6 +859,9 @@ export class SlidingCountMin {
      * `key` a SAFE INTEGER (a composite `channelIdx * 2^32 + tag` works); `count` a positive integer,
      * saturating at 2^32-1. Fail closed: a mode switch, a non-finite / decreasing `now`, or a
      * non-safe-integer key / non-positive-integer count throws [lite-adaptive] (byte-identical no-op).
+     * @throws RangeError [lite-adaptive] if `|now|` (or the count-mode tick) is outside the clock-precision
+     *   domain `<= pw * 2^42` (pw = W / panes, SCM_CLOCK_SPAN); the reject is a byte-identical no-op made
+     *   BEFORE any state write (1.10.0). Rebase the clock or use a larger W.
      */
     add(now: number | undefined, key: number, count?: number): this;
 
@@ -850,6 +870,8 @@ export class SlidingCountMin {
      * `buf[i+1]` = key, `buf[i+2]` = count). HOT, 0 B/op -- the ZERO-BOX entry (reads all three
      * UNBOXED). EXPLICIT-time only. Same validation / byte-identical-no-op-on-reject as `add`.
      * Throws [lite-adaptive] on a non-Float64Array `buf` or an out-of-range `i`.
+     * @throws RangeError [lite-adaptive] if `now` is outside the clock-precision domain `<= pw * 2^42`
+     *   (SCM_CLOCK_SPAN); a byte-identical no-op made BEFORE any state write (1.10.0).
      */
     addFrom(buf: Float64Array, i: number): this;
 
@@ -859,6 +881,8 @@ export class SlidingCountMin {
      * `estimate` reflects the window ending at `now` -- an idle key's estimate slides to 0. HOT,
      * amortized 0 B/op. EXPLICIT-time only (a count-locked instance throws; the first advance locks
      * EXPLICIT). Monotone: a `now` below the last applied time throws [lite-adaptive] (byte-identical no-op).
+     * @throws RangeError [lite-adaptive] if `now` is outside the clock-precision domain `<= pw * 2^42`
+     *   (SCM_CLOCK_SPAN); a byte-identical no-op made BEFORE any state write (1.10.0).
      */
     advance(now: number): this;
 
@@ -866,6 +890,8 @@ export class SlidingCountMin {
      * The ZERO-BOX sibling of `advance(now)`: reads `now = buf[i]` UNBOXED from a Float64Array.
      * Same validation / throws / EXPLICIT-only lock as `advance`. Throws [lite-adaptive] on a
      * non-Float64Array `buf` or out-of-range `i`.
+     * @throws RangeError [lite-adaptive] if `now` is outside the clock-precision domain `<= pw * 2^42`
+     *   (SCM_CLOCK_SPAN); a byte-identical no-op made BEFORE any state write (1.10.0).
      */
     advanceFrom(buf: Float64Array, i: number): this;
 

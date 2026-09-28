@@ -205,3 +205,28 @@ which is why the guard below exists), so it was reverted to inlined locals. Gate
 read ~16 B/op against the pre-fix file) AND by `test/perf/HashThroughput.test.mjs`, an in-process A/B
 that times shipped `addFrom` against the frozen 1.7.0 baseline and fails RED above 1.15x (the F19v1
 round-trip reads ~1.59x here).
+
+## Amendment (1.10.0) -- clock-precision domain (H2-1)
+
+The pane grid is exact only while the double clock resolves it: `ulp(now) << pw`, `pw = W / B`. Before
+1.10.0 there was no clock bound, so a large epoch clock at a small `W` silently under-counted --
+`new SlidingCountMin(1e-3)` then `add(1.75e12, 7)` three times read `estimate 1`, not 3, because
+`floor(now / pw)` and the pane-end arithmetic lost the low bits.
+
+DECISION (design-parity with SlidingAggregate / SlidingDDSketch, module-private consts, no new API):
+
+- `SCM_CLOCK_SPAN = 2^42`, `SCM_MIN_NORMAL = 2^-1022`.
+- The ctor precomputes `this._nowMax = pw * 2^42`. `add` / `addFrom` / `advance` / `advanceFrom` reject
+  `|now| > pw * 2^42` (count mode: the next tick past `pw * 2^42`) with a `RangeError [lite-adaptive]`
+  made BEFORE any state write (one field compare -- a byte-identical no-op). At the bound
+  `ulp(now) <= pw * 2^-10`, so the grid line `(floor(now/pw)+1)*pw` still CONTAINS the true window.
+- A SUBNORMAL pane width (`W / B < 2^-1022`) is rejected at construction (it under-covers `W`).
+- Pane ends are computed by multiplication from the grid index (`(k+1)*pw`), not an accumulating
+  `E += pw`. For a DYADIC `pw` this is bit-identical (GridParity D + count-mode replay bit-identical to
+  the 1.9.0 goldens); for a NON-DYADIC `pw` the accumulator drifted (up to 450 ulp on the tested
+  configs) and the grid form now matches the exact `(floor(t/pw)+1)*pw` oracle.
+
+Min legal `W` for a clock magnitude `C` is `B * C / 2^42`. Real clocks are comfortable: epoch-ms
+`|now| <= 1.37e14` at `W=1000`, `8.25e15` at `W=60000`; `W=16` epoch-ms is legal until ~2039-09
+(disclosed) and `W < 12.7` epoch-ms is rejected today; epoch-us `1.37e17` at `W=1e6` (`W=1e4` rejected,
+min 12,733 us). Remedy: rebase the clock (subtract an epoch, or use `performance.now()`) or a larger `W`.

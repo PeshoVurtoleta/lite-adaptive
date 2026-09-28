@@ -921,7 +921,7 @@ one block next to the EH F17 line: SA covered-span mean worstRel (assert <= 4.5e
 worstRel (edge, informational), and ExponentialHistogram(1000, 0.01) fed the same streams: sum()/count()
 worstRel vs true(W) (the F17 failure) + EH memory.
 
-## 10. v1.10.0 -- H2 HARDENING (fail-open + allocation findings in shipped classes)  [PLANNED -- NEXT]
+## 10. v1.10.0 -- H2 HARDENING (fail-open + allocation findings in shipped classes)  [CODE COMPLETE -- 2026-09-28; release pending]
 
 One theme: every reader a render path needs is 0 B/call, and the latch path is 0 B/op under every tier.
 - NEW (review, 2026-09-27): family-wide megamorphic-site boxing. A double FIELD read (`this._now`) at a
@@ -1007,6 +1007,24 @@ measure-and-document only. The DD option is chosen by the pre-declared rule (sec
 - H2-5 megamorphic double-field boxing -- CONFIRMED (V8 property; only with 5+ subclass shapes at one
   site). DECISION: measure and document (INFO lanes per class). The fix (a per-instance Float64Array
   "state slab") changes `bytes` and rewrites every hot body -- logged for a later minor, out of scope.
+- H2-6 NEW family-wide fail-open in throw-message building -- CONFIRMED. ~120 sites build reject text as
+  `'...got ' + String(userArg)`; on a Proxy / toString / valueOf / Symbol.toPrimitive arg `String()` RUNS
+  caller code AFTER the guard rejected, and a re-entrant trap mutates the same instance -- `SCM.estimateInto`
+  / `SA.into` / `DD.addFrom` throw the tagged error AND leave `total` / `count` at 3 not 1. FIX: one cold
+  `describeArg(x)` helper (typeof + `ArrayBuffer.isView`, never a trap; `String` only on a primitive)
+  replaces every `String(userArg)`; number messages stay byte-identical, objects named inertly. Cover:
+  test/TrapFreeReject.test.js (all 10 classes, ctors + withAccuracy); touches SlidingAggregate too, so
+  AppendParity keeps no frozen anchor and the one-byte-flip control moves onto the extractor itself.
+
+- SETTLED (coordinator, 2026-09-28) -- container-length threat model after 4c-i measured a 0.47-0.61x
+  hot-path regression for full subclass protection: HOT entry points (addFrom / advanceFrom, per item)
+  keep `ArrayBuffer.isView(x) && x instanceof Float64Array` + ONE `x.length` read into a local (a
+  caller-defined subclass `length` getter may run once per call -- the caller's own code; documented).
+  COLD render readers (into / estimateInto / quantileInto / topKInto / sampleInto) read length through
+  the intrinsic %TypedArray%.prototype.length getter (TA_LEN, captured at module init): a lying or
+  re-entrant `length` is ignored and never runs, benign subclasses stay accepted. Rationale: the
+  fail-closed law guards unverified STATE; a subclass getter is caller code the caller chose to run,
+  and the zero-GC hot path is the product.
 
 #### 2. Numeric domain (time-grid classes SCM, SDD; SA already guarded)
 - Per-class consts (design-parity copy, module-private, no new API): `SCM_CLOCK_SPAN` / `SLD_CLOCK_SPAN`
@@ -1143,7 +1161,9 @@ drift; the section 2 legal table.
 rows, container note, DD latch paragraph, test count), llms.txt, Adaptive.d.ts (JSDoc throws only), ADR
 amendments (SCM + SDD ADRs with a "Precision domain" section; 0007 with the chosen DD option; 0012 one line
 on family parity), CHANGELOG [Unreleased] Fixed / Changed / Known limitations (resolve the 1.8.0 DD entry
-per the rule), ROADMAP section 10 status. Never touch VERSION. T10: on scratch copies revert each fix and
+per the rule), ROADMAP section 10 status; ALSO the 1.9.0 doc-truth leftovers in llms.txt (SlidingAggregate
+"EXACT ... over the LAST W" at ~260 / ~976 -> the covered span [w, w+W/B]; "a +-0 tie keeps the first value
+seen" -> the sign of a zero extreme is unspecified). Never touch VERSION. T10: on scratch copies revert each fix and
 confirm its gate goes RED; record the list. Then `/release 1.10.0`, `/sync-card lite-adaptive`.
 
 #### 5. Assertions (oracle / the mutant that turns it RED)
@@ -1185,6 +1205,33 @@ incl. empty / NaN. Lanes `q_shll_countInto` / `q_dd_statisticInto` / `q_dd_meanI
 warmed; plain `count()` stays the [12, 40] must-box control. The demo `dd_frame` todos become <= 0.5
 gates once the render reads the Into slots. QueryContract rows; mega5 INFO rows. Docs: d.ts, README,
 llms.txt, SHLL ADR + 0007 amendments, CHANGELOG. Readers only, no other behavior change.
+
+### 10.2 What shipped vs the plan (2026-09-28)
+
+- **H2-2 REFUTED.** SlidingCountMin's per-rotation epoch box (passing `t` to `_advance(t)` / `_anchor(t)`)
+  was measured on a rotate-every-add epoch lane first; batch 2 adopted SlidingAggregate's argument-free
+  `_advance()` / `_anchor()` reading `this._now` anyway (it fell out of the grid-index rewrite), so the
+  concern is moot -- SCM / SDD rotate at 0 B/op.
+- **H2-6 FOUND and FIXED.** A family-wide fail-open that was NOT in the original H2 list: ~125 throw sites
+  built the reject message with `String(userArg)`, which runs a Proxy / `toString` trap AFTER the guard
+  rejected, so a re-entrant trap could mutate the same instance (SCM / SA / DD advanced `total` / `count`
+  on a "rejected" call). Fixed with one cold `describeArg(x)` helper; number messages stay byte-identical.
+- **Container-length HOT / COLD decision (SETTLED 2026-09-28).** Full subclass protection cost a
+  0.47-0.61x hot-path regression, so HOT entry points (`addFrom` / `advanceFrom`) keep `isView &&
+  instanceof` + ONE `x.length` read (a subclass getter may run once per call, documented), while COLD
+  render readers read the intrinsic `%TypedArray%.prototype.length` (TA_LEN). The fail-closed law guards
+  unverified STATE; a subclass getter is caller code the caller chose to run.
+- **DD latch fix: V0 + V3 chosen** by the pre-declared rule -- V0 (argument-free `_clampGap(dir)`) removes
+  the fire box with bit-identical output; V3 (gated re-centre past `threshold * 2^20`) bounds the
+  accumulators while staying bit-identical until the trip. `latch: false` / CUSUM bit-identical; latched-PH
+  throughput 0.98x HEAD.
+- **The EH 0.95x residue.** ExponentialHistogram's hot `addFrom` measures ~0.95x of 1.9.0 -- the cost of
+  the H2-4b stricter positive-form `now` check (`!(now > -Infinity && now < Infinity)`, which also rejects
+  an `undefined` buffer read). Accepted: fail-closed is law, and every other member is 0.98-1.01x.
+- Gates at CODE COMPLETE: `npm test` 817/817; `test:types` clean; torture 0 B/op; GridParity dyadic
+  bit-identical (non-dyadic drift corrected; HEAD drifted up to 450 ulp). H2-5 megamorphic box is
+  measure-and-document only (mega5 INFO: SCM 49, SDD 70.5). SHLL `countInto` + DD `statisticInto` /
+  `meanInto` moved to 1.11.0.
 
 ## 11. The demo session (repo-only; no npm release)  [PLANNED]
 

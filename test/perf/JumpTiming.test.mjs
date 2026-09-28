@@ -54,8 +54,8 @@ function timeSteps(step, trials = TRIALS, warm = WARM) {
  * subclass is possible here because `_advance` reads only instance fields + `_clearPane`.)
  */
 class PerPaneLoopScm extends SlidingCountMin {
-    _advance(t) {
-        const pw = this._paneW, B = this._ring;
+    _advance() {                         // 1.10.0: argument-free (reads this._now), matching the base
+        const pw = this._paneW, B = this._ring, t = this._now;
         let cur = this._cur;
         let E = this._paneEnd[cur];
         while (t >= E) {                 // NO `rot < B` cap: one iteration per skipped pane

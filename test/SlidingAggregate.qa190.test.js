@@ -402,8 +402,15 @@ test('QA into: writes only slots 0..4 of a longer array; a subarray view with an
     const snapA = Array.from(four);
     assert.throws(() => sa.into(four), (e) => e instanceof RangeError && /out.length \(4\) must be >= 5/.test(e.message));
     assert.deepEqual(Array.from(four), snapA, 'a short container is untouched');
-    class NaNLen extends Float64Array { get length() { return NaN; } }
-    assert.throws(() => sa.into(new NaNLen(5)), RangeError, 'NaN length fails closed');
+    // H34 (SETTLED 2026-09-28): into() is a COLD reader -- it reads the length through the intrinsic
+    // %TypedArray%.length getter (TA_LEN), so a benign NaN-length subclass over a valid 5-slot backing
+    // is ACCEPTED (TA_LEN reads 5, not NaN) and its own length getter is NEVER invoked.
+    let nanGetterCalls = 0;
+    class NaNLen extends Float64Array { get length() { nanGetterCalls++; return NaN; } }
+    const nanOut = new NaNLen(5);
+    assert.equal(sa.into(nanOut), 5, 'NaN-length subclass out ACCEPTED (cold reader reads TA_LEN=5)');
+    assert.equal(nanGetterCalls, 0, 'the subclass length getter is never invoked (intrinsic TA_LEN)');
+    assert.equal(nanOut[0], 3, 'count landed in slot 0');
     const px = new Proxy(new Float64Array(5), {});
     for (const o of [px, new Float32Array(5), [0, 0, 0, 0, 0], new DataView(new ArrayBuffer(40)), null, undefined, 5, new BigInt64Array(5)]) {
         assert.throws(() => sa.into(o), TypeError, 'into ' + Object.prototype.toString.call(o));
@@ -453,10 +460,15 @@ test('QA determinism: two instances (add vs addFrom) fed the same stream give bi
 test('QA adversarial: re-entrant add from an into() length getter is applied before the merge; clear mid-iteration over instances', () => {
     const sa = new SlidingAggregate(100);
     sa.add(1, 1);
+    // H34 (SETTLED 2026-09-28): into() is a COLD reader -- it reads the length through the intrinsic
+    // %TypedArray%.length getter (TA_LEN), so a re-entrant subclass length getter is NEVER invoked. The
+    // re-entrant add never fires; into() reads the true backing length (5) and answers normally.
     class ReLen extends Float64Array { get length() { sa.add(2, 10); return super.length; } }
     const o = new ReLen(5);
-    sa.into(o);
-    assert.deepEqual(Array.from(o), [2, 11, 5.5, 1, 10], 'the merge sees the re-entrant write, consistently');
+    const c0 = sa.count();
+    assert.equal(sa.into(o), 5, 're-entrant subclass out ACCEPTED (cold reader, TA_LEN backing length)');
+    assert.equal(sa.count(), c0, 'the re-entrant getter never ran (count unchanged)');
+    assert.equal(o[0], c0, 'count landed in slot 0');
     // clear during iteration over a set of instances: others unaffected, the cleared one re-locks
     const insts = [new SlidingAggregate(100), new SlidingAggregate(100), new SlidingAggregate(100)];
     for (let i = 0; i < 30; i++) for (let k = 0; k < 3; k++) { insts[k].add(i, k + 1); if (i === 15 && k === 1) insts[1].clear(); }

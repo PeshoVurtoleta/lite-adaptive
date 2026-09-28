@@ -297,3 +297,33 @@ is EXACTLY 2 fires at indices 0 / 2500 with directions +1 / -1; a stationary str
 `lastDriftIndex` NaN either way; a PH step fires once at the same item as its latch:false twin; a
 slow ramp fires strictly fewer times latched. NEGATIVE CONTROL: a reset-on-latched-fire subclass
 re-fires 5000 times and is REJECTED by the same "exactly one fire" gate.
+
+## Amendment (1.10.0) -- latched-PH accumulator drift + fire box (H2-3), decision V0 + V3
+
+On an infinite same-direction stream the latched PH running extremes (`gP` / `mMin`, `gN` / `mMax`)
+drifted monotonically (~0.078 per item on a square wave) toward `Infinity`, and the latched fire boxed
+one ~16 B HeapNumber in the Maglev tier (the 1.8.0 Known limitations). Five options were built on
+scratch copies and run against the pre-declared rule (ROADMAP 10.1 section 3):
+
+| option | what | box (fireheavy) | accumulator bound | parity |
+| --- | --- | --- | --- | --- |
+| V0 | argument-free `_clampGap(dir)` (reads `this._mode` / `this._threshold` from slots) | 0 B/op fresh + warmed | unchanged (still drifts) | bit-identical |
+| V1 | re-centre at the end of every latched entry | -- | `2*th + 2*A = 30` | changes output every fire |
+| V2 | V1 on fire items only | -- | 30 | changes output at each fire |
+| V3 | V1 only when `max(\|mMin\|,\|mMax\|) > th * 2^20` | -- | `th * 2^20 + 30` | bit-identical UNTIL the trip |
+| V4 | reset to canonical values at a fire | -- | 30 | changes output at each fire |
+
+DECISION: ship **V0 + V3**. V0 removes the fire box (the `dd_latch_ph_fireheavy` gate tightens from
+`<= 4` to `<= 0.25` B/op) with bit-identical output; V3 bounds all four accumulators to
+`threshold * 2^20 + 30` while staying bit-identical until the re-centre trips (past a
+`~threshold * 2^20` accumulator magnitude -- far beyond any parity series, so the 1.7.0 and 1.9.0
+latched-PH vectors need no re-pin). On the torture drift lane the re-centre fires ~98 per 100k items.
+
+IDENTICAL-UNTIL-FIRST-RE-CENTRE property: public output equals 1.9.0 exactly until the first re-centre.
+After it, `statistic` is *more accurate* (1.9.0's unbounded accumulators suffer catastrophic
+cancellation at a large-magnitude reversal, which the bounded re-centred accumulators avoid), and a
+re-arm at an *exact* `threshold / 2` tie may resolve differently; `fired`, `mean`, `count`,
+`lastDriftIndex` and `lastDirection` stay bit-identical, and the fire history is identical on the tested
+streams (`phLatch` / `phSquare` / `phStep1` / `phStep2` / `phDemo`). `latch: false` and CUSUM (both latch
+modes) are bit-identical to 1.9.0. Latched-PH throughput is 0.98x of 1.9.0. `_rearm` is untouched (it
+already zeroes the accumulators).

@@ -203,28 +203,30 @@ test('queryLanes', async (t) => {
 //     a stable 16 B in the estimator tail, +16 B when the caller is not yet optimized. Documented BAND
 //     [12, 40] B/op: the lower bound proves the probe SEES the cost (a 0-alloc claim would fail here),
 //     the upper bound fails on a THIRD box (the tail stays exactly one box). Measured 16 B/op steady.
-//   - dd_latch_ph_fireheavy (finding B): latched-PH on a fire-heavy square wave. A latched fire can box
-//     one ~16 B HeapNumber; the effect is TIER-DEPENDENT -- Maglev boxes (the probe's per-window gc()
-//     can re-tier the hot loop), steady Turbofan holds the value in a slot. No bit-identical source
-//     change removes it (25+ variants measured). Gated as a documented CEILING (<= 4 B/op, naming the
-//     Maglev re-tier mechanism) that the CURRENT code passes deterministically (measured ~0.5 B/op
-//     steady across 5 fresh runs) while a regression to a per-ADD box (>= 16 B/op) fails RED. latch:false
-//     and CUSUM read 0 (the dd_af / dd_latch_af lanes above).
+//   - dd_latch_ph_fireheavy (finding B): latched-PH on a fire-heavy square wave. Pre-T8 a latched fire
+//     boxed one ~16 B HeapNumber because _clampGap(dir, ph, th) took the threshold/mode DOUBLES as
+//     ARGUMENTS across a non-inlined call boundary. v1.10.0 T8 made _clampGap(dir) argument-free (it
+//     reads this._mode / this._threshold from slots), so the fire path no longer crosses a double at a
+//     call boundary. Measured 0 B/op fresh AND warmed. Gated at <= 0.25 B/op; a regression that restores
+//     argument passing (or any per-ADD box, >= 16 B/op) fails RED. latch:false and CUSUM read 0 (the
+//     dd_af / dd_latch_af lanes above).
 // ===========================================================================
 test('docTruthFindings', async (t) => {
     const shllBand = (steady) => (steady >= 12 && steady <= 40 ? null :
         'steady ' + steady + ' B/op outside the documented band [12, 40] (< 12: the probe went blind to the count() box; > 40: a THIRD box regressed the estimator tail)');
-    // Maglev re-tier ceiling: the current code reads ~0.5 B/op steady (Turbofan holds the value in a
-    // Float64Array slot); the ceiling catches a regression to a per-add box (>= 16), not the tier flake.
-    const fireCeil = (steady) => (steady <= 4 ? null :
-        'steady ' + steady + ' B/op > 4 (a per-ADD latched-PH box regressed; the Maglev re-tier flake is <= ~2)');
+    // T8 argument-free _clampGap: the fire path no longer boxes -- 0 B/op fresh AND warmed. The <=0.5
+    // ceiling catches a regression to argument passing (or any per-add box, >= 16 B/op).
+    // <= 0.25, not 0.5: the pre-T8 arg-passing _clampGap read EXACTLY 0.5 steady on this lane, so a 0.5 bar
+    // could not see the regression. The fixed code reads 0 fresh + warmed.
+    const fireCeil = (steady) => (steady <= 0.25 ? null :
+        'steady ' + steady + ' B/op > 0.25 (a latched-PH fire box regressed -- likely _clampGap arg passing restored)');
     const rows = [
         { lane: 'q_shll_count', mode: 'fresh', label: 'SHLL count() non-degenerate [finding A]', expected: '[12,40]', check: shllBand },
-        { lane: 'dd_latch_ph_fireheavy', mode: 'fresh', label: 'DD latch:true PH fire-heavy [finding B]', expected: '<=4', check: fireCeil },
-        { lane: 'dd_latch_ph_fireheavy', mode: 'warmed', label: 'DD latch:true PH fire-heavy (warm)', expected: '<=4', check: fireCeil },
+        { lane: 'dd_latch_ph_fireheavy', mode: 'fresh', label: 'DD latch:true PH fire-heavy [finding B]', expected: '<=0.25', check: fireCeil },
+        { lane: 'dd_latch_ph_fireheavy', mode: 'warmed', label: 'DD latch:true PH fire-heavy (warm)', expected: '<=0.25', check: fireCeil },
     ];
     await measureGroup(rows);
-    printTable('1.8.0 docTruthFindings (SHLL count() band [12,40]; latched-PH fire ceiling <=4):', rows, (r) => {
+    printTable('1.8.0 docTruthFindings (SHLL count() band [12,40]; latched-PH fire ceiling <=0.25):', rows, (r) => {
         const ok = r.check(r._steady, r._first) === null;
         return ok ? 'GREEN' : 'NEW FINDING';
     });
@@ -428,4 +430,70 @@ test('saIsViewGuardAB', () => {
     console.log('    plain (instanceof only) = ' + plain.toFixed(1) + ' ms;  guarded (isView + instanceof) = ' + guard.toFixed(1) +
         ' ms;  ratio = ' + ratio.toFixed(3) + (ratio > 1.10 ? '  <-- OVER 1.10 (reported to maintainer)' : '  (<= 1.10, negligible)'));
     // NOT gated (per T7): the ratio is printed only, never asserted.
+});
+
+// ===========================================================================
+// 1.10.0 H2 hardening (batch 1, T1). SCM/SDD event-heavy pw=1 rotate-every-op lanes (H2-2): HEAD
+// reads 0 B/op steady, so they gate LIVE at <= 0.5 (the argument-tagging box the roadmap flagged is
+// NOT observable at steady state -- amortized below the probe floor; recorded REFUTED). The must-box
+// scm_add_mega_rot proves the SCM event-heavy lanes have teeth (>= 12). mega5_<cls>_af are the H2-5
+// megamorphic double-field-box lanes: INFORMATIONAL, gated in an [m-4, m+4] band around the measured
+// HEAD value m (documents the box; a regression that removes or doubles it falls outside the band).
+// ===========================================================================
+test('h2EventHeavy', async (t) => {
+    const gate = (steady) => (steady <= 0.5 ? null : 'steady ' + steady + ' B/op > 0.5 (a per-rotation box on the SCM/SDD event-heavy path)');
+    const rows = [
+        { lane: 'scm_af_epoch_rot', mode: 'fresh', label: 'SCM addFrom epoch ROTATE-every-add', expected: '<=0.5' },
+        { lane: 'scm_af_epoch_rot', mode: 'warmed', label: 'SCM addFrom epoch ROTATE (warm)', expected: '<=0.5' },
+        { lane: 'scm_adv_epoch_rot', mode: 'fresh', label: 'SCM advanceFrom epoch ROTATE-every-op', expected: '<=0.5' },
+        { lane: 'scm_adv_epoch_rot', mode: 'warmed', label: 'SCM advanceFrom epoch ROTATE (warm)', expected: '<=0.5' },
+        { lane: 'sdd_af_epoch_rot', mode: 'fresh', label: 'SDD addFrom epoch ROTATE-every-add', expected: '<=0.5' },
+        { lane: 'sdd_af_epoch_rot', mode: 'warmed', label: 'SDD addFrom epoch ROTATE (warm)', expected: '<=0.5' },
+        { lane: 'sdd_adv_epoch_rot', mode: 'fresh', label: 'SDD advanceFrom epoch ROTATE-every-op', expected: '<=0.5' },
+        { lane: 'sdd_adv_epoch_rot', mode: 'warmed', label: 'SDD advanceFrom epoch ROTATE (warm)', expected: '<=0.5' },
+    ];
+    await measureGroup(rows);
+    printTable('H2-2 SCM/SDD event-heavy rotate-every-op (steady <= 0.5; HEAD reads 0 -> LIVE, box REFUTED):',
+        rows, (r) => (r._steady <= 0.5 ? 'GREEN' : 'NEW FINDING'));
+    for (const r of rows) await emit(t, r, gate);
+});
+
+test('h2EventHeavyTeeth', async (t) => {
+    const teeth = (steady) => (steady >= 12 ? null :
+        'steady ' + steady + ' B/op < 12 (the must-box control did NOT box -- the SCM event-heavy lanes have no teeth)');
+    const rows = [
+        { lane: 'scm_add_mega_rot', mode: 'fresh', label: 'SCM add() megamorphic rotate [must-box]', expected: '>=12', check: teeth },
+    ];
+    await measureGroup(rows);
+    printTable('H2-2 teeth: SCM add() megamorphic rotate (>= 12 B/op -- proves the event-heavy probe sees a box):',
+        rows, (r) => (r._steady >= 12 ? 'GREEN (teeth)' : 'NO TEETH'));
+    for (const r of rows) await emit(t, r, r.check);
+});
+
+test('h2Mega5', async (t) => {
+    // INFO band [m-4, m+4] around the measured HEAD value m (H2-5 megamorphic double-field box).
+    const band = (m) => (steady) => (steady >= m - 4 && steady <= m + 4 ? null :
+        'steady ' + steady + ' B/op outside the INFO band [' + (m - 4) + ', ' + (m + 4) + '] (H2-5 megamorphic field box drifted from HEAD ' + m + ')');
+    const rows = [
+        { lane: 'mega5_eh_af', mode: 'fresh', label: 'EH addFrom mega5 [H2-5 INFO]', expected: '32+-4', check: band(32) },
+        { lane: 'mega5_adwin_af', mode: 'fresh', label: 'ADWIN addFrom mega5 [H2-5 INFO]', expected: '147.3+-4', check: band(147.3) },
+        { lane: 'mega5_fd_af', mode: 'fresh', label: 'FD addFrom mega5 [H2-5 INFO]', expected: '144+-4', check: band(144) },
+        { lane: 'mega5_hk_af', mode: 'fresh', label: 'HK addFrom mega5 [H2-5 INFO]', expected: '16+-4', check: band(16) },
+        { lane: 'mega5_shll_af', mode: 'fresh', label: 'SHLL addFrom mega5 [H2-5 INFO]', expected: '32+-4', check: band(32) },
+        { lane: 'mega5_dd_af', mode: 'fresh', label: 'DD addFrom mega5 [H2-5 INFO]', expected: '226.5+-4', check: band(226.5) },
+        // Re-cut for the batch 1-2 review fix (H2-5 INFO): the range check now loads this._nowMax ONCE
+        // (`const nm = this._nowMax`) instead of reading the megamorphic double-field twice, so it drops
+        // ONE of the two 16 B HeapNumber boxes at the 5-map site: SDD addFrom moves 86.5 -> ~70.5 B/op
+        // (delta -16). INFO only, not a hot cost.
+        { lane: 'mega5_sdd_af', mode: 'fresh', label: 'SDD addFrom mega5 [H2-5 INFO]', expected: '70.5+-4', check: band(70.5) },
+        // Re-cut for the batch 1-2 review fix (H2-5 INFO): same single-load of this._nowMax drops one
+        // megamorphic double-field box, so SCM addFrom moves 65 -> ~49 B/op (delta -16). INFO only.
+        { lane: 'mega5_scm_af', mode: 'fresh', label: 'SCM addFrom mega5 [H2-5 INFO]', expected: '49+-4', check: band(49) },
+        { lane: 'mega5_dr_af', mode: 'fresh', label: 'DR addFrom mega5 [H2-5 INFO]', expected: '80+-4', check: band(80) },
+        { lane: 'mega5_sa_af', mode: 'fresh', label: 'SA addFrom mega5 [H2-5 INFO]', expected: '65+-4', check: band(65) },
+    ];
+    await measureGroup(rows);
+    printTable('H2-5 mega5 addFrom (megamorphic double-field box; INFO band [m-4, m+4] around HEAD m):',
+        rows, (r) => (r.check(r._steady, r._first) === null ? 'GREEN (in band)' : 'DRIFTED'));
+    for (const r of rows) await emit(t, r, r.check);
 });

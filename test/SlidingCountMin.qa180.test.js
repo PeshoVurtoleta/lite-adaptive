@@ -244,35 +244,44 @@ test('estimateInto on an UNSET instance: valid keys 0, invalid keys NaN, bad w a
     for (let j = 0; j < 6; j++) assert.ok(Number.isNaN(s.estimate(keys[j], 0)));
 });
 
-test('estimateInto: clear() DURING iteration (Proxy get trap) -> slots after the clear read 0; duplicate clear() is a safe no-op', () => {
+// 1.10.0 H2-4: a re-entrant clear() through the keys get trap can no longer race the read loop -- a
+// Proxy container is rejected at the door, before any element (hence any trap) is read.
+test('estimateInto: a Proxy keys whose get trap calls clear() is rejected (1.10.0 H2-4)', () => {
     const s = populated();
     const raw = new Float64Array([1, 2, 3, 4, 5, 6]);
-    const before = Array.from(raw, (k) => s.estimate(k));
-    let reads = 0;
+    let traps = 0;
     const keys = new Proxy(raw, { get(tgt, prop) {
-        if (typeof prop === 'string' && /^\d+$/.test(prop)) { if (++reads === 3) { s.clear(); s.clear(); } }
+        if (typeof prop === 'string' && /^\d+$/.test(prop)) { traps++; s.clear(); s.clear(); }
         const v = Reflect.get(tgt, prop); return typeof v === 'function' ? v.bind(tgt) : v; } });
-    const out = new Float64Array(6);
-    assert.equal(s.estimateInto(keys, out), 6);
-    assert.equal(out[0], before[0]); assert.equal(out[1], before[1]);
-    for (let j = 2; j < 6; j++) assert.equal(out[j], 0, 'post-clear slot ' + j);
-    assert.equal(s.total(), 0);
+    const out = new Float64Array(6).fill(-7);
+    const snap = (o) => { const t = {}; for (const k of Object.keys(o)) { const v = o[k]; t[k] = ArrayBuffer.isView(v) ? Array.from(v) : v; } return t; };
+    const before = snap(s);
+    assert.throws(() => s.estimateInto(keys, out),
+        (e) => e instanceof TypeError && /^\[lite-adaptive\] SlidingCountMin\.estimateInto\(keys, out, w\?\) keys must be a Float64Array/.test(e.message));
+    assert.equal(traps, 0, 'the get trap never ran -- rejection precedes the first read');
+    assert.deepEqual(snap(s), before, 'instance state is byte-identical after the rejection');
+    for (let j = 0; j < 6; j++) assert.equal(out[j], -7, 'out slot ' + j + ' untouched');
 });
 
-test('estimateInto: a RE-ENTRANT write (same-instance add in the get trap, same pane) -> each later slot reflects the live cells', () => {
+// 1.10.0 H2-4: the sharpest re-entrancy -- a same-instance add() in the get trap -- is now impossible:
+// the Proxy keys is rejected before the loop, so the write can never interleave a half-written read.
+test('estimateInto: a Proxy keys whose get trap re-enters add() on the SAME instance is rejected (1.10.0 H2-4)', () => {
     const s = mk();
     s.add(10, 1, 1);
     const raw = new Float64Array([5, 5, 5]);
-    let reads = 0;
+    let traps = 0;
     const keys = new Proxy(raw, { get(tgt, prop) {
-        if (typeof prop === 'string' && /^\d+$/.test(prop)) { if (++reads === 2) s.add(10, 5, 100); }
+        if (typeof prop === 'string' && /^\d+$/.test(prop)) { traps++; s.add(10, 5, 100); }
         const v = Reflect.get(tgt, prop); return typeof v === 'function' ? v.bind(tgt) : v; } });
-    const out = new Float64Array(3);
-    s.estimateInto(keys, out);
-    assert.ok(out[0] < 100, 'slot 0 read before the write');
-    assert.equal(out[1], s.estimate(5), 'slot 1 read after the write');
-    assert.equal(out[2], s.estimate(5));
-    assert.equal(s.total(), 101);
+    const out = new Float64Array(3).fill(-7);
+    const snap = (o) => { const t = {}; for (const k of Object.keys(o)) { const v = o[k]; t[k] = ArrayBuffer.isView(v) ? Array.from(v) : v; } return t; };
+    const before = snap(s);
+    assert.throws(() => s.estimateInto(keys, out),
+        (e) => e instanceof TypeError && /^\[lite-adaptive\] SlidingCountMin\.estimateInto\(keys, out, w\?\) keys must be a Float64Array/.test(e.message));
+    assert.equal(traps, 0, 'the get trap never ran -- no re-entrant write could interleave the read');
+    assert.deepEqual(snap(s), before, 'instance state is byte-identical after the rejection');
+    for (let j = 0; j < 3; j++) assert.equal(out[j], -7, 'out slot ' + j + ' untouched');
+    assert.equal(s.total(), 1, 'the re-entrant add(10, 5, 100) never happened');
 });
 
 test('estimateInto == estimate on 100% of (key, w) incl. unset + bad w, across fill/slide/clear (randomized, >= 5000 pairs)', () => {

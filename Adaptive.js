@@ -215,7 +215,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.9.0';
+export const VERSION = '1.10.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -237,6 +237,25 @@ export const VERSION = '1.9.0';
 const MODE_UNSET = 0;
 const MODE_EXPLICIT = 1;
 const MODE_COUNT = 2;
+
+/**
+ * The INTRINSIC %TypedArray%.prototype.length getter, captured ONCE at module init (H34). Used by
+ * the COLD render readers only (into / estimateInto / quantileInto / topKInto / sampleInto). A
+ * Float64Array SUBCLASS with an own `length` getter -- or an instance with a `length` accessor
+ * installed via Object.defineProperty -- still passes `ArrayBuffer.isView && instanceof`, so a cold
+ * reader that read `x.length` through the prototype chain would run CALLER CODE, and a re-entrant or
+ * lying getter could make an output site report more slots than exist. `TA_LEN.call(x)` reads the
+ * internal [[ArrayLength]] slot directly, runs NO user code, and returns 0 for a detached view (fail
+ * closed). Each cold reader reads the length ONCE through this getter into a local and uses only that
+ * local for bounds, loops and messages; a benign subclass is ACCEPTED with correct results.
+ *
+ * The HOT entry points (addFrom / advanceFrom) deliberately do NOT use TA_LEN: they read `x.length`
+ * ONCE into the bound (a caller-defined subclass getter may run at most once per call -- the caller's
+ * own code, documented). The zero-GC hot path is the product; the container guard verifies STATE, and
+ * a subclass getter is caller code the caller chose to run. See ROADMAP 10.1 (container-length threat
+ * model, SETTLED 2026-09-28).
+ */
+const TA_LEN = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Float64Array.prototype), 'length').get;
 
 /**
  * The smallest halfLife that yields a FINITE decay rate lambda = ln2 / halfLife (F14).
@@ -326,6 +345,22 @@ function optDoor(options, known, label) {
     }
 }
 
+/**
+ * COLD trap-free stringifier for throw messages (H2-6). `String(x)` on an object runs the caller's
+ * toString / valueOf / Symbol.toPrimitive -- and on a Proxy, ANY property access -- AFTER a guard has
+ * already decided to reject, so a re-entrant trap can mutate the same instance and the "no-op" reject
+ * is no longer a no-op (fail-open). `typeof` and `ArrayBuffer.isView` never fire a Proxy trap, and
+ * `String()` on a primitive (number / string / boolean / bigint / symbol / undefined) runs no user
+ * code, so a number message stays byte-identical while an object / function / view is named inertly.
+ */
+function describeArg(x) {
+    const t = typeof x;
+    if (x === null) return 'null';
+    if (t === 'object') return ArrayBuffer.isView(x) ? 'a typed-array view' : 'an object';
+    if (t === 'function') return 'a function';
+    return String(x);
+}
+
 /** Frozen marker of the known ctor option keys -- an unknown key is a throw with a did-you-mean. */
 const EH_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { maxCount: true }));
 
@@ -399,11 +434,11 @@ export class ExponentialHistogram {
         // typeof guard FIRST, BEFORE any allocation.
         if (typeof W !== 'number' || W !== W || W === Infinity || W === -Infinity || W <= 0) {
             throw new RangeError(
-                '[lite-adaptive] ExponentialHistogram W must be a finite number > 0, got ' + String(W));
+                '[lite-adaptive] ExponentialHistogram W must be a finite number > 0, got ' + describeArg(W));
         }
         if (typeof epsilon !== 'number' || epsilon !== epsilon || epsilon <= 0 || epsilon >= 1) {
             throw new RangeError(
-                '[lite-adaptive] ExponentialHistogram epsilon must be a number in (0, 1), got ' + String(epsilon));
+                '[lite-adaptive] ExponentialHistogram epsilon must be a number in (0, 1), got ' + describeArg(epsilon));
         }
         if (options !== undefined) {
             optDoor(options, EH_KNOWN_OPTS, 'ExponentialHistogram');
@@ -419,7 +454,7 @@ export class ExponentialHistogram {
                 mc <= 0 || mc > EH_MAXCOUNT_MAX) {
                 throw new RangeError(
                     '[lite-adaptive] ExponentialHistogram maxCount must be an integer in [1, 2^53-1], got ' +
-                    String(mc));
+                    describeArg(mc));
             }
             maxCount = mc;
         }
@@ -684,13 +719,13 @@ export class ExponentialHistogram {
      */
     addFrom(buf, i) {
         // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i + 1 < buf.length)) return this._badBuf(buf, i);
         const now = buf[i];       // UNBOXED Float64Array reads -- the whole point (no argument box).
         const v = buf[i + 1];     // packed [now, value]
         // --- validate the value FIRST (mirror add(); a Float64Array read is always a number,
         // so add()'s typeof branch is unreachable here and omitted). BYTE-IDENTICAL no-op. ---
-        if (v !== v || v === Infinity || v <= 0) return this._badValue(v);
+        if (!(v > 0 && v < Infinity)) return this._badValue(v);
         // --- addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify
         // EXPLICIT + the monotone `now` (typeof-first, no alloc). ---
         let t;
@@ -698,7 +733,7 @@ export class ExponentialHistogram {
         if (mode === MODE_COUNT) {
             return this._badMode('count', 'explicit');
         } else if (mode === MODE_EXPLICIT) {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badNow(now);
             if (now < this._lastNow) return this._badMonotone(now);
             t = now;
             // OVERFLOW PRE-CHECK -- one hot integer compare, cold read-only scan; BEFORE any
@@ -707,7 +742,7 @@ export class ExponentialHistogram {
             this._lastNow = now;
         } else {
             // first addFrom: the pool is empty, so the insert cannot overflow -- lock EXPLICIT.
-            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badNow(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
@@ -869,20 +904,20 @@ export class ExponentialHistogram {
     /** @private Cold thrower for a non-finite `now`. */
     _badNow(now) {
         throw new TypeError(
-            '[lite-adaptive] ExponentialHistogram add now must be a finite number, got ' + String(now));
+            '[lite-adaptive] ExponentialHistogram add now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone `now`. */
     _badMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] ExponentialHistogram add now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] ExponentialHistogram add now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad value. */
     _badValue(v) {
         throw new TypeError(
-            '[lite-adaptive] ExponentialHistogram add value must be a finite number > 0, got ' + String(v));
+            '[lite-adaptive] ExponentialHistogram add value must be a finite number > 0, got ' + describeArg(v));
     }
 
     /**
@@ -937,7 +972,7 @@ export class ExponentialHistogram {
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] ExponentialHistogram.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i + 1 < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 
     /**
@@ -1010,20 +1045,20 @@ export class ExponentialHistogram {
      * @returns {ExponentialHistogram} this
      */
     advanceFrom(buf, i) {
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badAdvanceBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i < buf.length)) return this._badAdvanceBuf(buf, i);
         const now = buf[i];   // UNBOXED Float64Array read (always a number -> no typeof branch).
         let t;
         const mode = this._mode;
         if (mode === MODE_COUNT) {
             return this._badAdvanceMode('count', 'explicit');
         } else if (mode === MODE_EXPLICIT) {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badAdvanceNow(now);
             if (now < this._lastNow) return this._badAdvanceMonotone(now);
             t = now;
             this._lastNow = now;
         } else {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badAdvanceNow(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
@@ -1061,21 +1096,21 @@ export class ExponentialHistogram {
     /** @private Cold thrower for a non-finite advance `now`. */
     _badAdvanceNow(now) {
         throw new TypeError(
-            '[lite-adaptive] ExponentialHistogram advance now must be a finite number, got ' + String(now));
+            '[lite-adaptive] ExponentialHistogram advance now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone advance `now`. */
     _badAdvanceMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] ExponentialHistogram advance now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] ExponentialHistogram advance now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad advanceFrom buffer/index. */
     _badAdvanceBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] ExponentialHistogram.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 }
 
@@ -1159,7 +1194,7 @@ export class ADWIN {
         // typeof guard FIRST, BEFORE any allocation.
         if (typeof delta !== 'number' || delta !== delta || delta <= 0 || delta >= 1) {
             throw new RangeError(
-                '[lite-adaptive] ADWIN delta must be a number in (0, 1), got ' + String(delta));
+                '[lite-adaptive] ADWIN delta must be a number in (0, 1), got ' + describeArg(delta));
         }
         if (options !== undefined) {
             optDoor(options, ADWIN_KNOWN_OPTS, 'ADWIN');
@@ -1363,13 +1398,13 @@ export class ADWIN {
      */
     addFrom(buf, i) {
         // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i < buf.length)) return this._badBuf(buf, i);
         const x = buf[i];   // UNBOXED Float64Array read -- the whole point (no argument box).
         // --- validate x FIRST (mirror add(); a Float64Array read is always a number, so add()'s
         // typeof branch is unreachable here and omitted). BYTE-IDENTICAL no-op on reject. ---
-        if (x !== x || x === Infinity || x === -Infinity ||
-            x > ADWIN_X_MAX || x < -ADWIN_X_MAX) return this._badValue(x);   // centred square would overflow
+        if (!(x <= ADWIN_X_MAX && x >= -ADWIN_X_MAX))
+            return this._badValue(x);   // centred square would overflow
         // CENTRING (F9) -- DUPLICATED from add(): anchor c on a (re)started window, accumulate x - c.
         if (this._total === 0) this._c = x;
         const xc = x - this._c;
@@ -1572,7 +1607,7 @@ export class ADWIN {
     _badValue(x) {
         throw new TypeError(
             '[lite-adaptive] ADWIN add x must be a finite number with |x| <= sqrt(Number.MAX_VALUE)/2 ' +
-            '(~6.7e153, so the centred square (x - c)*(x - c) stays finite), got ' + String(x));
+            '(~6.7e153, so the centred square (x - c)*(x - c) stays finite), got ' + describeArg(x));
     }
 
     /**
@@ -1601,7 +1636,7 @@ export class ADWIN {
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] ADWIN.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index (0 <= i < buf.length), got ' + String(buf) + ', ' + String(i));
+            'integer index (0 <= i < buf.length), got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 }
 
@@ -1690,15 +1725,15 @@ export class ForwardDecay {
         // typeof guard FIRST, BEFORE any field init.
         if (typeof halfLife !== 'number' || halfLife !== halfLife || halfLife === Infinity || halfLife <= 0) {
             throw new RangeError(
-                '[lite-adaptive] ForwardDecay halfLife must be a finite number > 0, got ' + String(halfLife));
+                '[lite-adaptive] ForwardDecay halfLife must be a finite number > 0, got ' + describeArg(halfLife));
         }
         // A subnormal halfLife makes lambda = ln2/halfLife overflow to Infinity, which poisons
         // every weight to NaN. Reject it here, BEFORE any field init, NaN-safe (F14).
         const lambda = Math.LN2 / halfLife;
         if (!(lambda < Infinity)) {
             throw new RangeError(
-                '[lite-adaptive] ForwardDecay halfLife ' + String(halfLife) +
-                ' is too small: lambda = ln2/halfLife = ' + String(lambda) +
+                '[lite-adaptive] ForwardDecay halfLife ' + describeArg(halfLife) +
+                ' is too small: lambda = ln2/halfLife = ' + describeArg(lambda) +
                 ' is not finite; halfLife must be >= ' + LAMBDA_HALFLIFE_MIN);
         }
         if (options !== undefined) {
@@ -1829,13 +1864,13 @@ export class ForwardDecay {
      */
     addFrom(buf, i) {
         // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i + 1 < buf.length)) return this._badBuf(buf, i);
         const now = buf[i];       // UNBOXED Float64Array reads -- the whole point (no argument box).
         const v = buf[i + 1];     // packed [now, value]
         // --- validate the value FIRST (mirror add(); any finite real is legal, signed OK; a
         // Float64Array read is always a number so add()'s typeof branch is omitted). ---
-        if (v !== v || v === Infinity || v === -Infinity) return this._badValue(v);
+        if (!(v > -Infinity && v < Infinity)) return this._badValue(v);
         // --- addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify
         // EXPLICIT + the monotone `now` (typeof-first, no alloc). ---
         let t;
@@ -1843,12 +1878,12 @@ export class ForwardDecay {
         if (mode === MODE_COUNT) {
             return this._badMode('count', 'explicit');
         } else if (mode === MODE_EXPLICIT) {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badNow(now);
             if (now < this._lastNow) return this._badMonotone(now);
             t = now;
             this._lastNow = now;
         } else {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badNow(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
@@ -1965,27 +2000,27 @@ export class ForwardDecay {
     /** @private Cold thrower for a non-finite `now`. */
     _badNow(now) {
         throw new TypeError(
-            '[lite-adaptive] ForwardDecay add now must be a finite number, got ' + String(now));
+            '[lite-adaptive] ForwardDecay add now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone `now`. */
     _badMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] ForwardDecay add now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] ForwardDecay add now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad value. */
     _badValue(v) {
         throw new TypeError(
-            '[lite-adaptive] ForwardDecay add value must be a finite number, got ' + String(v));
+            '[lite-adaptive] ForwardDecay add value must be a finite number, got ' + describeArg(v));
     }
 
     /** @private Cold thrower for a query time before the last add (can't un-decay). */
     _badQueryTime(now) {
         throw new RangeError(
             '[lite-adaptive] ForwardDecay query time must be a finite number >= the last add time (' +
-            String(this._now) + '), got ' + String(now));
+            describeArg(this._now) + '), got ' + describeArg(now));
     }
 
     /**
@@ -2007,7 +2042,7 @@ export class ForwardDecay {
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] ForwardDecay.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i + 1 < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 }
 
@@ -2213,15 +2248,15 @@ export class HeavyKeeper {
         // typeof guards FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
         if (typeof d !== 'number' || !Number.isInteger(d) || d < 1 || d > HK_D_MAX) {
             throw new RangeError(
-                '[lite-adaptive] HeavyKeeper d must be an integer in [1, ' + HK_D_MAX + '], got ' + String(d));
+                '[lite-adaptive] HeavyKeeper d must be an integer in [1, ' + HK_D_MAX + '], got ' + describeArg(d));
         }
         if (typeof w !== 'number' || !Number.isInteger(w) || w < 1 || w > HK_W_MAX) {
             throw new RangeError(
-                '[lite-adaptive] HeavyKeeper w must be an integer in [1, ' + HK_W_MAX + '], got ' + String(w));
+                '[lite-adaptive] HeavyKeeper w must be an integer in [1, ' + HK_W_MAX + '], got ' + describeArg(w));
         }
         if (typeof k !== 'number' || !Number.isInteger(k) || k < 1 || k > HK_K_MAX) {
             throw new RangeError(
-                '[lite-adaptive] HeavyKeeper k must be an integer in [1, ' + HK_K_MAX + '], got ' + String(k));
+                '[lite-adaptive] HeavyKeeper k must be an integer in [1, ' + HK_K_MAX + '], got ' + describeArg(k));
         }
         // Cells cap BEFORE allocation (F11): d*w past 2^27 aborted the process on a V8 fatal in 1.6.0.
         if (d * w > HK_CELLS_CAP) {
@@ -2237,7 +2272,7 @@ export class HeavyKeeper {
                 const s = options.seed;
                 if (typeof s !== 'number' || !Number.isInteger(s) || s < 0 || s > 4294967295) {
                     throw new RangeError(
-                        '[lite-adaptive] HeavyKeeper seed must be a uint32 (integer in [0, 2^32-1]), got ' + String(s));
+                        '[lite-adaptive] HeavyKeeper seed must be a uint32 (integer in [0, 2^32-1]), got ' + describeArg(s));
                 }
                 seed = s;
             }
@@ -2245,7 +2280,7 @@ export class HeavyKeeper {
                 const bb = options.b;
                 if (typeof bb !== 'number' || bb !== bb || bb === Infinity || bb <= 1) {
                     throw new RangeError(
-                        '[lite-adaptive] HeavyKeeper b (decay base) must be a finite number > 1, got ' + String(bb));
+                        '[lite-adaptive] HeavyKeeper b (decay base) must be a finite number > 1, got ' + describeArg(bb));
                 }
                 b = bb;
             }
@@ -2303,13 +2338,13 @@ export class HeavyKeeper {
     static withAccuracy(k, targetError, options) {
         if (typeof k !== 'number' || !Number.isInteger(k) || k < 1) {
             throw new RangeError(
-                '[lite-adaptive] HeavyKeeper.withAccuracy k must be an integer >= 1, got ' + String(k));
+                '[lite-adaptive] HeavyKeeper.withAccuracy k must be an integer >= 1, got ' + describeArg(k));
         }
         if (typeof targetError !== 'number' || targetError !== targetError ||
             targetError <= 0 || targetError >= 1) {
             throw new RangeError(
                 '[lite-adaptive] HeavyKeeper.withAccuracy targetError must be a number in (0, 1), got ' +
-                String(targetError));
+                describeArg(targetError));
         }
         // Same door as the ctor (R6), with the factory label, BEFORE forwarding options.
         optDoor(options, HK_KNOWN_OPTS, 'HeavyKeeper.withAccuracy');
@@ -2412,8 +2447,8 @@ export class HeavyKeeper {
      * @returns {HeavyKeeper} this
      */
     addFrom(buf, i) {
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i + 1 < buf.length)) return this._badBuf(buf, i);
         const key = buf[i];         // UNBOXED Float64Array reads -- the whole point (no arg box).
         const wt = buf[i + 1];      // packed [key, weight]
         if (!Number.isSafeInteger(key)) return this._badKey(key);
@@ -2509,7 +2544,7 @@ export class HeavyKeeper {
      * @returns {number} the number of [key, estimate] entries written (<= k).
      */
     topKInto(buf) {
-        if (!(buf instanceof Float64Array) || buf.length < 2 * this._k) return this._badTopKBuf(buf);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || !(TA_LEN.call(buf) >= 2 * this._k)) return this._badTopKBuf(buf);
         const n = this._hkN;
         const hk = this._hkKey, he = this._hkEst;
         for (let i = 0; i < n; i++) { buf[i * 2] = hk[i]; buf[i * 2 + 1] = he[i]; }
@@ -2693,33 +2728,33 @@ export class HeavyKeeper {
     /** @private Cold thrower for a bad key. */
     _badKey(key) {
         throw new TypeError(
-            '[lite-adaptive] HeavyKeeper key must be a safe integer, got ' + String(key));
+            '[lite-adaptive] HeavyKeeper key must be a safe integer, got ' + describeArg(key));
     }
 
     /** @private Cold thrower for a bad weight (closed domain [1, 2^32-1], SCM count parity). */
     _badWeight(w) {
         throw new TypeError(
-            '[lite-adaptive] HeavyKeeper weight must be an integer in [1, 4294967295], got ' + String(w));
+            '[lite-adaptive] HeavyKeeper weight must be an integer in [1, 4294967295], got ' + describeArg(w));
     }
 
     /** @private Cold thrower for a bad addFrom buffer/index. */
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] HeavyKeeper.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i + 1 < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 
     /** @private Cold thrower for a too-small / non-Float64Array topKInto buffer. */
     _badTopKBuf(buf) {
         throw new TypeError(
             '[lite-adaptive] HeavyKeeper.topKInto(buf) needs a Float64Array of length >= 2*k (k=' +
-            this._k + ', so it holds a full top-k as [key, estimate] pairs), got ' + String(buf));
+            this._k + ', so it holds a full top-k as [key, estimate] pairs), got ' + describeArg(buf));
     }
 
     /** @private Cold thrower for a non-function forEach callback. */
     _badFn(fn) {
         throw new TypeError(
-            '[lite-adaptive] HeavyKeeper.forEach(fn) needs a function, got ' + String(fn));
+            '[lite-adaptive] HeavyKeeper.forEach(fn) needs a function, got ' + describeArg(fn));
     }
 }
 
@@ -2866,7 +2901,7 @@ export class SlidingHyperLogLog {
         // typeof guard FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
         if (typeof W !== 'number' || W !== W || W === Infinity || W === -Infinity || W <= 0) {
             throw new RangeError(
-                '[lite-adaptive] SlidingHyperLogLog W must be a finite number > 0, got ' + String(W));
+                '[lite-adaptive] SlidingHyperLogLog W must be a finite number > 0, got ' + describeArg(W));
         }
         let p = SL_DEFAULT_P;
         let ringCap = SL_DEFAULT_RINGCAP;
@@ -2878,7 +2913,7 @@ export class SlidingHyperLogLog {
                 if (typeof pp !== 'number' || (pp | 0) !== pp || pp < SL_P_MIN || pp > SL_P_MAX) {
                     throw new RangeError(
                         '[lite-adaptive] SlidingHyperLogLog p must be an integer in [' + SL_P_MIN + ', ' +
-                        SL_P_MAX + '], got ' + String(pp));
+                        SL_P_MAX + '], got ' + describeArg(pp));
                 }
                 p = pp;
             }
@@ -2889,7 +2924,7 @@ export class SlidingHyperLogLog {
                     (rc & (rc - 1)) !== 0) {
                     throw new RangeError(
                         '[lite-adaptive] SlidingHyperLogLog ringCap must be a power of two in [2, ' +
-                        SL_RINGCAP_MAX + '], got ' + String(rc));
+                        SL_RINGCAP_MAX + '], got ' + describeArg(rc));
                 }
                 ringCap = rc;
             }
@@ -2899,7 +2934,7 @@ export class SlidingHyperLogLog {
                 if (typeof s !== 'number' || !Number.isInteger(s) || s < 0 || s > 4294967295) {
                     throw new RangeError(
                         '[lite-adaptive] SlidingHyperLogLog seed must be a uint32 (integer in [0, 2^32-1]), got ' +
-                        String(s));
+                        describeArg(s));
                 }
                 seed = s;
             }
@@ -3093,8 +3128,8 @@ export class SlidingHyperLogLog {
      */
     addFrom(buf, i) {
         // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i + 1 < buf.length)) return this._badBuf(buf, i);
         const now = buf[i];       // UNBOXED Float64Array reads -- the whole point (no argument box).
         const key = buf[i + 1];   // packed [now, key]
         if (!Number.isSafeInteger(key)) return this._badKey(key);
@@ -3104,12 +3139,12 @@ export class SlidingHyperLogLog {
         if (mode === MODE_COUNT) {
             return this._badMode('count', 'explicit');
         } else if (mode === MODE_EXPLICIT) {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badNow(now);
             if (now < this._lastNow) return this._badMonotone(now);
             t = now;
             this._lastNow = now;
         } else {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badNow(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
@@ -3241,7 +3276,7 @@ export class SlidingHyperLogLog {
     /** @private Cold thrower for a bad key. */
     _badKey(key) {
         throw new TypeError(
-            '[lite-adaptive] SlidingHyperLogLog key must be a safe integer, got ' + String(key));
+            '[lite-adaptive] SlidingHyperLogLog key must be a safe integer, got ' + describeArg(key));
     }
 
     /** @private Cold thrower for a mode switch after the mode locked. */
@@ -3254,21 +3289,21 @@ export class SlidingHyperLogLog {
     /** @private Cold thrower for a non-finite `now`. */
     _badNow(now) {
         throw new TypeError(
-            '[lite-adaptive] SlidingHyperLogLog add now must be a finite number, got ' + String(now));
+            '[lite-adaptive] SlidingHyperLogLog add now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone `now`. */
     _badMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] SlidingHyperLogLog add now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] SlidingHyperLogLog add now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad addFrom buffer/index. */
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] SlidingHyperLogLog.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i + 1 < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 
     /**
@@ -3320,20 +3355,20 @@ export class SlidingHyperLogLog {
      * @returns {SlidingHyperLogLog} this
      */
     advanceFrom(buf, i) {
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badAdvanceBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i < buf.length)) return this._badAdvanceBuf(buf, i);
         const now = buf[i];   // UNBOXED Float64Array read (always a number -> no typeof branch).
         let t;
         const mode = this._mode;
         if (mode === MODE_COUNT) {
             return this._badAdvanceMode('count', 'explicit');
         } else if (mode === MODE_EXPLICIT) {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badAdvanceNow(now);
             if (now < this._lastNow) return this._badAdvanceMonotone(now);
             t = now;
             this._lastNow = now;
         } else {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badAdvanceNow(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
@@ -3352,21 +3387,21 @@ export class SlidingHyperLogLog {
     /** @private Cold thrower for a non-finite advance `now`. */
     _badAdvanceNow(now) {
         throw new TypeError(
-            '[lite-adaptive] SlidingHyperLogLog advance now must be a finite number, got ' + String(now));
+            '[lite-adaptive] SlidingHyperLogLog advance now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone advance `now`. */
     _badAdvanceMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] SlidingHyperLogLog advance now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] SlidingHyperLogLog advance now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad advanceFrom buffer/index. */
     _badAdvanceBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] SlidingHyperLogLog.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 }
 
@@ -3436,6 +3471,9 @@ const DD_DEFAULT_THRESHOLD = 50;
  */
 const DD_X_MAX = 1e150;
 
+/** PH re-centre span: subtract the running min/max off gP/gN once max(|mMin|,|mMax|) > th*this, so a latched PH accumulator stays bounded on an infinite same-direction drift. ulp(th*2^20) stays << th. */
+const DD_RECENTRE_SPAN = 1048576; // 2^20
+
 /**
  * DriftDetector -- a SCALAR, O(1)-STATE streaming drift detector over a real-valued signal,
  * selected by a mode const (DRIFT_PH or DRIFT_CUSUM). It maintains a running mean plus one or
@@ -3489,7 +3527,7 @@ export class DriftDetector {
         // typeof / value guard FIRST, BEFORE any field init (a bad param leaves no half-built instance).
         if (mode !== DRIFT_PH && mode !== DRIFT_CUSUM) {
             throw new RangeError(
-                '[lite-adaptive] DriftDetector mode must be DRIFT_PH or DRIFT_CUSUM, got ' + String(mode));
+                '[lite-adaptive] DriftDetector mode must be DRIFT_PH or DRIFT_CUSUM, got ' + describeArg(mode));
         }
         let delta = DD_DEFAULT_DELTA;
         let threshold = DD_DEFAULT_THRESHOLD;
@@ -3506,7 +3544,7 @@ export class DriftDetector {
                 if (typeof d !== 'number' || d !== d || d === Infinity || d === -Infinity ||
                     d < 0 || d > DD_X_MAX) {
                     throw new RangeError(
-                        '[lite-adaptive] DriftDetector delta must be a finite number in [0, 1e150], got ' + String(d));
+                        '[lite-adaptive] DriftDetector delta must be a finite number in [0, 1e150], got ' + describeArg(d));
                 }
                 delta = d;
             }
@@ -3514,7 +3552,7 @@ export class DriftDetector {
                 const th = options.threshold;
                 if (typeof th !== 'number' || th !== th || th === Infinity || th === -Infinity || th <= 0) {
                     throw new RangeError(
-                        '[lite-adaptive] DriftDetector threshold must be a finite number > 0, got ' + String(th));
+                        '[lite-adaptive] DriftDetector threshold must be a finite number > 0, got ' + describeArg(th));
                 }
                 threshold = th;
             }
@@ -3526,7 +3564,7 @@ export class DriftDetector {
                     tg > DD_X_MAX || tg < -DD_X_MAX) {
                     throw new RangeError(
                         '[lite-adaptive] DriftDetector target must be a finite number with |target| <= 1e150, got ' +
-                        String(tg));
+                        describeArg(tg));
                 }
                 target = tg;
             }
@@ -3536,7 +3574,7 @@ export class DriftDetector {
                 const lt = options.latch;
                 if (typeof lt !== 'boolean') {
                     throw new TypeError(
-                        '[lite-adaptive] DriftDetector latch must be a boolean, got ' + String(lt));
+                        '[lite-adaptive] DriftDetector latch must be a boolean, got ' + describeArg(lt));
                 }
                 latch = lt;
             }
@@ -3561,7 +3599,7 @@ export class DriftDetector {
         if (latch && !(threshold * 0.5 > 0)) {
             throw new RangeError(
                 '[lite-adaptive] DriftDetector latch needs threshold / 2 > 0 (a re-arm level); ' +
-                'threshold ' + String(threshold) + ' underflows -- use threshold >= 2 * Number.MIN_VALUE');
+                'threshold ' + describeArg(threshold) + ' underflows -- use threshold >= 2 * Number.MIN_VALUE');
         }
         this._mode = mode;
         this._delta = delta;
@@ -3569,6 +3607,11 @@ export class DriftDetector {
         this._target = target;   // a finite mu0 for CUSUM; undefined for PH (config, never reset)
         this._latch = latch;     // config, never reset: false = auto-reset-on-fire (1.x), true = latch
         this._half = threshold * 0.5;   // the re-arm hysteresis level (latch mode), precomputed
+        // The latched-PH re-centre limit, precomputed once (threshold is set here and NEVER mutated --
+        // no setter, clear() does not touch it -- so this needs no recompute). Sign-aware compares in
+        // the cold fire path read this slot instead of recomputing threshold * DD_RECENTRE_SPAN and
+        // calling Math.abs on every latched item (the fire-heavy throughput fix, v1.10.0 4c-ii).
+        this._rcLim = threshold * DD_RECENTRE_SPAN;
         // _s -- an instance Float64Array(3): [0] the lifetime accepted-add counter (0-based item
         // index base; reset only by clear()), [1] lastDriftIndex, [2] lastDirection. A typed-array
         // slot so the hot-path counter store never boxes; allocated ONCE, before _initState().
@@ -3723,12 +3766,12 @@ export class DriftDetector {
      */
     addFrom(buf, i) {
         // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i < buf.length)) return this._badBuf(buf, i);
         const x = buf[i];   // UNBOXED Float64Array read -- the whole point (no argument box).
         // validate x (a Float64Array read is always a number, so add()'s typeof branch is omitted).
-        if (x !== x || x === Infinity || x === -Infinity ||
-            x > DD_X_MAX || x < -DD_X_MAX) return this._badValue(x);
+        if (!(x <= DD_X_MAX && x >= -DD_X_MAX))
+            return this._badValue(x);
         const n = this._n + 1;
         this._n = n;
         this._s[0]++;   // DUPLICATED from add(): lifetime accepted-add counter (a typed-array store, never boxes).
@@ -3839,7 +3882,8 @@ export class DriftDetector {
             this._lDir = dir;
             this._lvl = -Infinity;
             if (ph) { this._n = 0; this._mean = 0; }   // reset the PH reference AT the fire (1.x discipline)
-            this._clampGap(dir, ph, th);
+            this._clampGap(dir);
+            if (ph && (this._mMin < -this._rcLim || this._mMax > this._rcLim)) { this._gP -= this._mMin; this._mMin = 0; this._gN -= this._mMax; this._mMax = 0; }
             return true;
         }
         // Already latched. A single-item OPPOSITE gap > threshold fires on its own item (checked before
@@ -3853,7 +3897,8 @@ export class DriftDetector {
             this._s[2] = ndir;
             this._lDir = ndir;
             if (ph) { this._n = 0; this._mean = 0; }   // reset the PH reference AT the opposite fire (1.x discipline)
-            this._clampGap(ndir, ph, th);
+            this._clampGap(ndir);
+            if (ph && (this._mMin < -this._rcLim || this._mMax > this._rcLim)) { this._gP -= this._mMin; this._mMin = 0; this._gN -= this._mMax; this._mMax = 0; }
             return true;
         }
         if (latchedGap < this._half) {
@@ -3870,7 +3915,8 @@ export class DriftDetector {
         // already <= threshold (a gradual return toward baseline) it is LEFT to decay, so it can reach
         // threshold/2 and re-arm. Clamping unconditionally re-inflated a shrinking gap every item and
         // silently missed every later same-direction regime (F-latch-rearm).
-        if (latchedGap > th) this._clampGap(this._lDir, ph, th);
+        if (latchedGap > th) this._clampGap(this._lDir);
+        if (ph && (this._mMin < -this._rcLim || this._mMax > this._rcLim)) { this._gP -= this._mMin; this._mMin = 0; this._gN -= this._mMax; this._mMax = 0; }
         return false;
     }
 
@@ -3878,7 +3924,9 @@ export class DriftDetector {
      * @private Clamp the fired-direction accumulator so the firing gap equals exactly `threshold`
      * (PH: gP = mMin + th / gN = mMax - th; CUSUM: gP = th / gN = th). Keeps latched state bounded.
      */
-    _clampGap(dir, ph, th) {
+    _clampGap(dir) {
+        const ph = this._mode === DRIFT_PH;
+        const th = this._threshold;
         if (dir === 1) {
             this._gP = ph ? this._mMin + th : th;
         } else {
@@ -3895,7 +3943,7 @@ export class DriftDetector {
     /** @private Cold thrower for a bad value. */
     _badValue(x) {
         throw new TypeError(
-            '[lite-adaptive] DriftDetector add x must be a finite number with |x| <= 1e150, got ' + String(x));
+            '[lite-adaptive] DriftDetector add x must be a finite number with |x| <= 1e150, got ' + describeArg(x));
     }
 
     /**
@@ -3920,7 +3968,7 @@ export class DriftDetector {
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] DriftDetector.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index (0 <= i < buf.length), got ' + String(buf) + ', ' + String(i));
+            'integer index (0 <= i < buf.length), got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 }
 
@@ -3983,6 +4031,20 @@ const SLD_MAX_BINS = 2048;
  * DDSketch; SLD_KEY_MAX only bites at a pathologically small alpha whose offsets would not fit Int32.
  */
 const SLD_KEY_MAX = 1 << 30;
+/**
+ * SLD_MIN_NORMAL -- the smallest NORMAL double (2^-1022). W / panes must land here or above: a SUBNORMAL
+ * pane width loses significand bits, so the grid line (k+1)*pw no longer round-trips and (B+1)*pw can
+ * fall below W and the ring under-covers (H2-1 F3). The ctor rejects a subnormal pane width fail-closed
+ * BEFORE any allocation.
+ */
+const SLD_MIN_NORMAL = 2.2250738585072014e-308;
+/**
+ * SLD_CLOCK_SPAN -- the clock-precision domain (2^42). The pane grid is EXACT only while ulp(now) is far
+ * below the pane width: at |now| <= pw * 2^42, ulp(now) <= pw * 2^-10, so round(E / pw) recovers the grid
+ * index exactly and (k+1)*pw contains the true window. add / advance throw past this bound (count mode
+ * applies the same bound to its integer tick). Precomputed once per instance as this._nowMax = pw * 2^42.
+ */
+const SLD_CLOCK_SPAN = 4398046511104;   // 2^42
 
 /**
  * SlidingDDSketch -- WINDOWED relative-error QUANTILE estimation over the LAST W (a hard sliding
@@ -4039,7 +4101,7 @@ export class SlidingDDSketch {
         // typeof guard FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
         if (typeof W !== 'number' || W !== W || W === Infinity || W === -Infinity || W <= 0) {
             throw new RangeError(
-                '[lite-adaptive] SlidingDDSketch W must be a finite number > 0, got ' + String(W));
+                '[lite-adaptive] SlidingDDSketch W must be a finite number > 0, got ' + describeArg(W));
         }
         let alpha = SLD_DEFAULT_ALPHA;
         let strict = false;
@@ -4052,7 +4114,7 @@ export class SlidingDDSketch {
                 const a = options.alpha;
                 if (typeof a !== 'number' || !(a > 0 && a < 1)) {
                     throw new RangeError(
-                        '[lite-adaptive] SlidingDDSketch alpha must be a number in (0, 1), got ' + String(a));
+                        '[lite-adaptive] SlidingDDSketch alpha must be a number in (0, 1), got ' + describeArg(a));
                 }
                 alpha = a;
             }
@@ -4061,7 +4123,7 @@ export class SlidingDDSketch {
                 const st = options.strict;
                 if (typeof st !== 'boolean') {
                     throw new TypeError(
-                        '[lite-adaptive] SlidingDDSketch strict must be a boolean, got ' + String(st));
+                        '[lite-adaptive] SlidingDDSketch strict must be a boolean, got ' + describeArg(st));
                 }
                 strict = st;
                 strictSet = true;
@@ -4072,7 +4134,7 @@ export class SlidingDDSketch {
                 if (typeof p !== 'number' || (p | 0) !== p || p < SLD_PANES_MIN || p > SLD_PANES_MAX) {
                     throw new RangeError(
                         '[lite-adaptive] SlidingDDSketch panes must be an integer in [' + SLD_PANES_MIN +
-                        ', ' + SLD_PANES_MAX + '], got ' + String(p));
+                        ', ' + SLD_PANES_MAX + '], got ' + describeArg(p));
                 }
                 panes = p;
             }
@@ -4142,6 +4204,14 @@ export class SlidingDDSketch {
                 '[lite-adaptive] SlidingDDSketch W is too small for panes=' + panes +
                 ' (W / panes underflowed to ' + paneW + '); use a larger W or fewer panes');
         }
+        // The pane width must be a NORMAL double: a subnormal pw loses significand bits, so the grid line
+        // (k+1)*pw no longer round-trips and (B+1)*pw can fall below W -> under-cover (H2-1 F3). Fail closed
+        // BEFORE alloc (the `!(>=)` form also rejects a NaN paneW, though the step above caught it).
+        if (!(paneW >= SLD_MIN_NORMAL)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingDDSketch W / panes (' + paneW + ') is subnormal; the pane grid ' +
+                'cannot hold W exactly -- use a larger W or fewer panes');
+        }
 
         // F7: the ring holds B+1 panes so the covered span is [W, W + W/B] -- the straddling oldest
         // pane is INCLUDED (kept, never dropped) and the true window is ALWAYS fully covered. `_panes`
@@ -4155,7 +4225,8 @@ export class SlidingDDSketch {
         this._panes = panes;         // B (getter returns this; edge error is W / B); the ring holds B+1 panes
         this._ring = ring;           // B + 1
         this._maxBins = SLD_MAX_BINS;
-        this._paneW = paneW;              // per-pane time width (the disclosed edge error); guarded > 0 above
+        this._paneW = paneW;              // per-pane time width (the disclosed edge error); guarded normal above
+        this._nowMax = paneW * SLD_CLOCK_SPAN;   // |now| clock-precision bound (pw * 2^42); one field compare on the hot path
         this._gamma = gamma;
         this._multiplier = multiplier;
         // Hot key gate reads the ACCEPTED band (indexable, tightened to any declared range).
@@ -4290,33 +4361,43 @@ export class SlidingDDSketch {
         const mode = this._mode;
         if (mode === MODE_COUNT) {
             if (now !== undefined) return this._badMode('count', 'explicit');
-            t = ++this._tick;
+            t = this._tick + 1;
+            if (!(t <= this._nowMax)) return this._badNowRange(t);   // tick past pw * 2^42 -> fail closed
+            this._tick = t;
         } else if (mode === MODE_EXPLICIT) {
             if (now === undefined) return this._badMode('explicit', 'count');
             if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
                 return this._badNow(now);
             }
             if (now < this._lastNow) return this._badMonotone(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             t = now;
             this._lastNow = now;
         } else {
             if (now === undefined) {
+                t = this._tick + 1;
+                if (!(t <= this._nowMax)) return this._badNowRange(t);
                 this._mode = MODE_COUNT;
-                t = ++this._tick;
-                this._anchor(t);
+                this._tick = t;
+                this._now = t;
+                this._anchor();
             } else {
                 if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
                     return this._badNow(now);
                 }
+                const nm = this._nowMax;
+                if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
                 this._mode = MODE_EXPLICIT;
                 t = now;
                 this._lastNow = now;
-                this._anchor(t);
+                this._now = t;
+                this._anchor();
             }
         }
         this._now = t;
         // 4. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
-        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        if (t >= this._paneEnd[this._cur]) this._advance();
         // 5. write the value into the current pane.
         const cur = this._cur;
         if (value === 0) { this._paneZero[cur] += 1; this._paneCount[cur] += 1; return this; }
@@ -4348,12 +4429,12 @@ export class SlidingDDSketch {
      */
     addFrom(buf, i) {
         // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i + 1 < buf.length)) return this._badBuf(buf, i);
         const now = buf[i];         // UNBOXED Float64Array reads -- the whole point (no argument box).
         const value = buf[i + 1];   // packed [now, value]
         // 1. validate the VALUE first (a Float64Array read is always a number, so no typeof branch).
-        if (value !== value || value === Infinity || value === -Infinity) return this._badValue(value);
+        if (!(value > -Infinity && value < Infinity)) return this._badValue(value);
         if (value < 0) return this._badValue(value);
         // 2. compute the log-bucket key + indexable check for x > 0.
         let k = 0;
@@ -4369,18 +4450,23 @@ export class SlidingDDSketch {
         } else if (mode === MODE_EXPLICIT) {
             if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
             if (now < this._lastNow) return this._badMonotone(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             t = now;
             this._lastNow = now;
         } else {
             if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
-            this._anchor(t);
+            this._now = t;
+            this._anchor();
         }
         this._now = t;
         // 4. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
-        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        if (t >= this._paneEnd[this._cur]) this._advance();
         // 5. write the value into the current pane (DUPLICATED from add() -- byte-identical body).
         const cur = this._cur;
         if (value === 0) { this._paneZero[cur] += 1; this._paneCount[cur] += 1; return this; }
@@ -4401,10 +4487,11 @@ export class SlidingDDSketch {
     /**
      * @private Anchor the pane ring around the first `now` (grid-aligned to W/panes). The current
      * pane (index 0) covers the grid cell containing `now`; predecessors go backward by one pane
-     * width each. Cold (once per lifecycle / clear). 0 alloc.
+     * width each. Argument-free (reads this._now, the zero-box law). Cold (once per lifecycle /
+     * clear). 0 alloc.
      */
-    _anchor(now) {
-        const B = this._ring, pw = this._paneW;
+    _anchor() {
+        const B = this._ring, pw = this._paneW, now = this._now;
         const E = (Math.floor(now / pw) + 1) * pw;   // EXCLUSIVE upper bound of the current pane
         this._cur = 0;
         this._paneEnd[0] = E;
@@ -4413,19 +4500,27 @@ export class SlidingDDSketch {
     }
 
     /**
-     * @private Rotate the ring forward so the current pane covers time `t`, clearing each pane it
+     * @private Rotate the ring forward so the current pane covers this._now, clearing each pane it
      * rotates onto. Capped at B+1 rotations (rotating >= B+1 panes clears the WHOLE ring, then
-     * re-anchors it around `t`). 0 alloc. Called only when `t` crossed the current pane boundary.
+     * re-anchors it around this._now). Argument-free (reads this._now, the zero-box law). 0 alloc.
+     * Called only when this._now crossed the current boundary.
      */
-    _advance(t) {
-        const pw = this._paneW, B = this._ring;
+    _advance() {
+        const pw = this._paneW, B = this._ring, t = this._now;
         let cur = this._cur;
+        // Grid index of the current pane end (E = k*pw exactly for an integer k in the legal clock
+        // domain, |now| <= pw * 2^42, where ulp(E) <= pw * 2^-10 so the division round-trips). Each new
+        // pane end is (k+1)*pw by MULTIPLICATION -- drift-free and bit-identical to the anchor / oracle's
+        // (floor(t/pw)+1)*pw -- rather than an accumulating `E += pw`, whose per-step rounding drifts by
+        // up to ~pw near the domain edge and can drop a live pane (H2-1 F2, fail-open).
+        let k = Math.round(this._paneEnd[cur] / pw);
         let E = this._paneEnd[cur];
         let rot = 0;
         while (t >= E && rot < B) {
             cur++; if (cur === B) cur = 0;
             this._clearPane(cur);
-            E += pw;
+            k += 1;
+            E = k * pw;
             this._paneEnd[cur] = E;
             rot++;
         }
@@ -4723,10 +4818,13 @@ export class SlidingDDSketch {
      * @returns {number} the count of quantiles written.
      */
     quantileInto(qs, out) {
-        if (!(qs instanceof Float64Array) || !(out instanceof Float64Array) || out.length < qs.length) {
+        if (!(ArrayBuffer.isView(qs) && qs instanceof Float64Array) || !(ArrayBuffer.isView(out) && out instanceof Float64Array)) {
             return this._badInto(qs, out);   // argument-TYPE guard (a wrong container is a programming error)
         }
-        const n = qs.length;
+        const n = TA_LEN.call(qs);           // H34: intrinsic length, read ONCE (a subclass getter runs no user code)
+        if (!(TA_LEN.call(out) >= n)) {
+            return this._badInto(qs, out);   // argument-TYPE guard (a wrong container is a programming error)
+        }
         if (this._mode === MODE_UNSET) {
             for (let j = 0; j < n; j++) out[j] = NaN;
             return n;
@@ -4771,7 +4869,7 @@ export class SlidingDDSketch {
     /** @private Cold thrower for a bad value (non-finite / negative). */
     _badValue(value) {
         throw new TypeError(
-            '[lite-adaptive] SlidingDDSketch value must be a finite number >= 0, got ' + String(value));
+            '[lite-adaptive] SlidingDDSketch value must be a finite number >= 0, got ' + describeArg(value));
     }
 
     /**
@@ -4781,24 +4879,24 @@ export class SlidingDDSketch {
     _badIndexable(value) {
         if (this._rangeMin === this._rangeMin) {   // a range was declared (NaN when not)
             throw new RangeError(
-                '[lite-adaptive] SlidingDDSketch value ' + String(value) +
+                '[lite-adaptive] SlidingDDSketch value ' + describeArg(value) +
                 ' is outside the declared strict range [' + this._rangeMin + ', ' + this._rangeMax + ']');
         }
         throw new RangeError(
-            '[lite-adaptive] SlidingDDSketch value ' + String(value) + ' is outside the sketch\'s indexable range');
+            '[lite-adaptive] SlidingDDSketch value ' + describeArg(value) + ' is outside the sketch\'s indexable range');
     }
 
     /** @private Cold thrower for a malformed `range` option (before any allocation). */
     _badRange(range) {
         throw new RangeError(
             '[lite-adaptive] SlidingDDSketch range must be [rmin, rmax] with finite 0 < rmin < rmax, both ' +
-            'inside the alpha indexable band, got ' + String(range));
+            'inside the alpha indexable band, got ' + describeArg(range));
     }
 
     /** @private Cold thrower for a strict-mode collapse rejection (below the floor OR above the ceiling). */
     _badStrict(k) {
         throw new RangeError(
-            '[lite-adaptive] SlidingDDSketch strict mode: value (bucket key ' + String(k) +
+            '[lite-adaptive] SlidingDDSketch strict mode: value (bucket key ' + describeArg(k) +
             ') falls outside the pane\'s representable window and would collapse');
     }
 
@@ -4812,28 +4910,28 @@ export class SlidingDDSketch {
     /** @private Cold thrower for a non-finite `now`. */
     _badNow(now) {
         throw new TypeError(
-            '[lite-adaptive] SlidingDDSketch add now must be a finite number, got ' + String(now));
+            '[lite-adaptive] SlidingDDSketch add now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone `now`. */
     _badMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] SlidingDDSketch add now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] SlidingDDSketch add now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad quantileInto(qs, out). */
     _badInto(qs, out) {
         throw new TypeError(
             '[lite-adaptive] SlidingDDSketch.quantileInto(qs, out) needs two Float64Arrays with ' +
-            'out.length >= qs.length, got ' + String(qs) + ', ' + String(out));
+            'out.length >= qs.length, got ' + describeArg(qs) + ', ' + describeArg(out));
     }
 
     /** @private Cold thrower for a bad addFrom buffer/index. */
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] SlidingDDSketch.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i + 1 < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 
     /**
@@ -4859,19 +4957,24 @@ export class SlidingDDSketch {
                 return this._badAdvanceNow(now);
             }
             if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             t = now;
             this._lastNow = now;
         } else {
             if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
                 return this._badAdvanceNow(now);
             }
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
-            this._anchor(t);
+            this._now = t;
+            this._anchor();
         }
         this._now = t;
-        if (t >= this._paneEnd[this._cur]) this._advance(t);   // rotate + clear stale panes (bounded).
+        if (t >= this._paneEnd[this._cur]) this._advance();   // rotate + clear stale panes (bounded).
         return this;
     }
 
@@ -4885,8 +4988,8 @@ export class SlidingDDSketch {
      * @returns {SlidingDDSketch} this
      */
     advanceFrom(buf, i) {
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badAdvanceBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i < buf.length)) return this._badAdvanceBuf(buf, i);
         const now = buf[i];   // UNBOXED Float64Array read (always a number -> no typeof branch).
         let t;
         const mode = this._mode;
@@ -4895,18 +4998,37 @@ export class SlidingDDSketch {
         } else if (mode === MODE_EXPLICIT) {
             if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
             if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             t = now;
             this._lastNow = now;
         } else {
             if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
-            this._anchor(t);
+            this._now = t;
+            this._anchor();
         }
         this._now = t;
-        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        if (t >= this._paneEnd[this._cur]) this._advance();
         return this;
+    }
+
+    /**
+     * @private Cold thrower for a `now` (or count-mode tick) outside the clock-precision domain
+     * |now| <= pw * 2^42. Past it ulp(now) is no longer far below the pane width, so round(E / pw) can
+     * miss the grid index and (k+1)*pw drifts off the true window -- the covered span would silently
+     * under-count / mis-answer (H2-1 F1/F2). Fail closed BEFORE any state write.
+     */
+    _badNowRange(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingDDSketch now (' + describeArg(now) + ') is too large for the pane width (' +
+            this._paneW + '); |now| must be <= pw * 2^42 (' + this._nowMax +
+            ')' + (this._mode === MODE_COUNT ? ', including the count-mode tick,' : '') +
+            ' -- rebase the clock (e.g. performance.now()) or use a larger W');
     }
 
     /** @private Cold thrower for an advance mode switch (advance is EXPLICIT-only). */
@@ -4919,21 +5041,21 @@ export class SlidingDDSketch {
     /** @private Cold thrower for a non-finite advance `now`. */
     _badAdvanceNow(now) {
         throw new TypeError(
-            '[lite-adaptive] SlidingDDSketch advance now must be a finite number, got ' + String(now));
+            '[lite-adaptive] SlidingDDSketch advance now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone advance `now`. */
     _badAdvanceMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] SlidingDDSketch advance now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] SlidingDDSketch advance now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad advanceFrom buffer/index. */
     _badAdvanceBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] SlidingDDSketch.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 }
 
@@ -4998,6 +5120,19 @@ const SCM_DEFAULT_SEED = 0x9e3779b1;
 const SCM_DEFAULT_EPSILON = 0.01;
 /** Default failure probability (derives the default depth d = ceil(ln(1/delta))). */
 const SCM_DEFAULT_DELTA = 0.01;
+/**
+ * SCM_MIN_NORMAL -- the smallest NORMAL double (2^-1022). W / panes must land here or above: a SUBNORMAL
+ * pane width loses significand bits, so (B+1)*pw can fall below W and the ring under-covers (H2-1 F3).
+ * The ctor rejects a subnormal pane width fail-closed BEFORE any allocation.
+ */
+const SCM_MIN_NORMAL = 2.2250738585072014e-308;
+/**
+ * SCM_CLOCK_SPAN -- the clock-precision domain (2^42). The pane grid is EXACT only while ulp(now) is far
+ * below the pane width: at |now| <= pw * 2^42, ulp(now) <= pw * 2^-10, so round(E / pw) recovers the grid
+ * index exactly and (k+1)*pw contains the true window. add / advance throw past this bound (count mode
+ * applies the same bound to its integer tick). Precomputed once per instance as this._nowMax = pw * 2^42.
+ */
+const SCM_CLOCK_SPAN = 4398046511104;   // 2^42
 
 /**
  * SlidingCountMin -- WINDOWED per-label FREQUENCY estimation over the LAST W (a hard sliding window)
@@ -5052,7 +5187,7 @@ export class SlidingCountMin {
         // typeof guard FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
         if (typeof W !== 'number' || W !== W || W === Infinity || W === -Infinity || W <= 0) {
             throw new RangeError(
-                '[lite-adaptive] SlidingCountMin W must be a finite number > 0, got ' + String(W));
+                '[lite-adaptive] SlidingCountMin W must be a finite number > 0, got ' + describeArg(W));
         }
         let epsilon, delta, wOpt, dOpt;
         let panes = SCM_DEFAULT_PANES;
@@ -5064,28 +5199,28 @@ export class SlidingCountMin {
                 epsilon = options.epsilon;
                 if (typeof epsilon !== 'number' || !(epsilon > 0 && epsilon < 1)) {
                     throw new RangeError(
-                        '[lite-adaptive] SlidingCountMin epsilon must be a number in (0, 1), got ' + String(epsilon));
+                        '[lite-adaptive] SlidingCountMin epsilon must be a number in (0, 1), got ' + describeArg(epsilon));
                 }
             }
             if (options.delta !== undefined) {
                 delta = options.delta;
                 if (typeof delta !== 'number' || !(delta > 0 && delta < 1)) {
                     throw new RangeError(
-                        '[lite-adaptive] SlidingCountMin delta must be a number in (0, 1), got ' + String(delta));
+                        '[lite-adaptive] SlidingCountMin delta must be a number in (0, 1), got ' + describeArg(delta));
                 }
             }
             if (options.w !== undefined) {
                 wOpt = options.w;
                 if (typeof wOpt !== 'number' || (wOpt | 0) !== wOpt || wOpt < 1 || wOpt > SCM_W_MAX) {
                     throw new RangeError(
-                        '[lite-adaptive] SlidingCountMin w must be an integer in [1, ' + SCM_W_MAX + '], got ' + String(wOpt));
+                        '[lite-adaptive] SlidingCountMin w must be an integer in [1, ' + SCM_W_MAX + '], got ' + describeArg(wOpt));
                 }
             }
             if (options.d !== undefined) {
                 dOpt = options.d;
                 if (typeof dOpt !== 'number' || (dOpt | 0) !== dOpt || dOpt < 1 || dOpt > SCM_D_MAX) {
                     throw new RangeError(
-                        '[lite-adaptive] SlidingCountMin d must be an integer in [1, ' + SCM_D_MAX + '], got ' + String(dOpt));
+                        '[lite-adaptive] SlidingCountMin d must be an integer in [1, ' + SCM_D_MAX + '], got ' + describeArg(dOpt));
                 }
             }
             if (options.panes !== undefined) {
@@ -5093,7 +5228,7 @@ export class SlidingCountMin {
                 if (typeof p !== 'number' || (p | 0) !== p || p < SCM_PANES_MIN || p > SCM_PANES_MAX) {
                     throw new RangeError(
                         '[lite-adaptive] SlidingCountMin panes must be an integer in [' + SCM_PANES_MIN +
-                        ', ' + SCM_PANES_MAX + '], got ' + String(p));
+                        ', ' + SCM_PANES_MAX + '], got ' + describeArg(p));
                 }
                 panes = p;
             }
@@ -5101,7 +5236,7 @@ export class SlidingCountMin {
                 seed = options.seed;
                 if (typeof seed !== 'number' || !Number.isInteger(seed)) {
                     throw new RangeError(
-                        '[lite-adaptive] SlidingCountMin seed must be an integer, got ' + String(seed));
+                        '[lite-adaptive] SlidingCountMin seed must be an integer, got ' + describeArg(seed));
                 }
             }
             // conservative = true is the default; guard `undefined`, and require a real boolean (null is not true).
@@ -5109,7 +5244,7 @@ export class SlidingCountMin {
                 conservative = options.conservative;
                 if (typeof conservative !== 'boolean') {
                     throw new TypeError(
-                        '[lite-adaptive] SlidingCountMin conservative must be a boolean, got ' + String(conservative));
+                        '[lite-adaptive] SlidingCountMin conservative must be a boolean, got ' + describeArg(conservative));
                 }
             }
         }
@@ -5156,6 +5291,14 @@ export class SlidingCountMin {
                 '[lite-adaptive] SlidingCountMin W is too small for panes=' + panes +
                 ' (W / panes underflowed to ' + paneW + '); use a larger W or fewer panes');
         }
+        // The pane width must be a NORMAL double: a subnormal pw loses significand bits, so the grid line
+        // (k+1)*pw no longer round-trips and (B+1)*pw can fall below W -> under-cover (H2-1 F3). Fail closed
+        // BEFORE alloc (the `!(>=)` form also rejects a NaN paneW, though the step above caught it).
+        if (!(paneW >= SCM_MIN_NORMAL)) {
+            throw new RangeError(
+                '[lite-adaptive] SlidingCountMin W / panes (' + paneW + ') is subnormal; the pane grid ' +
+                'cannot hold W exactly -- use a larger W or fewer panes');
+        }
 
         this._W = W;
         this._panes = panes;         // B (getter returns this); the ring holds B+1 panes
@@ -5166,7 +5309,8 @@ export class SlidingCountMin {
         this._dw = d * w;            // cells per pane
         this._seed = seed | 0;       // SMI-safe (signed int32); the murmur uses it as `s | 0` either way
         this._conservative = conservative;
-        this._paneW = paneW;         // per-pane time width (the disclosed edge error); guarded > 0 above
+        this._paneW = paneW;         // per-pane time width (the disclosed edge error); guarded normal above
+        this._nowMax = paneW * SCM_CLOCK_SPAN;   // |now| clock-precision bound (pw * 2^42); one field compare on the hot path
         this._epsilon = Math.E / w;  // theoretical relative error e/w
         this._delta = Math.exp(-d);  // theoretical failure probability e^-d
         this._cells = new Uint32Array(ring * d * w);   // (B+1) dense d x w matrices (saturate at 2^32-1)
@@ -5194,11 +5338,11 @@ export class SlidingCountMin {
     static withAccuracy(W, epsilon, delta, options) {
         if (typeof epsilon !== 'number' || !(epsilon > 0 && epsilon < 1)) {
             throw new RangeError(
-                '[lite-adaptive] SlidingCountMin.withAccuracy epsilon must be a number in (0, 1), got ' + String(epsilon));
+                '[lite-adaptive] SlidingCountMin.withAccuracy epsilon must be a number in (0, 1), got ' + describeArg(epsilon));
         }
         if (typeof delta !== 'number' || !(delta > 0 && delta < 1)) {
             throw new RangeError(
-                '[lite-adaptive] SlidingCountMin.withAccuracy delta must be a number in (0, 1), got ' + String(delta));
+                '[lite-adaptive] SlidingCountMin.withAccuracy delta must be a number in (0, 1), got ' + describeArg(delta));
         }
         // Same door as the ctor (R6), with the factory label, BEFORE copying options.
         optDoor(options, SCM_KNOWN_OPTS, 'SlidingCountMin.withAccuracy');
@@ -5280,33 +5424,43 @@ export class SlidingCountMin {
         const mode = this._mode;
         if (mode === MODE_COUNT) {
             if (now !== undefined) return this._badMode('count', 'explicit');
-            t = ++this._tick;
+            t = this._tick + 1;
+            if (!(t <= this._nowMax)) return this._badNowRange(t);   // tick past pw * 2^42 -> fail closed
+            this._tick = t;
         } else if (mode === MODE_EXPLICIT) {
             if (now === undefined) return this._badMode('explicit', 'count');
             if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
                 return this._badNow(now);
             }
             if (now < this._lastNow) return this._badMonotone(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             t = now;
             this._lastNow = now;
         } else {
             if (now === undefined) {
+                t = this._tick + 1;
+                if (!(t <= this._nowMax)) return this._badNowRange(t);
                 this._mode = MODE_COUNT;
-                t = ++this._tick;
-                this._anchor(t);
+                this._tick = t;
+                this._now = t;
+                this._anchor();
             } else {
                 if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
                     return this._badNow(now);
                 }
+                const nm = this._nowMax;
+                if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
                 this._mode = MODE_EXPLICIT;
                 t = now;
                 this._lastNow = now;
-                this._anchor(t);
+                this._now = t;
+                this._anchor();
             }
         }
         this._now = t;
         // 3. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
-        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        if (t >= this._paneEnd[this._cur]) this._advance();
         this._paneTotal[this._cur] += count;   // exact per-pane N (AFTER rotation: lands in the target pane; 1.8.0)
         // 4. two-lane murmur, HAND-INLINED in int32 locals (F19v2): the key word / hash state never
         //    leaves a register -- nothing crosses a call boundary (no >= 2^31 HeapNumber box) and
@@ -5380,8 +5534,8 @@ export class SlidingCountMin {
      */
     addFrom(buf, i) {
         // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i + 2 >= buf.length) return this._badBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i + 2 < buf.length)) return this._badBuf(buf, i);
         const now = buf[i];         // UNBOXED Float64Array reads -- the whole point (no argument box).
         const key = buf[i + 1];     // packed [now, key, count]
         const count = buf[i + 2];
@@ -5397,18 +5551,23 @@ export class SlidingCountMin {
         } else if (mode === MODE_EXPLICIT) {
             if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
             if (now < this._lastNow) return this._badMonotone(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             t = now;
             this._lastNow = now;
         } else {
             if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
-            this._anchor(t);
+            this._now = t;
+            this._anchor();
         }
         this._now = t;
         // 3. rotate + clear panes if this t crossed the current pane boundary (bounded, 0-alloc).
-        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        if (t >= this._paneEnd[this._cur]) this._advance();
         this._paneTotal[this._cur] += count;   // exact per-pane N (AFTER rotation: lands in the target pane; 1.8.0)
         // 4. two-lane murmur, HAND-INLINED in int32 locals (F19v2; DUPLICATED from add() --
         //    byte-identical body; base = hi ^ lo).
@@ -5472,8 +5631,8 @@ export class SlidingCountMin {
      * (index 0) covers the grid cell containing `now`; predecessors go backward by one pane width each.
      * Cold (once per lifecycle / clear). 0 alloc.
      */
-    _anchor(now) {
-        const B = this._ring, pw = this._paneW;
+    _anchor() {
+        const B = this._ring, pw = this._paneW, now = this._now;
         const E = (Math.floor(now / pw) + 1) * pw;   // EXCLUSIVE upper bound of the current pane
         this._cur = 0;
         this._paneEnd[0] = E;
@@ -5482,20 +5641,27 @@ export class SlidingCountMin {
     }
 
     /**
-     * @private Rotate the ring forward so the current pane covers time `t`, clearing each pane it rotates
+     * @private Rotate the ring forward so the current pane covers this._now, clearing each pane it rotates
      * onto. Capped at B+1 rotations (a now-jump of k panes clears min(k, B+1) panes, NEVER loops k --
-     * skipping >= B+1 panes clears them ALL, then re-anchors the ring around `t`). 0 alloc. Called only
-     * when `t` crossed the current pane boundary.
+     * skipping >= B+1 panes clears them ALL, then re-anchors the ring around this._now). Argument-free
+     * (reads this._now, the zero-box law). 0 alloc. Called only when this._now crossed the current boundary.
      */
-    _advance(t) {
-        const pw = this._paneW, B = this._ring;
+    _advance() {
+        const pw = this._paneW, B = this._ring, t = this._now;
         let cur = this._cur;
+        // Grid index of the current pane end (E = k*pw exactly for an integer k in the legal clock
+        // domain, |now| <= pw * 2^42, where ulp(E) <= pw * 2^-10 so the division round-trips). Each new
+        // pane end is (k+1)*pw by MULTIPLICATION -- drift-free and bit-identical to the anchor / oracle's
+        // (floor(t/pw)+1)*pw -- rather than an accumulating `E += pw`, whose per-step rounding drifts by
+        // up to ~pw near the domain edge and can drop a live pane (H2-1 F2, fail-open).
+        let k = Math.round(this._paneEnd[cur] / pw);
         let E = this._paneEnd[cur];
         let rot = 0;
         while (t >= E && rot < B) {
             cur++; if (cur === B) cur = 0;
             this._clearPane(cur);
-            E += pw;
+            k += 1;
+            E = k * pw;
             this._paneEnd[cur] = E;
             rot++;
         }
@@ -5625,18 +5791,19 @@ export class SlidingCountMin {
      * @returns {number} n = keys.length (the number of slots written).
      */
     estimateInto(keys, out, w) {
-        if (!(keys instanceof Float64Array)) {
+        if (!(ArrayBuffer.isView(keys) && keys instanceof Float64Array)) {
             throw new TypeError(
-                '[lite-adaptive] SlidingCountMin.estimateInto(keys, out, w?) keys must be a Float64Array, got ' + String(keys));
+                '[lite-adaptive] SlidingCountMin.estimateInto(keys, out, w?) keys must be a Float64Array, got ' + describeArg(keys));
         }
-        if (!(out instanceof Float64Array)) {
+        if (!(ArrayBuffer.isView(out) && out instanceof Float64Array)) {
             throw new TypeError(
-                '[lite-adaptive] SlidingCountMin.estimateInto(keys, out, w?) out must be a Float64Array, got ' + String(out));
+                '[lite-adaptive] SlidingCountMin.estimateInto(keys, out, w?) out must be a Float64Array, got ' + describeArg(out));
         }
-        const n = keys.length;
-        if (out.length < n) {
+        const n = TA_LEN.call(keys);         // H34: intrinsic length, read ONCE (a subclass getter runs no user code)
+        const outN = TA_LEN.call(out);       // H34: read ONCE; the message uses this local, never re-reads out.length
+        if (!(outN >= n)) {
             throw new RangeError(
-                '[lite-adaptive] SlidingCountMin.estimateInto out.length (' + out.length +
+                '[lite-adaptive] SlidingCountMin.estimateInto out.length (' + outN +
                 ') must be >= keys.length (' + n + ')');
         }
         // A bad sub-window `w` -> every out slot NaN (parity with estimate's bad-w NaN), then return n.
@@ -5703,19 +5870,24 @@ export class SlidingCountMin {
                 return this._badAdvanceNow(now);
             }
             if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             t = now;
             this._lastNow = now;
         } else {
             if (typeof now !== 'number' || now !== now || now === Infinity || now === -Infinity) {
                 return this._badAdvanceNow(now);
             }
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
-            this._anchor(t);
+            this._now = t;
+            this._anchor();
         }
         this._now = t;
-        if (t >= this._paneEnd[this._cur]) this._advance(t);   // rotate + clear stale panes (bounded).
+        if (t >= this._paneEnd[this._cur]) this._advance();   // rotate + clear stale panes (bounded).
         return this;
     }
 
@@ -5729,8 +5901,8 @@ export class SlidingCountMin {
      * @returns {SlidingCountMin} this
      */
     advanceFrom(buf, i) {
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badAdvanceBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i < buf.length)) return this._badAdvanceBuf(buf, i);
         const now = buf[i];   // UNBOXED Float64Array read (always a number -> no typeof branch).
         let t;
         const mode = this._mode;
@@ -5739,17 +5911,22 @@ export class SlidingCountMin {
         } else if (mode === MODE_EXPLICIT) {
             if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
             if (now < this._lastNow) return this._badAdvanceMonotone(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             t = now;
             this._lastNow = now;
         } else {
             if (now !== now || now === Infinity || now === -Infinity) return this._badAdvanceNow(now);
+            const nm = this._nowMax;
+            if (!(now <= nm && now >= -nm)) return this._badNowRange(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
-            this._anchor(t);
+            this._now = t;
+            this._anchor();
         }
         this._now = t;
-        if (t >= this._paneEnd[this._cur]) this._advance(t);
+        if (t >= this._paneEnd[this._cur]) this._advance();
         return this;
     }
 
@@ -5762,13 +5939,13 @@ export class SlidingCountMin {
     /** @private Cold thrower for a bad key (non-safe-integer). */
     _badKey(key) {
         throw new TypeError(
-            '[lite-adaptive] SlidingCountMin key must be a safe integer (|key| <= 2^53 - 1), got ' + String(key));
+            '[lite-adaptive] SlidingCountMin key must be a safe integer (|key| <= 2^53 - 1), got ' + describeArg(key));
     }
 
     /** @private Cold thrower for a bad count. */
     _badCount(count) {
         throw new RangeError(
-            '[lite-adaptive] SlidingCountMin count must be an integer in [1, ' + SCM_SAT + '], got ' + String(count));
+            '[lite-adaptive] SlidingCountMin count must be an integer in [1, ' + SCM_SAT + '], got ' + describeArg(count));
     }
 
     /** @private Cold thrower for a mode switch after the mode locked. */
@@ -5781,21 +5958,34 @@ export class SlidingCountMin {
     /** @private Cold thrower for a non-finite `now`. */
     _badNow(now) {
         throw new TypeError(
-            '[lite-adaptive] SlidingCountMin add now must be a finite number, got ' + String(now));
+            '[lite-adaptive] SlidingCountMin add now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone `now`. */
     _badMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] SlidingCountMin add now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] SlidingCountMin add now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
+    }
+
+    /**
+     * @private Cold thrower for a `now` (or count-mode tick) outside the clock-precision domain
+     * (|now| > pw * 2^42). Fail closed BEFORE any state write -- past this bound the double clock cannot
+     * represent the pane grid, so the covered span would silently under-cover the true window (H2-1 F1/F2).
+     */
+    _badNowRange(now) {
+        throw new RangeError(
+            '[lite-adaptive] SlidingCountMin now (' + describeArg(now) + ') is too large for the pane width (' +
+            this._paneW + '); |now| must be <= pw * 2^42 (' + this._nowMax +
+            ')' + (this._mode === MODE_COUNT ? ', including the count-mode tick,' : '') +
+            ' -- rebase the clock (e.g. performance.now()) or use a larger W');
     }
 
     /** @private Cold thrower for a bad addFrom buffer/index. */
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] SlidingCountMin.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i + 2 < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i + 2 < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 
     /** @private Cold thrower for an advance mode switch (advance is EXPLICIT-only). */
@@ -5808,21 +5998,21 @@ export class SlidingCountMin {
     /** @private Cold thrower for a non-finite advance `now`. */
     _badAdvanceNow(now) {
         throw new TypeError(
-            '[lite-adaptive] SlidingCountMin advance now must be a finite number, got ' + String(now));
+            '[lite-adaptive] SlidingCountMin advance now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone advance `now`. */
     _badAdvanceMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] SlidingCountMin advance now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] SlidingCountMin advance now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad advanceFrom buffer/index. */
     _badAdvanceBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] SlidingCountMin.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 }
 
@@ -5920,11 +6110,11 @@ export class DecayedReservoir {
         // typeof guards FIRST, BEFORE any allocation (a bad param leaves no half-built instance).
         if (typeof k !== 'number' || !Number.isInteger(k) || k < 1 || k > DR_K_MAX) {
             throw new RangeError(
-                '[lite-adaptive] DecayedReservoir k must be an integer in [1, ' + DR_K_MAX + '], got ' + String(k));
+                '[lite-adaptive] DecayedReservoir k must be an integer in [1, ' + DR_K_MAX + '], got ' + describeArg(k));
         }
         if (typeof halfLife !== 'number' || halfLife !== halfLife || halfLife === Infinity || halfLife <= 0) {
             throw new RangeError(
-                '[lite-adaptive] DecayedReservoir halfLife must be a finite number > 0, got ' + String(halfLife));
+                '[lite-adaptive] DecayedReservoir halfLife must be a finite number > 0, got ' + describeArg(halfLife));
         }
         // A subnormal halfLife makes lambda = ln2/halfLife overflow to Infinity, which poisons
         // the A-Res priorities to NaN and freezes the sample at the first k values. Reject it here,
@@ -5932,8 +6122,8 @@ export class DecayedReservoir {
         const lambda = Math.LN2 / halfLife;
         if (!(lambda < Infinity)) {
             throw new RangeError(
-                '[lite-adaptive] DecayedReservoir halfLife ' + String(halfLife) +
-                ' is too small: lambda = ln2/halfLife = ' + String(lambda) +
+                '[lite-adaptive] DecayedReservoir halfLife ' + describeArg(halfLife) +
+                ' is too small: lambda = ln2/halfLife = ' + describeArg(lambda) +
                 ' is not finite; halfLife must be >= ' + LAMBDA_HALFLIFE_MIN);
         }
         let seed = DR_DEFAULT_SEED;
@@ -5944,7 +6134,7 @@ export class DecayedReservoir {
                 const s = options.seed;
                 if (typeof s !== 'number' || !Number.isInteger(s) || s < 0 || s > 4294967295) {
                     throw new RangeError(
-                        '[lite-adaptive] DecayedReservoir seed must be a uint32 (integer in [0, 2^32-1]), got ' + String(s));
+                        '[lite-adaptive] DecayedReservoir seed must be a uint32 (integer in [0, 2^32-1]), got ' + describeArg(s));
                 }
                 seed = s;
             }
@@ -6098,13 +6288,13 @@ export class DecayedReservoir {
      */
     addFrom(buf, i) {
         // Guard the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || !(i + 1 < buf.length)) return this._badBuf(buf, i);
         const now = buf[i];       // UNBOXED Float64Array reads -- the whole point (no argument box).
         const v = buf[i + 1];     // packed [now, value]
         // --- validate the value FIRST (mirror add(); any finite real is legal, signed OK; a
         // Float64Array read is always a number so add()'s typeof branch is omitted). ---
-        if (v !== v || v === Infinity || v === -Infinity) return this._badValue(v);
+        if (!(v > -Infinity && v < Infinity)) return this._badValue(v);
         // --- addFrom is an EXPLICIT-time entry: reject a count-locked instance, else lock/verify
         // EXPLICIT + the monotone `now` (typeof-first, no alloc). ---
         let t;
@@ -6112,12 +6302,12 @@ export class DecayedReservoir {
         if (mode === MODE_COUNT) {
             return this._badMode('count', 'explicit');
         } else if (mode === MODE_EXPLICIT) {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badNow(now);
             if (now < this._lastNow) return this._badMonotone(now);
             t = now;
             this._lastNow = now;
         } else {
-            if (now !== now || now === Infinity || now === -Infinity) return this._badNow(now);
+            if (!(now > -Infinity && now < Infinity)) return this._badNow(now);
             this._mode = MODE_EXPLICIT;
             t = now;
             this._lastNow = now;
@@ -6211,7 +6401,7 @@ export class DecayedReservoir {
      * @returns {number} the number of values written (<= k).
      */
     sampleInto(buf) {
-        if (!(buf instanceof Float64Array) || buf.length < this._k) return this._badSampleBuf(buf);
+        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || !(TA_LEN.call(buf) >= this._k)) return this._badSampleBuf(buf);
         const n = this._n, val = this._val;
         for (let i = 0; i < n; i++) buf[i] = val[i];
         return n;
@@ -6249,40 +6439,40 @@ export class DecayedReservoir {
     /** @private Cold thrower for a non-finite `now`. */
     _badNow(now) {
         throw new TypeError(
-            '[lite-adaptive] DecayedReservoir add now must be a finite number, got ' + String(now));
+            '[lite-adaptive] DecayedReservoir add now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone `now`. */
     _badMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] DecayedReservoir add now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] DecayedReservoir add now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad value. */
     _badValue(v) {
         throw new TypeError(
-            '[lite-adaptive] DecayedReservoir add value must be a finite number, got ' + String(v));
+            '[lite-adaptive] DecayedReservoir add value must be a finite number, got ' + describeArg(v));
     }
 
     /** @private Cold thrower for a bad addFrom buffer/index. */
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] DecayedReservoir.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i + 1 < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 
     /** @private Cold thrower for a too-small / non-Float64Array sampleInto buffer. */
     _badSampleBuf(buf) {
         throw new TypeError(
             '[lite-adaptive] DecayedReservoir.sampleInto(buf) needs a Float64Array of length >= k (' +
-            this._k + '), got ' + String(buf));
+            this._k + '), got ' + describeArg(buf));
     }
 
     /** @private Cold thrower for a non-function forEach callback. */
     _badFn(fn) {
         throw new TypeError(
-            '[lite-adaptive] DecayedReservoir.forEach(fn) needs a function, got ' + String(fn));
+            '[lite-adaptive] DecayedReservoir.forEach(fn) needs a function, got ' + describeArg(fn));
     }
 }
 
@@ -6387,7 +6577,7 @@ export class SlidingAggregate {
         // 1. W: a finite number > 0, BEFORE any allocation or option read.
         if (typeof W !== 'number' || !(W > 0) || !Number.isFinite(W)) {
             throw new RangeError(
-                '[lite-adaptive] SlidingAggregate W must be a finite number > 0, got ' + String(W));
+                '[lite-adaptive] SlidingAggregate W must be a finite number > 0, got ' + describeArg(W));
         }
         // 2. the shared cold option door (R6), with the class label.
         optDoor(options, SA_KNOWN_OPTS, 'SlidingAggregate');
@@ -6395,7 +6585,7 @@ export class SlidingAggregate {
         const panes = (options !== undefined && options.panes !== undefined) ? options.panes : SA_DEFAULT_PANES;
         if (typeof panes !== 'number' || !Number.isInteger(panes) || panes < SA_PANES_MIN || panes > SA_PANES_MAX) {
             throw new RangeError(
-                '[lite-adaptive] SlidingAggregate panes must be an integer in [2, 1024], got ' + String(panes));
+                '[lite-adaptive] SlidingAggregate panes must be an integer in [2, 1024], got ' + describeArg(panes));
         }
         // 4. W / panes must stay a finite positive pane width (a subnormal W underflows to 0 -> no
         //    pane ever live; fail closed BEFORE alloc rather than fail open on a NaN grid).
@@ -6837,11 +7027,12 @@ export class SlidingAggregate {
         // ArrayBuffer.isView rejects a Proxy that forwards instanceof; the length check is NaN-safe.
         if (!(ArrayBuffer.isView(out) && out instanceof Float64Array)) {
             throw new TypeError(
-                '[lite-adaptive] SlidingAggregate.into(out, w?) out must be a Float64Array, got ' + String(out));
+                '[lite-adaptive] SlidingAggregate.into(out, w?) out must be a Float64Array, got ' + describeArg(out));
         }
-        if (!(out.length >= 5)) {
+        const outN = TA_LEN.call(out);       // H34: intrinsic length, read ONCE; the message uses this local, never re-reads out.length
+        if (!(outN >= 5)) {
             throw new RangeError(
-                '[lite-adaptive] SlidingAggregate.into out.length (' + out.length + ') must be >= 5');
+                '[lite-adaptive] SlidingAggregate.into out.length (' + outN + ') must be >= 5');
         }
         let effW = this._W;
         if (w !== undefined) {
@@ -6946,7 +7137,7 @@ export class SlidingAggregate {
     /** @private Cold thrower for a bad value (non-number / NaN / +-Infinity / over-cap). */
     _badValue(v) {
         throw new TypeError(
-            '[lite-adaptive] SlidingAggregate add value must be a finite number with |value| <= 1e150, got ' + String(v));
+            '[lite-adaptive] SlidingAggregate add value must be a finite number with |value| <= 1e150, got ' + describeArg(v));
     }
 
     /** @private Cold thrower for a mode switch after the mode locked. */
@@ -6959,14 +7150,14 @@ export class SlidingAggregate {
     /** @private Cold thrower for a non-finite `now`. */
     _badNow(now) {
         throw new TypeError(
-            '[lite-adaptive] SlidingAggregate add now must be a finite number, got ' + String(now));
+            '[lite-adaptive] SlidingAggregate add now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone `now`. */
     _badMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] SlidingAggregate add now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] SlidingAggregate add now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /**
@@ -6976,7 +7167,7 @@ export class SlidingAggregate {
      */
     _badNowRange(now) {
         throw new RangeError(
-            '[lite-adaptive] SlidingAggregate now (' + String(now) + ') is too large for the pane width (' +
+            '[lite-adaptive] SlidingAggregate now (' + describeArg(now) + ') is too large for the pane width (' +
             this._paneW + '); |now| must be <= pw * 2^42 (' + this._nowMax +
             ')' + (this._mode === MODE_COUNT ? ', including the count-mode tick,' : '') +
             ' -- rebase the clock (e.g. performance.now()) or use a larger W');
@@ -6986,7 +7177,7 @@ export class SlidingAggregate {
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] SlidingAggregate.addFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i + 1 < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i + 1 < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 
     /** @private Cold thrower for an advance mode switch (advance is EXPLICIT-only). */
@@ -6999,20 +7190,20 @@ export class SlidingAggregate {
     /** @private Cold thrower for a non-finite advance `now`. */
     _badAdvanceNow(now) {
         throw new TypeError(
-            '[lite-adaptive] SlidingAggregate advance now must be a finite number, got ' + String(now));
+            '[lite-adaptive] SlidingAggregate advance now must be a finite number, got ' + describeArg(now));
     }
 
     /** @private Cold thrower for a non-monotone advance `now`. */
     _badAdvanceMonotone(now) {
         throw new RangeError(
-            '[lite-adaptive] SlidingAggregate advance now must be non-decreasing: got ' + String(now) +
-            ' after ' + String(this._lastNow));
+            '[lite-adaptive] SlidingAggregate advance now must be non-decreasing: got ' + describeArg(now) +
+            ' after ' + describeArg(this._lastNow));
     }
 
     /** @private Cold thrower for a bad advanceFrom buffer/index. */
     _badAdvanceBuf(buf, i) {
         throw new TypeError(
             '[lite-adaptive] SlidingAggregate.advanceFrom(buf, i) needs a Float64Array and an in-bounds ' +
-            'integer index with i < buf.length, got ' + String(buf) + ', ' + String(i));
+            'integer index with i < buf.length, got ' + describeArg(buf) + ', ' + describeArg(i));
     }
 }

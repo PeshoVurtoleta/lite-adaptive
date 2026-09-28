@@ -18,5 +18,8 @@ test('retention: 10 cycles x 50 instances each of SCM / DD latch / HK large-key 
     assert.equal(res.live, 0, 'lite-leak live handles ' + res.live + ' / ' + res.tracked);
     assert.equal(res.findings, 0, 'lite-leak audit findings');
     assert.ok(res.spread < 1024 * 1024, 'heapUsed spread ' + res.spread + ' B over cycles 1..9');
+    // 1.10.0 H2-4: every cycle x instance rejected its Proxy-keys estimateInto at the door (tagged throw).
+    assert.equal(res.expectRejects, 500, 'expected reject count = cycles x instances');
+    assert.equal(res.rejects, res.expectRejects, 'tagged Proxy rejections ' + res.rejects + ' / ' + res.expectRejects);
     assert.ok(res.sinkFinite);
 });
