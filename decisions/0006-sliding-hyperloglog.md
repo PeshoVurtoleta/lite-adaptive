@@ -177,3 +177,39 @@ to inlined locals. Gated by the `noInlineLargeKey` group in `test/perf/AllocMatr
 (now-scale AND epoch clocks x keys `2^31` / `2^53-1`; the same lanes read 16 B/op against the pre-fix
 file) AND by `test/perf/HashThroughput.test.mjs`, an in-process A/B that pins shipped `addFrom`
 throughput to <= 1.15x the frozen 1.7.0 baseline (a reintroduced round-trip reads ~1.37x -> RED).
+
+## Amendment (1.11.0) -- the estimator tail goes 0-box, plus `countInto` (settle S3)
+
+`count()` kept its Ertl multiplicity scratch free of ARRAY allocation, but the estimator TAIL still
+RETURNED computed doubles: `slSigma(x)` / `slTau(x)` each returned their converged correction, and
+`count()` returned `Math.round(...)`. A returned double boxes a ~16 B HeapNumber at a call boundary V8
+does not inline, so `count()` carried a STABLE 16 B/call inside the tail even under Turbofan (1.8.0
+finding A), plus another 16 B while the caller was not yet optimized -- and a `countInto` reader would
+have inherited the SAME box, which is why S3 pre-declared that `countInto` does not ship unless that box
+goes.
+
+FIX (S3 branch a -- bit-identical, so `count()` benefits too). `slSigma` / `slTau` become VOID,
+ARGUMENT-FREE helpers `slSigmaInto` / `slTauInto`: their `x` fraction is handed in through
+SlidingHyperLogLog-ONLY module-level scratch (`SL_SIG_S` / `SL_TAU_S`, the per-series `(x, y)`
+convergence accumulators) and their converged value is written into `SL_EST` -- never returned. The
+estimator body itself moves into a shared `_writeCount(out)` that reads the sub-window cutoff from
+`SL_CUT[0]` (handed via the slot, never a fractional-double argument) and writes the rounded count
+straight into a caller-owned `Float64Array` slot. `count()` calls `_writeCount(SL_EST)` and returns
+`SL_EST[0]`; `countInto` calls `_writeCount(out)` and returns 1 -- so the math lives in ONE place and no
+computed double crosses a call boundary. This is exactly the module-scratch discipline HeavyKeeper uses
+for `HK_KIN` (ADR 0005): the helpers are fully synchronous and no user code runs while a slot is live, so
+the shared `SL_EST` / `SL_SIG_S` / `SL_TAU_S` / `SL_CUT` scratch is re-entrancy-safe.
+
+RESULT: `count()` is 0 B/call steady (and 0 B/op under `--no-turbo-inlining`), boxing only its one
+returned double at a megamorphic 5+ shape site (the family-wide field-read box). Output is BIT-IDENTICAL
+to 1.10.0 on the `SHLLParity` + `F19Boundary` vectors and a 1e6 random-query sweep (the estimate is
+`Math.round`-ed and the float expressions are unchanged, only relocated slot-to-slot). The `q_shll_count`
+lane is re-cut to the new 0-box steady state; `q_shll_countInto` gates `<= 0.5` B/op at a monomorphic /
+poly-4 site (mega5 INFO 16 B).
+
+`countInto(out, w?) -> 1` is the 0-alloc render sibling: writes `count(w)` into `out[0]`
+(`Object.is`-identical), returns 1; a bad `w` writes `out[0] = NaN` and returns 1 (the F12 NaN contract,
+never a throw); an unset sketch writes 0. `out` is validated by the COLD-reader contract -- the intrinsic
+`@@toStringTag` type tag (`TA_TAG`, S2 RE-SETTLED) rejects a non-`Float64Array` with a tagged `TypeError`,
+`TA_LEN` (read ONCE) rejects `length < 1` with a `RangeError`, and the container check + write happen only
+AFTER validation, so `out` is untouched on a throw.

@@ -289,6 +289,11 @@ const slC2: number = sl.count(500);
 const slQ: number = sl.query();
 void slC; void slC2; void slQ;
 
+// countInto: 0-alloc render sibling; returns the literal 1; optional sub-window
+const slCountInto: 1 = sl.countInto(new Float64Array(1));
+const slCountIntoW: 1 = sl.countInto(new Float64Array(1), 500);
+void slCountInto; void slCountIntoW;
+
 // clear is chainable
 const slCleared: SlidingHyperLogLog = sl.clear();
 void slCleared;
@@ -330,6 +335,12 @@ sl.count('500');
 // @ts-expect-error -- query takes no arguments.
 sl.query(1);
 
+// @ts-expect-error -- countInto out must be a Float64Array.
+sl.countInto([0]);
+
+// @ts-expect-error -- countInto requires an out argument.
+sl.countInto();
+
 // --- DriftDetector -----------------------------------------------------------
 const dd = new DriftDetector(DRIFT_PH);
 const dd2 = new DriftDetector(DRIFT_CUSUM, { delta: 0, threshold: 5, target: 0 });   // delta=0 / target=0 valid
@@ -369,6 +380,10 @@ void ddDrift; void ddDrift2;
 const ddBuf = new Float64Array([3.14]);
 const ddDriftFrom: boolean = dd.addFrom(ddBuf, 0);
 void ddDriftFrom;
+
+// into: 0-alloc render reader; writes 5 slots and returns the literal 5
+const ddInto: 5 = dd.into(new Float64Array(5));
+void ddInto;
 
 // clear is chainable
 const ddCleared: DriftDetector = dd.clear();
@@ -414,6 +429,12 @@ dd.addFrom(ddBuf, 'x');
 // @ts-expect-error -- add returns a boolean, not assignable to DriftDetector (no chaining).
 const ddChain: DriftDetector = dd.add(1);
 void ddChain;
+
+// @ts-expect-error -- into out must be a Float64Array.
+dd.into([0, 0, 0, 0, 0]);
+
+// @ts-expect-error -- into requires an out argument.
+dd.into();
 
 // --- SlidingDDSketch ---------------------------------------------------------
 const sd = new SlidingDDSketch(1000);

@@ -432,12 +432,14 @@ function qDrSampleInto() {
         for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[k & 15]; dr.addFrom(buf, 0); } const out = new Float64Array(32); return { dr, out, acc: new Float64Array(1) }; },
         hot(s, n) { const dr = s.dr, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { const m = dr.sampleInto(out); acc[0] += out[0] + m; } } };
 }
-// SHLL count() on a NON-degenerate sketch (thousands of distinct keys across a wide window). Finding
-// (A): count() keeps its Ertl scratch (no ARRAY alloc) but RETURNS a rounded double -- a stable 16 B in
-// the estimator tail (slTau / the k-loop / slSigma / Math.round), +16 B when the caller is not yet
-// optimized. No library alloc gate measured count() before 1.8.0. Documented band [12, 40] B/op: the
-// lower bound proves the probe SEES the cost; the upper bound fails on a third box (the estimator tail
-// stays ONE box). Fed unboxed from a Float64Array key table so the DRIVER never boxes (R3).
+// SHLL count() on a NON-degenerate sketch (thousands of distinct keys across a wide window). v1.11.0
+// (S3-a + review B1): count()'s estimator tail is now box-free. The slSigmaInto / slTauInto helpers are
+// VOID (they write the converged value into SL_EST, never return it) AND argument-free (the empty /
+// saturated fraction is handed through the SL_SIG_S / SL_TAU_S slots, never a computed-double argument
+// that boxes when V8 does not inline the helper), and count() writes the rounded estimate straight into a
+// Float64Array slot via _writeCount. At an inlinable monomorphic call site (this lane) count() reads <=
+// 0.5 B/op steady -- fed unboxed from a Float64Array key table so the DRIVER never boxes (R3). The
+// must-box teeth now live in the demo mustbox control and the DD six-getter lane.
 function qShllCount() {
     return { setup() { const sl = new SlidingHyperLogLog(100000, { p: 12, ringCap: 8, seed: 3 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
         for (let k = 0; k < 20000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((k * 2654435761) >>> 0); sl.addFrom(buf, 0); }
@@ -668,8 +670,116 @@ function mega5AF(kind) {
     };
 }
 
+// ===========================================================================
+// v1.11.0 READERS (ROADMAP 12.2 T3). The zero-alloc reader lanes for the two new members:
+//   - SlidingHyperLogLog.countInto(out, w?)  -- q_shll_countInto (mono) + _poly4 (4-shape site)
+//   - DriftDetector.into(out)                -- q_dd_into (mono) + _poly4 (4-shape site)
+// Gate: steady B/op <= 0.5 fresh + warmed. TODO until batches 2 / 3 (the methods do not exist yet, so
+// the AllocMatrix rows measure these INSIDE their todo subtest -- a missing method fails as todo, not
+// hard). Plus mega5 INFO reader lanes and the DD six-getter MUST-BOX render control (~48 B). Every
+// clock / key / value lives in a Float64Array slot; sinks accumulate into a slot (R3).
+// ===========================================================================
+
+// non-degenerate SHLL (thousands of distinct keys over a wide window) shared by the countInto lanes.
+function buildShllNonDegenerate() {
+    const sl = new SlidingHyperLogLog(100000, { p: 12, ringCap: 8, seed: 3 });
+    const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+    for (let k = 0; k < 20000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((k * 2654435761) >>> 0); sl.addFrom(buf, 0); }
+    if (!(sl.count() > 1000)) throw new Error('q_shll_countInto setup: sketch is degenerate (count=' + sl.count() + ')');
+    return sl;
+}
+// SHLL countInto at a MONOMORPHIC site: nothing returned as a double (returns 1, a Smi) -> 0 B/op.
+function qShllCountInto() {
+    return { setup() { const sl = buildShllNonDegenerate(); const out = new Float64Array(1); return { sl, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const sl = s.sl, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { sl.countInto(out); acc[0] += out[0]; } } };
+}
+class SHLLSubA extends SlidingHyperLogLog {}
+class SHLLSubB extends SlidingHyperLogLog {}
+class SHLLSubC extends SlidingHyperLogLog {}
+const SHLL_SHAPES4 = [SlidingHyperLogLog, SHLLSubA, SHLLSubB, SHLLSubC];
+function callCountIntoP(o, out) { return o.countInto(out); }
+// SHLL countInto at a POLYMORPHIC-4 site (4 subclass shapes): still inline-cacheable -> 0 B/op.
+function qShllCountIntoPoly4() {
+    return { setup() {
+            const insts = SHLL_SHAPES4.map((C) => { const sl = new C(100000, { p: 12, ringCap: 8, seed: 3 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+                for (let k = 0; k < 20000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((k * 2654435761) >>> 0); sl.addFrom(buf, 0); } return sl; });
+            const out = new Float64Array(1);
+            for (let i = 0; i < 4000; i++) callCountIntoP(insts[i & 3], out);
+            return { insts, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const insts = s.insts, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { callCountIntoP(insts[i & 3], out); acc[0] += out[0]; } } };
+}
+
+// a DD driven into a real, non-empty, fired PH statistic (fractional signal so the getters are doubles).
+function buildDdFired(K) {
+    const dd = new K(DRIFT_PH, { delta: 0.005, threshold: 5 });
+    const buf = new Float64Array(1);
+    for (let k = 0; k < 4000; k++) { buf[0] = (k % 1000 < 500 ? 0 : 10) + (k % 7) * 0.01; dd.addFrom(buf, 0); }
+    return dd;
+}
+// DD into at a MONOMORPHIC site: returns 5 (a Smi), all five channels land in out slots -> 0 B/op.
+function qDdInto() {
+    return { setup() { const dd = buildDdFired(DriftDetector); const out = new Float64Array(5); return { dd, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const dd = s.dd, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { dd.into(out); acc[0] += out[0]; } } };
+}
+class DDSubA extends DriftDetector {}
+class DDSubB extends DriftDetector {}
+class DDSubC extends DriftDetector {}
+const DD_SHAPES4 = [DriftDetector, DDSubA, DDSubB, DDSubC];
+function callIntoDdP(o, out) { return o.into(out); }
+// DD into at a POLYMORPHIC-4 site (4 subclass shapes): still inline-cacheable -> 0 B/op.
+function qDdIntoPoly4() {
+    return { setup() { const insts = DD_SHAPES4.map(buildDdFired); const out = new Float64Array(5);
+            for (let i = 0; i < 4000; i++) callIntoDdP(insts[i & 3], out);
+            return { insts, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const insts = s.insts, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { callIntoDdP(insts[i & 3], out); acc[0] += out[0]; } } };
+}
+// MUST-BOX render control: a demo-shaped render reading the DD scalar getters one by one and PACKING
+// each into a TAGGED (non-typed) sink array -- the exact pattern the into() reader replaces (a panel
+// materializes each value before formatting it). The ~48 B/op (3 boxes) comes from STORING the doubles
+// INTO the tagged sink array, not from the getters themselves: a fractional double (statistic / mean /
+// delta) boxes a ~16 B HeapNumber when it lands in a tagged-array slot, while the Smi-ish ones (count /
+// lastDirection / a small lastDriftIndex) store unboxed. This is the into() foil -- it proves
+// the reader probe SEES the per-store box into() avoids (into writes to a Float64Array, 0 B). Gated
+// >= 12 (teeth). The SINK is a plain array (PACKED_ELEMENTS), so a double store boxes.
+// A TAGGED (PACKED_ELEMENTS) sink -- seeding it with strings keeps the elements kind tagged (like
+// N1_BOXARR), so a double store boxes a HeapNumber (a PACKED_DOUBLE array would store f64 unboxed).
+const DD_RENDER_SINK = ['', '', '', '', '', ''];
+function qDdSixGetter() {
+    return { setup() { const dd = buildDdFired(DriftDetector); return { dd, acc: new Float64Array(1) }; },
+        hot(s, n) { const dd = s.dd, acc = s.acc, R = DD_RENDER_SINK; for (let i = 0; i < n; i++) {
+            R[0] = dd.statistic; R[1] = dd.mean; R[2] = dd.delta; R[3] = dd.lastDirection; R[4] = dd.lastDriftIndex; R[5] = dd.count;
+            acc[0] += R[0] + R[3] + R[5]; } } };
+}
+// mega5 INFO reader lanes: countInto / into at a 5-map (megamorphic) site. A megamorphic reader call
+// cannot inline; the callee's first double-field read boxes ~16 B/op (family-wide V8 property). INFO.
+function shllShapes5() { class MA extends SlidingHyperLogLog {} class MB extends SlidingHyperLogLog {} class MC extends SlidingHyperLogLog {} class MD extends SlidingHyperLogLog {} return [SlidingHyperLogLog, MA, MB, MC, MD]; }
+function callCountIntoM(o, out) { return o.countInto(out); }
+function mega5ShllCountInto() {
+    return { setup() { const insts = shllShapes5().map((C) => { const sl = new C(100000, { p: 12, ringCap: 8, seed: 3 }); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+                for (let k = 0; k < 20000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = ((k * 2654435761) >>> 0); sl.addFrom(buf, 0); } return sl; });
+            const out = new Float64Array(1); for (let i = 0; i < 4000; i++) callCountIntoM(insts[i % 5], out);
+            return { insts, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const insts = s.insts, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { callCountIntoM(insts[i % 5], out); acc[0] += out[0]; } } };
+}
+function ddShapes5() { class MA extends DriftDetector {} class MB extends DriftDetector {} class MC extends DriftDetector {} class MD extends DriftDetector {} return [DriftDetector, MA, MB, MC, MD]; }
+function callIntoDdM(o, out) { return o.into(out); }
+function mega5DdInto() {
+    return { setup() { const insts = ddShapes5().map(buildDdFired); const out = new Float64Array(5); for (let i = 0; i < 4000; i++) callIntoDdM(insts[i % 5], out);
+            return { insts, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const insts = s.insts, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { callIntoDdM(insts[i % 5], out); acc[0] += out[0]; } } };
+}
+
 export const LANES = {
     n1, noop,
+    // v1.11.0 readers (T3): countInto / into at mono + poly4 sites; mega5 INFO; the DD six-getter must-box.
+    q_shll_countInto: qShllCountInto(),
+    q_shll_countInto_poly4: qShllCountIntoPoly4(),
+    q_dd_into: qDdInto(),
+    q_dd_into_poly4: qDdIntoPoly4(),
+    q_dd_sixgetter: qDdSixGetter(),
+    mega5_shll_countInto: mega5ShllCountInto(),
+    mega5_dd_into: mega5DdInto(),
+
     eh_addFrom, fd_addFrom, shll_addFrom, sd_addFrom, scm_addFrom, dr_addFrom,
     hk_addFrom_small: hkAddFrom('small', 1),
     hk_addFrom_p31: hkAddFrom('p31', 1),

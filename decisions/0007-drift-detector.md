@@ -327,3 +327,40 @@ re-arm at an *exact* `threshold / 2` tie may resolve differently; `fired`, `mean
 streams (`phLatch` / `phSquare` / `phStep1` / `phStep2` / `phDemo`). `latch: false` and CUSUM (both latch
 modes) are bit-identical to 1.9.0. Latched-PH throughput is 0.98x of 1.9.0. `_rearm` is untouched (it
 already zeroes the accumulators).
+
+## Amendment (1.11.0) -- `into(out)`, the 0-alloc render reader (settle S1)
+
+A HUD dashboard reads a detector's whole row every frame -- `statistic`, `mean`, `count`,
+`lastDriftIndex`, `lastDirection`. Each of those getters returns a computed double, which boxes a ~16 B
+HeapNumber at a non-inlined call boundary (F6), so a six-getter render loop allocates ~48 B per frame per
+channel. `into(out) -> 5` writes the whole row `[statistic, mean, count, lastDriftIndex, lastDirection]`
+into a caller-owned `Float64Array` at `out[0..4]` (each slot `Object.is` its matching getter) and returns
+5 -- every value goes straight into a typed-array slot, so it is 0 B/call at a monomorphic / poly-4 site
+(mega5 INFO 160 B). Rejected (S1): `statisticInto` / `meanInto` -- two calls, two container checks, and the
+render still needs count / lastDriftIndex / lastDirection. Multi-channel packing is a caller-side
+`subarray` view per channel, created once at setup.
+
+FAIL-CLOSED ORDERING (the load-bearing part). The empty case and the non-finite case must match the
+getters exactly, and no partial write may ever land:
+
+1. Container first. The intrinsic `@@toStringTag` type tag (`TA_TAG`, S2 RE-SETTLED) rejects a
+   non-`Float64Array` `out` with a tagged `TypeError`; `TA_LEN` (read ONCE, so a lying / re-entrant
+   `length` getter never runs) rejects `length < 5` with a tagged `RangeError`. Both throw before any slot
+   write.
+2. Empty (`_n <= 0`). Writes `[0, 0, 0, this._s[1], this._s[2]]` -- statistic / mean / count read 0, but
+   `lastDriftIndex` / `lastDirection` have NO empty-case value: their getters ALWAYS return `_s[1]` / `_s[2]`
+   (a fire log that SURVIVES the reset-on-fire and a `clear()` resets to NaN), NaN only before any fire.
+   Writing a hardcoded NaN would DIVERGE from the getters after a reset-on-fire, so the slots are read from
+   `_s`, never assumed.
+3. Non-finite accumulator (`_n > 0`). `_guardFinite()` runs BEFORE the first slot write, so a non-finite
+   accumulator throws the SAME `RangeError` the `statistic` / `mean` getters throw and `out` stays
+   untouched -- never a partial write. Only after the guard passes are the five slots filled (the
+   `statistic` expression is inlined from the getter -- same `up > dn` / `_gP > _gN` tie form -- so no
+   computed double crosses a non-inlined boundary).
+
+GATE (`test/Readers111.test.js` + `test/perf/AllocMatrix.test.mjs`): the five slots `Object.is` the
+matching getters over 10k queries across unset / empty / post-reset-on-fire / after-clear states; the
+return is 5; a non-finite accumulator throws and `out` is untouched; container rejects per S2 (Proxy,
+non-`Float64Array`, prototype-swapped `Uint8Array` / `DataView`, short, re-entrant length getter never
+runs); `q_dd_into` `<= 0.5` B/op at a monomorphic and a poly-4 site (mega5 INFO 160 B). Mutants each RED:
+write before `_guardFinite`, swap two slots, drop the `TA_LEN` read.

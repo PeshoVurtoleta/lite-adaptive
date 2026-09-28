@@ -6,6 +6,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-09-28
+
+The zero-alloc READERS release (ROADMAP section 12; one feature). Two render readers --
+`SlidingHyperLogLog.countInto` and `DriftDetector.into` -- plus the estimator fix that makes
+`SlidingHyperLogLog.count()` itself 0-box (output bit-identical to 1.10.0). The only other behavior change is
+on invalid input: the cold readers reject a prototype-swapped typed array / DataView. Gates: npm test
+860/860; torture 0 B/op on every lane (0 major GC); test:perf 33/33; test:perf:matrix 167/167 incl. the
+`--no-turbo-inlining` reader rows; witness ok; gates:red exit 0.
+
+### Added
+
+- **`SlidingHyperLogLog.countInto(out, w?) -> 1`** -- the 0-alloc render sibling of `count(w?)`. Writes
+  `count(w)` into `out[0]` (the SAME value, `Object.is`-identical -- one estimator path, no duplicated
+  math) and returns `1`. A bad sub-window `w` writes `out[0] = NaN` and returns 1 (the F12 NaN contract,
+  never a throw); an unset sketch writes 0. `out` must be a `Float64Array` of length `>= 1`: a wrong
+  container TYPE throws `TypeError`, a short one `RangeError` (length read ONCE via the intrinsic getter),
+  and `out` is untouched on a throw. 0 B/call at a monomorphic / poly-4 site (mega5 INFO 16 B).
+- **`DriftDetector.into(out) -> 5`** -- the 0-alloc render reader. Writes
+  `[statistic, mean, count, lastDriftIndex, lastDirection]` into `out[0..4]` (each slot `Object.is` its
+  matching getter) and returns `5`. A never-fed or cleared detector writes `[0, 0, 0, NaN, NaN]`; after a
+  reset-on-fire the count is 0 but slots 3-4 KEEP the last fire. `out` must be a `Float64Array` of length
+  `>= 5` (wrong TYPE -> `TypeError`, short -> `RangeError`). FAIL CLOSED: when `count > 0` the accumulator
+  guard runs BEFORE the first slot write, so a non-finite accumulator throws the SAME `RangeError` the
+  `statistic` / `mean` getters throw and `out` stays untouched (never a partial write). 0 B/call at a
+  monomorphic / poly-4 site (mega5 INFO 160 B); a six-getter render loop boxes ~48 B/frame.
+
+### Changed
+
+- **The `SlidingHyperLogLog` estimator tail is now 0-box.** `slSigma` / `slTau` and the count no longer
+  RETURN a computed double (each returned double boxes a ~16 B HeapNumber at a non-inlined call boundary --
+  the 1.8.0 finding A stable box inside `count()`). They are now VOID helpers writing their converged value
+  into SHLL-only module-level scratch (`SL_EST` / `SL_SIG_S` / `SL_TAU_S` / `SL_CUT`, re-entrancy-safe like
+  HeavyKeeper's `HK_KIN`), and the shared `_writeCount` estimator body writes the rounded count straight
+  into a caller slot. `count()` is now **0 B/call steady** (and 0 B/op under `--no-turbo-inlining`),
+  boxing only its one returned double at a megamorphic 5+ shape site. Output is **bit-identical to 1.10.0**
+  on the SHLLParity + F19Boundary vectors and a 1e6 random-query sweep.
+- **The cold readers now check the INTRINSIC type tag (S2 RE-SETTLED).** `SlidingHyperLogLog.countInto`,
+  `DriftDetector.into`, `SlidingAggregate.into`, `SlidingCountMin.estimateInto`,
+  `SlidingDDSketch.quantileInto`, `HeavyKeeper.topKInto` and `DecayedReservoir.sampleInto` verify the
+  container with the `%TypedArray%.prototype[@@toStringTag]` getter (captured at module init as `TA_TAG`;
+  it reads the element-kind of the internal slot and returns `'Float64Array'` only for a genuine
+  `Float64Array`, runs no user code) instead of `ArrayBuffer.isView(x) && x instanceof Float64Array`. This
+  is a **behavior change on invalid input only**: a prototype-swapped `Uint8Array` / `DataView` re-parented
+  to `Float64Array.prototype` is now REJECTED with the tagged `TypeError` -- before, it was accepted with
+  silent byte truncation, or hit a native error. HOT entry points keep `isView && instanceof`. A valid
+  `Float64Array` behaves byte-identically.
+
+### Fixed
+
+- **RESOLVED: the 1.8.0 Known limitation on `SlidingHyperLogLog.count(w?)` (16-32 B/call, the `[12, 40]`
+  band).** The estimator-tail box is gone (see Changed above): `count()` is 0 B/call steady, and the
+  `q_shll_count` lane is re-cut accordingly. What REMAINS is the megamorphic-site field-read box -- at a
+  call site of 5+ subclass shapes V8 boxes the one returned double (the family-wide clock/field-read box
+  already logged for `SlidingAggregate` in 1.10.0); use `countInto` for a guaranteed 0-alloc render path.
+
 ## [1.10.0] - 2026-09-28
 
 The H2 HARDENING release (ROADMAP section 10; fail-open + allocation findings in the shipped classes).

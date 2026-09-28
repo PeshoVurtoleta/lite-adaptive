@@ -451,6 +451,29 @@ async function main() {
     const slCountBytes = Math.max(0, Math.round(slCountBpc));
     const slCountOk = slCountBytes === 0;
 
+    // SlidingHLL countInto(out): the v1.11.0 0-alloc render sibling of count(). It shares the PURE
+    // estimator path (SL_CUT slot in, SL_EST slot helpers, out[0] straight write -- no returned or
+    // argument double), so it must be 0 B/op. A full, churning window primed + an interleaved add each
+    // step so the ring keeps moving and the query really re-scans. Both full-W and sub-window branches.
+    const slCountInto = new SlidingHyperLogLog(1000, { p: 10, ringCap: 8, seed: 6 });
+    let slciT = 0;
+    for (let k = 0; k < 4000; k++) slCountInto.add(slciT++, (k * 2654435761) % 2000);
+    const SLCI_OUT = new Float64Array(1);
+    let slCountIntoSink = 0;
+    const slCountIntoStep = () => {
+        slCountInto.add(slciT, (slciT * 2654435761) % 2000);
+        slciT = (slciT + 1) | 0;
+        slCountInto.countInto(SLCI_OUT);
+        let acc = SLCI_OUT[0];
+        if (slciT & 1) { slCountInto.countInto(SLCI_OUT, 500); acc += SLCI_OUT[0]; }
+        slCountIntoSink = (slCountIntoSink + (acc | 0)) | 0;   // full + sub-window
+    };
+    const slCountIntoRes = measureAllocs(slCountIntoStep, { iterations: 100000, batches: 8 });
+    const slCountIntoBpc = slCountIntoRes.bytesPerCall === null ? 0 : slCountIntoRes.bytesPerCall;
+    const slCountIntoBytes = Math.max(0, Math.round(slCountIntoBpc));
+    // FAIL CLOSED: an unmeasured lane (bytesPerCall === null) must NOT pass as 0 B/op.
+    const slCountIntoOk = slCountIntoRes.bytesPerCall !== null && slCountIntoBytes === 0;
+
     // ---- phase 2a-sexies: DriftDetector -- add (PH + CUSUM, both mode branches, incl. the reset
     // on a fire) + the ZERO-BOX addFrom on a FRACTIONAL value + clear. Pure scalars, no pool. ----
     // DriftDetector add PH: a drifting stream (mean alternates every 512 items) so every measured add
@@ -635,6 +658,33 @@ async function main() {
     // fail closed on an unmeasured lane (bytesPerCall === null must not pass) AND require the re-centre to
     // have actually fired inside the measured loop (count > 0), so a disabled re-centre cannot pass here.
     const ddDriftOk = ddDriftRes.bytesPerCall !== null && ddDriftBytes === 0 && ddDriftRecentres > 0;
+
+    // DriftDetector into(out): the v1.11.0 0-alloc render sibling of the six scalar getters. It writes
+    // [statistic, mean, count, lastDriftIndex, lastDirection] straight into out[0..4] -- no computed
+    // double is returned or passed across a non-inlined call, so it must be 0 B/op even on a FRACTIONAL,
+    // fired signal (the six-getter render foil boxes ~48 B). The render read happens INSIDE a latched-PH
+    // stream: a latched detector on a fast-drift sawtooth so into() reads a live, fired, latched
+    // statistic (fractional mean + gaps) each step, with an interleaved addFrom keeping the stream moving.
+    const DD_INTO_PAT_N = 2048;
+    const DD_INTO_PAT = new Float64Array(DD_INTO_PAT_N);
+    for (let p = 0; p < DD_INTO_PAT_N; p++) DD_INTO_PAT[p] = (p % 1024 < 512 ? 0 : 10) + (p % 7) * 0.01;   // fractional square wave
+    const ddInto = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5, latch: true });
+    const DDINBUF = new Float64Array(1);
+    const DDIN_OUT = new Float64Array(5);
+    let ddIntoI = 0;
+    for (let k = 0; k < 8000; k++) { DDINBUF[0] = DD_INTO_PAT[ddIntoI & (DD_INTO_PAT_N - 1)]; ddInto.addFrom(DDINBUF, 0); ddIntoI++; }
+    let ddIntoSink = 0;
+    const ddIntoStep = () => {
+        DDINBUF[0] = DD_INTO_PAT[ddIntoI & (DD_INTO_PAT_N - 1)];
+        ddInto.addFrom(DDINBUF, 0);
+        ddIntoI = (ddIntoI + 1) | 0;
+        ddInto.into(DDIN_OUT);   // the render read: 5 slots straight into out, 0 B/op
+        ddIntoSink = (ddIntoSink + ((DDIN_OUT[0] + DDIN_OUT[1] + DDIN_OUT[2]) | 0)) | 0;   // observe (defeat DCE)
+    };
+    const ddIntoRes = measureAllocs(ddIntoStep, { iterations: 100000, batches: 8 });
+    const ddIntoBpc = ddIntoRes.bytesPerCall === null ? 0 : ddIntoRes.bytesPerCall;
+    const ddIntoBytes = Math.max(0, Math.round(ddIntoBpc));
+    const ddIntoOk = ddIntoRes.bytesPerCall !== null && ddIntoBytes === 0;
 
     // ---- phase 2a-septies: SlidingDDSketch -- add (log-bucket key + pane rotate/clear + collapse) +
     // the ZERO-BOX addFrom on FRACTIONAL [now, value] + quantile + quantileInto + clear. ----
@@ -1543,7 +1593,7 @@ async function main() {
     SINK += addSink + addTSink + adSink + fpSink + frSink + ehFromSink + fdFromSink + ehBoxedSink + fdBoxedSink +
         hkSink + hkFromSink + hkBoxedSink + adFromSink + hkClearSink + slSink + slFromSink + slClearSink +
         ddPhSink + ddCuSink + ddFromSink + ddClearSink +
-        ddPhLSink + ddCuLSink + ddFromLSink +
+        ddPhLSink + ddCuLSink + ddFromLSink + ddIntoSink +
         sdSink + sdFromSink + sdQSink + sdIntoSink + sdClearSink +
         ehAdvSink + ehAvfSink + slAdvSink + slAvfSink + sdAdvSink + sdAvfSink +
         ehBigSink + slBigSink + sdBigSink +
@@ -1606,9 +1656,9 @@ async function main() {
     // ---- verdict + GATE line ----
     const ok = trackedOk && live === 0 && findings.length === 0 &&
         addOk && addTOk && adOk && fdOk && fdRebOk && ehFromOk && fdFromOk &&
-        hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk && slCountOk &&
+        hkOk && hkFromOk && adFromOk && hkClearOk && slOk && slFromOk && slClearOk && slCountOk && slCountIntoOk &&
         ddPhOk && ddCuOk && ddFromOk && ddClearOk &&
-        ddPhLOk && ddCuLOk && ddFromLOk && ddDriftOk &&
+        ddPhLOk && ddCuLOk && ddFromLOk && ddDriftOk && ddIntoOk &&
         sdOk && sdFromOk && sdStrictOk && sdRangeOk && sdReancOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk &&
         ehAdvOk && ehAvfOk && slAdvOk && slAvfOk && sdAdvOk && sdAvfOk && advRetOk &&
         ehBigOk && slBigOk && sdBigOk && hugeOk &&
@@ -1635,6 +1685,7 @@ async function main() {
         slFromBytes + ' B/op (SlidingHyperLogLog addFrom epoch-ms + large key) ' +
         slClearBytes + ' B/op (SlidingHyperLogLog clear) ' +
         slCountBytes + ' B/op (SlidingHyperLogLog count PURE) ' +
+        slCountIntoBytes + ' B/op (SlidingHyperLogLog countInto PURE) ' +
         ddPhBytes + ' B/op (DriftDetector add PH) ' +
         ddCuBytes + ' B/op (DriftDetector add CUSUM) ' +
         ddFromBytes + ' B/op (DriftDetector addFrom fractional) ' +
@@ -1643,6 +1694,7 @@ async function main() {
         ddCuLBytes + ' B/op (DriftDetector add CUSUM latch) ' +
         ddFromLBytes + ' B/op (DriftDetector addFrom latch) ' +
         ddDriftBytes + ' B/op (DriftDetector latch PH re-centre) ' +
+        ddIntoBytes + ' B/op (DriftDetector into latched-PH) ' +
         sdBytes + ' B/op (SlidingDDSketch add + pane rotate + collapse) ' +
         sdFromBytes + ' B/op (SlidingDDSketch addFrom fractional) ' +
         sdStrictBytes + ' B/op (SlidingDDSketch strict add span re-anchor) ' +
@@ -1709,11 +1761,13 @@ async function main() {
         if (!slFromOk) console.error('  alloc ' + slFromBytes + ' B/op SlidingHyperLogLog addFrom (raw ' + slFromBpc + ')');
         if (!slClearOk) console.error('  alloc ' + slClearBytes + ' B/op SlidingHyperLogLog clear (raw ' + slClearBpc + ')');
         if (!slCountOk) console.error('  alloc ' + slCountBytes + ' B/op SlidingHyperLogLog count (raw ' + slCountBpc + ')');
+        if (!slCountIntoOk) console.error('  alloc ' + slCountIntoBytes + ' B/op SlidingHyperLogLog countInto (raw ' + slCountIntoBpc + ')');
         if (!ddPhOk) console.error('  alloc ' + ddPhBytes + ' B/op DriftDetector add PH (raw ' + ddPhBpc + ')');
         if (!ddCuOk) console.error('  alloc ' + ddCuBytes + ' B/op DriftDetector add CUSUM (raw ' + ddCuBpc + ')');
         if (!ddFromOk) console.error('  alloc ' + ddFromBytes + ' B/op DriftDetector addFrom (raw ' + ddFromBpc + ')');
         if (!ddClearOk) console.error('  alloc ' + ddClearBytes + ' B/op DriftDetector clear (raw ' + ddClearBpc + ')');
         if (!ddDriftOk) console.error('  alloc ' + ddDriftBytes + ' B/op DriftDetector latch PH re-centre (raw ' + ddDriftBpc + ', measured=' + (ddDriftRes.bytesPerCall !== null) + ', recentres=' + ddDriftRecentres + ')');
+        if (!ddIntoOk) console.error('  alloc ' + ddIntoBytes + ' B/op DriftDetector into latched-PH (raw ' + ddIntoBpc + ', measured=' + (ddIntoRes.bytesPerCall !== null) + ')');
         if (!sdOk) console.error('  alloc ' + sdBytes + ' B/op SlidingDDSketch add (raw ' + sdBpc + ')');
         if (!sdFromOk) console.error('  alloc ' + sdFromBytes + ' B/op SlidingDDSketch addFrom (raw ' + sdFromBpc + ')');
         if (!sdStrictOk) console.error('  alloc ' + sdStrictBytes + ' B/op SlidingDDSketch strict add (raw ' + sdStrictBpc + ')');

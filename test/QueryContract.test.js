@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     SlidingDDSketch, SlidingHyperLogLog, SlidingCountMin, HeavyKeeper, SlidingAggregate,
+    DriftDetector, DRIFT_PH,
 } from '../Adaptive.js';
 
 /** A stable structural snapshot of an instance's own state (typed arrays -> arrays, scalars verbatim). */
@@ -52,7 +53,7 @@ test('F12 SlidingDDSketch: bad q / bad w -> NaN; wrong container -> throw; no ke
     assertThrowsPure(sdd, () => sdd.quantileInto(new Float64Array([0.5]), [0]), 'SDD quantileInto(qs, non-F64)');
 });
 
-test('F12 SlidingHyperLogLog: bad w -> NaN; no q / key / container axis', () => {
+test('F12 SlidingHyperLogLog: bad w -> NaN; countInto bad w -> NaN slot; wrong container -> throw; no q / key axis', () => {
     const shll = new SlidingHyperLogLog(1000);
     for (let i = 0; i < 200; i++) shll.add(i, i);
     // bad w -> NaN (was a throw before 1.7.0)
@@ -60,7 +61,20 @@ test('F12 SlidingHyperLogLog: bad w -> NaN; no q / key / container axis', () => 
     assertNaNPure(shll, () => shll.count(NaN), 'SHLL count(NaN)');
     assertNaNPure(shll, () => shll.count(1e9), 'SHLL count(>W)');
     assertNaNPure(shll, () => shll.count('x'), 'SHLL count(non-number)');
-    // bad q: N/A; bad key: N/A; wrong container: N/A -- skipped explicitly.
+    // countInto (v1.11.0): a bad w VALUE fills out[0] with NaN and returns 1, never a throw; pure.
+    const out = new Float64Array(1);
+    for (const bad of [-1, 0, NaN, Infinity, -Infinity, 1e9, 'x']) {
+        const before = snap(shll);
+        assert.equal(shll.countInto(out, bad), 1, 'SHLL countInto(bad w=' + String(bad) + ') -> returns 1');
+        assert.ok(Number.isNaN(out[0]), 'SHLL countInto(bad w=' + String(bad) + ') -> NaN slot');
+        assert.equal(snap(shll), before, 'SHLL countInto(bad w) left state byte-identical');
+    }
+    // countInto WRONG CONTAINER TYPE (a programming error) -> throw, state byte-identical
+    assertThrowsPure(shll, () => shll.countInto([0]), 'SHLL countInto(non-F64)');
+    assertThrowsPure(shll, () => shll.countInto(new Float32Array(1)), 'SHLL countInto(Float32Array)');
+    assertThrowsPure(shll, () => shll.countInto(new Proxy(new Float64Array(1), {})), 'SHLL countInto(Proxy)');
+    assertThrowsPure(shll, () => shll.countInto(new Float64Array(0)), 'SHLL countInto(length 0)');
+    // bad q: N/A; bad key: N/A -- skipped explicitly.
 });
 
 test('F12 SlidingCountMin: bad key / bad w -> NaN; unseen valid key -> 0; no q / container axis', () => {
@@ -158,4 +172,28 @@ test('F12 SlidingAggregate: bad w -> NaN on all 5 readers; into wrong container 
     assert.equal(saU.sum(), 0, 'SA unset sum() -> 0');
     assert.ok(Number.isNaN(saU.mean()) && Number.isNaN(saU.min()) && Number.isNaN(saU.max()), 'SA unset mean/min/max NaN');
     // bad q: N/A; bad key: N/A -- skipped explicitly.
+});
+
+test('F12 DriftDetector: into wrong container / short -> throw pure; non-finite accumulator -> throw, out untouched; no q / w / key axis', () => {
+    const dd = new DriftDetector(DRIFT_PH, { delta: 0.005, threshold: 5 });
+    for (let i = 0; i < 400; i++) dd.add((i < 200 ? 0 : 10) + (i % 3) * 0.01);
+    // WRONG CONTAINER TYPE (into) -> throw, state byte-identical (a programming error, not data)
+    assertThrowsPure(dd, () => dd.into([0, 0, 0, 0, 0]), 'DD into(non-F64)');
+    assertThrowsPure(dd, () => dd.into(new Float32Array(5)), 'DD into(Float32Array)');
+    assertThrowsPure(dd, () => dd.into(new Proxy(new Float64Array(5), {})), 'DD into(Proxy)');
+    assertThrowsPure(dd, () => dd.into(new Float64Array(4)), 'DD into(out too short)');
+    // FAIL CLOSED: a non-finite accumulator throws the _guardFinite RangeError BEFORE any slot write,
+    // so `out` is left untouched (never a partial write). DD.into has no w / q / key axis (no bad-VALUE
+    // NaN branch): the only data-domain failure is the accumulator guard, which THROWS (fail closed).
+    const bad = new DriftDetector(DRIFT_PH);
+    for (let k = 0; k < 32; k++) bad.add((k < 16 ? 0 : 10) + k * 0.001);   // _n > 0 (a real, fired run)
+    // The public API caps |x| <= DD_X_MAX and resets on a fire, so _guardFinite is defense-in-depth
+    // (unreachable via add()); corrupt an accumulator directly to exercise the SAME guard the getters use.
+    bad._gP = Infinity;
+    const SENT = -987654.5;
+    const out = new Float64Array(5); out.fill(SENT);
+    const before = snap(bad);
+    assert.throws(() => bad.into(out), /\[lite-adaptive\]/, 'DD into(non-finite accumulator) throws tagged');
+    assert.equal(snap(bad), before, 'DD into(non-finite) left dd state byte-identical');
+    for (let s = 0; s < 5; s++) assert.ok(Object.is(out[s], SENT), 'DD into(non-finite) slot ' + s + ' untouched (fail closed)');
 });

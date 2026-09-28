@@ -2201,21 +2201,22 @@ test('D3 steady-state probe: renderHkPrep + stepHk on BIG (>= 2^31) keys read <=
     }
 });
 
-test('D4 steady-state probe: stepShll (query-every-frame and never) reads <= 0.5 B/op (blocker 2: the boxing count() moved OFF the frame path), and renderShllPrep boxes ~16 B/op (the documented display count() the probe SEES)', async () => {
+test('D4 steady-state probe: stepShll (query-every-frame and never) AND renderShllPrep read <= 0.5 B/op (blocker 2: the count() query moved OFF the frame path; v1.11.0: count() no longer boxes -- estimator tail is argument-free)', async () => {
     for (const lane of ['shll_step_q1', 'shll_step_never']) {
         const r = await runDemoLane(lane);
         process.stdout.write('  ' + lane + ' steady: ' + r.steady + ' B/op (readings ' + r.readings.join(',') + ')\n');
         assert.ok(r.steady <= 0.5, lane + ' must read <= 0.5 B/op steady, got ' + r.steady);
     }
-    // renderShllPrep is the 10Hz tick. Its cost is 16-32 B/op depending on the V8 tier (DEMO.md D4):
-    // a stable 16 B inside the library's count() estimator tail, plus (when the render is not Turbofan-
-    // optimized) 16 B for count()'s integer-valued double return materialized at the call boundary.
-    // Banded [12, 40]: the lower bound proves the probe SEES what measureAllocs reads as a false 0;
-    // the upper bound FAILS if a THIRD box (48 B) appears.
+    // renderShllPrep is the 10Hz tick; it queries the display twin slD.count() once per tick. Before
+    // v1.11.0 this read a documented 16-32 B/op: a stable 16 B inside count()'s estimator tail (the
+    // slSigmaInto / slTauInto helpers took the empty / saturated fraction as a computed-double ARGUMENT,
+    // which boxes whenever V8 does not inline the helper), plus count()'s returned double at the call
+    // boundary. v1.11.0 hands the fraction through the SL_SIG_S / SL_TAU_S slots (argument-free helpers)
+    // and keeps every render value in a Float64Array slot, so count() is box-free and this reads 0.
+    // Teeth for the 0 live in the SEPARATE mustbox control test (>= 12 B/op), which still holds.
     const rr = await runDemoLane('shll_render');
-    process.stdout.write('  shll_render steady: ' + rr.steady + ' B/op (documented 16-32 B, V8-inlining dependent)\n');
-    assert.ok(rr.steady >= 12, 'renderShllPrep must show the display-count() box the probe can see (>= 12 B/op), got ' + rr.steady);
-    assert.ok(rr.steady <= 40, 'renderShllPrep must stay <= 40 B/op (documented 32 B ceiling + slack; a third box at 48 fails), got ' + rr.steady);
+    process.stdout.write('  shll_render steady: ' + rr.steady + ' B/op (v1.11.0: count() is box-free)\n');
+    assert.ok(rr.steady <= 0.5, 'renderShllPrep must read <= 0.5 B/op steady (v1.11.0 count() no longer boxes), got ' + rr.steady);
 });
 
 /* =============================================================================================

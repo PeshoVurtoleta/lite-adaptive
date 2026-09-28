@@ -6,7 +6,7 @@ complete at 1.0.0). See `RESEARCH.md` for the identity, the two witnesses (recen
 change response), the roster rationale (incl. the verdict on the inherited backlog), and the
 open questions. ASCII-only (`->`, `<=`, `x`, "epsilon", "alpha", "delta").
 
-> **NEXT: v1.10.0 -- H2 hardening (section 10; batch 1 of 10.1 is launch-ready).** v1.9.0 SlidingAggregate released 2026-09-27.
+> **NEXT: v1.11.0 -- zero-alloc readers (section 12; batch 1 launch-ready), then the demo session (section 11).** v1.10.0 H2 hardening released 2026-09-28. v1.9.0 SlidingAggregate released 2026-09-27.
 > Previously NEXT: v1.9.0 -- SlidingAggregate ONLY (section 9). 1.8.0 (additive API) released 2026-09-27;
 > 1.7.0 H1 hardening shipped 2026-09-26. After 1.9.0: section 10 (v1.10.0, the zero-alloc readers +
 > the latched-PH fix, from the 1.8.0 doc-truth findings) and section 11 (the demo session, repo-only,
@@ -921,7 +921,7 @@ one block next to the EH F17 line: SA covered-span mean worstRel (assert <= 4.5e
 worstRel (edge, informational), and ExponentialHistogram(1000, 0.01) fed the same streams: sum()/count()
 worstRel vs true(W) (the F17 failure) + EH memory.
 
-## 10. v1.10.0 -- H2 HARDENING (fail-open + allocation findings in shipped classes)  [CODE COMPLETE -- 2026-09-28; release pending]
+## 10. v1.10.0 -- H2 HARDENING (fail-open + allocation findings in shipped classes)  [SHIPPED -- 1.10.0, 2026-09-28]
 
 One theme: every reader a render path needs is 0 B/call, and the latch path is 0 B/op under every tier.
 - NEW (review, 2026-09-27): family-wide megamorphic-site boxing. A double FIELD read (`this._now`) at a
@@ -1232,6 +1232,110 @@ llms.txt, SHLL ADR + 0007 amendments, CHANGELOG. Readers only, no other behavior
   bit-identical (non-dyadic drift corrected; HEAD drifted up to 450 ulp). H2-5 megamorphic box is
   measure-and-document only (mega5 INFO: SCM 49, SDD 70.5). SHLL `countInto` + DD `statisticInto` /
   `meanInto` moved to 1.11.0.
+
+## 12. v1.11.0 -- zero-alloc READERS (one feature)  [CODE COMPLETE -- 2026-09-28; release pending]
+
+Planned 2026-09-28 by the coordinator (no planner spawn -- the brief was 10.1 section 8; facts checked in
+code). One feature per minor: two new 0-alloc render readers, no other behavior change.
+
+### 12.1 SETTLED (coordinator; maintainer may override on the ping)
+- S1 API shape -- mirror `SlidingAggregate.into(out, w?)`, one container per call:
+  - `SlidingHyperLogLog.countInto(out, w?) -> 1` writes `count(w)` into `out[0]` (the SAME value,
+    `Object.is`-identical). Bad `w` -> `out[0] = NaN` and returns 1 (NaN contract, never a throw);
+    unset -> 0.
+  - `DriftDetector.into(out) -> 5` writes `[statistic, mean, count, lastDriftIndex, lastDirection]` into
+    `out[0..4]` (each `Object.is` its getter; a never-fed or cleared detector -> `[0, 0, 0, NaN, NaN]`;
+    after a reset-on-fire, count is 0 but slots 3-4 keep the last fire, exactly as the getters). A non-finite accumulator
+    throws the SAME `_guardFinite` RangeError BEFORE any slot is written (out untouched -- fail closed,
+    never a partial write).
+  - Rejected: `statisticInto` / `meanInto` (two calls, two container checks, and the demo render still
+    needs count / lastDriftIndex / lastDirection). Multi-channel packing: the caller passes one
+    `subarray` view per channel, created once at setup (subarray views are valid containers, QA 1.10.0 C8).
+- S2 Containers -- the 1.10.0 COLD-reader model: `ArrayBuffer.isView(out) && out instanceof Float64Array`,
+  length via the intrinsic `TA_LEN.call(out)` read ONCE, `!(n >= 1)` / `!(n >= 5)` -> RangeError; a wrong
+  type -> TypeError; messages via `describeArg`. A lying / re-entrant `length` is ignored and never runs.
+- S2 RE-SETTLED (coordinator, 2026-09-28, after review + QA111-R1/R2): COLD readers (SHLL countInto, DD
+  into, and the 1.10.0 cold readers SA into / SCM estimateInto / SDD quantileInto / HK topKInto / DR
+  sampleInto) check the INTRINSIC type tag -- `TA_TAG.call(x) === 'Float64Array'` with TA_TAG the
+  %TypedArray%.prototype[@@toStringTag] getter captured at module init (reads the internal slot, returns
+  undefined for a non-typed-array, never runs user code) -- instead of `isView && instanceof`. A
+  prototype-swapped Uint8Array / DataView used to be ACCEPTED (silent byte truncation) or hit a native
+  TypeError. HOT entry points keep `isView && instanceof` (a prototype swap is caller code, like a
+  subclass getter; documented), per the 1.10.0 hot/cold model.
+- S3 The SHLL estimator box. `count()` costs a STABLE 16 B inside the estimator tail (`slTau` / the k-loop /
+  `slSigma` / `Math.round`, ~Adaptive.js 3240-3265) on non-degenerate registers -- not only its return
+  (1.8.0 finding A). `countInto` is pointless unless that box goes. PRE-DECLARED RULE:
+  (a) a bit-identical estimator change that makes `countInto` <= 0.5 B/call steady -> ship it (count()
+  benefits too); (b) else a change whose `count()` output is identical on every SHLLParity / F19Boundary
+  vector + a 1e6-query random sweep (the result is `Math.round`-ed, so a reordered-but-equivalent float
+  expression usually rounds identically) -> ship it, disclose "estimator reordered, outputs identical on
+  N queries"; (c) else STOP and report -- do not ship a `countInto` that boxes.
+- S4 Numeric domain: the Ertl estimate can exceed 2^53 only for astronomically saturated banks (degraded
+  flag) -- it is stored into a Float64 slot, so no Smi / box concern; `lastDriftIndex` <= 2^53-1 by
+  construction; DD values are finite (guarded) or NaN (before any fire).
+
+### 12.2 Batches (ONE job per coder; coordinator runs the FULL npm test after every batch)
+**BATCH 1 -- measure + red-first (NO Adaptive.js edit).** Launch verbatim.
+Rules: read-only git only (never commit / add / stash / checkout / reset / push); no VERSION bump;
+Adaptive.js byte-identical (record `shasum -a 256 Adaptive.js` at start and end); ASCII only; node:test
+only; scratch = the session scratchpad. Tasks:
+- T1 isolate the SHLL estimator box on scratch copies with the pinned probe (test/perf/AllocProbe.mjs
+  style: `--expose-gc --min-semi-space-size=4 --max-semi-space-size=4`, steady = min over windows
+  1..n-1): a lane storing `count()` into a Float64Array slot at a monomorphic site on a NON-degenerate
+  sketch (thousands of distinct keys); bisect the estimator tail expression by expression (inline
+  `slTau` / `slSigma`, hoist `Math.round`, split the k-loop accumulator, `z` as a local vs a field, the
+  `C` scratch reads) until the 16 B is located. Deliver: the exact boxing expression, a candidate fix,
+  its B/op, and whether `count()` stays bit-identical (SHLLParity + F19Boundary + a 1e6 random-query
+  sweep vs HEAD) -- i.e. which S3 branch (a / b / c) applies.
+- T2 red-first `test/Readers111.test.js` (every case `todo: 'readers batch 2|3'`, printing `not ok ...
+  # TODO`): slot values `Object.is` the scalar readers over 10k queries incl. unset / empty / bad w / NaN
+  states; return values (1 / 5); DD non-finite accumulator -> throws and `out` untouched; container
+  rejects per S2 (Proxy, non-F64, short, NaN-length subclass over a valid backing ACCEPTED, re-entrant
+  length getter never runs); subarray-view packing of 50 channels.
+- T3 lanes in AllocProbe + AllocMatrix rows (todo until B2/B3): `q_shll_countInto` and `q_dd_into` <= 0.5
+  fresh + warmed at a monomorphic and a 4-shape site; `mega5_*` INFO rows; must-box controls stay:
+  `q_shll_count` [12, 40] and a DD six-getter render lane (~48 B).
+Gate: npm test green (todos allowed); Adaptive.js sha unchanged. Report the T1 verdict first.
+
+**BATCH 2 -- `SlidingHyperLogLog.countInto` + the estimator fix per the S3 branch.** SHLL only. Gates:
+Readers111 SHLL rows live; SHLLParity / F19Boundary bit-identical (or S3-b disclosure); `q_shll_countInto`
+<= 0.5; `q_shll_count` band re-cut if `count()` dropped (disclose); torture lane "SlidingHyperLogLog
+countInto" 0 B/op; QueryContract F12 row; mutants: ignore `w` in countInto, write before the w check,
+revert the estimator fix -> each RED.
+
+**BATCH 3 -- `DriftDetector.into(out)`.** DD only. Gates: Readers111 DD rows live; DDParity untouched;
+`q_dd_into` <= 0.5 (mono + poly4); torture lane 0 B/op; mutants: write before `_guardFinite`, swap two
+slots, drop the TA_LEN read -> each RED.
+
+**Review** (reviewer, the diff only, report by turn 25) -> **QA** boundary pass (before docs) ->
+**BATCH 4 docs** (README readers table + Zero-GC rows + DD / SHLL sections, llms.txt, d.ts, ADR 0006 +
+0007 amendments, CHANGELOG [Unreleased]: Added + resolve the SHLL count() known limitation per S3) ->
+coordinator `npm run verify` + `gates:red` -> `/release 1.11.0` -> `/sync-card`.
+After 1.11.0: the demo session (section 11) -- the DD scene reads `dd.into`, its `dd_frame` todos become
+<= 0.5 gates.
+
+### 12.3 What shipped vs the plan (2026-09-28)
+
+- **S3-a landed in batch 1.** The batch-1 probe located the estimator-tail box in `slSigma` / `slTau` /
+  `Math.round` RETURNING computed doubles, and a VOID-helper-into-slot rewrite (SHLL-only module scratch
+  `SL_EST` / `SL_SIG_S` / `SL_TAU_S` / `SL_CUT`, like HeavyKeeper's `HK_KIN`) makes `count()` 0-box with
+  BIT-IDENTICAL output -- S3 branch (a). So `count()` benefits, `countInto` ships, and the `q_shll_count`
+  band is re-cut to the new 0-box steady state.
+- **The argument box was caught by review under `--no-turbo-inlining`.** A candidate that handed the
+  sub-window cutoff to the estimator body as a fractional-double ARGUMENT still boxed at a non-inlined call
+  site; review's `--no-turbo-inlining` lane made it deterministic, and the cutoff was moved into the
+  `SL_CUT[0]` slot.
+- **S2 was re-settled to `TA_TAG` across the 7 cold readers.** Review + QA111-R1/R2 found the shipped
+  `isView && instanceof` cold guard ACCEPTED a prototype-swapped `Uint8Array` / `DataView` (silent byte
+  truncation). The fix switched all seven cold readers (SHLL `countInto`, DD `into`, SA `into`, SCM
+  `estimateInto`, SDD `quantileInto`, HK `topKInto`, DR `sampleInto`) to the intrinsic
+  `%TypedArray%.prototype[@@toStringTag]` type tag captured at init -- a behavior change on invalid input
+  only. HOT entry points keep `isView && instanceof`.
+- **A coordinator spec error on the DD empty state was caught by the batch-3 coder.** The original S1 text
+  implied a never-fed detector writes a hardcoded `[0,0,0,NaN,NaN]`; the coder noted the `lastDriftIndex` /
+  `lastDirection` getters ALWAYS return `_s[1]` / `_s[2]` (a fire log surviving a reset-on-fire), so a
+  hardcoded NaN would DIVERGE from the getters after a reset. `into` now reads slots 3-4 from `_s`, and the
+  S1 wording was corrected (12.1).
 
 ## 11. The demo session (repo-only; no npm release)  [PLANNED]
 

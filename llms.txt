@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.10.0
+Version: 1.11.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -134,10 +134,17 @@ BYTE-IDENTICAL (only the file header + VERSION change).
   key would box as plain arguments). `count(w?) -> number` is PURE (never mutates the rings; it only
   reads the oldest in-window entry per register), and runs Ertl's improved estimator (design-parity with lite-sketch,
   inline) -- standard error `1.04 / sqrt(m)` (guaranteed while `degraded === false`); `w` is an
-  optional sub-window in `(0, W]` (outside that range -> NaN, never throws -- F12). The scratch keeps
-  count() free of ARRAY allocation, but it RETURNS a rounded double: count() boxes 16 B/call steady
-  (the estimator tail) and 32 B when the caller is not yet optimized (the boxed return). A 0-alloc
-  `countInto` reader is planned for 1.11.0. `query()` aliases
+  optional sub-window in `(0, W]` (outside that range -> NaN, never throws -- F12). Since 1.11.0 the
+  estimator tail is 0-box: slSigma / slTau and the count are written into SHLL-only module scratch
+  (SL_EST / SL_SIG_S / SL_TAU_S / SL_CUT, like HeavyKeeper's HK_KIN) instead of RETURNED, so no
+  computed double crosses a call boundary. count() is 0 B/call steady (and 0 B/op under
+  --no-turbo-inlining), bit-identical to 1.10.0 on SHLLParity / F19Boundary / a 1e6 random sweep,
+  boxing only its one returned double at a megamorphic 5+ shape site (the family field-read box).
+  `countInto(out, w?) -> 1` (1.11.0) is the 0-alloc render sibling: writes count(w) into out[0]
+  (Object.is-identical), returns 1; a bad w writes out[0] = NaN and returns 1; an unset sketch writes
+  0; out must be a Float64Array of length >= 1 (a wrong TYPE throws TypeError, a short one RangeError
+  via the intrinsic length getter read ONCE, out untouched on a throw); 0 B/call at a mono / poly-4
+  site (mega5 INFO 16 B). `query()` aliases
   `count()`. Keys are safe integers; on add a bad key / now / option throws [lite-adaptive] typeof-first
   (byte-identical no-op), while count(w) with a bad `w` reads NaN. Fully deterministic
   (no PRNG). Getters: `W` / `p` / `m` / `ringCap` / `seed` / `standardError` / `lastNow` / `mode` /
@@ -174,7 +181,14 @@ BYTE-IDENTICAL (only the file header + VERSION change).
   `threshold/2` on a return to baseline -- while `add` returns false until re-arm). `mean` /
   `statistic` throw [lite-adaptive] fail-closed on a non-finite accumulator;
   getters return 0 on empty (`lastDriftIndex` / `lastDirection` return NaN before any fire -- null is
-  not zero, and each boxes one double per read). LATCH (1.8.0, opt-in; default false is 1.x-identical
+  not zero, and each boxes one double per read; a six-getter render loop is ~48 B/frame). `into(out) ->
+  5` (1.11.0) is the 0-alloc render reader: writes `[statistic, mean, count, lastDriftIndex,
+  lastDirection]` into out[0..4] (each slot Object.is its getter), returns 5; a never-fed or cleared
+  detector writes [0, 0, 0, NaN, NaN]; after a reset-on-fire count is 0 but slots 3-4 keep the last
+  fire. out must be a Float64Array of length >= 5 (wrong TYPE -> TypeError, short -> RangeError via the
+  intrinsic length getter read ONCE). FAIL CLOSED: when count > 0 the accumulator guard runs BEFORE the
+  first slot write, so a non-finite accumulator throws the SAME RangeError the statistic / mean getters
+  throw and out stays untouched. 0 B/call at a mono / poly-4 site (mega5 INFO 160 B). LATCH (1.8.0, opt-in; default false is 1.x-identical
   and bit-for-bit proven): with `latch: true` the detector fires ONCE per regime instead of on every
   sustained item -- a fire latches (re-clamping the firing gap back to `threshold` ONLY while it is
   still ABOVE `threshold`, so a SUSTAINED regime stays bounded and never spuriously re-arms; a gap
@@ -281,7 +295,7 @@ BYTE-IDENTICAL (only the file header + VERSION change).
   never throws; a wrong CONTAINER type (into's `out` not a Float64Array or length < 5) throws. Getters:
   `W` / `panes` / `mode` / `lastNow` / `bytes` (= (B+1) * 48; 1584 B at B=32, 50 channels = 79,200 B).
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.10.0'.
+- `VERSION` -- string, '1.11.0'.
 
 ## ExponentialHistogram
 
@@ -578,7 +592,15 @@ door BEFORE any allocation.
                                  stamp <= now - w), run Ertl's improved estimator (sigma / tau,
                                  alpha_inf; inline). Returns 0 on an empty window. `w` is an
                                  optional sub-window in (0, W] (outside that range -> NaN, never
-                                 throws -- F12).
+                                 throws -- F12). Since 1.11.0 the estimator tail is 0-box (slSigma /
+                                 slTau / the count write into SHLL-only module scratch, never
+                                 returned): 0 B/call steady, bit-identical to 1.10.0.
+- countInto(out, w?) -> 1        COLD, 0 B/call (mono / poly-4; mega5 INFO 16 B). The 0-alloc render
+                                 sibling: writes count(w) into out[0] (Object.is-identical), returns
+                                 1. A bad w -> out[0] = NaN, returns 1 (F12, never a throw); an unset
+                                 sketch -> 0. out is a Float64Array, length >= 1 -- a wrong TYPE
+                                 throws TypeError, a short one RangeError (length via the intrinsic
+                                 getter, read ONCE), out untouched on a throw.
 - query() -> number              COLD; an alias of count() over the full window W.
 - clear() -> this                0-alloc reset (reuse the arrays; unlocks the mode).
 - W / p / m / ringCap / seed / standardError / lastNow / mode / overflows / degraded / bytes
@@ -644,6 +666,16 @@ any field init (fail-closed, never a silent ignore).
 - addFrom(buf, i) -> boolean  HOT, 0 B/op ZERO-BOX sibling: reads x = buf[i] UNBOXED from a
                             Float64Array (for a FRACTIONAL x that add(x) would box). Same validation
                             + body as add.
+- into(out) -> 5            COLD, 0 B/call (mono / poly-4; mega5 INFO 160 B). The 0-alloc render
+                            reader: writes [statistic, mean, count, lastDriftIndex, lastDirection]
+                            into out[0..4] (each slot Object.is its getter), returns 5. A never-fed
+                            or cleared detector -> [0, 0, 0, NaN, NaN]; after a reset-on-fire count is
+                            0 but slots 3-4 KEEP the last fire. out is a Float64Array, length >= 5 --
+                            wrong TYPE -> TypeError, short -> RangeError (length via the intrinsic
+                            getter, read ONCE). FAIL CLOSED: when count > 0 the accumulator guard runs
+                            BEFORE the first slot write, so a non-finite accumulator throws the SAME
+                            RangeError the statistic / mean getters throw and out stays untouched. A
+                            six-getter render loop is ~48 B/frame; into reads the whole row in one call.
 - clear() -> this           Reset all scalar state; keep the config (mode / delta / threshold /
                             target / latch). Re-arms latch and resets lastDriftIndex / lastDirection
                             to NaN. O(1).
@@ -1125,18 +1157,25 @@ only when the windowed count is >= 2^31 (a Smi-range count returns 0 B/call; `es
 0-alloc batch reader that fixes it). `ExponentialHistogram.sum()` and `HeavyKeeper.estimate` box only in
 the early JIT tier (steady state 0). `count()` and integer-count returns are Smis, 0 B/call.
 
-## Container arguments -- the HOT / COLD threat model (H2-4, 1.10.0)
+## Container arguments -- the HOT / COLD threat model (H2-4, 1.10.0; type-tag hardened, 1.11.0)
 
-Every method that takes a caller-owned Float64Array verifies the type with `ArrayBuffer.isView(x) && x
-instanceof Float64Array` (a Proxy passes instanceof alone but not isView) and NaN-safe bounds (`!(i + k <
-n)`). The two halves differ on the LENGTH read. A HOT entry point (addFrom / advanceFrom, per item) reads
-`x.length` ONCE into the index bound -- a caller-defined subclass length getter may run at most once per
-call (the caller's own code; the zero-GC hot path is the product). A COLD render reader (into /
-estimateInto / quantileInto / topKInto / sampleInto) reads the length through the intrinsic
-%TypedArray%.prototype.length getter (TA_LEN, captured at module init), so a lying or re-entrant length is
-ignored and never runs and a benign subclass is accepted with correct results. A valid Float64Array behaves
-byte-identically. Reject messages use a cold describeArg(x) (typeof + isView, never a trap; String only on a
-primitive), so a rejected call runs no caller code and mutates nothing (H2-6, ~125 sites).
+The two halves differ on BOTH the type check and the LENGTH read. A HOT entry point (addFrom /
+advanceFrom, per item) verifies the type with `ArrayBuffer.isView(x) && x instanceof Float64Array` (a Proxy
+passes instanceof alone but not isView) and reads `x.length` ONCE into the index bound -- a caller-defined
+subclass length getter may run at most once per call (the caller's own code; the zero-GC hot path is the
+product). A COLD render reader (countInto / into / estimateInto / quantileInto / topKInto / sampleInto)
+instead checks the INTRINSIC type tag -- `TA_TAG.call(x) === 'Float64Array'`, TA_TAG the
+%TypedArray%.prototype[@@toStringTag] getter captured at module init, which reads the element-kind of the
+internal slot and returns 'Float64Array' ONLY for a genuine Float64Array, undefined (never a throw) for a
+prototype-swapped typed array / DataView / Proxy / plain object / primitive, running NO user code -- and
+reads the length through the intrinsic %TypedArray%.prototype.length getter (TA_LEN, captured at module
+init). So a lying or re-entrant length is ignored and never runs, a benign subclass over a valid backing is
+accepted with correct results, and (the 1.11.0 change, S2 RE-SETTLED) a prototype-swapped Uint8Array /
+DataView re-parented to Float64Array.prototype is now REJECTED with the tagged TypeError -- before, it was
+accepted with silent byte truncation, or hit a native error. A behavior change on invalid input only; a
+valid Float64Array behaves byte-identically. Reject messages use a cold describeArg(x) (typeof + isView,
+never a trap; String only on a primitive), so a rejected call runs no caller code and mutates nothing (H2-6,
+~125 sites).
 
 ## The time source + the bucket pool (ADR 0001)
 

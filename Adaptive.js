@@ -215,7 +215,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.10.0';
+export const VERSION = '1.11.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -256,6 +256,18 @@ const MODE_COUNT = 2;
  * model, SETTLED 2026-09-28).
  */
 const TA_LEN = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Float64Array.prototype), 'length').get;
+
+/**
+ * The intrinsic %TypedArray%.prototype[@@toStringTag] getter (S2 RE-SETTLED, 2026-09-28). It reads the
+ * element-kind of the internal [[TypedArrayName]] slot -- returning 'Float64Array' ONLY for a genuine
+ * Float64Array, and `undefined` (never a throw) for a prototype-swapped typed array, a DataView, a
+ * Proxy, a plain object or a primitive. Unlike `ArrayBuffer.isView(x) && x instanceof Float64Array`, it
+ * cannot be spoofed by a prototype swap (a Uint8Array re-parented to Float64Array.prototype passed the
+ * old check and then silently byte-truncated) and it runs NO user code. Every COLD reader uses it for
+ * the container-TYPE guard; the HOT entry points keep `isView && instanceof` (a prototype swap there is
+ * caller code, like a subclass getter -- documented). See ROADMAP 12.1 (S2 RE-SETTLED).
+ */
+const TA_TAG = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Float64Array.prototype), Symbol.toStringTag).get;
 
 /**
  * The smallest halfLife that yields a FINITE decay rate lambda = ln2 / halfLife (F14).
@@ -2544,7 +2556,7 @@ export class HeavyKeeper {
      * @returns {number} the number of [key, estimate] entries written (<= k).
      */
     topKInto(buf) {
-        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || !(TA_LEN.call(buf) >= 2 * this._k)) return this._badTopKBuf(buf);
+        if (TA_TAG.call(buf) !== 'Float64Array' || !(TA_LEN.call(buf) >= 2 * this._k)) return this._badTopKBuf(buf);
         const n = this._hkN;
         const hk = this._hkKey, he = this._hkEst;
         for (let i = 0; i < n; i++) { buf[i * 2] = hk[i]; buf[i * 2 + 1] = he[i]; }
@@ -2816,44 +2828,67 @@ const SL_KNOWN_OPTS = Object.freeze(Object.assign(Object.create(null), { p: true
 // so no >= 2^31 word crosses a call boundary (no 31-bit-Smi HeapNumber box) and there is no per-round
 // Int32Array round-trip (that cost throughput). Bit-identical to the golden vectors -- SHLLParity.
 
+// SlidingHyperLogLog-ONLY estimator scratch (module-level, like HeavyKeeper's HK_KIN). The Ertl
+// sigma / tau correction series and the count() estimator tail used to RETURN computed doubles
+// (slSigma / slTau / Math.round), each of which boxes a ~16 B HeapNumber when it crosses a call
+// boundary V8 does not inline -- a stable box inside count() (1.8.0 finding A) that countInto could
+// never avoid. slSigmaInto / slTauInto are now VOID helpers writing their converged value into
+// these slots instead of returning it; the estimator body reads the slots and writes the final
+// count straight into a caller slot (_writeCount). No user code runs while a slot is live, and the
+// helpers are fully synchronous, so this shared scratch is re-entrancy-safe (exactly like HK_KIN).
+//   SL_EST[0] = slSigmaInto result   SL_EST[1] = slTauInto result
+//   SL_SIG_S / SL_TAU_S = the per-series (x, y) convergence-loop accumulators
+//   SL_CUT[0] = the sub-window cutoff (now - effW) handed from count() / countInto to _writeCount,
+//               so no fractional double crosses that call boundary as an argument (no box)
+const SL_EST = new Float64Array(2);
+const SL_SIG_S = new Float64Array(2);
+const SL_TAU_S = new Float64Array(2);
+const SL_CUT = new Float64Array(1);
+
 /**
  * sigma -- the small-range correction series of Ertl's improved HyperLogLog estimator
  * (Ertl 2017). x is the fraction of EMPTY registers. Self-terminating (converges to a fixed
  * point), so it is table-free -- no HLL++ empirical bias tables. Cold (once per count()).
- * Reimplemented INLINE (design-parity with lite-sketch, never an import).
+ * Reimplemented INLINE (design-parity with lite-sketch, never an import). VOID + ARGUMENT-FREE:
+ * x is handed in through SL_SIG_S[0] (a slot, never a boxed argument -- a fractional double crossing
+ * a non-inlined call boundary boxes ~16 B); writes the converged value into SL_EST[0] (never returns
+ * it -- a returned double boxes ~16 B).
  */
-function slSigma(x) {
-    if (x === 1) return Infinity;
-    let y = 1;
-    let z = x;
+function slSigmaInto() {
+    const s = SL_SIG_S;
+    if (s[0] === 1) { SL_EST[0] = Infinity; return; }
+    s[1] = 1;
+    SL_EST[0] = s[0];
     let prev;
     do {
-        x = x * x;
-        prev = z;
-        z += x * y;
-        y += y;
-    } while (z !== prev);
-    return z;
+        s[0] = s[0] * s[0];
+        prev = SL_EST[0];
+        SL_EST[0] += s[0] * s[1];
+        s[1] += s[1];
+    } while (SL_EST[0] !== prev);
 }
 
 /**
- * tau -- the large-range correction series of Ertl's improved estimator (companion to slSigma).
+ * tau -- the large-range correction series of Ertl's improved estimator (companion to slSigmaInto).
  * x is 1 minus the fraction of SATURATED registers. Self-terminating fixed point; table-free.
- * Cold (once per count()). Reimplemented INLINE (design-parity with lite-sketch).
+ * Cold (once per count()). Reimplemented INLINE (design-parity with lite-sketch). VOID + ARGUMENT-FREE:
+ * x is handed in through SL_TAU_S[0] (a slot, never a boxed argument); writes the converged value into
+ * SL_EST[1] (never returns it -- a returned double boxes ~16 B).
  */
-function slTau(x) {
-    if (x === 0 || x === 1) return 0;
-    let y = 1;
-    let z = 1 - x;
+function slTauInto() {
+    const s = SL_TAU_S;
+    if (s[0] === 0 || s[0] === 1) { SL_EST[1] = 0; return; }
+    s[1] = 1;
+    SL_EST[1] = 1 - s[0];
     let prev;
     do {
-        x = Math.sqrt(x);
-        prev = z;
-        y *= 0.5;
-        const d = 1 - x;
-        z -= d * d * y;
-    } while (z !== prev);
-    return z / 3;
+        s[0] = Math.sqrt(s[0]);
+        prev = SL_EST[1];
+        s[1] *= 0.5;
+        const d = 1 - s[0];
+        SL_EST[1] -= d * d * s[1];
+    } while (SL_EST[1] !== prev);
+    SL_EST[1] = SL_EST[1] / 3;
 }
 
 /**
@@ -3225,9 +3260,64 @@ export class SlidingHyperLogLog {
             effW = w;
         }
         if (this._mode === MODE_UNSET) return 0;
-        const now = this._now;
-        const subCut = now - effW;       // sub-window cutoff (full-W entries with stamp <= now - W
-                                         // are already skipped by this scan, since subCut >= now - W)
+        // The sub-window cutoff is handed to _writeCount through the SL_CUT slot, never as a
+        // fractional-double argument -- and the estimate is read back from SL_EST[0], never RETURNED
+        // by a helper. So count() no longer boxes inside the estimator tail (1.8.0 finding A); at an
+        // inlinable call site it is 0 B/op, and it boxes at most its own one returned double.
+        SL_CUT[0] = this._now - effW;    // (full-W entries with stamp <= now - W are already skipped
+                                         // by this scan, since the cutoff >= now - W)
+        this._writeCount(SL_EST);
+        return SL_EST[0];
+    }
+
+    /**
+     * The 0-alloc render sibling of count(): writes count(w) into `out[0]` and returns 1 (S1). The
+     * COLD-reader contract (S2): a non-Float64Array container throws TypeError, a length < 1 throws
+     * RangeError (length read ONCE via the TA_LEN intrinsic, so a lying / re-entrant `length` getter
+     * is ignored and never runs); a BAD sub-window value writes `out[0] = NaN` and returns 1 (the
+     * F12 NaN contract, never a throw); an unset sketch writes 0. Otherwise `out[0]` is EXACTLY what
+     * count(w) returns (Object.is-identical -- the same estimator path, no duplicated math). The
+     * container check + write happen only AFTER validation, so `out` is untouched on a throw and the
+     * bad-w branch is the only write before returning. 0 B/op at an inlinable site.
+     * @param {Float64Array} out a caller-owned Float64Array with length >= 1.
+     * @param {number} [w] an optional sub-window in `(0, W]` (omit for the full window W).
+     * @returns {1}
+     */
+    countInto(out, w) {
+        if (TA_TAG.call(out) !== 'Float64Array') {
+            throw new TypeError('[lite-adaptive] SlidingHyperLogLog.countInto out must be a Float64Array, got ' + describeArg(out));
+        }
+        const n = TA_LEN.call(out);      // intrinsic length, read ONCE (a lying getter never runs)
+        if (!(n >= 1)) {
+            throw new RangeError('[lite-adaptive] SlidingHyperLogLog.countInto out must have length >= 1, got ' + describeArg(out));
+        }
+        let effW = this._W;
+        if (w !== undefined) {
+            // F12 parity with count(w): a bad sub-window is NaN, never a throw. null is not zero.
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
+                out[0] = NaN;
+                return 1;
+            }
+            effW = w;
+        }
+        if (this._mode === MODE_UNSET) { out[0] = 0; return 1; }
+        SL_CUT[0] = this._now - effW;    // hand the cutoff via the slot (no boxed argument)
+        this._writeCount(out);           // writes the SAME value count(w) returns, straight into out[0]
+        return 1;
+    }
+
+    /**
+     * The shared SlidingHyperLogLog estimator body (SHLL-only). Reads the sub-window cutoff from the
+     * SL_CUT slot (never a boxed argument), folds the register multiplicity vector through Ertl's
+     * improved estimator via the argument-free slSigmaInto / slTauInto helpers (their x fraction is
+     * handed in through the SL_SIG_S / SL_TAU_S slots, their result read back from SL_EST), and writes
+     * the rounded count straight into `out[0]` (a Float64Array slot). No computed double is ever
+     * returned or passed as an argument, so the estimator tail is box-free; count() and countInto both call it, so the math
+     * lives in ONE place. PURE (F8): it never mutates the rings. Assumes mode is set (callers guard).
+     * @param {Float64Array} out the destination slot (SL_EST for count(), the caller's out for countInto).
+     */
+    _writeCount(out) {
+        const subCut = SL_CUT[0];        // sub-window cutoff (now - effW), handed via the slot
         const m = this._m, cap = this._ringCap, mask = this._mask;
         const stamps = this._stamps, rhos = this._rho;
         const heads = this._head, lens = this._len;
@@ -3236,10 +3326,9 @@ export class SlidingHyperLogLog {
         C.fill(0);
         for (let jj = 0; jj < m; jj++) {
             const base = jj * cap;
-            // F8: count() is PURE -- it NEVER expires ring entries (that now happens in add()). The
-            // read-only sub-window scan skips every stamp <= subCut, and subCut >= now - W, so an
-            // expired-by-W entry is skipped here anyway -> the estimate is bit-identical to the old
-            // destructive path, but `overflows` / the ring state no longer depend on query cadence.
+            // F8: PURE -- never expires ring entries (that happens in add()). The read-only scan skips
+            // every stamp <= subCut, and subCut >= now - W, so an expired-by-W entry is skipped here
+            // anyway -> bit-identical to the old destructive path.
             const head = heads[jj];
             const len = lens[jj];
             // the first entry with stamp > subCut is the OLDEST in-window entry, which carries the
@@ -3253,11 +3342,14 @@ export class SlidingHyperLogLog {
             }
             C[maxRho]++;
         }
-        // Ertl improved estimator: z accumulates the corrected inverse-sum.
-        let z = m * slTau((m - C[q + 1]) / m);   // large-range (saturated) correction
+        // Ertl improved estimator: z accumulates the corrected inverse-sum. slTauInto / slSigmaInto
+        // write their converged value into SL_EST[1] / SL_EST[0] (never returned -> no box).
+        SL_TAU_S[0] = (m - C[q + 1]) / m; slTauInto();   // large-range (saturated) correction -> SL_EST[1]
+        let z = m * SL_EST[1];
         for (let k = q; k >= 1; k--) z = 0.5 * (z + C[k]);
-        z += m * slSigma(C[0] / m);              // small-range (empty) correction
-        return Math.round(SL_ALPHA_INF * m * m / z);
+        SL_SIG_S[0] = C[0] / m; slSigmaInto();            // small-range (empty) correction -> SL_EST[0]
+        z += m * SL_EST[0];
+        out[0] = Math.round(SL_ALPHA_INF * m * m / z);
     }
 
     /**
@@ -3689,6 +3781,61 @@ export class DriftDetector {
             return up > dn ? up : dn;
         }
         return this._gP > this._gN ? this._gP : this._gN;
+    }
+
+    /**
+     * Write the render snapshot `[statistic, mean, count, lastDriftIndex, lastDirection]` into
+     * `out[0..4]` (a caller-owned Float64Array, length >= 5) and return 5. Each slot is Object.is
+     * to its matching getter (S1). A never-fed or cleared detector writes `[0, 0, 0, NaN, NaN]` (no
+     * fire has happened, so lastDriftIndex / lastDirection are NaN); AFTER a reset-on-fire the count is
+     * 0 but slots 3-4 KEEP the last fire (lastDriftIndex / lastDirection), exactly as the getters. The ZERO-BOX render
+     * reader (F6): the six getters each box a double per call, so a per-frame render allocates; this
+     * writes every value straight into a typed-array slot, 0 B/op at an inlinable site. Read a
+     * dashboard's whole DD row in ONE call, at 10-15 Hz, with no allocation.
+     *
+     * COLD-reader contract (S2, mirrors SlidingAggregate.into / SlidingHyperLogLog.countInto): a
+     * non-Float64Array `out` -> TypeError; length read ONCE via the TA_LEN intrinsic (a lying /
+     * re-entrant getter is ignored and never runs), length < 5 -> RangeError; messages via
+     * describeArg. FAIL CLOSED: when _n > 0 the accumulator guard `_guardFinite()` runs BEFORE the
+     * first slot write, so a non-finite accumulator throws the SAME RangeError the statistic / mean
+     * getters throw and `out` stays untouched (never a partial write).
+     * @param {Float64Array} out a caller-owned Float64Array with length >= 5.
+     * @returns {5}
+     */
+    into(out) {
+        // The intrinsic @@toStringTag getter rejects a Proxy, a DataView and a prototype-swapped typed
+        // array (returns undefined, never runs user code); the length check is NaN-safe.
+        if (TA_TAG.call(out) !== 'Float64Array') {
+            throw new TypeError(
+                '[lite-adaptive] DriftDetector.into(out) out must be a Float64Array, got ' + describeArg(out));
+        }
+        const n = TA_LEN.call(out);      // intrinsic length, read ONCE (a lying getter never runs)
+        if (!(n >= 5)) {
+            throw new RangeError(
+                '[lite-adaptive] DriftDetector.into out must have length >= 5, got ' + describeArg(out));
+        }
+        if (this._n <= 0) {
+            // empty: statistic / mean getters read 0, count is _n (0); but lastDriftIndex / lastDirection
+            // have NO empty-case value -- their getters ALWAYS return _s[1] / _s[2] (a fire log that
+            // survives a reset), NaN only before any fire. Match the getters, never a hardcoded NaN.
+            out[0] = 0; out[1] = 0; out[2] = 0; out[3] = this._s[1]; out[4] = this._s[2];
+            return 5;
+        }
+        this._guardFinite();             // fail closed BEFORE any slot write; out untouched on throw
+        // statistic, inlined from the getter (same expression, same up > dn tie form): no computed
+        // double crosses a non-inlined call boundary -- each value is written straight into out.
+        if (this._mode === DRIFT_PH) {
+            const up = this._gP - this._mMin;
+            const dn = this._mMax - this._gN;
+            out[0] = up > dn ? up : dn;
+        } else {
+            out[0] = this._gP > this._gN ? this._gP : this._gN;
+        }
+        out[1] = this._mean;             // mean (guarded above; _n > 0 so never the empty 0)
+        out[2] = this._n;                // count
+        out[3] = this._s[1];             // lastDriftIndex (NaN before any fire)
+        out[4] = this._s[2];             // lastDirection (NaN before any fire)
+        return 5;
     }
 
     /**
@@ -4818,7 +4965,7 @@ export class SlidingDDSketch {
      * @returns {number} the count of quantiles written.
      */
     quantileInto(qs, out) {
-        if (!(ArrayBuffer.isView(qs) && qs instanceof Float64Array) || !(ArrayBuffer.isView(out) && out instanceof Float64Array)) {
+        if (TA_TAG.call(qs) !== 'Float64Array' || TA_TAG.call(out) !== 'Float64Array') {
             return this._badInto(qs, out);   // argument-TYPE guard (a wrong container is a programming error)
         }
         const n = TA_LEN.call(qs);           // H34: intrinsic length, read ONCE (a subclass getter runs no user code)
@@ -5791,11 +5938,11 @@ export class SlidingCountMin {
      * @returns {number} n = keys.length (the number of slots written).
      */
     estimateInto(keys, out, w) {
-        if (!(ArrayBuffer.isView(keys) && keys instanceof Float64Array)) {
+        if (TA_TAG.call(keys) !== 'Float64Array') {
             throw new TypeError(
                 '[lite-adaptive] SlidingCountMin.estimateInto(keys, out, w?) keys must be a Float64Array, got ' + describeArg(keys));
         }
-        if (!(ArrayBuffer.isView(out) && out instanceof Float64Array)) {
+        if (TA_TAG.call(out) !== 'Float64Array') {
             throw new TypeError(
                 '[lite-adaptive] SlidingCountMin.estimateInto(keys, out, w?) out must be a Float64Array, got ' + describeArg(out));
         }
@@ -6401,7 +6548,7 @@ export class DecayedReservoir {
      * @returns {number} the number of values written (<= k).
      */
     sampleInto(buf) {
-        if (!(ArrayBuffer.isView(buf) && buf instanceof Float64Array) || !(TA_LEN.call(buf) >= this._k)) return this._badSampleBuf(buf);
+        if (TA_TAG.call(buf) !== 'Float64Array' || !(TA_LEN.call(buf) >= this._k)) return this._badSampleBuf(buf);
         const n = this._n, val = this._val;
         for (let i = 0; i < n; i++) buf[i] = val[i];
         return n;
@@ -7024,8 +7171,9 @@ export class SlidingAggregate {
      * @returns {number} 5
      */
     into(out, w) {
-        // ArrayBuffer.isView rejects a Proxy that forwards instanceof; the length check is NaN-safe.
-        if (!(ArrayBuffer.isView(out) && out instanceof Float64Array)) {
+        // The intrinsic @@toStringTag getter rejects a Proxy, a DataView and a prototype-swapped typed
+        // array (returns undefined, never runs user code); the length check is NaN-safe.
+        if (TA_TAG.call(out) !== 'Float64Array') {
             throw new TypeError(
                 '[lite-adaptive] SlidingAggregate.into(out, w?) out must be a Float64Array, got ' + describeArg(out));
         }

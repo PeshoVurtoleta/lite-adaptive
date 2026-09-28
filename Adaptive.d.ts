@@ -487,12 +487,23 @@ export class SlidingHyperLogLog {
      * The windowed DISTINCT-COUNT estimate over the last W (or a sub-window `w <= W`). COLD, O(m).
      * Standard error 1.04 / sqrt(m) (guaranteed while not degraded). Returns 0 on an empty window.
      * NEVER throws (F12, one query contract): a sub-window `w` outside `(0, W]` reads NaN; `w`
-     * omitted queries the full window W. null is not zero. The scratch keeps count() free of ARRAY
-     * allocation, but it RETURNS a rounded double: it boxes 16 B/call steady (the estimator tail) and
-     * 32 B when the caller is not yet optimized (the boxed return). A 0-alloc `countInto` reader is
-     * planned for 1.10.0. See the README F6 alloc table.
+     * omitted queries the full window W. null is not zero. Since 1.11.0 the estimator tail is 0-box
+     * (slSigma / slTau / the count are written into SHLL-only module scratch, never RETURNED), so
+     * count() is 0 B/call steady (and 0 B/op under --no-turbo-inlining), bit-identical to 1.10.0,
+     * boxing only its one returned double at a megamorphic 5+ shape site. See the README F6 alloc table.
      */
     count(w?: number): number;
+
+    /**
+     * The 0-alloc render sibling of count(): writes count(w) into `out[0]` (the SAME value,
+     * Object.is-identical) and returns 1. A bad sub-window `w` writes `out[0] = NaN` and returns 1
+     * (the F12 NaN contract, never a throw); an unset sketch writes 0. Throws [lite-adaptive] on a
+     * non-Float64Array `out` (TypeError, via the intrinsic @@toStringTag tag -- a prototype-swapped
+     * typed array / DataView / Proxy is rejected) or `out.length < 1` (RangeError, length read ONCE
+     * via the intrinsic getter, NaN-safe); `out` is untouched on a throw. 0 B/call at a monomorphic /
+     * poly-4 site.
+     */
+    countInto(out: Float64Array, w?: number): 1;
 
     /** The primary windowed estimate -- an alias of count() over the full window W. COLD. Never throws. */
     query(): number;
@@ -638,6 +649,20 @@ export class DriftDetector {
      * non-finite / out-of-domain `buf[i]` is a byte-identical no-op.
      */
     addFrom(buf: Float64Array, i: number): boolean;
+
+    /**
+     * The 0-alloc render reader: writes [statistic, mean, count, lastDriftIndex, lastDirection] into
+     * `out[0..4]` (each slot Object.is its matching getter) and returns 5. A never-fed or cleared
+     * detector writes [0, 0, 0, NaN, NaN]; after a reset-on-fire the count is 0 but slots 3-4 KEEP the
+     * last fire (lastDriftIndex / lastDirection), exactly as the getters. FAIL CLOSED: when count > 0
+     * the accumulator guard runs BEFORE the first slot write, so a non-finite accumulator throws the
+     * SAME RangeError the statistic / mean getters throw and `out` stays untouched. Throws
+     * [lite-adaptive] on a non-Float64Array `out` (TypeError, via the intrinsic @@toStringTag tag -- a
+     * prototype-swapped typed array / DataView / Proxy is rejected) or `out.length < 5` (RangeError,
+     * length read ONCE via the intrinsic getter, NaN-safe). 0 B/call at a monomorphic / poly-4 site
+     * (a six-getter render loop boxes ~48 B/frame).
+     */
+    into(out: Float64Array): 5;
 
     /** Reset all scalar state; keep the mode / delta / threshold. */
     clear(): this;

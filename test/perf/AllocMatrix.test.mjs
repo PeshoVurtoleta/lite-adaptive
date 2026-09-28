@@ -198,11 +198,15 @@ test('queryLanes', async (t) => {
 
 // ===========================================================================
 // 1.8.0 doc-truth findings: two honest lanes no library alloc gate measured before.
-//   - q_shll_count (finding A): SlidingHyperLogLog.count() on a NON-degenerate sketch (thousands of
-//     distinct keys). count() keeps its Ertl scratch (no ARRAY alloc) but RETURNS a rounded double --
-//     a stable 16 B in the estimator tail, +16 B when the caller is not yet optimized. Documented BAND
-//     [12, 40] B/op: the lower bound proves the probe SEES the cost (a 0-alloc claim would fail here),
-//     the upper bound fails on a THIRD box (the tail stays exactly one box). Measured 16 B/op steady.
+//   - q_shll_count (finding A, RESOLVED v1.11.0 S3-a): SlidingHyperLogLog.count() on a NON-degenerate
+//     sketch (thousands of distinct keys). Before v1.11.0 count()'s Ertl estimator tail RETURNED
+//     computed doubles (slSigma / slTau / Math.round), a STABLE 16 B box per call (documented band was
+//     [12, 40]). The batch 2 estimator fix (S3-a) made the sigma/tau helpers VOID slot-writers
+//     (SL_EST) and folds the result straight into a slot, so count() no longer boxes inside the tail:
+//     at an inlinable monomorphic site it now reads 0 B/op (measured 0 fresh + warmed). The band is
+//     therefore RE-CUT [12, 40] -> <= 0.5 (a regression that restores a returned/argument double fails
+//     RED). The teeth move to the `n1` must-box control below (a one-box-per-op lane), so the group
+//     still proves the probe SEES a 16 B HeapNumber.
 //   - dd_latch_ph_fireheavy (finding B): latched-PH on a fire-heavy square wave. Pre-T8 a latched fire
 //     boxed one ~16 B HeapNumber because _clampGap(dir, ph, th) took the threshold/mode DOUBLES as
 //     ARGUMENTS across a non-inlined call boundary. v1.10.0 T8 made _clampGap(dir) argument-free (it
@@ -212,8 +216,14 @@ test('queryLanes', async (t) => {
 //     dd_af / dd_latch_af lanes above).
 // ===========================================================================
 test('docTruthFindings', async (t) => {
-    const shllBand = (steady) => (steady >= 12 && steady <= 40 ? null :
-        'steady ' + steady + ' B/op outside the documented band [12, 40] (< 12: the probe went blind to the count() box; > 40: a THIRD box regressed the estimator tail)');
+    // v1.11.0 S3-a: count() no longer boxes in the estimator tail -> <= 0.5 (was [12, 40]). A
+    // regression that restores a returned/argument double reads >= 16 B/op and fails RED here.
+    const shllBand = (steady) => (steady <= 0.5 ? null :
+        'steady ' + steady + ' B/op > 0.5 (count() estimator tail regressed to a boxed return/argument -- S3-a reverted)');
+    // the must-box control that inherits the [12, 40] teeth: a one-box-per-op lane MUST box (>= 12),
+    // proving this group's probe still SEES a 16 B HeapNumber after count() went to 0.
+    const teeth = (steady) => (steady >= 12 ? null :
+        'steady ' + steady + ' B/op < 12 (the n1 one-box control did NOT box -- the docTruth probe has no teeth)');
     // T8 argument-free _clampGap: the fire path no longer boxes -- 0 B/op fresh AND warmed. The <=0.5
     // ceiling catches a regression to argument passing (or any per-add box, >= 16 B/op).
     // <= 0.25, not 0.5: the pre-T8 arg-passing _clampGap read EXACTLY 0.5 steady on this lane, so a 0.5 bar
@@ -221,12 +231,13 @@ test('docTruthFindings', async (t) => {
     const fireCeil = (steady) => (steady <= 0.25 ? null :
         'steady ' + steady + ' B/op > 0.25 (a latched-PH fire box regressed -- likely _clampGap arg passing restored)');
     const rows = [
-        { lane: 'q_shll_count', mode: 'fresh', label: 'SHLL count() non-degenerate [finding A]', expected: '[12,40]', check: shllBand },
+        { lane: 'q_shll_count', mode: 'fresh', label: 'SHLL count() non-degenerate [S3-a: 0-box]', expected: '<=0.5', check: shllBand },
+        { lane: 'n1', mode: 'fresh', label: 'n1 one-box control [teeth for count()]', expected: '>=12', check: teeth },
         { lane: 'dd_latch_ph_fireheavy', mode: 'fresh', label: 'DD latch:true PH fire-heavy [finding B]', expected: '<=0.25', check: fireCeil },
         { lane: 'dd_latch_ph_fireheavy', mode: 'warmed', label: 'DD latch:true PH fire-heavy (warm)', expected: '<=0.25', check: fireCeil },
     ];
     await measureGroup(rows);
-    printTable('1.8.0 docTruthFindings (SHLL count() band [12,40]; latched-PH fire ceiling <=0.25):', rows, (r) => {
+    printTable('v1.11.0 docTruthFindings (SHLL count() <=0.5 [S3-a]; n1 teeth >=12; latched-PH fire <=0.25):', rows, (r) => {
         const ok = r.check(r._steady, r._first) === null;
         return ok ? 'GREEN' : 'NEW FINDING';
     });
@@ -263,6 +274,16 @@ test('noInlineLargeKey', async (t) => {
     }
     // SlidingCountMin: key 2^31 / 2^32-1, fresh + warmed (pre-fix: ~16 B/op).
     for (const [lane, lbl] of [['scm_af_epoch_p31_c1', 'SCM addFrom key 2^31'], ['scm_af_epoch_p32m1_c1', 'SCM addFrom key 2^32-1']]) {
+        rows.push({ lane, flags: NOINLINE, mode: 'fresh', label: lbl + ' [no-inline]', expected: '<=0.5' });
+        rows.push({ lane, flags: NOINLINE, mode: 'warmed', label: lbl + ' [no-inline warm]', expected: '<=0.5' });
+    }
+    // SlidingHyperLogLog estimator tail (review B1): pre-fix the argument-free slSigmaInto / slTauInto
+    // helpers still took the empty / saturated FRACTION as a computed-double ARGUMENT ((C[0]/m),
+    // (m-C[q+1])/m). That is 0 B only because Turbofan inlines the helpers; with inlining forced off the
+    // fractional argument boxes a HeapNumber and BOTH count() (via _writeCount) and countInto read 16 B/op.
+    // The fix hands the fraction through the SL_SIG_S[0] / SL_TAU_S[0] slots (helpers take NO arguments),
+    // so no number crosses the call: <= 0.5 B/op even with inlining off, fresh AND warmed.
+    for (const [lane, lbl] of [['q_shll_countInto', 'SHLL countInto (estimator tail)'], ['q_shll_count', 'SHLL count() (estimator tail)']]) {
         rows.push({ lane, flags: NOINLINE, mode: 'fresh', label: lbl + ' [no-inline]', expected: '<=0.5' });
         rows.push({ lane, flags: NOINLINE, mode: 'warmed', label: lbl + ' [no-inline warm]', expected: '<=0.5' });
     }
@@ -495,5 +516,64 @@ test('h2Mega5', async (t) => {
     await measureGroup(rows);
     printTable('H2-5 mega5 addFrom (megamorphic double-field box; INFO band [m-4, m+4] around HEAD m):',
         rows, (r) => (r.check(r._steady, r._first) === null ? 'GREEN (in band)' : 'DRIFTED'));
+    for (const r of rows) await emit(t, r, r.check);
+});
+
+// ===========================================================================
+// v1.11.0 READERS (ROADMAP 12.2 T3). countInto / into at a monomorphic + a polymorphic-4 site,
+// fresh + warmed (gate <= 0.5), and the mega5 INFO reader lanes. These lanes call methods that DO
+// NOT exist until batches 2 / 3, so each row is measured INSIDE its own `todo` subtest: a missing
+// method rejects the child and the case reports `not ok ... # TODO` (the suite stays green). Batches
+// 2 / 3 drop the `todo` (S3-a: the estimator fix makes countInto 0 B/op; into() writes 5 slots, 0 B).
+// ===========================================================================
+test('readers111', async (t) => {
+    const gate = (steady) => (steady <= 0.5 ? null : 'steady ' + steady + ' B/op > 0.5 (a box on the 0-alloc reader path)');
+    // mega5 reader box is INFORMATIONAL: a megamorphic reader call cannot inline, so the callee's first
+    // double-field read boxes ~16 B (family-wide V8 property). INFO band [m-4, m+4] around the measured m.
+    const band = (m) => (steady) => (steady >= m - 4 && steady <= m + 4 ? null :
+        'steady ' + steady + ' B/op outside the INFO band [' + (m - 4) + ', ' + (m + 4) + '] (mega5 reader field box drifted from ' + m + ')');
+    const rows = [
+        // batch 2 SHIPPED -- SHLL countInto rows are LIVE (S3-a: the estimator fix makes them 0 B/op).
+        { lane: 'q_shll_countInto', mode: 'fresh', label: 'SHLL countInto [mono]', expected: '<=0.5', check: gate },
+        { lane: 'q_shll_countInto', mode: 'warmed', label: 'SHLL countInto [mono warm]', expected: '<=0.5', check: gate },
+        { lane: 'q_shll_countInto_poly4', mode: 'fresh', label: 'SHLL countInto [poly4]', expected: '<=0.5', check: gate },
+        { lane: 'q_shll_countInto_poly4', mode: 'warmed', label: 'SHLL countInto [poly4 warm]', expected: '<=0.5', check: gate },
+        // SHLL countInto at a 5-map (megamorphic) site: INFO band [12, 20] around the measured m=16.
+        { lane: 'mega5_shll_countInto', mode: 'fresh', label: 'SHLL countInto [mega5 INFO]', expected: '16+-4', check: band(16) },
+        // batch 3 SHIPPED -- DD into rows are LIVE (into writes 5 slots straight into out, 0 B/op).
+        { lane: 'q_dd_into', mode: 'fresh', label: 'DD into [mono]', expected: '<=0.5', check: gate },
+        { lane: 'q_dd_into', mode: 'warmed', label: 'DD into [mono warm]', expected: '<=0.5', check: gate },
+        { lane: 'q_dd_into_poly4', mode: 'fresh', label: 'DD into [poly4]', expected: '<=0.5', check: gate },
+        { lane: 'q_dd_into_poly4', mode: 'warmed', label: 'DD into [poly4 warm]', expected: '<=0.5', check: gate },
+        // DD into at a 5-map (megamorphic) site: INFO band [m-4, m+4] around the measured m=160.
+        { lane: 'mega5_dd_into', mode: 'fresh', label: 'DD into [mega5 INFO]', expected: '160+-4', check: band(160) },
+    ];
+    // measure INSIDE the (possibly todo) subtest -- a missing method (B3) fails as todo, never a hard error.
+    for (const r of rows) {
+        const opts = (r.id && !GATES_STRICT) ? { todo: r.id } : {};
+        await t.test(r.label + (r.id ? ' [' + r.id + ']' : ''), opts, async () => {
+            const res = await runLane(r.lane, r.mode || 'fresh', 200000, r.flags || []);
+            const reason = r.check(res.steady, res.first);
+            assert.ok(reason === null, reason + '  (first=' + res.first + ' steady=' + res.steady + ')');
+        });
+    }
+});
+
+// ===========================================================================
+// v1.11.0 readers MUST-BOX control (LIVE, has teeth today): the DD six-getter render lane -- a demo
+// panel reading each DD scalar getter and packing it into a tagged sink. The fractional-double getters
+// (statistic / mean / delta) box ~16 B each -> ~48 B/op. This is the into() foil: it proves the reader
+// probe SEES the per-getter box that into() (a Float64Array writer) avoids. Gated >= 12 (teeth).
+// (After v1.11.0 S3-a count() reads 0 B/op, so the `n1` one-box lane is now docTruthFindings' teeth.)
+// ===========================================================================
+test('readersMustBox', async (t) => {
+    const teeth = (steady) => (steady >= 12 ? null :
+        'steady ' + steady + ' B/op < 12 (the DD six-getter render control did NOT box -- the reader lanes have no teeth)');
+    const rows = [
+        { lane: 'q_dd_sixgetter', mode: 'fresh', label: 'DD six-getter render [must-box, ~48 B]', expected: '>=12', check: teeth },
+    ];
+    await measureGroup(rows);
+    printTable('v1.11.0 readers must-box (DD six-getter render >= 12 B/op -- the into() foil has teeth):',
+        rows, (r) => (r._steady >= 12 ? 'GREEN (teeth)' : 'NO TEETH'));
     for (const r of rows) await emit(t, r, r.check);
 });
