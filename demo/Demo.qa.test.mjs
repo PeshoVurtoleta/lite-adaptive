@@ -467,46 +467,38 @@ test('QA cross-scene: every option-door rejection leaves a live world intact -- 
 /* ============================== probe + GC (full run only) ============================== */
 
 // Every DemoProbe lane is classified here; an unclassified new lane defaults to 'zero' (<= 0.5 B/op under
-// DEFAULT flags). dd_render is a DOCUMENTED band [44, 52] (six _guardFinite getters, three box).
-// sld_quantile_box is a MUST-BOX control (the scalar quantile() return). dd_frame / dd_frame_nolatch are
-// 'todo' -- the library finding ROADMAP 8 (latched PH Maglev-tier fire box) makes both read ~2 B/op; the
-// demo fix lands in a later session. NOTE dd_frame_nolatch does NOT disable the latched detectors (the
-// `latch` arg is only a display toggle; createDdWorld always builds all four and stepDd feeds them), so it
-// reads the SAME ~2 B/op as dd_frame.
+// DEFAULT flags). dd_render is gated 0 since the demo reads dd.into (1.11.0); dd_getter_box is its MUST-BOX
+// control (the old six-getter render shape, ~48 B).
+// sld_quantile_box is a MUST-BOX control (the scalar quantile() return). Since 1.10.0 (latched PH 0 B/op per
+// fire) dd_frame / dd_frame_nolatch are plain 'zero' lanes, and since 1.11.0 (SlidingHyperLogLog.count() is
+// 0-box) so is shll_render. NOTE dd_frame_nolatch does NOT disable the latched detectors (the `latch` arg is
+// only a display toggle; createDdWorld always builds all four and stepDd feeds them).
 const LANE_CLASS = {
-    mustbox: 'box', ad_mean_sink: 'box', ad_variance_sink: 'box', shll_render: 'box',
-    sld_quantile_box: 'box', dd_render: 'band', noop: 'zero',
-    dd_frame: 'todo', dd_frame_nolatch: 'todo',
+    mustbox: 'box', ad_mean_sink: 'box', ad_variance_sink: 'box',
+    sld_quantile_box: 'box', dd_getter_box: 'box', scm_estimate_box: 'box', sa_mean_box: 'box', noop: 'zero',
 };
-const LANE_BAND = { dd_render: [44, 52] };
-const LANE_TODO = 'library finding ROADMAP 8 (latched PH Maglev-tier fire box) -- demo session';
-test('QA probe sweep: every DemoProbe lane is classified; box controls >= 12 B/op, dd_render in its documented band, noop + every gated lane <= 0.5 B/op', async (t) => {
+const LANE_BAND = {};
+test('QA probe sweep: every DemoProbe lane is classified; box controls >= 12 B/op, noop + every gated lane <= 0.5 B/op', async (t) => {
     if (FAST) { t.skip('fast (demo:check: the lanes run in Demo.test.mjs)'); return; }
     for (const name of Object.keys(LANES)) {
         const cls = LANE_CLASS[name] || 'zero';
         const r = await runDemoLane(name);
         process.stdout.write('  qa lane ' + name + ' [' + cls + '] steady ' + r.steady + ' B/op (first ' + r.first + ')\n');
         assert.ok(r.execArgv.includes('--min-semi-space-size=4') && r.execArgv.includes('--max-semi-space-size=4'), 'pinned semi-space');
-        if (cls === 'todo') {
-            await t.test('lane ' + name + ' <= 0.5 B/op', { todo: LANE_TODO }, () => {
-                assert.ok(r.steady <= 0.5, name + ' must read <= 0.5, got ' + r.steady);
-            });
-        } else if (cls === 'box') assert.ok(r.steady >= 12, name + ' control must read >= 12, got ' + r.steady);
+        if (cls === 'box') assert.ok(r.steady >= 12, name + ' control must read >= 12, got ' + r.steady);
         else if (cls === 'band') { const b = LANE_BAND[name]; assert.ok(r.steady >= b[0] && r.steady <= b[1], name + ' must read in [' + b[0] + ', ' + b[1] + '], got ' + r.steady); }
         else assert.ok(r.steady <= 0.5, name + ' must read <= 0.5, got ' + r.steady);
     }
 });
 
-test('QA shll_render documented cost: DEMO.md D4 says 16-32 B/tick (V8-inlining dependent) -- sampled over 10 fresh pinned children, every reading is in the banded [12, 40] and a THIRD box (48) would fail the upper bound', async (t) => {
+test('QA shll_render tier independence: DEMO.md D4 says 0 B/tick since 1.11.0 -- sampled over 10 fresh pinned children, EVERY reading is <= 0.5 (the 1.8.0-1.10.0 box was bimodal 16 / 32 by V8 tier; a tier-dependent box must not hide in one lucky child), with the mustbox control proving the probe still sees a box', async (t) => {
     if (FAST) { t.skip('fast (10 child processes)'); return; }
     const seen = [];
     for (let i = 0; i < 10; i++) { const r = await runDemoLane('shll_render'); seen.push(r.steady); }
-    // report the distribution (the box is BIMODAL: 16 when the render inlines to Turbofan, 32 when it
-    // stays a Maglev standalone and the library's own count() boxes a second fractional temporary).
-    const at16 = seen.filter((v) => v === 16).length, at32 = seen.filter((v) => v === 32).length;
-    process.stdout.write('  qa shll_render x10: ' + seen.join(',') + ' B/op (16x' + at16 + ' 32x' + at32 + ')\n');
-    for (const v of seen) assert.ok(v >= 12, 'the display box must stay visible (>= 12 B/op), got ' + v);
-    assert.ok(Math.max(...seen) <= 40, 'documented 16-32 B/op (ceiling 32 + slack); a third box at 48 must fail, measured ' + seen.join(','));
+    process.stdout.write('  qa shll_render x10: ' + seen.join(',') + ' B/op\n');
+    for (const v of seen) assert.ok(v <= 0.5, 'renderShllPrep must read <= 0.5 B/op in every fresh child (1.11.0 count() is 0-box), measured ' + seen.join(','));
+    const c = await runDemoLane('mustbox');
+    assert.ok(c.steady >= 12, 'mustbox control must read >= 12 B/op (the probe can see a box), got ' + c.steady);
 });
 
 test('QA 0-B/op + 0-major-GC over 200k ops with every P1/P2 control ENGAGED at once (failed dense10k EH, ADWIN 1.7e12 preset, HK neg keys at 2^32-1, SHLL cadence 7)', async (t) => {

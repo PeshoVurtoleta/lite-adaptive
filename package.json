@@ -31,8 +31,8 @@
     "test:perf": "node --expose-gc --min-semi-space-size=4 --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
     "test:perf:matrix": "node --expose-gc --min-semi-space-size=4 --max-semi-space-size=4 --test test/perf/AllocMatrix.test.mjs test/perf/JumpTiming.test.mjs test/perf/HashThroughput.test.mjs",
     "gates:red": "r=0; LITE_GATES_STRICT=1 npm run test:perf || r=1; LITE_GATES_STRICT=1 npm run test:perf:matrix || r=1; LITE_GATES_STRICT=1 npm run witness || r=1; exit $r",
-    "demo": "node --expose-gc --test demo/Demo.test.mjs demo/Demo.qa.test.mjs",
-    "demo:check": "LITE_DEMO_FAST=1 node --expose-gc --test demo/Demo.test.mjs demo/Demo.qa.test.mjs",
+    "demo": "node --expose-gc --test demo/Demo.test.mjs demo/Demo.qa.test.mjs demo/DemoAudit.test.mjs demo/DemoSession.qa.test.mjs",
+    "demo:check": "LITE_DEMO_FAST=1 node --expose-gc --test demo/Demo.test.mjs demo/Demo.qa.test.mjs demo/DemoAudit.test.mjs demo/DemoSession.qa.test.mjs",
     "demo:serve": "node demo/serve.mjs",
     "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run test:perf && npm run test:perf:matrix && npm run demo:check"
   },

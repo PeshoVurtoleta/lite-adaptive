@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Demo (repo-only; `demo/` is not in the npm tarball, no library change)
+
+The demo session (ROADMAP section 11). `Adaptive.js` is byte-identical to 1.11.0. Gates: `npm run demo`
+(Demo.test + Demo.qa.test + the new DemoAudit.test + DemoSession.qa.test) all green with 0 todo; `npm test`
+860/860.
+
+- Re-baselined to 1.11.0: the SlidingHyperLogLog render (`countInto`) and the DriftDetector render
+  (`dd.into`, 48 -> 0 B/tick) are gated 0 B/op lanes with must-box controls; the stale `dd_frame` todos
+  are real gates (0 B/op since 1.10.0).
+- SlidingCountMin scene (D7 / D8): the render reads through `estimateInto`; `total(W)` is shown beside the
+  oracle N; a heavy-count mode pushes a tracked key past 2^31 (0 B/op; the scalar `estimate()` control
+  boxes 16); a contracts line shows a bad sub-window reading NaN and the library's own did-you-mean.
+- New Scene 10 -- SlidingAggregate: whole-ms latencies, count / sum / min / max gated EXACTLY equal to an
+  independent recount, next to ExponentialHistogram's `sum()` breaking its epsilon on spikes (measured up to
+  ~14.6% vs 5%, F17). 0 B/op frame and render lanes.
+- S11: an on-demand, Chromium-only key-magnitude lane in the HeavyKeeper panel, self-tested against a
+  boxing control ("n/a (meter blind)", never 0). Measured in headless Chrome with precise memory info:
+  `HeavyKeeper.addFrom` reads 0.00 B/op for keys in [2^30, 2^31) (N6 closed for HK addFrom).
+- `demo/DemoAudit.test.mjs`: the static DEMO AUDIT (unique ids, cached DOM lookups incl. handlers and toggle
+  callbacks, no per-frame closure / format / string build over the call graph from `loop`, no layout read
+  after a write, layout reads only in `measureScene`, tick writes only through the write-on-change helpers,
+  pointer events, `:hover` in `@media (hover: hover)`, hex before oklch, no inline style), each rule with an
+  injected-violation control.
+
+### Fixed (demo)
+
+- Two duplicate ids (`eh-eps`, `dr-hl`) made two readouts write into their slider `<input>` and never update.
+- The SlidingCountMin oracle expired the oldest LIVE pane (`<=` for `<`): its N ran one pane short of
+  `total()` and every tracked `true(W)` was under-counted, so the one-sided bound gate was weaker than
+  claimed. Found by the new `total(W)` readout; gated by a from-spec recount.
+- Turning a scene's exact oracle off (SCM) showed a false "VIOLATED"; oracle slots now read "n/a" while off
+  and until a full covered span refills.
+- Forced reflows: one per canvas in every scene layout (now one per layout, two-phase sizing) and one in
+  three rebuild handlers; per-frame closures in two draw functions; DOM lookups in 16 handlers.
+- Readouts: every ~10Hz readout is write-on-change (no format and no DOM write for an unchanged value; NaN
+  renders "n/a"); a count above 2^31 no longer wraps through an int32 fold; `fmtNum(NaN)` renders "n/a".
+- The tab bar scrolls instead of clipping the last tabs; the space bar pauses every scene.
+
 ## [1.11.0] - 2026-09-28
 
 The zero-alloc READERS release (ROADMAP section 12; one feature). Two render readers --

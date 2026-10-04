@@ -17,7 +17,7 @@
 import {
     ExponentialHistogram, ADWIN, ForwardDecay, HeavyKeeper,
     SlidingHyperLogLog, DriftDetector, DRIFT_PH, DRIFT_CUSUM,
-    SlidingDDSketch, SlidingCountMin, DecayedReservoir,
+    SlidingDDSketch, SlidingCountMin, DecayedReservoir, SlidingAggregate,
     VERSION,
 } from '../Adaptive.js';
 
@@ -1397,28 +1397,27 @@ export function stepShllOracle(world, allocState) {
     return map.size;
 }
 
+// 1.11.0 render slot for SlidingHyperLogLog.countInto(out) (module scope, reused every tick).
+const SHLL_ROW = new Float64Array(1);
+
 /**
  * Render-prep (~10Hz): re-derive every displayed SlidingHyperLogLog number LIVE from the shipped
- * instances vs the exact windowed-distinct Map. The DISPLAY estimate is slD.count() (the display-only
- * twin, queried EVERY tick): count() is O(m) and costs >= 16 B per call (see MEASURED COST) -- fine at
- * 10Hz; the gated shll_render probe lane SEES it where measureAllocs reads a false 0. slA is
+ * instances vs the exact windowed-distinct Map. The DISPLAY estimate is slD.countInto(SHLL_ROW) (the
+ * display-only twin, queried EVERY tick through the 1.11.0 render reader; O(m), 0 B/call). slA is
  * count()-queried ONLY when the cadence countdown fires (0 queries when queryEvery is Infinity /
- * "never"), so the query-rate control has teeth.
- * map.size is O(1). No per-frame count(); only this 10Hz tick boxes, once per queried instance.
+ * "never"), so the query-rate control has teeth. map.size is O(1). No per-frame count().
  *
- * MEASURED COST: 16-32 B per tick, depending on the V8 tier. 16 B is a STABLE allocation inside the
- * shipped SlidingHyperLogLog.count() itself (present Turbofan-only; not its return, not the slTau /
- * slSigma boundaries -- a scratch bisect localizes it to the estimator tail, non-degenerate registers
- * only). A second 16 B appears when this render is not Turbofan-optimized: count()'s integer-valued
- * double return is materialized as a HeapNumber at the call boundary -> 32 B. No demo-side value boxes
- * (standardError / relerr / the gate each 0 B). Logged as a library finding in ROADMAP.md. Never > 32 B.
+ * MEASURED COST: 0 B per tick (DemoProbe shll_render, gated <= 0.5 in 10 fresh children). From 1.8.0 to
+ * 1.10.0 the scalar count() cost 16-32 B per tick depending on the V8 tier (an estimator-tail box plus
+ * the returned double); 1.11.0 moved the estimator tail into module scratch slots (ROADMAP 12).
  * @param {object} world
  * @param {object} allocState
  * @returns {number} the windowed distinct estimate (folded).
  */
 export function renderShllPrep(world, allocState) {
     const sl = world.sl, flat = world.flat, map = world.oMap;
-    const est = world.slD.count();   // the display twin -- the documented ~16 B boxed return, once per tick
+    world.slD.countInto(SHLL_ROW);   // the display twin through the 1.11.0 render reader (0 B/call)
+    const est = SHLL_ROW[0];
     const trueD = map.size;
     const relerr = trueD > 0 ? Math.abs(est - trueD) / trueD : 0;
     const gate = SHLL_SIGMA_MULT * sl.standardError;
@@ -1528,6 +1527,10 @@ export const DD_FLAT_LEN = 34;
 /** Fixed scalar footprint of the two detectors (both share the tiny O(1)-state class). */
 export const DD_SKETCH_BYTES = 128;
 
+// 1.11.0 render row: dd.into(out) writes [statistic, mean, count, lastDriftIndex, lastDirection] into a
+// caller Float64Array in ONE call (0 B/call). One module-scope row, reused for all four detectors in turn.
+const DD_ROW = new Float64Array(5);
+
 /** The regime mean for a buffer index: alternates LO / HI every DD_REGIME items. */
 function ddRegimeMean(bufIdx) {
     return ((((bufIdx / DD_REGIME) | 0) & 1) ? DD_MEAN_HI : DD_MEAN_LO);
@@ -1636,17 +1639,24 @@ export function stepDdOracle(world, allocState) {
 
 /**
  * Render-prep (~10Hz): re-derive every displayed DriftDetector number LIVE from ALL FOUR shipped
- * detectors (the unlatched PH/CUSUM plus the D5 latched twins). Every getter return is read into a local
- * and stored into a Float64Array slot (lite-law: elided by V8) and the function returns an int32 fold, so
- * nothing boxes -- HEAD returned `ps` (a fractional statistic) and boxed 16 B/call, which the DemoProbe
- * dd_render lane now gates against. 0 B/op steady.
+ * detectors (the unlatched PH/CUSUM plus the D5 latched twins). Each detector is read through
+ * dd.into(DD_ROW) (1.11.0; [statistic, mean, count, lastDriftIndex, lastDirection] in one call) and the
+ * function returns an int32 fold: 0 B/tick (DemoProbe dd_render, gated <= 0.5). The six scalar statistic /
+ * mean getters this replaced boxed ~48 B/tick (V8's cumulative inlining budget) -- the dd_getter_box
+ * MUST-BOX control keeps that shape and measures 48, so the 0 has teeth.
  * @param {object} world
  * @param {object} allocState
  * @returns {number} an int32 fold of the fire counts (defeats DCE; never a boxed double).
  */
 export function renderDdPrep(world, allocState) {
-    const ph = world.ph, cu = world.cu, flat = world.flat;
-    const ps = ph.statistic, pt = ph.threshold, cs = cu.statistic, ct = cu.threshold;
+    const ph = world.ph, cu = world.cu, flat = world.flat, row = DD_ROW;
+    const pt = ph.threshold, ct = cu.threshold;
+    // Every detector is read through dd.into(row) (1.11.0): the whole row in one call, 0 B/tick. The six
+    // scalar statistic / mean getters this replaced boxed ~48 B/tick (V8's cumulative inlining budget).
+    ph.into(row);
+    const ps = row[0], pm = row[1];
+    cu.into(row);
+    const cs = row[0], cm = row[1];
     flat[G_PH_STAT] = ps;
     flat[G_PH_THRESH] = pt;
     flat[G_PH_FRAC] = pt > 0 ? ps / pt : 0;
@@ -1658,21 +1668,23 @@ export function renderDdPrep(world, allocState) {
     flat[G_PH_FIRED] = world.phFired;
     flat[G_CU_FIRED] = world.cuFired;
     flat[G_TRUEMEAN] = world.curMu;
-    flat[G_PH_MEAN] = ph.mean;
-    flat[G_CU_MEAN] = cu.mean;
+    flat[G_PH_MEAN] = pm;
+    flat[G_CU_MEAN] = cm;
     flat[G_N] = world.n;
     flat[G_CP] = world.cp;
     flat[G_SKETCH_BYTES] = DD_SKETCH_BYTES;
     flat[G_ORACLE_BYTES] = world.n * BYTES_PER_F64;
     flat[G_SKETCH_ALLOC] = allocState.sketchCount;
     flat[G_ORACLE_ALLOC] = allocState.oracleCount;
-    // --- 1.8.0 (D5) APPEND-ONLY: the LATCHED twins (S9). Every getter return is read into a local and
-    // stored into a Float64Array slot (lite-law: elided by V8). lastDriftIndex / lastDirection are NaN
-    // before any fire (null is not zero -- the UI tick renders "n/a", never String(NaN) -> "NaN"). The
-    // latched statistic is read into the pls/cls locals ONCE and reused for both the slot and the frac
-    // cursor. 0 B/op steady (DemoProbe dd_render lane; HEAD's `return ps` boxed 16 B, now an int fold).
+    // --- 1.8.0 (D5) APPEND-ONLY: the LATCHED twins (S9), also read through into(row).
+    // lastDriftIndex / lastDirection (row[3] / row[4]) are NaN before any fire (null is not zero -- the UI
+    // tick renders "n/a", never String(NaN) -> "NaN"). 0 B/op steady (DemoProbe dd_render lane, gated;
+    // the dd_getter_box control proves the probe still sees the old getter boxes).
     const phL = world.phL, cuL = world.cuL;
-    const pls = phL.statistic, cls = cuL.statistic;
+    phL.into(row);
+    const pls = row[0], plIdx = row[3], plDir = row[4];
+    cuL.into(row);
+    const cls = row[0], clIdx = row[3], clDir = row[4];
     flat[G_PHL_STAT] = pls;
     flat[G_PHL_FRAC] = pt > 0 ? pls / pt : 0;
     flat[G_CUL_STAT] = cls;
@@ -1681,10 +1693,10 @@ export function renderDdPrep(world, allocState) {
     flat[G_CUL_FIRES] = world.cuLFires;
     flat[G_PHL_FIRED] = world.phLFired;
     flat[G_CUL_FIRED] = world.cuLFired;
-    flat[G_PHL_LASTIDX] = phL.lastDriftIndex;
-    flat[G_PHL_LASTDIR] = phL.lastDirection;
-    flat[G_CUL_LASTIDX] = cuL.lastDriftIndex;
-    flat[G_CUL_LASTDIR] = cuL.lastDirection;
+    flat[G_PHL_LASTIDX] = plIdx;
+    flat[G_PHL_LASTDIR] = plDir;
+    flat[G_CUL_LASTIDX] = clIdx;
+    flat[G_CUL_LASTDIR] = clDir;
     flat[G_PHL_LATCHED] = phL.latched ? 1 : 0;
     flat[G_CUL_LATCHED] = cuL.latched ? 1 : 0;
     flat[G_LATCH_ON] = world.latchOn ? 1 : 0;
@@ -2047,7 +2059,21 @@ export const C_SKETCH_BYTES = C_BOUNDOK + 8;           // scm.bytes (fixed)
 export const C_ORACLE_BYTES = C_BOUNDOK + 9;           // live * 16 ((t, key) pairs, O(W))
 export const C_SKETCH_ALLOC = C_BOUNDOK + 10;
 export const C_ORACLE_ALLOC = C_BOUNDOK + 11;
-export const SCM_FLAT_LEN = C_BOUNDOK + 12;
+// --- 1.8.0 (D7) APPEND-ONLY: total(w) beside the ORACLE N, and the heavy-count mode (F6). ---
+export const C_TOTAL = C_BOUNDOK + 12;                 // scm.total() -- the library's exact windowed N
+export const C_TOTALOK = C_BOUNDOK + 13;               // 1 iff scm.total() === the ORACLE N (faithfulness)
+export const C_HEAVY = C_BOUNDOK + 14;                 // heavy-count mode on (1/0)
+export const SCM_FLAT_LEN = C_BOUNDOK + 15;
+
+/**
+ * Heavy-count mode (D7 / F6): once per frame, tracked key 0 also gets ONE add of this count, so its
+ * windowed estimate exceeds 2^31 within a few panes (the scalar estimate() return would box; the render
+ * reads through estimateInto). One add per frame keeps every pane cell far below the 2^32-1 saturation
+ * (<= 2 frames per pane at the widest slider W -> <= 2^31 + the stream share per cell).
+ */
+export const SCM_HEAVY_COUNT = 1 << 30;
+/** Heavy-add oracle ring (pow2) -- MUST exceed the live heavy adds (one per frame; <= 66 at W = 4096). */
+export const SCM_HEAVY_RING = 256;
 
 /** The grid-pane end covering time `t` for pane width `pw` (matches the SlidingCountMin pane math). */
 function scmPaneEnd(t, pw) { return (Math.floor(t / pw) + 1) * pw; }
@@ -2094,9 +2120,34 @@ export function createScmWorld(W, epsilon, panes, seed) {
         oKey: new Float64Array(SCM_RING_LEN),          // in-window keys (ring)
         oMask: SCM_RING_LEN - 1, oHead: 0, oTail: 0,
         flat: new Float64Array(SCM_FLAT_LEN),
+        // D7: the render reads every tracked key in ONE estimateInto call (0 B/call, F6) into estOut.
+        estOut: new Float64Array(SCM_TRACKED),
+        // D7 heavy-count mode: a display toggle read by stepScm (no rebuild). The heavy adds live in their
+        // OWN small oracle ring (times only; the count is SCM_HEAVY_COUNT), so with heavy off every
+        // pre-existing flat slot stays bit-identical (golden).
+        heavy: false, frameHeavy: 0,
+        // B9: the oracle toggle state (stepScmOracle is skipped while off -> the ring goes stale; after a
+        // resume it is incomplete until a full covered span W + W/B refills). renderScmPrep NaNs every
+        // oracle-derived slot in either state -- never a verdict on an unchecked state.
+        oracleOn: true, resumeNow: -Infinity,
+        hT: new Float64Array(SCM_HEAVY_RING), hMask: SCM_HEAVY_RING - 1, hHead: 0, hTail: 0,
     };
     fillScmStream(world);
     return world;
+}
+
+/**
+ * D8 contracts line: two library contracts, observed LIVE from the shipped SlidingCountMin (cold, once at
+ * boot -- never per frame). A bad sub-window reads NaN (F12: never a fail-open 0), and a typo'd option key
+ * throws with the library's own did-you-mean hint. The message is the library's, never demo text.
+ * @param {object} world
+ * @returns {{ badW: number, typoMsg: string }}
+ */
+export function scmContracts(world) {
+    const badW = world.scm.estimate(0, -1);
+    let typoMsg = 'no throw (contract broken)';
+    try { new SlidingCountMin(world.W, { sede: 1 }); } catch (e) { typoMsg = e.message; }
+    return { badW, typoMsg };
 }
 
 /**
@@ -2111,7 +2162,7 @@ export function stepScm(world) {
         const now = world.now + world.keysPerFrame;
         world.packed[0] = now;
         world.scm.advanceFrom(world.packed, 0);
-        world.now = now; world.frameNowStart = now; world.frameCount = 0;
+        world.now = now; world.frameNowStart = now; world.frameCount = 0; world.frameHeavy = 0;
         return 0;
     }
     const stream = world.stream, mask = world.streamMask, scm = world.scm, kpf = world.keysPerFrame;
@@ -2126,6 +2177,14 @@ export function stepScm(world) {
         scm.addFrom(packed, 0);
         sink = (sink + (now | 0)) | 0;
         pos = pos + 1;
+    }
+    // D7 heavy-count mode: ONE extra [now, key 0, 2^30] add per frame (same now -> non-decreasing).
+    if (world.heavy) {
+        packed[0] = now; packed[1] = 0; packed[2] = SCM_HEAVY_COUNT;
+        scm.addFrom(packed, 0);
+        world.frameHeavy = 1;
+    } else {
+        world.frameHeavy = 0;
     }
     world.cursor = pos & 0x3fffffff;
     world.now = now; world.frameCount = kpf;
@@ -2151,9 +2210,22 @@ export function stepScmOracle(world, allocState) {
         oT[tail] = now; oKey[tail] = stream[(start + i) & mask]; tail = (tail + 1) & omask;
         allocState.oracleCount++;                       // a retained (t, key) pair the sketch refuses
     }
+    // An entry is LIVE iff paneEnd(t) >= paneEnd(now) - W (== the library's paneEnd > now - W, and the
+    // render's liveThresh). Expire strictly BELOW the cut: until 2026-10-04 this was `<= liveCut`, which
+    // dropped the oldest LIVE pane, so the oracle N ran one pane short of scm.total() (993 vs 1025 at
+    // W=1024) and the one-sided band was too tight -- caught by the D7 total(w) faithfulness readout.
     const liveCut = scmPaneEnd(now, pw) - W;
-    while (head !== tail && scmPaneEnd(oT[head], pw) <= liveCut) head = (head + 1) & omask;
+    while (head !== tail && scmPaneEnd(oT[head], pw) < liveCut) head = (head + 1) & omask;
     world.oHead = head; world.oTail = tail;
+    // D7: the frame's heavy add (if any) at the frame's end time, then the same grid-pane expiry.
+    const hT = world.hT, hmask = world.hMask;
+    let hh = world.hHead, ht = world.hTail;
+    if (world.frameHeavy === 1 && count > 0) {
+        hT[ht] = now; ht = (ht + 1) & hmask;
+        allocState.oracleCount++;
+    }
+    while (hh !== ht && scmPaneEnd(hT[hh], pw) < liveCut) hh = (hh + 1) & hmask;
+    world.hHead = hh; world.hTail = ht;
     world.n = (world.n + count) | 0;
     return (tail - head) & omask;
 }
@@ -2164,7 +2236,7 @@ export function stepScmOracle(world, allocState) {
  * the bound per tracked key. scm.estimate is COLD 0-alloc; the ring scan is 0-alloc. 0 B/op.
  * @param {object} world
  * @param {object} allocState
- * @returns {number} tracked key 0's estimate (folded).
+ * @returns {number} an int32 fold (1 iff the bound holds) -- never a boxed double.
  */
 export function renderScmPrep(world, allocState) {
     const scm = world.scm, flat = world.flat, pw = world.pw, W = world.W, eps = world.epsilon;
@@ -2194,12 +2266,31 @@ export function renderScmPrep(world, allocState) {
         }
         i = (i + 1) & omask;
     }
+    // D7 heavy adds: weighted SCM_HEAVY_COUNT into N and into tracked key 0's true(W) / trueLive.
+    let nW = nLive, hLive = 0;
+    const hT = world.hT, hmask = world.hMask, htail = world.hTail;
+    for (let h = world.hHead; h !== htail; h = (h + 1) & hmask) {
+        if (scmPaneEnd(hT[h], pw) >= liveThresh) {
+            hLive++;
+            nW += SCM_HEAVY_COUNT;
+            for (let k = 0; k < nt; k++) {
+                if (tracked[k] === 0) {
+                    if (hT[h] > idealCut) flat[k * SCM_STRIDE + 1] += SCM_HEAVY_COUNT;
+                    flat[k * SCM_STRIDE + 2] += SCM_HEAVY_COUNT;
+                    break;
+                }
+            }
+        }
+    }
+    // D7: every tracked estimate in ONE estimateInto call (0 B/call even for a count >= 2^31, F6).
+    const estOut = world.estOut;
+    scm.estimateInto(tracked, estOut);
     let boundOk = 1;
     for (let k = 0; k < nt; k++) {
-        const est = scm.estimate(tracked[k]);
+        const est = estOut[k];
         const trueW = flat[k * SCM_STRIDE + 1];
         const trueLive = flat[k * SCM_STRIDE + 2];
-        const upper = trueLive + eps * nLive;
+        const upper = trueLive + eps * nW;   // the eps x N band from the ORACLE's N, never scm.total()
         if (est < trueW - 1e-9 || est > upper + 1e-9) boundOk = 0;
         flat[k * SCM_STRIDE] = est;
         flat[k * SCM_STRIDE + 1] = trueW;
@@ -2207,17 +2298,32 @@ export function renderScmPrep(world, allocState) {
     }
     flat[C_BOUNDOK] = boundOk;
     flat[C_SATURATED] = scm.saturated;
-    flat[C_NLIVE] = nLive;
+    flat[C_NLIVE] = nW;
     flat[C_N] = world.n;
     flat[C_EPS] = eps;
     flat[C_PANES] = scm.panes;
     flat[C_W] = scm.W;
     flat[C_NOW] = now;
     flat[C_SKETCH_BYTES] = scm.bytes;
-    flat[C_ORACLE_BYTES] = nLive * (BYTES_PER_F64 * 2);
+    flat[C_ORACLE_BYTES] = (nLive + hLive) * (BYTES_PER_F64 * 2);
     flat[C_SKETCH_ALLOC] = allocState.sketchCount;
     flat[C_ORACLE_ALLOC] = allocState.oracleCount;
-    return flat[0];
+    // D7: the library's own exact windowed N, displayed BESIDE the oracle N as its own faithfulness check.
+    const tot = scm.total();
+    flat[C_TOTAL] = tot;
+    flat[C_TOTALOK] = tot === nW ? 1 : 0;
+    flat[C_HEAVY] = world.heavy ? 1 : 0;
+    // Oracle off / refilling after a resume: NaN every oracle-derived slot (the estimates, total(),
+    // saturated and the bytes stay live). At defaults (oracleOn true, resumeNow -Infinity) this never
+    // fires, so the golden is unchanged.
+    if (!world.oracleOn || now - world.resumeNow < W + pw) {
+        for (let k = 0; k < nt; k++) { flat[k * SCM_STRIDE + 1] = NaN; flat[k * SCM_STRIDE + 2] = NaN; }
+        flat[C_BOUNDOK] = NaN; flat[C_NLIVE] = NaN; flat[C_TOTALOK] = NaN;
+        return 0;
+    }
+    // an int32 fold, never flat[0]: in heavy mode the tracked estimate exceeds 2^31 and a returned large
+    // double boxes 16 B/call at the call boundary (DemoProbe scm_render_heavy).
+    return boundOk | 0;
 }
 
 // =======================================================================================
@@ -2352,4 +2458,379 @@ export function renderDrPrep(world, allocState) {
     flat[R_SKETCH_ALLOC] = allocState.sketchCount;
     flat[R_ORACLE_ALLOC] = allocState.oracleCount;
     return c;
+}
+
+// =======================================================================================
+// Scene 10 -- SlidingAggregate (exact windowed count / sum / mean / min / max; 1.9.0, ADR 0012)
+// =======================================================================================
+// A lite-hud-shaped latency panel: integer-ms lognormal latencies (+ an optional 1% x50 spike mode) fly in
+// via addFrom([now, value]); the canvas plots the windowed MEAN from SlidingAggregate (exact over the covered
+// span [W, W + W/B]) beside an exact oracle and beside ExponentialHistogram's sum()-derived mean on the SAME
+// stream -- the F17 failure: EH's sum() error is bounded by the straddling bucket's POPULATION, not its value
+// mass, so a skewed (spiky) stream breaks EH's <= epsilon intuition while SlidingAggregate stays exact.
+//
+// Numeric domain (ROADMAP 11.1 D-S7): a sim clock in ms from 0, SA_DT = 1000/60 per frame, SA_EVENTS_PER_FRAME
+// events per frame at frameNow + (j+1) * SA_DT / K (computed by multiplication, never accumulated). W = 1000,
+// B = 32 -> pw = 31.25 (a normal double); the library's clock bound pw * 2^42 = 1.37e14 ms is never near.
+// Values are WHOLE milliseconds (round(lognormal), min 1; spikes x50 stay integers, max ~5.5e4), so every
+// windowed sum is an exactly representable integer (<< 2^53): SlidingAggregate's count / sum / min / max are
+// gated EXACTLY EQUAL to an independent recount, and EH's integer-valued sum() returns a Smi (no render box).
+
+/** Pre-generated latency stream length (pow2). */
+export const SA_STREAM_LEN = 1 << 16;
+/** Latency events per rAF frame. */
+export const SA_EVENTS_PER_FRAME = 32;
+/** Sim milliseconds per frame (60 Hz). */
+export const SA_DT = 1000 / 60;
+/** Default window (ms) and pane count B. */
+export const SA_DEFAULT_W = 1000;
+export const SA_DEFAULT_PANES = 32;
+/** Lognormal latency model: median e^3 ~ 20 ms, mean e^3.5 ~ 33 ms. */
+export const SA_MU = 3;
+export const SA_SIGMA = 1;
+/** Spike mode: 1% of events x50 (the skew that breaks EH's sum()). */
+export const SA_SPIKE_RATE = 0.01;
+export const SA_SPIKE_MULT = 50;
+export const SA_STREAM_SEED = 0x5a17e4c9;
+/** The EH contrast: epsilon and a pool sized for the window population (~1.9k events per W = 1000 ms). */
+export const SA_EH_EPS = 0.05;
+export const SA_EH_MAXCOUNT = 8192;
+/** Exact-oracle ring (pow2) -- MUST exceed the events in the covered span at the widest slider W (4000 ms:
+ *  (4000 + 125) / SA_DT * 32 ~ 7.9k). */
+export const SA_RING_LEN = 1 << 14;
+
+// flat slots -- the sketch row (through sa.into), the oracle row, the EH contrast, bookkeeping.
+export const L_COUNT = 0;          // sa: covered-span count (exact)
+export const L_SUM = 1;            // sa: covered-span sum
+export const L_MEAN = 2;           // sa: sum / count (NaN on empty)
+export const L_MIN = 3;            // sa: min (NaN on empty)
+export const L_MAX = 4;            // sa: max (NaN on empty)
+export const L_TCOUNT = 5;         // oracle: covered-span count (NaN when the oracle is off / resuming)
+export const L_TSUM = 6;           // oracle: covered-span sum
+export const L_TMEAN = 7;          // oracle: covered-span mean
+export const L_TMIN = 8;           // oracle: covered-span min
+export const L_TMAX = 9;           // oracle: covered-span max
+export const L_EXACT = 10;         // 1 iff count / sum / min / max equal the oracle exactly (NaN when off)
+export const L_TSUMW = 11;         // oracle: TRUE-window (now - W, now] sum -- what EH's sum() estimates
+export const L_TCOUNTW = 12;       // oracle: TRUE-window count
+export const L_EHSUM = 13;         // eh.sum() over the last W
+export const L_EHMEAN = 14;        // eh.sum() / eh.count() (NaN on empty)
+export const L_EHREL = 15;         // |eh.sum() - trueSum(W)| / trueSum(W) (NaN when off / empty)
+export const L_EHEPS = 16;         // the EH epsilon (the "<= epsilon" intuition F17 breaks)
+export const L_SPIKES = 17;        // spike mode on (1/0)
+export const L_N = 18;             // events fed
+export const L_NOW = 19;           // sim clock (ms)
+export const L_SKETCH_BYTES = 20;  // sa.bytes (fixed)
+export const L_ORACLE_BYTES = 21;  // live ring entries * 16 ((t, v) pairs, O(W))
+export const L_SKETCH_ALLOC = 22;
+export const L_ORACLE_ALLOC = 23;
+export const L_EHRELMAX = 24;      // running max of L_EHREL while the oracle is valid (spikes are rare)
+export const SA_FLAT_LEN = 25;
+
+/** SlidingAggregate render row: sa.into(out) writes [count, sum, mean, min, max] (0 B/call). */
+const SA_ROW = new Float64Array(5);
+
+/** Fill the reused integer-ms latency stream + the 1% spike mask (Box-Muller lognormal). Warmup only. */
+function fillSaStream(world) {
+    const vals = world.vals, spike = world.spike, len = vals.length;
+    const rng = makeRng(world.seed);
+    for (let i = 0; i < len; i++) {
+        let u1 = rng(); if (u1 < 1e-12) u1 = 1e-12;
+        const u2 = rng();
+        const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        const ms = Math.round(Math.exp(SA_MU + SA_SIGMA * z));
+        vals[i] = ms < 1 ? 1 : ms;                   // whole ms, >= 1 (EH requires a positive value)
+        spike[i] = rng() < SA_SPIKE_RATE ? 1 : 0;
+    }
+}
+
+/** The grid-pane end covering time `t` for pane width `pw` (the SlidingAggregate pane math, ADR 0012). */
+function saPaneEnd(t, pw) { return (Math.floor(t / pw) + 1) * pw; }
+
+/**
+ * Build the Scene-10 world ONCE: the REAL SlidingAggregate, the ExponentialHistogram contrast on the same
+ * stream, an exact (t, v) ring oracle, the reused latency stream, and the flat buffer. Fails closed on a bad
+ * W / panes via the library's ctor guards.
+ * @param {number} W       window span in ms (finite > 0).
+ * @param {number} panes   pane count B in [2, 1024].
+ * @param {number} [seed]  uint32 stream seed.
+ */
+export function createSaWorld(W, panes, seed) {
+    const s = (seed === undefined || seed === null) ? SA_STREAM_SEED : (seed >>> 0);
+    const sa = new SlidingAggregate(W, { panes });               // throws [lite-adaptive] on bad args
+    const eh = new ExponentialHistogram(W, SA_EH_EPS, { maxCount: SA_EH_MAXCOUNT });
+    const world = {
+        sa, eh, W, panes, pw: W / panes, seed: s,
+        paused: false, spikes: false, oracleOn: true, resumeNow: -Infinity,
+        ehAcc: new Float64Array(3),                              // [eh.count(), eh.sum(), running max rel err]
+        vals: new Float64Array(SA_STREAM_LEN), spike: new Uint8Array(SA_STREAM_LEN), streamMask: SA_STREAM_LEN - 1,
+        cursor: 0, frameStart: 0, frameCount: 0, frameNowStart: 0, frameSpikes: 0, now: 0, n: 0, sink: 0,
+        packed: new Float64Array(2),                             // [now, value] scratch for addFrom (reused)
+        oT: new Float64Array(SA_RING_LEN), oV: new Float64Array(SA_RING_LEN),
+        oMask: SA_RING_LEN - 1, oHead: 0, oTail: 0,
+        flat: new Float64Array(SA_FLAT_LEN),
+    };
+    fillSaStream(world);
+    return world;
+}
+
+/**
+ * One SKETCH-path frame: SA_EVENTS_PER_FRAME [now, latency] pairs UNBOXED into SlidingAggregate.addFrom AND
+ * ExponentialHistogram.addFrom (the F17 contrast on the same stream). While paused, idle-slides both via
+ * advanceFrom (R11, NO add) so the window empties. 0 B/op.
+ * @param {object} world
+ * @returns {number} an int32 fold (defeats DCE).
+ */
+export function stepSa(world) {
+    const packed = world.packed, frameNow = world.now;
+    if (world.paused) {
+        const now = frameNow + SA_DT;
+        packed[0] = now;
+        world.sa.advanceFrom(packed, 0);
+        world.eh.advanceFrom(packed, 0);
+        world.now = now; world.frameNowStart = now; world.frameCount = 0;
+        return 0;
+    }
+    const vals = world.vals, spike = world.spike, mask = world.streamMask, sa = world.sa, eh = world.eh;
+    const K = SA_EVENTS_PER_FRAME, step = SA_DT / K, spikesOn = world.spikes;
+    let pos = world.cursor, t = frameNow, sink = 0;
+    world.frameStart = pos & mask;
+    world.frameNowStart = frameNow;
+    world.frameSpikes = spikesOn ? 1 : 0;
+    for (let j = 0; j < K; j++) {
+        t = frameNow + (j + 1) * step;
+        const i = pos & mask;
+        const v = (spikesOn && spike[i] === 1) ? vals[i] * SA_SPIKE_MULT : vals[i];
+        packed[0] = t; packed[1] = v;
+        sa.addFrom(packed, 0);
+        eh.addFrom(packed, 0);
+        sink = (sink + (v | 0)) | 0;
+        pos = pos + 1;
+    }
+    world.cursor = pos & 0x3fffffff;
+    world.now = t; world.frameCount = K;
+    world.n = world.n + K;
+    world.sink = (world.sink + sink) | 0;
+    return sink;
+}
+
+/**
+ * One EXACT-ORACLE frame: replay the frame's events (same times / values, recomputed from the stream) into
+ * the preallocated (t, v) ring and expire every entry whose grid pane has left the covered span (LIVE iff
+ * paneEnd(t) > now - W, the library's rule). 0 B/op.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} the live ring size.
+ */
+export function stepSaOracle(world, allocState) {
+    const vals = world.vals, spike = world.spike, mask = world.streamMask;
+    const start = world.frameStart, count = world.frameCount, spikesOn = world.frameSpikes === 1;
+    const oT = world.oT, oV = world.oV, omask = world.oMask, pw = world.pw;
+    const frameNow = world.frameNowStart, step = SA_DT / SA_EVENTS_PER_FRAME;
+    let head = world.oHead, tail = world.oTail;
+    for (let j = 0; j < count; j++) {
+        const i = (start + j) & mask;
+        oT[tail] = frameNow + (j + 1) * step;
+        oV[tail] = (spikesOn && spike[i] === 1) ? vals[i] * SA_SPIKE_MULT : vals[i];
+        tail = (tail + 1) & omask;
+        allocState.oracleCount++;                        // a retained (t, v) pair the sketch refuses
+    }
+    const cut = world.now - world.W;
+    while (head !== tail && !(saPaneEnd(oT[head], pw) > cut)) head = (head + 1) & omask;
+    world.oHead = head; world.oTail = tail;
+    return (tail - head) & omask;
+}
+
+/**
+ * Render-prep (~10Hz): the SlidingAggregate row through sa.into(SA_ROW) (0 B/call) and the exact oracle over
+ * the covered span (count / sum / min / max, one ring scan) plus the TRUE window (now - W, now] sum that the
+ * EH contrast is judged against. Oracle-derived slots fail CLOSED to NaN while the oracle is off or refilling
+ * after a resume (never a stale "exact"). Every fractional result is stored straight into its slot from an
+ * if / else -- a `cond ? x / y : NaN` ternary merges a computed double with the NaN constant and boxes the
+ * phi (16 B each, DemoProbe sa_render). 0 B/tick. Returns an int32 fold.
+ * @param {object} world
+ * @param {object} allocState
+ * @returns {number} 1 iff the sketch row equals the oracle exactly (0 otherwise / when off).
+ */
+export function renderSaPrep(world, allocState) {
+    const sa = world.sa, flat = world.flat, row = SA_ROW;
+    sa.into(row);
+    const c = row[0], s = row[1], mn = row[3], mx = row[4];
+    flat[L_COUNT] = c; flat[L_SUM] = s; flat[L_MEAN] = row[2]; flat[L_MIN] = mn; flat[L_MAX] = mx;
+    flat[L_EHEPS] = SA_EH_EPS;
+    flat[L_SPIKES] = world.spikes ? 1 : 0;
+    flat[L_N] = world.n;
+    flat[L_NOW] = world.now;
+    flat[L_SKETCH_BYTES] = sa.bytes;
+    flat[L_ORACLE_BYTES] = ((world.oTail - world.oHead) & world.oMask) * (BYTES_PER_F64 * 2);
+    flat[L_SKETCH_ALLOC] = allocState.sketchCount;
+    flat[L_ORACLE_ALLOC] = allocState.oracleCount;
+    // Oracle off, or refilling after a resume (a full covered span W + W/B must pass): NaN every oracle slot.
+    if (!world.oracleOn || world.now - world.resumeNow < world.W + world.pw) {
+        flat[L_TCOUNT] = NaN; flat[L_TSUM] = NaN; flat[L_TMEAN] = NaN; flat[L_TMIN] = NaN; flat[L_TMAX] = NaN;
+        flat[L_EXACT] = NaN; flat[L_TSUMW] = NaN; flat[L_TCOUNTW] = NaN;
+        return 0;
+    }
+    const oT = world.oT, oV = world.oV, omask = world.oMask, pw = world.pw;
+    const cut = world.now - world.W, tail = world.oTail;
+    let tc = 0, ts = 0, tmin = Infinity, tmax = -Infinity, tcw = 0, tsw = 0;
+    for (let i = world.oHead; i !== tail; i = (i + 1) & omask) {
+        const t = oT[i], v = oV[i];
+        if (saPaneEnd(t, pw) > cut) {
+            tc++; ts += v;                                // whole-ms integers: exact (<< 2^53)
+            if (v < tmin) tmin = v;
+            if (v > tmax) tmax = v;
+            if (t > cut) { tcw++; tsw += v; }
+        }
+    }
+    flat[L_TCOUNT] = tc; flat[L_TSUM] = ts; flat[L_TSUMW] = tsw; flat[L_TCOUNTW] = tcw;
+    if (tc > 0) {
+        flat[L_TMEAN] = ts / tc; flat[L_TMIN] = tmin; flat[L_TMAX] = tmax;
+    } else {
+        flat[L_TMEAN] = NaN; flat[L_TMIN] = NaN; flat[L_TMAX] = NaN;
+    }
+    // exact equality; an empty window is exact when both sides are empty (sketch min / max are NaN)
+    let exact = 0;
+    if (c === tc && s === ts) {
+        if (tc === 0) exact = (mn !== mn && mx !== mx) ? 1 : 0;
+        else exact = (mn === tmin && mx === tmax) ? 1 : 0;
+    }
+    flat[L_EXACT] = exact;
+    return exact;
+}
+
+/**
+ * EH contrast (~10Hz, after renderSaPrep): eh.sum() / eh.count() on the same stream and the relative error
+ * of eh.sum() against the oracle's TRUE-window sum (L_TSUMW), plus its running max. eh.count() / eh.sum()
+ * return a half-bucket estimate (x.5); each return is stored straight into a world.ehAcc Float64Array slot,
+ * so V8 elides the box: 0 B/tick (DemoProbe sa_eh_render). NaN while the oracle is off / resuming.
+ * @param {object} world
+ */
+export function renderSaEhPrep(world) {
+    const eh = world.eh, flat = world.flat, acc = world.ehAcc;
+    acc[0] = eh.count();
+    acc[1] = eh.sum();
+    flat[L_EHSUM] = acc[1];
+    if (acc[0] > 0) flat[L_EHMEAN] = acc[1] / acc[0]; else flat[L_EHMEAN] = NaN;
+    const tsw = flat[L_TSUMW];
+    if (tsw > 0) {
+        flat[L_EHREL] = Math.abs(acc[1] - tsw) / tsw;
+        if (!(flat[L_EHREL] <= acc[2])) acc[2] = flat[L_EHREL];   // running max (acc[2] starts at 0)
+        flat[L_EHRELMAX] = acc[2];
+    } else {
+        flat[L_EHREL] = NaN; flat[L_EHRELMAX] = NaN;           // oracle off / resuming / empty
+    }
+}
+
+// =======================================================================================
+// S11 (D8) -- the Chromium-only key-magnitude allocation lane (N6: 31-bit Smis)
+// =======================================================================================
+// On a 31-bit-Smi build (Chromium with pointer compression) an integer key in [2^30, 2^31) is a HeapNumber,
+// not a Smi; on this Node (arm64, 32-bit Smis) it is a Smi, so every Node 0 B/op says nothing about Chrome
+// (ROADMAP 7.1 N6). This lane measures it IN the browser, on demand (a button -- never the frame path), from
+// the deltas of a caller-supplied heap meter (performance.memory.usedJSHeapSize). The meter is coarse, so
+// the result is SELF-TESTED: a control lane that boxes one HeapNumber per op must read >= KM_CONTROL_MIN
+// B/op, else the lane reports 'blind' -- a blind meter NEVER reads as a clean 0 (null is not zero). No
+// meter at all (non-Chromium) -> 'absent'.
+
+/** Ops per measured window, the SAME for every lane (16 B/op x 12.5k = 0.2 MB: most windows fit between
+ *  scavenges; a precise-info meter resolves it). */
+export const KM_OPS = 12500;
+/** The control must read at least this many B/op, else the meter is blind. */
+export const KM_CONTROL_MIN = 8;
+/** Keys in [2^30, 2^31): Smi on a 32-bit-Smi build, HeapNumber on a 31-bit-Smi build. */
+export const KM_BIG31_BASE = 1073741824;
+const KM_ROUNDS = 8;
+const KM_BOX = [{}, 0];
+
+function kmWindow(meter, lane, hk, buf, v, n) {
+    const a = meter();
+    if (lane === 0) {
+        for (let i = 0; i < n; i++) { v[0] += 1; KM_BOX[1] = v[0]; }
+    } else {
+        const base = lane === 1 ? 0 : KM_BIG31_BASE;
+        for (let i = 0; i < n; i++) { buf[0] = base + (i & 1023); hk.addFrom(buf, 0); }
+    }
+    return (meter() - a) / n;
+}
+
+/** Clean windows a lane needs (of KM_ROUNDS) before its reading is reported at all. */
+export const KM_MIN_CLEAN = 3;
+
+/**
+ * Aggregate one lane's per-window readings (B/op). A NEGATIVE window means a scavenge ran inside it -- it is
+ * not a measurement, so it is DROPPED (never clamped to 0). A scavenge can only LOWER a reading, so the
+ * value is taken from the TOP of the clean windows: the SECOND-largest, which discards exactly one outlier
+ * window (a JIT tier-up landing in one window: measured 0.9 B/op once, 0.0 in the other 7) while a real box
+ * -- present in EVERY clean window -- still shows in full. Fewer than KM_MIN_CLEAN clean windows -> NaN
+ * (the caller reports 'blind').
+ * @param {Float64Array} readings
+ * @returns {number}
+ */
+export function kmAggregate(readings) {
+    let clean = 0, top = -Infinity, second = -Infinity;
+    for (let i = 0; i < readings.length; i++) {
+        const r = readings[i];
+        if (!(r >= 0 && r < Infinity)) continue;      // a scavenged (negative), NaN or infinite window (QA-2)
+        clean++;
+        if (r > top) { second = top; top = r; } else if (r > second) second = r;
+    }
+    return clean >= KM_MIN_CLEAN ? second : NaN;
+}
+
+/**
+ * Run the S11 lane: the two key lanes FIRST (after unmeasured warm-up of every lane for the JIT tiers, then
+ * KM_ROUNDS windows each) and the boxing control LAST (so its garbage is never collected inside a key-lane window).
+ * EVERY window has the SAME size (KM_OPS), so a meter that resolves the control resolves the key lanes too.
+ * Each lane is kmAggregate'd (scavenged windows dropped, the second-largest clean reading); any lane with fewer than
+ * KM_MIN_CLEAN clean windows, or a control below KM_CONTROL_MIN, makes the whole result 'blind' -- never a
+ * 0 from a meter that cannot see. COLD -- allocates its HeavyKeeper, scratch and result; never per frame.
+ * @param {(() => number) | undefined} meter  e.g. () => performance.memory.usedJSHeapSize
+ * @param {number} [ops]
+ * @returns {{ state: 'ok' | 'blind' | 'absent', control: number, small: number, big31: number,
+ *             raw: { control: Float64Array, small: Float64Array, big31: Float64Array } | null }}
+ */
+export function runKeyMagLane(meter, ops) {
+    const n = ops === undefined ? KM_OPS : ops;
+    // fail closed: a bad window size (QA-3: 0 / null divided by zero into an 'ok' Infinity) is never measured
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) return { state: 'blind', control: NaN, small: NaN, big31: NaN, raw: null };
+    let probe;
+    try { probe = typeof meter === 'function' ? meter() : undefined; } catch (e) { probe = undefined; }
+    if (typeof probe !== 'number' || probe !== probe) return { state: 'absent', control: NaN, small: NaN, big31: NaN, raw: null };
+    // a meter that THROWS mid-run (QA-1) is a blind meter: the result is 'blind', never a thrown click
+    // handler that leaves a stale earlier reading on screen
+    try {
+        return kmRun(meter, n);
+    } catch (e) {
+        return { state: 'blind', control: NaN, small: NaN, big31: NaN, raw: null };
+    }
+}
+
+function kmRun(meter, n) {
+    const hk = new HeavyKeeper(HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K);
+    const buf = new Float64Array(2); buf[1] = 1;
+    const v = new Float64Array(1); v[0] = 0.5;
+    // warm-up (unmeasured): the control path first, then 4 rounds of both key lanes -- the first windows of a
+    // fresh process carry JIT tier-up allocation (measured: 1.2 / 0.8 / 0.3 B/op on small keys, 43.7 on the
+    // control), which is not the steady-state cost
+    for (let r = 0; r < 2; r++) kmWindow(meter, 0, hk, buf, v, n);
+    for (let r = 0; r < 4; r++) { kmWindow(meter, 1, hk, buf, v, n); kmWindow(meter, 2, hk, buf, v, n); }
+    const ss = new Float64Array(KM_ROUNDS), bs = new Float64Array(KM_ROUNDS), cs = new Float64Array(KM_ROUNDS);
+    for (let r = 0; r < KM_ROUNDS; r++) { ss[r] = kmWindow(meter, 1, hk, buf, v, n); bs[r] = kmWindow(meter, 2, hk, buf, v, n); }
+    for (let r = 0; r < KM_ROUNDS; r++) cs[r] = kmWindow(meter, 0, hk, buf, v, n);
+    const raw = { control: cs, small: ss, big31: bs };
+    const control = kmAggregate(cs), small = kmAggregate(ss), big31 = kmAggregate(bs);
+    if (!(control >= KM_CONTROL_MIN) || small !== small || big31 !== big31) return { state: 'blind', control, small: NaN, big31: NaN, raw };
+    return { state: 'ok', control, small, big31, raw };
+}
+
+/** The S11 readout text: "n/a (...)" for absent / blind -- never a bare 0 from a meter that cannot see. */
+export function keyMagText(r) {
+    if (r.state === 'absent') return 'n/a (no performance.memory: non-Chromium)';
+    if (r.state === 'blind') {
+        if (!(r.control >= KM_CONTROL_MIN)) return 'n/a (meter blind: the boxing control read ' + (r.control === r.control ? r.control.toFixed(1) : 'too few clean windows') + (r.control === r.control ? ' B/op < ' + KM_CONTROL_MIN : '') + ')';
+        return 'n/a (meter blind: too few scavenge-free key-lane windows)';
+    }
+    // ok: every value is a max over >= KM_MIN_CLEAN clean (non-negative) windows -- never clamped
+    return 'small keys ' + r.small.toFixed(1) + ' B/op | [2^30, 2^31) keys ' + r.big31.toFixed(1) + ' B/op (control ' + r.control.toFixed(1) + ')';
 }

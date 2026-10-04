@@ -66,7 +66,7 @@ import {
     DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD, DD_REGIME,
     G_PH_STAT, G_PH_THRESH, G_CU_STAT, G_CU_THRESH, G_PH_FIRES, G_CU_FIRES, G_CP, G_N,
     G_SKETCH_ALLOC, G_ORACLE_ALLOC,
-    G_PHL_STAT, G_PHL_FIRES, G_CUL_FIRES, G_PHL_FIRED, G_CUL_FIRED, G_PHL_LASTIDX, G_PHL_LASTDIR,
+    G_PHL_STAT, G_CUL_STAT, G_PH_MEAN, G_CU_MEAN, G_PHL_FIRES, G_CUL_FIRES, G_PHL_FIRED, G_CUL_FIRED, G_PHL_LASTIDX, G_PHL_LASTDIR,
     G_CUL_LASTIDX, G_CUL_LASTDIR, G_PHL_LATCHED, G_CUL_LATCHED, G_LATCH_ON,
     // Scene 07 -- SlidingDDSketch
     createSldWorld, stepSld, stepSldOracle, renderSldPrep,
@@ -78,10 +78,17 @@ import {
     createScmWorld, stepScm, stepScmOracle, renderScmPrep,
     SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, SCM_KEYS_PER_FRAME, SCM_TRACKED, SCM_STRIDE,
     C_BOUNDOK, C_NLIVE, C_SATURATED, C_N, C_SKETCH_ALLOC, C_ORACLE_ALLOC,
+    C_TOTAL, C_TOTALOK, C_HEAVY, C_ORACLE_BYTES, SCM_HEAVY_COUNT, scmContracts,
     // Scene 09 -- DecayedReservoir
     createDrWorld, stepDr, stepDrOracle, renderDrPrep,
     DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, DR_ADDS_PER_FRAME,
     R_SIZE, R_K, R_MEANAGE, R_RECENCYFRAC, R_N, R_SKETCH_ALLOC, R_ORACLE_ALLOC,
+    // Scene 10 -- SlidingAggregate
+    createSaWorld, stepSa, stepSaOracle, renderSaPrep, renderSaEhPrep, SA_DEFAULT_W, SA_DEFAULT_PANES, SA_DT, SA_EVENTS_PER_FRAME,
+    SA_SPIKE_MULT, SA_EH_EPS, L_COUNT, L_SUM, L_MEAN, L_MIN, L_MAX, L_TCOUNT, L_TSUM, L_TMEAN, L_TMIN, L_TMAX,
+    L_EXACT, L_TSUMW, L_EHSUM, L_EHMEAN, L_EHREL, L_EHRELMAX,
+    // S11 (D8) -- the Chromium-only key-magnitude lane
+    runKeyMagLane, keyMagText, kmAggregate, KM_CONTROL_MIN, KM_MIN_CLEAN,
 } from './kernels.mjs';
 
 // Dev-only peer (already a devDependency -- the same tool test/torture.mjs uses). Used ONLY by the
@@ -497,6 +504,28 @@ test('DD faithfulness: renderDdPrep displays exactly both shipped detectors stat
     assert.equal(world.flat[G_PH_THRESH], world.ph.threshold, 'displayed PH threshold must be the shipped getter');
     assert.equal(world.flat[G_CU_STAT], world.cu.statistic, 'displayed CUSUM statistic must be the shipped getter');
     assert.equal(world.flat[G_CU_THRESH], world.cu.threshold, 'displayed CUSUM threshold must be the shipped getter');
+});
+
+test('DD into faithfulness (1.11.0): every slot renderDdPrep reads through dd.into(row) is Object.is the shipped getter -- fresh (lastDriftIndex / lastDirection NaN) and after fires, all four detectors', () => {
+    const world = createDdWorld(DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD, true);
+    const a = createAllocState();
+    const check = (label) => {
+        renderDdPrep(world, a);
+        const f = world.flat, ph = world.ph, cu = world.cu, phL = world.phL, cuL = world.cuL;
+        const pairs = [
+            [G_PH_STAT, ph.statistic, 'ph.statistic'], [G_CU_STAT, cu.statistic, 'cu.statistic'],
+            [G_PH_MEAN, ph.mean, 'ph.mean'], [G_CU_MEAN, cu.mean, 'cu.mean'],
+            [G_PHL_STAT, phL.statistic, 'phL.statistic'], [G_CUL_STAT, cuL.statistic, 'cuL.statistic'],
+            [G_PHL_LASTIDX, phL.lastDriftIndex, 'phL.lastDriftIndex'], [G_PHL_LASTDIR, phL.lastDirection, 'phL.lastDirection'],
+            [G_CUL_LASTIDX, cuL.lastDriftIndex, 'cuL.lastDriftIndex'], [G_CUL_LASTDIR, cuL.lastDirection, 'cuL.lastDirection'],
+        ];
+        for (const [slot, want, name] of pairs) assert.ok(Object.is(f[slot], want), label + ': slot ' + slot + ' = ' + f[slot] + ' must be Object.is ' + name + ' = ' + want);
+    };
+    check('fresh');
+    assert.ok(Number.isNaN(world.flat[G_PHL_LASTIDX]), 'fresh latched PH: lastDriftIndex must render NaN (null is not zero)');
+    for (let f = 0; f < 1600; f++) { stepDd(world); stepDdOracle(world, a); }
+    assert.ok(world.phLFires > 0 && world.cuLFires > 0, 'non-vacuous: both latched detectors must have fired');
+    check('after fires');
 });
 
 test('DD witness: the mode is LOAD-BEARING -- on a slow mean ramp CUSUM (fixed mu0) fires FAR more than PH (adaptive)', () => {
@@ -938,6 +967,87 @@ test('SCM witness: the one-sided bound true(W) <= est <= true(W+W/B) + eps*N hol
     }
     assert.ok(checks >= 2000, 'the witness must sample >= 2000 per-key windowed-frequency queries, got ' + checks);
     assert.equal(viol, 0, 'the one-sided bound must hold on 100% of renders (violating renders: ' + viol + ')');
+});
+
+// From-spec SCM truth, recomputed from the DETERMINISTIC stream (item t = 1..now has key stream[t-1]; in heavy
+// mode key 0 also gets SCM_HEAVY_COUNT at every streaming frame's end time), never from the kernel's oracle
+// rings: N over the covered span (paneEnd(t) > now - W, the library's live rule) and true(W) per tracked key.
+function scmSpecTruth(world, heavyEnds) {
+    const pw = world.W / world.panes, now = world.now, cut = now - world.W;
+    const live = (t) => (Math.floor(t / pw) + 1) * pw > cut;
+    let N = 0;
+    const trueW = new Float64Array(SCM_TRACKED);
+    for (let t = 1; t <= now; t++) {
+        const key = world.stream[(t - 1) & world.streamMask];
+        if (live(t)) N++;
+        if (t > cut) for (let k = 0; k < SCM_TRACKED; k++) if (world.tracked[k] === key) trueW[k]++;
+    }
+    for (const t of heavyEnds) {
+        if (live(t)) N += SCM_HEAVY_COUNT;
+        if (t > cut) for (let k = 0; k < SCM_TRACKED; k++) if (world.tracked[k] === 0) trueW[k] += SCM_HEAVY_COUNT;
+    }
+    return { N, trueW };
+}
+
+test('D7 SCM total(W) + oracle N vs the from-spec truth: the oracle N, total(W) and every tracked true(W) equal a recount from the stream on EVERY render (3 W x heavy on/off); C_TOTALOK is 1 -- the pre-2026-10-04 `<=` oracle expiry dropped the oldest LIVE pane (N 1985 vs 2049) and goes RED here', () => {
+    for (const W of [1024, 2048, 4096]) {
+        for (const heavy of [false, true]) {
+            const world = createScmWorld(W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0xD7);
+            world.heavy = heavy;
+            const a = createAllocState(), heavyEnds = [];
+            let renders = 0;
+            for (let f = 0; f < 400; f++) {
+                stepScm(world); stepScmOracle(world, a);
+                if (heavy) heavyEnds.push(world.now);
+                if (f % 9 !== 0) continue;
+                renderScmPrep(world, a);
+                renders++;
+                const spec = scmSpecTruth(world, heavyEnds), fl = world.flat;
+                const tag = 'W=' + W + ' heavy=' + heavy + ' frame ' + f;
+                assert.equal(fl[C_NLIVE], spec.N, tag + ': the oracle N must equal the from-spec covered-span N');
+                assert.equal(fl[C_TOTAL], spec.N, tag + ': scm.total() must equal the from-spec N');
+                assert.equal(fl[C_TOTALOK], 1, tag + ': C_TOTALOK must be 1');
+                for (let k = 0; k < SCM_TRACKED; k++) {
+                    assert.equal(fl[k * SCM_STRIDE + 1], spec.trueW[k], tag + ': tracked ' + k + ' true(W) must equal the from-spec count');
+                }
+                assert.equal(fl[C_BOUNDOK], 1, tag + ': the one-sided bound must hold');
+            }
+            assert.ok(renders >= 40, 'non-vacuous render count');
+        }
+    }
+});
+
+test('D7 SCM heavy-count mode: key 0 passes 2^31 without saturating a pane cell; the render reads every tracked key through estimateInto, Object.is the scalar estimate(); C_HEAVY mirrors the flag; pausing slides N and total(W) to 0', () => {
+    const world = createScmWorld(4096, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0x4EA7);
+    world.heavy = true;
+    const a = createAllocState();
+    for (let f = 0; f < 300; f++) { stepScm(world); stepScmOracle(world, a); }
+    renderScmPrep(world, a);
+    const fl = world.flat;
+    assert.ok(fl[0] >= 2 ** 31, 'tracked key 0 estimate must exceed 2^31 in heavy mode, got ' + fl[0]);
+    assert.equal(fl[C_SATURATED], 0, 'one heavy add per frame must never saturate a Uint32 pane cell');
+    assert.equal(fl[C_HEAVY], 1, 'C_HEAVY mirrors world.heavy');
+    for (let k = 0; k < SCM_TRACKED; k++) {
+        assert.ok(Object.is(fl[k * SCM_STRIDE], world.scm.estimate(world.tracked[k])), 'tracked ' + k + ': estimateInto slot must be Object.is estimate()');
+    }
+    world.paused = true;
+    for (let f = 0; f < 200; f++) { stepScm(world); stepScmOracle(world, a); }
+    renderScmPrep(world, a);
+    assert.equal(fl[C_NLIVE], 0, 'paused: the oracle N slides to 0');
+    assert.equal(fl[C_TOTAL], 0, 'paused: total(W) slides to 0');
+    assert.equal(fl[0], 0, 'paused: the heavy key estimate slides to 0');
+});
+
+test('D8 SCM contracts line: scmContracts reads the library LIVE -- a bad sub-window is NaN (never a fail-open 0) and a typo option key throws the library\'s own did-you-mean message', () => {
+    const world = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES);
+    const c = scmContracts(world);
+    assert.ok(Number.isNaN(c.badW), 'estimate(k, -1) must be NaN, got ' + c.badW);
+    let direct = null;
+    try { new SlidingCountMin(SCM_DEFAULT_W, { sede: 1 }); } catch (e) { direct = e.message; }
+    assert.equal(c.typoMsg, direct, 'the shown typo message must be the library\'s own');
+    assert.match(c.typoMsg, /^\[lite-adaptive\].*did you mean "seed"/, 'the library message must carry the did-you-mean hint');
+    const html = readFileSync(join(DEMO_DIR, 'index.html'), 'utf8');
+    assert.match(html, /const c = scmContracts\(scmWorld\);/, 'index.html must render the contracts line from scmContracts');
 });
 
 test('SCM boundary: a bad W / epsilon / panes fails closed at the ctor', () => {
@@ -1404,6 +1514,7 @@ const GOLDEN_SCENES = {
     SLD:   () => goldenSceneBits(() => createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES), stepSld, stepSldOracle, renderSldPrep),
     SCM:   () => goldenSceneBits(() => createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES), stepScm, stepScmOracle, renderScmPrep),
     DR:    () => goldenSceneBits(() => createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE), stepDr, stepDrOracle, renderDrPrep),
+    SA:    () => goldenSceneBits(() => createSaWorld(SA_DEFAULT_W, SA_DEFAULT_PANES), stepSa, stepSaOracle, (w, a) => { renderSaPrep(w, a); renderSaEhPrep(w); }),
 };
 
 // (scene -> [allowed-to-differ slot indices]). P2 (D3) declares the ONLY exception: renderHkPrep now
@@ -1413,6 +1524,11 @@ const GOLDEN_SCENES = {
 // the old estimate-based recall; the SOURCE of the number changed, so the exception is declared.)
 const GOLDEN_EXCEPTIONS = Object.create(null);
 GOLDEN_EXCEPTIONS.HK = [H_RECALL, H_FOUND];
+// B6 (2026-10-04) declares the SCM exceptions: the oracle expiry was off by one pane (`<=` dropped the
+// oldest LIVE pane), so at defaults the oracle-derived slots move -- every tracked true(W) and upper bound,
+// C_NLIVE (1985 -> 2049 == scm.total()) and C_ORACLE_BYTES. The library-derived slots (estimates,
+// saturated, bytes, ...) stay bit-identical. The D7 from-spec test gates the corrected values.
+GOLDEN_EXCEPTIONS.SCM = [1, 2, 4, 5, 7, 8, 10, 11, C_NLIVE, C_ORACLE_BYTES];
 
 /** Compare current bits against golden for the PRE-EXISTING (golden-length) slots, honoring exceptions.
  *  Returns a list of 'SCENE[i]: golden -> current' mismatch strings (empty === bit-identical). */
@@ -1715,8 +1831,115 @@ test('D6 index.html sldTick fails closed on NaN: renders "n/a" (never "NaN") and
     assert.ok(tick, 'index.html must define sldTick()');
     // the frac / cursor className is only written when it changes (last-value guard).
     assert.ok(/sldLastFracCls/.test(tick) && /sldLastCurCls/.test(tick), 'sldTick must guard className writes with a last value');
-    // NaN renders "n/a" (via sldFmt / sldPct / Number.isNaN branches), never String(NaN).
-    assert.ok(/n\/a/.test(html), 'sldTick must render NaN as "n/a"');
+    // NaN renders "n/a" (via sldFmt / sldPct / putFixed / the cursor's Number.isNaN branch), never "NaN".
+    // Behavioral, not a page-wide grep (review B5: /n\/a/ over the whole page could never fail).
+    assert.deepEqual(sldNaNFailures(html), [], 'every sld NaN path must render "n/a"');
+    // CONTROL with teeth: strip each NaN branch from a copy -> the check goes RED.
+    const m1 = html.replace("return Number.isNaN(v) ? 'n/a' : v.toFixed(2);", 'return v.toFixed(2);');
+    const m2 = html.replace("return Number.isNaN(v) ? 'n/a' : (v * 100).toFixed(2) + '%';", "return (v * 100).toFixed(2) + '%';");
+    const m3 = html.replace("setText(sldDom.cursor, Number.isNaN(cur) ? 'n/a' : ", 'setText(sldDom.cursor, ');
+    for (const [name, m] of [['sldFmt', m1], ['sldPct', m2], ['cursor', m3]]) {
+        assert.notEqual(m, html, 'control ' + name + ': the mutation must apply (the source line moved?)');
+        assert.ok(sldNaNFailures(m).length > 0, 'control ' + name + ': a stripped NaN branch must be caught');
+    }
+});
+
+// The sld NaN contract, checked by RUNNING the shipped helpers (extracted from index.html) on NaN.
+function sldNaNFailures(html) {
+    const out = [];
+    const ro = loadReadoutHelpers(html);
+    const fmt = new Function('return function sldFmt' + fnSource(html, 'sldFmt'))();
+    const pct = new Function('return function sldPct' + fnSource(html, 'sldPct'))();
+    if (fmt(NaN) !== 'n/a') out.push('sldFmt(NaN) = ' + fmt(NaN));
+    if (pct(NaN) !== 'n/a') out.push('sldPct(NaN) = ' + pct(NaN));
+    const el = fakeEl();
+    ro.putFixed(el, 0, new Float64Array([NaN]), 0, 1, 2, 'x');
+    if (el.textContent !== 'n/a') out.push('putFixed(NaN) = ' + el.textContent);
+    const tick = extractFnBody(html, 'sldTick') || '';
+    if (!/putFixed\(sldDom\.frac,/.test(tick)) out.push('sldDom.frac must go through putFixed (NaN-safe)');
+    if (!/setText\(sldDom\.cursor, Number\.isNaN\(cur\) \? 'n\/a' : /.test(tick)) out.push('sldDom.cursor must branch on Number.isNaN');
+    return out;
+}
+
+// `function name(args) { body }` -> "(args) { body }" (for re-evaluating a pure helper in node).
+function fnSource(src, name) {
+    const start = src.indexOf('function ' + name + '(');
+    assert.ok(start !== -1, 'index.html must define ' + name);
+    const paren = src.indexOf('(', start);
+    return src.slice(paren, src.indexOf('{', paren)) + '{' + extractFnBody(src, name) + '}';
+}
+
+// Evaluate index.html's write-on-change readout block (RO_* + put* / setText / setClass) in isolation.
+function loadReadoutHelpers(html) {
+    const a = html.indexOf('    // ---- write-on-change readouts');
+    const b = html.indexOf('    // Compact integer-ish formatter');
+    assert.ok(a !== -1 && b > a, 'index.html must hold the write-on-change readout block before fmtNum');
+    return new Function(html.slice(a, b) + '\nreturn { RO_N, putFixed, putInt, putNum, putExp, putSmi, setText, setClass };')();
+}
+
+function fakeEl() {
+    let text = 'placeholder', cls = '';
+    return {
+        writes: 0,
+        get textContent() { return text; }, set textContent(v) { text = v; this.writes++; },
+        get className() { return cls; }, set className(v) { cls = v; this.writes++; },
+    };
+}
+
+// The write-on-change law (D-S4): after EVERY call the shown text equals the format of the CURRENT value
+// (a skipped write never leaves a stale number), an unchanged value writes nothing, NaN <-> number both
+// rewrite, and a fresh slot writes even when its first key is 0. Returns the failures (empty = pass).
+function readoutLawFailures(html) {
+    const out = [];
+    const ro = loadReadoutHelpers(html);
+    const f = new Float64Array(1);
+    let seed = 12345;
+    const rnd = () => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return seed / 4294967296; };
+    const cases = [[1, 0, ''], [1, 2, 'x'], [100, 2, '%'], [1 / 1024, 1, ' KB'], [1, 3, '']];
+    for (let c = 0; c < cases.length; c++) {
+        const [scale, d, suf] = cases[c];
+        const el = fakeEl(), p = Math.pow(10, d);
+        let prev = NaN;
+        for (let i = 0; i < 2000; i++) {
+            const r = rnd();
+            // repeats, tiny moves below the shown digits, NaN, 0, and large jumps
+            const v = r < 0.1 ? NaN : r < 0.3 ? prev : r < 0.5 ? (prev === prev ? prev + (rnd() - 0.5) * 3 / (p * scale) : 0) : (rnd() - 0.3) * 1e4;
+            f[0] = v;
+            const before = el.writes;
+            ro.putFixed(el, c, f, 0, scale, d, suf);
+            const want = v !== v ? 'n/a' : (Math.round(v * scale * p) / p).toFixed(d) + suf;
+            if (el.textContent !== want) { out.push('putFixed case ' + c + ' v=' + v + ': shows ' + el.textContent + ', want ' + want); break; }
+            if (i > 0 && Object.is(v, prev) && el.writes !== before) { out.push('putFixed case ' + c + ': an unchanged value rewrote'); break; }
+            prev = v;
+        }
+    }
+    // putInt: first key 0 writes; NaN <-> number rewrites both ways
+    const el = fakeEl();
+    for (const [v, want] of [[0, '0'], [0, '0'], [NaN, 'n/a'], [7.9, '7'], [NaN, 'n/a'], [-3, '-3']]) {
+        f[0] = v; ro.putInt(el, 40, f, 0);
+        if (el.textContent !== want) out.push('putInt(' + v + ') shows ' + el.textContent + ', want ' + want);
+    }
+    const e2 = fakeEl(); f[0] = 0; ro.putFixed(e2, 41, f, 0, 1, 2, '');
+    if (e2.textContent !== '0.00') out.push('a fresh putFixed slot must write even when its first key is 0, shows ' + e2.textContent);
+    return out;
+}
+
+test('D-S4 index.html write-on-change readouts: the shown text ALWAYS equals the format of the current value (no stale display), unchanged values write nothing, NaN <-> number rewrites, a 0 first key still writes; every put* slot is unique and < RO_N (B4; review B5 MAJOR 5)', () => {
+    const html = readFileSync(join(DEMO_DIR, 'index.html'), 'utf8');
+    assert.deepEqual(readoutLawFailures(html), [], 'write-on-change law');
+    const slots = [...html.matchAll(/put(?:Fixed|Int|Num|Exp|Smi)\(\w+\.\w+, (\d+),/g)].map((m) => +m[1]);
+    const { RO_N } = loadReadoutHelpers(html);
+    assert.ok(slots.length >= 90, 'the ticks must route their numeric readouts through put* (found ' + slots.length + ')');
+    assert.equal(new Set(slots).size, slots.length, 'every put* slot must be unique (a shared slot skips a write)');
+    assert.ok(Math.max(...slots) < RO_N, 'every put* slot must be < RO_N');
+    // CONTROLS with teeth: drop the digit scale from the key (3-decimal values go stale), and seed the
+    // seen-flag (a 0 first key never writes) -- both must be caught.
+    const m1 = html.replace('let k = Math.round(x * p);', 'let k = Math.round(x);');
+    const m2 = html.replace('const RO_SEEN = new Uint8Array(RO_N);', 'const RO_SEEN = new Uint8Array(RO_N).fill(1);');
+    for (const [name, m] of [['no-digit-scale key', m1], ['pre-seen slots', m2]]) {
+        assert.notEqual(m, html, 'control ' + name + ': the mutation must apply');
+        assert.ok(readoutLawFailures(m).length > 0, 'control ' + name + ': must be caught');
+    }
 });
 
 test('D2 ADWIN offset invariance (F9): offset 1.7e12 cut indices match offset 0 within +-2, count <= off0 + 1', () => {
@@ -2207,7 +2430,8 @@ test('D4 steady-state probe: stepShll (query-every-frame and never) AND renderSh
         process.stdout.write('  ' + lane + ' steady: ' + r.steady + ' B/op (readings ' + r.readings.join(',') + ')\n');
         assert.ok(r.steady <= 0.5, lane + ' must read <= 0.5 B/op steady, got ' + r.steady);
     }
-    // renderShllPrep is the 10Hz tick; it queries the display twin slD.count() once per tick. Before
+    // renderShllPrep is the 10Hz tick; it reads the display twin through slD.countInto(SHLL_ROW) once per
+    // tick (B2; the scalar count() is itself 0-box since 1.11.0, so both shapes read 0 here). Before
     // v1.11.0 this read a documented 16-32 B/op: a stable 16 B inside count()'s estimator tail (the
     // slSigmaInto / slTauInto helpers took the empty / saturated fraction as a computed-double ARGUMENT,
     // which boxes whenever V8 does not inline the helper), plus count()'s returned double at the call
@@ -2261,29 +2485,43 @@ test('P1 ADWIN renderAdPrep steady-state probe: reads <= 0.5 B/op (default / off
 
 /* =============================================================================================
  * P3 (D5 / D6) STEADY-STATE PROBE: the pinned-semi-space bytes/op probe for the DD / SLD hot kernels.
- * Frame lanes must read <= 0.5 B/op steady; the SLD render (through quantileInto, F5) reads 0. The DD
- * render reads the shipped statistic / mean getters, which box ONE HeapNumber per call by the F6
- * contract (like SHLL's display count()) -- a DOCUMENTED 10Hz cost, measured as a documented lane (never
- * claimed 0). The MUST-BOX control sld_quantile_box sinks the scalar quantile() so the render's 0 has teeth.
+ * Frame lanes must read <= 0.5 B/op steady; the SLD render (through quantileInto, F5) and the DD render
+ * (through dd.into, 1.11.0) read 0. The MUST-BOX controls sld_quantile_box (the scalar quantile()) and
+ * dd_getter_box (the six scalar statistic / mean getters, the pre-1.11.0 render) give each 0 its teeth.
  * ============================================================================================= */
 
 test('P3 DD steady-state probe: stepDd (4 detectors, latched twins engaged) reads <= 0.5 B/op under DEFAULT flags -- the library holds every value in a Float64Array slot end to end, so the frame path is 0 B/op (no --no-maglev exemption)',
-    { todo: 'library finding ROADMAP 8 (latched PH Maglev-tier fire box) -- demo session' }, async () => {
+    async () => {
     const r = await runDemoLane('dd_frame', 4000, 6);
     process.stdout.write('  dd_frame steady: ' + r.steady + ' B/op (readings ' + r.readings.join(',') + ')\n');
     assert.ok(r.steady <= 0.5, 'dd_frame must read <= 0.5 B/op steady under default flags, got ' + r.steady);
     // NOTE: dd_frame_nolatch does NOT actually disable the latched detectors -- createDdWorld always
     // builds all four and stepDd always feeds them, so the `latch` arg here is only a DISPLAY toggle.
-    // Both lanes run the latched-PH twin and both read ~2 B/op in the Maglev tier (ROADMAP 8).
+    // Both lanes run the latched-PH twin. Before 1.10.0 both read ~2 B/op in the Maglev tier (the latched-PH
+    // fire box, ROADMAP 8); 1.10.0 made a latched PH fire 0 B/op, so this is a real gate, not a todo.
     const c = await runDemoLane('dd_frame_nolatch', 4000, 6);
     process.stdout.write('  dd_frame_nolatch steady: ' + c.steady + ' B/op\n');
     assert.ok(c.steady <= 0.5, 'dd_frame_nolatch must read <= 0.5 B/op steady under default flags, got ' + c.steady);
 });
 
-test('P3 DD render documented cost: renderDdPrep reads SIX fractional statistic / mean getters in one unit; each calls _guardFinite() and three exhaust V8\'s cumulative inlining budget and box -- a documented ~48 B/tick (band [44, 52]) the probe SEES', async () => {
+test('P4 SCM heavy-count probe: stepScm + stepScmOracle (one 2^30 heavy addFrom per frame) and renderScmPrep (estimateInto + total(), tracked key 0 > 2^31) each read <= 0.5 B/op, while the scalar estimate() of that key (scm_estimate_box control) boxes >= 12 -- the render 0 is estimateInto, not a blind probe', async () => {
+    for (const lane of ['scm_frame_heavy', 'scm_render_heavy']) {
+        const r = await runDemoLane(lane);
+        process.stdout.write('  ' + lane + ' steady: ' + r.steady + ' B/op (readings ' + r.readings.join(',') + ')\n');
+        assert.ok(r.steady <= 0.5, lane + ' must read <= 0.5 B/op steady, got ' + r.steady);
+    }
+    const c = await runDemoLane('scm_estimate_box');
+    process.stdout.write('  scm_estimate_box steady: ' + c.steady + ' B/op (the F6 scalar estimate() box)\n');
+    assert.ok(c.steady >= 12, 'scm_estimate_box control must box >= 12 B/op, got ' + c.steady);
+});
+
+test('P3 DD render probe: renderDdPrep reads all four detectors through dd.into(row) (1.11.0) at <= 0.5 B/op, while the old six-getter render shape (dd_getter_box control) still boxes >= 12 B/op -- the 0 is the reader, not a blind probe', async () => {
     const r = await runDemoLane('dd_render');
-    process.stdout.write('  dd_render steady: ' + r.steady + ' B/op (six _guardFinite getters; three box)\n');
-    assert.ok(r.steady >= 44 && r.steady <= 52, 'renderDdPrep must read in the documented band [44, 52] B/op, got ' + r.steady);
+    process.stdout.write('  dd_render steady: ' + r.steady + ' B/op (dd.into row)\n');
+    assert.ok(r.steady <= 0.5, 'renderDdPrep must read <= 0.5 B/op through dd.into, got ' + r.steady);
+    const c = await runDemoLane('dd_getter_box');
+    process.stdout.write('  dd_getter_box steady: ' + c.steady + ' B/op (six scalar getters; the pre-1.11.0 render)\n');
+    assert.ok(c.steady >= 12, 'dd_getter_box control must box >= 12 B/op, got ' + c.steady);
 });
 
 test('P3 SLD steady-state probe: stepSld (range + strict modes) reads <= 0.5 B/op, and renderSldPrep through quantileInto (F5) reads <= 0.5 -- while the scalar quantile() control boxes ~16 B (the render 0 is genuine elision)', async () => {
@@ -2296,4 +2534,230 @@ test('P3 SLD steady-state probe: stepSld (range + strict modes) reads <= 0.5 B/o
     const c = await runDemoLane('sld_quantile_box');
     process.stdout.write('  sld_quantile_box steady: ' + c.steady + ' B/op (the documented scalar quantile() box)\n');
     assert.ok(c.steady >= 12, 'sld_quantile_box must box >= 12 B/op (the scalar quantile return), got ' + c.steady);
+});
+
+/* =============================================================================================
+ * SCENE 10 -- SlidingAggregate (exact windowed count / sum / mean / min / max; D9 -> demo session B7a)
+ * ============================================================================================= */
+
+// From-spec SA truth, recomputed from the DETERMINISTIC stream (event j of frame f sits at
+// f * SA_DT + (j + 1) * SA_DT / K with value vals[pos] (x SA_SPIKE_MULT when that frame had spikes on and
+// spike[pos])), never from the kernel's oracle ring. Covered span: paneEnd(t) > now - W (ADR 0012).
+function saSpecTruth(world, frameSpikes) {
+    const K = SA_EVENTS_PER_FRAME, step = SA_DT / K, pw = world.W / world.panes, cut = world.now - world.W;
+    let c = 0, s = 0, mn = Infinity, mx = -Infinity, cw = 0, sw = 0, pos = 0;
+    for (let f = 0; f < frameSpikes.length; f++) {
+        const frameNow = frameSpikes[f][0];
+        for (let j = 0; j < K; j++, pos++) {
+            const i = pos & world.streamMask;
+            const t = frameNow + (j + 1) * step;
+            const v = (frameSpikes[f][1] && world.spike[i] === 1) ? world.vals[i] * SA_SPIKE_MULT : world.vals[i];
+            if ((Math.floor(t / pw) + 1) * pw > cut) {
+                c++; s += v; if (v < mn) mn = v; if (v > mx) mx = v;
+                if (t > cut) { cw++; sw += v; }
+            }
+        }
+    }
+    return { c, s, mn: c ? mn : NaN, mx: c ? mx : NaN, cw, sw };
+}
+
+test('SA exactness vs the from-spec truth: on EVERY render (W 1000 / 4000 x spikes off / on, spikes toggled mid-run) the SlidingAggregate row equals a recount from the stream exactly (count / sum / min / max; mean = sum / count), the oracle row agrees, and L_EXACT is 1', () => {
+    for (const W of [1000, 4000]) {
+        for (const spikes of [false, true]) {
+            const world = createSaWorld(W, SA_DEFAULT_PANES);
+            const a = createAllocState(), frames = [];
+            let renders = 0;
+            for (let f = 0; f < 700; f++) {
+                world.spikes = spikes && f > 150;                 // toggled mid-run
+                frames.push([world.now, world.spikes]);
+                stepSa(world); stepSaOracle(world, a);
+                if (f % 11 !== 0 || f < 120) continue;
+                renderSaPrep(world, a); renderSaEhPrep(world);
+                renders++;
+                const t = saSpecTruth(world, frames), fl = world.flat, tag = 'W=' + W + ' spikes=' + spikes + ' frame ' + f;
+                assert.equal(fl[L_COUNT], t.c, tag + ': count'); assert.equal(fl[L_SUM], t.s, tag + ': sum');
+                assert.equal(fl[L_MIN], t.mn, tag + ': min'); assert.equal(fl[L_MAX], t.mx, tag + ': max');
+                assert.equal(fl[L_MEAN], t.s / t.c, tag + ': mean');
+                assert.equal(fl[L_TCOUNT], t.c, tag + ': oracle count'); assert.equal(fl[L_TSUM], t.s, tag + ': oracle sum');
+                assert.equal(fl[L_TSUMW], t.sw, tag + ': oracle true-window sum');
+                assert.equal(fl[L_EXACT], 1, tag + ': L_EXACT');
+            }
+            assert.ok(renders >= 50, 'non-vacuous');
+        }
+    }
+});
+
+test('SA faithfulness: every row slot read through sa.into is Object.is the scalar getter (count / sum / mean / min / max); the EH contrast slots are eh.sum() and eh.sum() / eh.count()', () => {
+    const world = createSaWorld(SA_DEFAULT_W, SA_DEFAULT_PANES);
+    world.spikes = true;
+    const a = createAllocState();
+    for (let f = 0; f < 400; f++) { stepSa(world); stepSaOracle(world, a); }
+    renderSaPrep(world, a); renderSaEhPrep(world);
+    const fl = world.flat, sa = world.sa, eh = world.eh;
+    for (const [slot, want, name] of [[L_COUNT, sa.count(), 'count'], [L_SUM, sa.sum(), 'sum'], [L_MEAN, sa.mean(), 'mean'], [L_MIN, sa.min(), 'min'], [L_MAX, sa.max(), 'max'], [L_EHSUM, eh.sum(), 'eh.sum']]) {
+        assert.ok(Object.is(fl[slot], want), name + ': slot ' + fl[slot] + ' must be Object.is ' + want);
+    }
+    assert.equal(fl[L_EHMEAN], eh.sum() / eh.count(), 'EH mean = eh.sum() / eh.count()');
+});
+
+test('SA vs EH (F17): with spikes ON, EH sum() relative error vs the true window exceeds its epsilon on some renders while SlidingAggregate stays exact on all; with spikes OFF EH stays within epsilon -- the scene shows a real failure, not a staged one', () => {
+    for (const spikes of [true, false]) {
+        const world = createSaWorld(SA_DEFAULT_W, SA_DEFAULT_PANES);
+        world.spikes = spikes;
+        const a = createAllocState();
+        let over = 0, exact = 0, renders = 0;
+        for (let f = 0; f < 1200; f++) {
+            stepSa(world); stepSaOracle(world, a);
+            if (f % 6 !== 0 || f < 120) continue;
+            renderSaPrep(world, a); renderSaEhPrep(world); renders++;
+            if (world.flat[L_EHREL] > SA_EH_EPS) over++;
+            if (world.flat[L_EXACT] === 1) exact++;
+        }
+        assert.equal(exact, renders, 'SlidingAggregate exact on every render (spikes=' + spikes + ')');
+        if (spikes) {
+            assert.ok(over > 0, 'spikes on: EH sum() must exceed epsilon on some render (F17), got ' + over);
+            assert.ok(world.flat[L_EHRELMAX] > SA_EH_EPS, 'the running max shows the breach, got ' + world.flat[L_EHRELMAX]);
+        } else {
+            assert.equal(over, 0, 'spikes off: EH stays within epsilon (got ' + over + ' breaches)');
+        }
+    }
+});
+
+test('SA idle-slide + fail-closed: pausing slides count / sum to 0 and mean / min / max to NaN (null is not zero); oracle OFF NaNs every oracle slot; turning it back on HOLDS NaN until a full covered span (W + W/B) refills', () => {
+    const world = createSaWorld(SA_DEFAULT_W, SA_DEFAULT_PANES);
+    const a = createAllocState();
+    for (let f = 0; f < 200; f++) { stepSa(world); stepSaOracle(world, a); }
+    world.oracleOn = false;
+    for (let f = 0; f < 30; f++) stepSa(world);                       // the UI skips the oracle step while off
+    renderSaPrep(world, a); renderSaEhPrep(world);
+    for (const s of [L_TCOUNT, L_TSUM, L_TMEAN, L_TMIN, L_TMAX, L_EXACT, L_TSUMW, L_EHREL, L_EHRELMAX]) assert.ok(Number.isNaN(world.flat[s]), 'oracle off: slot ' + s + ' must be NaN');
+    assert.ok(world.flat[L_COUNT] > 0, 'the sketch row stays live with the oracle off');
+    world.oracleOn = true; world.resumeNow = world.now;
+    stepSa(world); stepSaOracle(world, a); renderSaPrep(world, a); renderSaEhPrep(world);
+    assert.ok(Number.isNaN(world.flat[L_EXACT]), 'resume hold: the half-refilled ring must not claim exactness');
+    const framesToRefill = Math.ceil((SA_DEFAULT_W + SA_DEFAULT_W / SA_DEFAULT_PANES) / SA_DT) + 1;
+    for (let f = 0; f < framesToRefill; f++) { stepSa(world); stepSaOracle(world, a); }
+    renderSaPrep(world, a); renderSaEhPrep(world);
+    assert.equal(world.flat[L_EXACT], 1, 'after a full covered span the oracle is valid and exact again');
+    world.paused = true;
+    for (let f = 0; f < 120; f++) { stepSa(world); stepSaOracle(world, a); }
+    renderSaPrep(world, a); renderSaEhPrep(world);
+    assert.equal(world.flat[L_COUNT], 0, 'paused: count slides to 0'); assert.equal(world.flat[L_SUM], 0, 'paused: sum slides to 0');
+    for (const s of [L_MEAN, L_MIN, L_MAX]) assert.ok(Number.isNaN(world.flat[s]), 'paused: slot ' + s + ' must be NaN on an empty window');
+    assert.equal(world.flat[L_EXACT], 1, 'empty window: sketch and oracle agree (both empty)');
+});
+
+test('SA boundary: a bad W / panes fails closed at the library ctor; a W / panes that makes a subnormal pane width is rejected', () => {
+    assert.throws(() => createSaWorld(0, SA_DEFAULT_PANES), /\[lite-adaptive\]/, 'W=0');
+    assert.throws(() => createSaWorld(SA_DEFAULT_W, 1), /\[lite-adaptive\]/, 'panes<2');
+    assert.throws(() => createSaWorld(1e-320, 32), /\[lite-adaptive\]/, 'subnormal pane width');
+    assert.doesNotThrow(() => createSaWorld(4000, 32), 'the widest slider W constructs');
+});
+
+test('P5 SA probe: stepSa + stepSaOracle (spikes on), renderSaPrep (sa.into + the exact oracle scan) and renderSaEhPrep (the EH contrast) each read <= 0.5 B/op, while the scalar sa.mean() (sa_mean_box control) boxes >= 12 -- the render 0 is sa.into, not a blind probe', async () => {
+    for (const lane of ['sa_frame', 'sa_render']) {
+        const r = await runDemoLane(lane);
+        process.stdout.write('  ' + lane + ' steady: ' + r.steady + ' B/op (readings ' + r.readings.join(',') + ')\n');
+        assert.ok(r.steady <= 0.5, lane + ' must read <= 0.5 B/op steady, got ' + r.steady);
+    }
+    const c = await runDemoLane('sa_mean_box');
+    process.stdout.write('  sa_mean_box steady: ' + c.steady + ' B/op (the scalar fractional mean() box)\n');
+    assert.ok(c.steady >= 12, 'sa_mean_box control must box >= 12 B/op, got ' + c.steady);
+    // The EH contrast (eh.count() / eh.sum() return half-bucket x.5 doubles) also reads 0: each return is
+    // stored straight into a Float64Array slot (world.ehAcc), so V8 elides the box.
+    const e = await runDemoLane('sa_eh_render');
+    process.stdout.write('  sa_eh_render steady: ' + e.steady + ' B/op (EH contrast)\n');
+    assert.ok(e.steady <= 0.5, 'renderSaEhPrep must read <= 0.5 B/op steady, got ' + e.steady);
+});
+
+test('Scene 10 index.html wiring: a tab + section + keyboard "0"; the loop steps / draws it; saTick renders through renderSaPrep THEN renderSaEhPrep and writes every readout via put* / setText; layoutActive sizes it; the oracle toggle sets resumeNow (the refill hold); a rebuild never calls saLayout()', () => {
+    const html = readFileSync(join(DEMO_DIR, 'index.html'), 'utf8');
+    assert.match(html, /<button data-tab="sa">/, 'a Scene 10 tab button');
+    assert.match(html, /<section class="scene" data-scene="sa">/, 'a Scene 10 section');
+    assert.match(html, /e\.key === '0'\) activate\('sa'\)/, 'keyboard 0 -> sa');
+    const loop = extractFnBody(html, 'loop');
+    assert.match(loop, /activeScene === 'sa'\) \{\s*if \(!paused\) saStep\(\);\s*saDraw\(\);/, 'the frame loop steps sa under the global pause (space bar) and draws it');
+    assert.match(loop, /activeScene === 'sa'\) saTick\(\);/, 'the 10Hz mask ticks sa');
+    const tick = extractFnBody(html, 'saTick');
+    assert.ok(tick.indexOf('renderSaPrep(') !== -1 && tick.indexOf('renderSaEhPrep(') > tick.indexOf('renderSaPrep('), 'saTick: renderSaPrep then renderSaEhPrep (the EH error needs the oracle true-window sum)');
+    assert.ok(!/\.textContent =|\.className =/.test(tick), 'saTick writes only through put* / setText / setClass');
+    assert.match(extractFnBody(html, 'layoutActive'), /tab === 'sa'\) \{\s*saLayout\(\);\s*saPanels\(\);/, 'layoutActive sizes sa');
+    assert.ok(!/saLayout\s*\(/.test(extractFnBody(html, 'saRebuild')), 'saRebuild must NOT call saLayout() (forced reflow)');
+    assert.match(html, /if \(on && !saWorld\.oracleOn\) saWorld\.resumeNow = saWorld\.now;/, 'turning the oracle back on starts the refill hold');
+});
+
+test('S11 key-magnitude lane self-test: no meter -> "absent"; a meter that cannot see the boxing control -> "blind" (never a 0 reading); every non-ok text starts with "n/a" and claims no B/op number for the key lanes', () => {
+    for (const m of [undefined, null, 42, () => NaN, () => 'x']) {
+        const r = runKeyMagLane(m, 2000);
+        assert.equal(r.state, 'absent', 'meter ' + String(m) + ' -> absent');
+        assert.match(keyMagText(r), /^n\/a \(no performance\.memory/, 'absent text');
+    }
+    // A BLIND meter (constant, or quantized coarser than the control) must never produce an "ok" 0.
+    for (const blind of [() => 1e6, () => 4096 * Math.floor(process.memoryUsage().heapUsed / 4096 / 1e6)]) {
+        const r = runKeyMagLane(blind, 5000);
+        assert.equal(r.state, 'blind', 'a blind meter must be detected, got ' + r.state);
+        assert.ok(Number.isNaN(r.small) && Number.isNaN(r.big31), 'blind: the key lanes are NaN, never 0');
+        const t = keyMagText(r);
+        assert.match(t, /^n\/a \(meter blind/, 'blind text');
+        assert.ok(!/keys \d/.test(t), 'blind text must not print a key-lane number: ' + t);
+    }
+    assert.equal(KM_CONTROL_MIN, 8, 'the control floor (DEMO.md item 6)');
+});
+
+test('S11 key-magnitude lane with a real heap meter (node heapUsed): the control is SEEN (>= 8 B/op) and HeavyKeeper.addFrom reads ~0 for small AND [2^30, 2^31) keys (this Node has 32-bit Smis -- the Chromium number comes from the page)', () => {
+    let r = null;
+    for (let attempt = 0; attempt < 4 && (!r || r.state !== 'ok'); attempt++) r = runKeyMagLane(() => process.memoryUsage().heapUsed);
+    assert.equal(r.state, 'ok', 'the node heap meter must see the boxing control in >= 1 of 4 attempts (control read ' + r.control + ')');
+    assert.ok(r.control >= KM_CONTROL_MIN, 'control >= 8 B/op, got ' + r.control);
+    assert.ok(r.small >= 0 && r.small <= 2 && r.big31 >= 0 && r.big31 <= 2, 'addFrom must read ~0 B/op (two-sided: a negative reading is a scavenge, never a value) for both key classes here, got ' + r.small + ' / ' + r.big31);
+    for (const lane of ['small', 'big31', 'control']) assert.equal(r.raw[lane].length, 8, 'raw windows are returned for the record');
+    assert.match(keyMagText(r), /^small keys \d+\.\d B\/op \| \[2\^30, 2\^31\) keys \d+\.\d B\/op \(control \d+\.\d\)$/, 'ok text format');
+    const html = readFileSync(join(DEMO_DIR, 'index.html'), 'utf8');
+    assert.match(html, /\$\('hk-smi31-run'\)\.addEventListener\('click', \(\) => \{[\s\S]*?runKeyMagLane\([\s\S]*?keyMagText\(r\)/, 'index.html runs the lane ON CLICK only and renders keyMagText');
+    assert.ok(!/runKeyMagLane/.test(extractFnBody(html, 'loop')), 'never on the frame path');
+});
+
+test('S11 kmAggregate (review B9 BLOCKER 1): a NEGATIVE window is a scavenge -- dropped, never clamped to 0; fewer than KM_MIN_CLEAN clean windows -> NaN (blind); a box present in every clean window shows in full; ONE outlier window is discarded', () => {
+    assert.equal(KM_MIN_CLEAN, 3);
+    // the reviewer's fail-open: a lane that boxes 16 B/op but has a scavenge in EVERY window must be blind, never "0.0"
+    assert.ok(Number.isNaN(kmAggregate(Float64Array.of(-48.7, -16.8, -64.7, -9.1, -3.0))), 'all windows scavenged -> NaN');
+    assert.ok(Number.isNaN(kmAggregate(Float64Array.of(16, -50, 16, -40, -30))), '2 clean windows < KM_MIN_CLEAN -> NaN');
+    assert.equal(kmAggregate(Float64Array.of(16, -50, 16, -40, 16)), 16, 'a box in every clean window shows in full');
+    assert.equal(kmAggregate(Float64Array.of(0.9, 0, 0, 0, 0, 0, 0, 0)), 0, 'one JIT tier-up outlier is discarded');
+    assert.equal(kmAggregate(Float64Array.of(12, 12, -66.5, 12, 12)), 12, 'the measured Chrome control shape -> 12');
+    assert.ok(Number.isNaN(kmAggregate(Float64Array.of(NaN, NaN, NaN, 1))), 'NaN windows are not clean');
+    // end to end: a meter that UNDER-reads every key window (a scavenge per window) -> blind, never an ok 0
+    let calls = 0, heap = 1e8;
+    const scavengingMeter = () => { calls++; heap += (calls % 2 === 0) ? -50000 : 0; return heap; };   // every window reads negative
+    const r = runKeyMagLane(scavengingMeter, 1000);
+    assert.equal(r.state, 'blind', 'a meter whose every window is scavenged must be blind, got ' + r.state + ' ' + keyMagText(r));
+    assert.match(keyMagText(r), /^n\/a \(meter blind/);
+});
+
+test('SCM oracle off / resume hold (review B9 BLOCKER 5): with the exact ring skipped, renderScmPrep NaNs C_BOUNDOK / C_NLIVE / C_TOTALOK and every tracked true(W) / upper (never a false "VIOLATED"); the estimates and total() stay live; back on, the NaNs HOLD until a full covered span refills, then the bound and total() check pass again', () => {
+    const world = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0x0FF);
+    const a = createAllocState();
+    for (let f = 0; f < 200; f++) { stepScm(world); stepScmOracle(world, a); }
+    world.oracleOn = false;
+    for (let f = 0; f < 10; f++) stepScm(world);                         // the UI skips the oracle step while off
+    renderScmPrep(world, a);
+    const fl = world.flat;
+    for (const s of [C_BOUNDOK, C_NLIVE, C_TOTALOK]) assert.ok(Number.isNaN(fl[s]), 'oracle off: slot ' + s + ' must be NaN');
+    for (let k = 0; k < SCM_TRACKED; k++) {
+        assert.ok(Number.isNaN(fl[k * SCM_STRIDE + 1]) && Number.isNaN(fl[k * SCM_STRIDE + 2]), 'oracle off: tracked ' + k + ' true(W) / upper must be NaN');
+        assert.ok(Object.is(fl[k * SCM_STRIDE], world.scm.estimate(world.tracked[k])), 'oracle off: the estimate stays live');
+    }
+    assert.equal(fl[C_TOTAL], world.scm.total(), 'oracle off: total() stays live');
+    world.oracleOn = true; world.resumeNow = world.now;
+    for (let f = 0; f < 5; f++) { stepScm(world); stepScmOracle(world, a); }
+    renderScmPrep(world, a);
+    assert.ok(Number.isNaN(fl[C_BOUNDOK]) && Number.isNaN(fl[C_TOTALOK]), 'resume hold: a half-refilled ring must not give a verdict');
+    const refill = Math.ceil((SCM_DEFAULT_W + SCM_DEFAULT_W / SCM_DEFAULT_PANES) / SCM_KEYS_PER_FRAME) + 1;
+    for (let f = 0; f < refill; f++) { stepScm(world); stepScmOracle(world, a); }
+    renderScmPrep(world, a);
+    assert.equal(fl[C_BOUNDOK], 1, 'after a full covered span the bound is checked again and holds');
+    assert.equal(fl[C_TOTALOK], 1, 'after a full covered span total() equals the oracle N again');
+    const html = readFileSync(join(DEMO_DIR, 'index.html'), 'utf8');
+    assert.match(html, /if \(on && !scmWorld\.oracleOn\) scmWorld\.resumeNow = scmWorld\.now;/, 'the SCM oracle toggle starts the refill hold');
+    assert.match(extractFnBody(html, 'scmTick'), /bk !== bk \? 'n\/a'/, 'scmTick renders a NaN verdict as "n/a"');
 });

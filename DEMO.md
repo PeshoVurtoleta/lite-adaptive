@@ -54,7 +54,7 @@ identity.
 
 ---
 
-## 2. Roster -> scene map (all 9 shipped members demoed)
+## 2. Roster -> scene map (all 10 shipped members demoed)
 
 One scene per member. Each scene streams a pre-generated stream (a reused typed
 array, no per-frame RNG alloc) into BOTH the member and a live exact oracle, and
@@ -73,6 +73,7 @@ gap (member fixed vs oracle growing).
 | 07 | **SlidingDDSketch** | what are the last-W QUANTILES? | log-bin p50/p90/p99 bars + alpha band | exact sorted-array over live pane content (PREALLOCATED buffer, no `.sort()`) | `relerr <= alpha`; edge `<= W/panes` | sd.bytes fixed vs samples O(W) |
 | 08 | **SlidingCountMin** | how OFTEN did key k occur in the last W? | tracked-key est bars inside the one-sided band | exact per-key windowed (t,key) ring | `true(W) <= est <= true(W+W/B) + eps*N` | scm.bytes fixed vs ring O(W) |
 | 09 | **DecayedReservoir** | give me k RECENT items | the k-sample by AGE (recent = left) | brute-force decayed sampler (retains O(N)) | inclusion rate by age `~ exp(-lambda*age)` | dr.bytes fixed vs O(N) retained |
+| 10 | **SlidingAggregate** | what is the latency MEAN / min / max over the last W? | windowed mean over time: SA vs oracle vs EH's sum()-derived mean | exact (t, v) ring over the covered span | count / sum / min / max EXACT (equality); EH `sum()` breaks `<= epsilon` on spikes (F17) | sa.bytes fixed vs ring O(W) |
 
 ### 1.8.0 additions (D1-D8) -- what each scene grows to demonstrate the 1.7.0 / 1.8.0 work
 
@@ -224,19 +225,16 @@ D9 (SlidingAggregate scene) is MOVED to v1.9.0 with the member -- excluded here.
     independent of the cadence). All three `overflows` getters are ALWAYS EQUAL (F8: `count()` is
     non-destructive -- expiry moved into the add push, so `overflows` / `degraded` no longer depend on
     query frequency). `slA` and `slB` are shown side by side.
-  - The display `count()` (on `slD`) boxes a double return once per 10Hz tick (the documented
-    one-boxed-return, NOT a library bug); the per-frame `stepShll` calls NO `count()`, so it is honestly
-    0 B/op. A shared steady-state probe (`demo/DemoProbe.mjs`, pinned semi-space) SEES the box in the
-    `shll_render` lane (built at cadence "never" to isolate the render) where the demo's `measureAllocs`
-    gate reads a false 0 -- and proves every per-frame lane is <= 0.5 B/op. The render's cost is
-    **16-32 B per tick, depending on the V8 tier**. 16 B is a STABLE allocation inside the shipped
-    `SlidingHyperLogLog.count()` itself: it is present even Turbofan-only, it is not the return value and
-    not the `slTau` / `slSigma` call boundaries -- a scratch bisect localizes it to the estimator tail and
-    it fires only on non-degenerate (fractional) register data. A SECOND 16 B appears in some runs: when
-    the render is not Turbofan-optimized, `count()`'s integer-valued double return is materialized as a
-    HeapNumber at the call boundary -> 32 B. Nothing in the demo code boxes (`standardError` / `relerr` /
-    the gate each read 0 B). The per-call library cost is a known finding logged in ROADMAP.md, not
-    hidden here. The `shll_render` gate is banded `>= 12 AND <= 40` B/op -- a THIRD box (48 B) fails it.
+  - The display `count()` (on `slD`) runs once per 10Hz tick; the per-frame `stepShll` calls NO
+    `count()`, so it is 0 B/op. A shared steady-state probe (`demo/DemoProbe.mjs`, pinned semi-space)
+    measures the render in the `shll_render` lane (built at cadence "never" to isolate the render), where
+    the demo's `measureAllocs` gate cannot see a transient box. **Since 1.11.0 the render is 0 B per
+    tick**: the library moved the estimator tail into module scratch slots, so `count()` no longer boxes
+    (output bit-identical). From 1.8.0 to 1.10.0 it cost 16-32 B per tick depending on the V8 tier (a
+    stable 16 B in the estimator tail, plus 16 B for the returned double when the render was not
+    Turbofan-optimized) -- the ROADMAP 8 finding that 1.11.0 closed. The `shll_render` gate is `<= 0.5`
+    B/op in EVERY one of 10 fresh pinned children (so a tier-dependent box cannot hide), and the
+    `mustbox` control (>= 12) proves the probe still sees a box.
   - **Oracle-off fail-closed**: with the exact-`Map` oracle toggle off, `renderShllPrep` NaNs `S_TRUE` /
     `S_RELERR` / `S_FRAC` in its cold branch (rendered "n/a", gauge skipped), never a frozen stale number.
 
@@ -271,16 +269,14 @@ D9 (SlidingAggregate scene) is MOVED to v1.9.0 with the member -- excluded here.
   - **Cost, honestly**: `stepDd` (32 values x 4 detectors' `addFrom`) is **0 B/op** in the steady state
     under DEFAULT flags (DemoProbe `dd_frame` + `dd_frame_nolatch` lanes, pinned semi-space, gated
     `<= 0.5 B/op` -- the library holds every value in a `Float64Array` slot end to end, so the frame path
-    never boxes; no `--no-maglev` exemption). The ~10Hz `renderDdPrep` reads SIX fractional `statistic` /
-    `mean` getters in one unit (unlatched PH/CUSUM + the two latched twins). Each getter calls
-    `_guardFinite()`; six of them in one function exhaust V8's cumulative inlining budget, so THREE of the
-    returns run out of line and box ~16 B each -> **~48 B/tick**, a DOCUMENTED cost the DemoProbe `dd_render`
-    lane measures in the band `[44, 52]` (never claimed 0). It is NOT that "V8 will not elide each getter"
-    -- each getter read alone elides to 0 B/op (proven: two/three getters read 0, four read 16, six read
-    48); the box is the cumulative-budget cutoff. Reading fewer getters per tick is not possible without
-    leaving a displayed slot stale (the golden pins them). HEAD's `renderDdPrep` also returned `ps` (a
-    fractional statistic) and boxed a fourth 16 B; the render now returns an int32 fire-count fold, so the
-    ONLY boxes are the three required getter reads.
+    never boxes; no `--no-maglev` exemption). The ~10Hz `renderDdPrep` reads all four detectors through
+    the 1.11.0 render reader `dd.into(row)` -- `[statistic, mean, count, lastDriftIndex, lastDirection]`
+    into one module-scope `Float64Array(5)`, reused per detector -- so the render is **0 B/tick** (DemoProbe
+    `dd_render` lane, gated `<= 0.5`). Every displayed slot is `Object.is` its scalar getter (fresh and
+    after fires). Before 1.11.0 the render read SIX fractional `statistic` / `mean` getters in one unit;
+    each calls `_guardFinite()`, six exhaust V8's cumulative inlining budget, and three returns boxed
+    -> ~48 B/tick. That shape is kept as the MUST-BOX control `dd_getter_box` (>= 12, measures 48), so the
+    render's 0 is the reader, not a blind probe.
 
 ### Scene 07 -- SlidingDDSketch (windowed relative-error quantiles)
 - A positive lognormal stream (its center shifts each lap) flies in via
@@ -334,6 +330,22 @@ D9 (SlidingAggregate scene) is MOVED to v1.9.0 with the member -- excluded here.
     (F6: the large-count return boxes once per call; the render reads through **`estimateInto`**, a
     batch 0-alloc reader over Float64Arrays).
   - Same `w` semantics as `estimate`: a bad sub-window reads NaN (F12), never a fail-open 0.
+  - **As built (demo session, 2026-10-04)**: the truth panel prints `total(W)` beside the oracle N (green
+    when they are equal). The heavy-count toggle adds tracked key 0 ONCE per frame with count 2^30
+    (`SCM_HEAVY_COUNT`), so its windowed count passes 2^31 within a few panes while every Uint32 pane cell
+    stays below 2^32-1 (never saturated); the heavy adds live in their own small oracle ring, so with the
+    toggle off every pre-existing golden slot is unchanged by the toggle. The render reads all tracked keys in ONE
+    `estimateInto` call and returns an int32 fold: `scm_render_heavy` and `scm_frame_heavy` read 0 B/op,
+    while the `scm_estimate_box` control (the scalar `estimate()` of the > 2^31 key) boxes 16.
+  - **Oracle fix found by `total(W)`**: the oracle's ring expiry used `paneEnd(t) <= paneEnd(now) - W`,
+    which dropped the oldest LIVE pane -- its N ran one pane short of `total()` (1985 vs 2049 at defaults)
+    and, since that pane overlaps `(now - W, now]`, every tracked `true(W)` was under-counted too (so the
+    lower side of the bound gate was weaker than claimed). Now `<`: the D7 from-spec test recomputes N and
+    `true(W)` from the deterministic stream on every render (3 W x heavy on/off) and both the oracle and
+    `total()` match exactly. The 10 oracle-derived SCM golden slots are declared exceptions.
+- **D8 contracts line** (SCM truth panel, written once at boot from `scmContracts`): `estimate(k, w=-1)`
+  reads NaN (F12, never a fail-open 0) and a typo'd option (`sede`) throws the library's own
+  did-you-mean message -- both observed LIVE from the shipped class, never demo text.
 
 ### Scene 09 -- DecayedReservoir (recency-biased fixed-k sample)
 - A stream flies in via `addFrom([now, value])` (value = the arrival timestamp, so age =
@@ -346,12 +358,36 @@ D9 (SlidingAggregate scene) is MOVED to v1.9.0 with the member -- excluded here.
   toggle (a sample, not a hard window -- it correctly holds its last decayed sample).
 - Sliders: sample size `k`, `halfLife`.
 
-### Pause the stream (idle-slide) -- the FOUR windowed scenes only
-Scenes 01 / 05 / 07 / 08 (ExponentialHistogram, SlidingHyperLogLog, SlidingDDSketch,
-SlidingCountMin) carry a per-scene "pause the stream" toggle that sets `world.paused`.
+### Scene 10 -- SlidingAggregate (exact windowed count / sum / mean / min / max)
+- The lite-hud latency panel (F17, ADR 0012). Whole-millisecond lognormal latencies (median ~20 ms, mean
+  ~33 ms; `round(exp(3 + z))`, min 1) fly in via `addFrom([now, value])`, 32 per frame on a sim clock
+  (`SA_DT = 1000/60` ms per frame, event j at `frameNow + (j+1) * SA_DT / 32`, by multiplication). The SAME
+  stream feeds an ExponentialHistogram (epsilon 0.05, `maxCount` 8192) as the contrast.
+- **Numeric domain**: W = 1000 ms, B = 32 -> pw = 31.25 (normal); the library's clock bound pw * 2^42 =
+  1.37e14 ms is never near. Whole-ms values (spikes x50 stay integers, max ~5.5e4) keep every windowed sum an
+  exactly representable integer, so the gate is EQUALITY, not a tolerance: count / sum / min / max equal an
+  independent recount from the stream on every render (W 1000 / 4000 x spikes off / on, toggled mid-run).
+  Kahan's fractional-sum guarantee is gated in the library's own tests (ADR 0012), not here.
+- **The F17 contrast**: a spike toggle multiplies 1% of events by 50. EH's `sum()` error is bounded by the
+  straddling bucket's POPULATION, not its value mass, so its relative error vs the true window (now - W, now]
+  breaks its `<= epsilon` intuition (measured max ~14.6% vs epsilon 5% at W = 1000) while SlidingAggregate
+  stays exact; with spikes off EH stays within epsilon. The panel shows the live EH error and its running max.
+- **Render path**: `renderSaPrep` reads the row through `sa.into(out)` (`[count, sum, mean, min, max]`, 0 B),
+  then one exact oracle scan; `renderSaEhPrep` stores `eh.count()` / `eh.sum()` straight into Float64Array
+  slots. All three lanes (`sa_frame`, `sa_render`, `sa_eh_render`) read 0 B/op; the `sa_mean_box` control (the
+  scalar fractional `sa.mean()`) boxes 16. Found while building it: a `cond ? x / y : NaN` ternary merges a
+  computed double with the NaN constant and boxes the phi (16 B each) -- every fractional result is stored
+  from an if / else instead.
+- **Fail-closed**: oracle off -> every oracle slot is NaN ("n/a"); turning it back on HOLDS NaN until a full
+  covered span (W + W/B) has refilled (never a stale "exact"). Pause -> `advanceFrom` idle-slides both members:
+  count / sum read 0, mean / min / max read NaN (null is not zero).
+
+### Pause the stream (idle-slide) -- the FIVE windowed scenes only
+Scenes 01 / 05 / 07 / 08 / 10 (ExponentialHistogram, SlidingHyperLogLog, SlidingDDSketch,
+SlidingCountMin, SlidingAggregate) carry a per-scene "pause the stream" toggle that sets `world.paused`.
 While paused, `stepX` performs NO add: it advances the clock once per frame via the
 member's `advanceFrom([now], 0)` (R11 idle-slide, 0 B/op), so the readout slides to empty
-with no traffic -- count/distinct -> 0, quantile -> NaN, estimate -> 0. This is the
+with no traffic -- count/distinct -> 0, quantile -> NaN, estimate -> 0, SA mean/min/max -> NaN. This is the
 demo's proof of the idle-slide contract. ADWIN / ForwardDecay / HeavyKeeper /
 DriftDetector / DecayedReservoir get NO such toggle (they are item-indexed or decay-based,
 not hard windows).
@@ -396,6 +432,20 @@ lite-sketch verbatim); item 4 is the lite-adaptive family witness.
    behind a **meter self-test control**: a lane KNOWN to box `>= 8 B/op` must read `>= 8`, else the
    readout shows **"n/a (meter blind)"** -- NEVER 0 (null is not zero; a blind meter must not read as a
    clean pass). Absent `performance.memory` (non-Chromium) the whole lane reads "n/a".
+   **As built (demo session, 2026-10-04)**: `runKeyMagLane(meter)` in kernels.mjs, run ON CLICK from the
+   HeavyKeeper truth panel (never the frame path). Method (hardened after review B9, which caught a
+   fail-open clamp of negative readings to "0.0"): every lane is warmed (the control first, then 4 rounds of
+   both key lanes), then the two key lanes run first and the boxing control LAST (8 windows each, all of the
+   SAME 12.5k-op size), so the control's garbage is never collected inside a key-lane window. A negative
+   window is a scavenge and is DROPPED (never clamped); each lane reports the SECOND-largest clean window
+   (one JIT tier-up outlier discarded; a real box shows in every clean window); fewer than 3 clean windows,
+   or a control below 8 B/op, makes the whole result "n/a (meter blind)". **Measured (headless Chrome,
+   `--enable-precise-memory-info`, 4 runs x 8 windows, raw)**: control 12.00 B/op in every clean window (a
+   pointer-compressed HeapNumber; scavenged windows read -66 .. -74 and were dropped); keys in [2^30, 2^31)
+   0.00 in all 32 windows; small keys 0.00 except two single-window tier-up outliers (0.22, 0.50) -> the
+   lane prints 0.0 / 0.0. The 1.8.0 F19 register-local hash path holds on a 31-bit-Smi build: N6 is closed
+   for HK addFrom. Default Chrome (quantized `performance.memory`) reads "n/a (meter blind)" (control 0.00 in
+   every window), exactly as designed.
 
 ---
 

@@ -36,6 +36,10 @@ import {
     createDdWorld, stepDd, stepDdOracle, renderDdPrep, DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD, G_PH_FIRES,
     createSldWorld, stepSld, stepSldOracle, renderSldPrep,
     SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES, SLD_MODE_STRICT, SLD_MODE_RANGE, Q_COUNT,
+    // P4 (SCM D7) lanes
+    createScmWorld, stepScm, stepScmOracle, renderScmPrep, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, C_BOUNDOK,
+    // P5 (SA) lanes
+    createSaWorld, stepSa, stepSaOracle, renderSaPrep, renderSaEhPrep, SA_DEFAULT_W, SA_DEFAULT_PANES, L_COUNT,
 } from './kernels.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -104,11 +108,9 @@ const shll_step_never = {
     setup() { return shllWorldBuilt(Infinity); },
     hot(s, n) { const w = s.w, acc = s.acc; for (let i = 0; i < n; i++) { stepShll(w); acc[0] += (w.sink | 0); } },
 };
-// DOCUMENTED-COST lane (NOT gated at 0): renderShllPrep queries the display twin slD.count() EVERY tick
-// for the display estimate, whose double return boxes ~16 B once per call -- the documented one-boxed-
-// return (lite-law: a query read at 10-15 Hz boxes once; say so). Built with cadence Infinity ("never")
-// so slA is NOT also queried here -- this lane isolates the ONE display-count() box (~16 B), matching the
-// DEMO.md D4 line. It proves the probe SEES that 16 B the measureAllocs gate reads as a false 0.
+// GATED render lane: renderShllPrep reads the display twin through slD.countInto(row) EVERY tick (1.11.0,
+// 0 B/call; from 1.8.0 to 1.10.0 the scalar count() boxed 16-32 B here). Built with cadence Infinity
+// ("never") so slA is NOT also queried -- the lane isolates the display read. Teeth: the mustbox control.
 const shll_render = {
     setup() { return shllWorldBuilt(Infinity); },
     hot(s, n) { const w = s.w, a = s.a, acc = s.acc, flat = w.flat; for (let i = 0; i < n; i++) { renderShllPrep(w, a); acc[0] += flat[S_OVF_A]; } },
@@ -198,8 +200,8 @@ const ad_render_preset = adRenderLane(0.002, 5, 0, 'bigJumpThenPlus1', 1300);
 
 // ---------------------------------------------------------------------------
 // P3 (DD / SLD) lanes. DD frame = stepDd feeding the UNLATCHED + LATCHED twins (4 detectors, addFrom
-// unboxed); DD render = renderDdPrep (six fractional statistic / mean getters, each behind a
-// _guardFinite() branch V8 will not fully inline -- a DOCUMENTED ~48 B/tick box, see dd_render's band).
+// unboxed); DD render = renderDdPrep through dd.into(row) (1.11.0, gated 0; the dd_getter_box control
+// keeps the old six-getter shape, which boxes ~48 B/tick, so the 0 has teeth).
 // SLD frame = stepSld in RANGE mode (the rejected-value advanceFrom path engaged); SLD render =
 // renderSldPrep through quantileInto (F5, 0 B/call). The MUST-BOX control sld_quantile_box sinks the
 // scalar sd.quantile() return (its documented one boxed 16 B), proving the render's 0 is genuine
@@ -226,13 +228,76 @@ const dd_frame_nolatch = {
     setup() { return ddWorldBuilt(false); },
     hot(s, n) { const w = s.w, acc = s.acc; for (let i = 0; i < n; i++) { stepDd(w); acc[0] += (w.sink | 0); } },
 };
-// DOCUMENTED-COST render lane (NOT gated at 0): renderDdPrep (~10Hz) reads six fractional statistic / mean
-// getters in one unit. Each calls _guardFinite() (Adaptive.js); six of them in one function exhaust V8's
-// cumulative inlining budget, so three run out of line and their fractional returns box -- ~48 B/tick, a
-// documented cost (dd_render band [44, 52] in the P3 test).
+// GATED render lane: renderDdPrep (~10Hz) reads all four detectors through dd.into(row) (1.11.0), 0 B/tick.
 const dd_render = {
     setup() { return ddWorldBuilt(true); },
     hot(s, n) { const w = s.w, a = s.a, acc = s.acc, flat = w.flat; for (let i = 0; i < n; i++) { renderDdPrep(w, a); acc[0] += (flat[G_PH_FIRES] | 0); } },
+};
+// MUST-BOX control for dd_render: the pre-1.11.0 render shape -- the SIX scalar statistic / mean getters
+// read in one unit into Float64Array slots. Six _guardFinite() getters exhaust V8's cumulative inlining
+// budget, so some returns box (~48 B/tick before 1.11.0). If this reads 0 the dd_render 0 has no teeth.
+function ddGetterRender(w, out) {
+    const ph = w.ph, cu = w.cu, phL = w.phL, cuL = w.cuL;
+    out[0] = ph.statistic; out[1] = cu.statistic; out[2] = ph.mean; out[3] = cu.mean;
+    out[4] = phL.statistic; out[5] = cuL.statistic;
+    return (w.phFires + w.cuFires) | 0;
+}
+const dd_getter_box = {
+    setup() { const s = ddWorldBuilt(true); s.out = new Float64Array(6); return s; },
+    hot(s, n) { const w = s.w, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) acc[0] += ddGetterRender(w, out); },
+};
+
+// P4 (SCM D7) lanes, heavy-count mode ENGAGED (tracked key 0's windowed count > 2^31). Frame = stepScm (the
+// stream + one heavy addFrom per frame) + stepScmOracle; render = renderScmPrep through estimateInto +
+// total(): both GATED 0. MUST-BOX control scm_estimate_box sinks the scalar estimate() of the > 2^31 key
+// into a PACKED array (its documented F6 boxed return), so the render's 0 is genuine estimateInto elision.
+function scmWorldBuilt() {
+    const w = createScmWorld(4096, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0x5C40);
+    w.heavy = true;
+    const a = createAllocState();
+    for (let i = 0; i < 200; i++) { stepScm(w); stepScmOracle(w, a); }
+    return { w, a, acc: new Float64Array(1) };
+}
+const scm_frame_heavy = {
+    setup() { return scmWorldBuilt(); },
+    hot(s, n) { const w = s.w, a = s.a, acc = s.acc; for (let i = 0; i < n; i++) { stepScm(w); stepScmOracle(w, a); acc[0] += (w.sink | 0); } },
+};
+const scm_render_heavy = {
+    setup() { return scmWorldBuilt(); },
+    hot(s, n) { const w = s.w, a = s.a, acc = s.acc, flat = w.flat; for (let i = 0; i < n; i++) { renderScmPrep(w, a); acc[0] += (flat[C_BOUNDOK] | 0); } },
+};
+const SCM_BOX_ARR = [{}, 0];
+const scm_estimate_box = {
+    setup() { return scmWorldBuilt(); },
+    hot(s, n) { const scm = s.w.scm, acc = s.acc; for (let i = 0; i < n; i++) { SCM_BOX_ARR[1] = scm.estimate(0); acc[0] += 1; } },
+};
+
+// Scene 10 (SA) lanes, spike mode ENGAGED. Frame = stepSa (32 unboxed addFrom into SlidingAggregate AND the
+// EH contrast) + stepSaOracle; render = renderSaPrep (sa.into + the exact oracle scan) and the EH contrast
+// renderSaEhPrep (eh.count() / eh.sum() stored straight into world.ehAcc slots): all GATED 0. MUST-BOX control sa_mean_box sinks the scalar fractional sa.mean() into a PACKED array.
+function saWorldBuilt() {
+    const w = createSaWorld(SA_DEFAULT_W, SA_DEFAULT_PANES);
+    w.spikes = true;
+    const a = createAllocState();
+    for (let i = 0; i < 200; i++) { stepSa(w); stepSaOracle(w, a); }
+    return { w, a, acc: new Float64Array(1) };
+}
+const sa_frame = {
+    setup() { return saWorldBuilt(); },
+    hot(s, n) { const w = s.w, a = s.a, acc = s.acc; for (let i = 0; i < n; i++) { stepSa(w); stepSaOracle(w, a); acc[0] += (w.sink | 0); } },
+};
+const sa_render = {
+    setup() { return saWorldBuilt(); },
+    hot(s, n) { const w = s.w, a = s.a, acc = s.acc, flat = w.flat; for (let i = 0; i < n; i++) { renderSaPrep(w, a); acc[0] += (flat[L_COUNT] | 0); } },
+};
+const sa_eh_render = {
+    setup() { const s = saWorldBuilt(); renderSaPrep(s.w, s.a); return s; },
+    hot(s, n) { const w = s.w, acc = s.acc; for (let i = 0; i < n; i++) { renderSaEhPrep(w); acc[0] += 1; } },
+};
+const SA_BOX_ARR = [{}, 0];
+const sa_mean_box = {
+    setup() { return saWorldBuilt(); },
+    hot(s, n) { const sa = s.w.sa, acc = s.acc; for (let i = 0; i < n; i++) { SA_BOX_ARR[1] = sa.mean(); acc[0] += 1; } },
 };
 
 function sldWorldBuilt(mode) {
@@ -277,9 +342,11 @@ export const LANES = {
     ad_render_default, ad_render_offset, ad_render_preset,
     ad_mean_sink, ad_variance_sink,
     // P3 DD / SLD. dd_frame + dd_frame_nolatch are 0-B/op frame lanes gated <= 0.5 under DEFAULT flags;
-    // dd_render is a DOCUMENTED band [44, 52] (six _guardFinite getters, three box); sld_quantile_box is a
+    // dd_render is GATED 0 (dd.into, 1.11.0) and dd_getter_box is its MUST-BOX control; sld_quantile_box is a
     // MUST-BOX control (the scalar quantile() return, >= 12); sld render/frame lanes are 0-B/op.
-    dd_frame, dd_frame_nolatch, dd_render,
+    dd_frame, dd_frame_nolatch, dd_render, dd_getter_box,
+    scm_frame_heavy, scm_render_heavy, scm_estimate_box,
+    sa_frame, sa_render, sa_eh_render, sa_mean_box,
     sld_frame_range, sld_frame_strict, sld_render, sld_quantile_box,
 };
 

@@ -496,7 +496,7 @@ witness `ok`. The gates are green on code that has every finding below.
 | F18 | NEW (found by QA, 2026-09-25; pre-existing in 1.6.0, missed by the audit) | ADWIN's range term R = max - min is a running min/max over ALL raw x that never shrinks after a cut. After one large level shift, the Bernstein range term stays inflated for the instance's lifetime. Measured, 5 seeds: a later +1 shift is caught in 87-99 items with no earlier jump, 921-988 items after an earlier jump of 100, and NEVER within 20000 items after an earlier jump of 1e4 or 1e6. A straddling mixed bucket also persists (a window variance of ~2.7e8 instead of 1 after a 1e6 jump). It fails open, and lite-hud M6 uses ADWIN. Identical output on 1.6.0. SETTLED (maintainer): fix in 1.7.0 with per-bucket min/max, so R is the live window's range. |
 | S1 | REPRODUCED | CUSUM(target 0, delta .5, threshold 8) with a +10 step: 5000 alarms in 5000 items. No `lastDriftIndex` / `lastDirection`. |
 | S2/S4/S5 | REPRODUCED | SCM has no `total`. SCM `seed` 2^32+1 reads 1 (HK throws). `lastNow` reads 0 before the first add (SHLL/SDD/SCM). The ADWIN/DD empty `mean` is 0. |
-| N6 | OPEN | this Node (arm64) has 32-bit Smis: `%IsSmi(2**31-1)` true. Every Node 0 on a key in [2^30, 2^31) says nothing about Chrome. |
+| N6 | CLOSED for HK addFrom (2026-10-04, demo S11) | this Node (arm64) has 32-bit Smis: `%IsSmi(2**31-1)` true. Every Node 0 on a key in [2^30, 2^31) says nothing about Chrome. Measured in headless Chrome (`--enable-precise-memory-info`, self-tested meter, 4 runs x 8 windows of 12.5k ops, raw): control 12.00 B/op in every clean window; HeavyKeeper.addFrom 0.00 B/op in all 32 windows for keys in [2^30, 2^31) (DEMO.md item 6). Other members' key paths are not yet measured in-browser. |
 
 **Method corrections (these change how the N gates are built):**
 1. **The scavenge-to-bytes ratio is not fixed.** Under `--max-semi-space-size=4`, 16 B/op reads 24
@@ -1233,7 +1233,7 @@ llms.txt, SHLL ADR + 0007 amendments, CHANGELOG. Readers only, no other behavior
   measure-and-document only (mega5 INFO: SCM 49, SDD 70.5). SHLL `countInto` + DD `statisticInto` /
   `meanInto` moved to 1.11.0.
 
-## 12. v1.11.0 -- zero-alloc READERS (one feature)  [CODE COMPLETE -- 2026-09-28; release pending]
+## 12. v1.11.0 -- zero-alloc READERS (one feature)  [SHIPPED -- 1.11.0, committed 0728d80]
 
 Planned 2026-09-28 by the coordinator (no planner spawn -- the brief was 10.1 section 8; facts checked in
 code). One feature per minor: two new 0-alloc render readers, no other behavior change.
@@ -1337,7 +1337,7 @@ After 1.11.0: the demo session (section 11) -- the DD scene reads `dd.into`, its
   hardcoded NaN would DIVERGE from the getters after a reset. `into` now reads slots 3-4 from `_s`, and the
   S1 wording was corrected (12.1).
 
-## 11. The demo session (repo-only; no npm release)  [PLANNED]
+## 11. The demo session (repo-only; no npm release)  [SHIPPED -- 2026-10-04, working tree; see 11.2]
 
 Finish demo/ for 1.7.0 -- 1.10.0. The tree already holds P0-P2 (APPROVED + QA'd) and P3 (the DD / SDD
 blockers fixed, NOT yet re-reviewed). Run after 1.11.0 (the readers), so the DD scene reads the new `Into`
@@ -1353,5 +1353,134 @@ readers (render 0 B/tick) and the `dd_frame` `todo` becomes a real <= 0.5 gate.
   renderXPrep (tested); NaN renders "n/a" neutral; no layout call in a rebuild; reviewers run BOTH
   demo test files.
 - Exit: full `npm run demo` green, reviewer approves the DEMO AUDIT, a repo-only CHANGELOG note.
+
+**Static audit findings (coordinator + maintainer, 2026-10-04, demo/index.html at 0728d80).** Baseline:
+`npm run demo:check` 151 pass / 0 fail / 13 skipped / 1 todo (`dd_frame`). Fold these into P5 (each one
+becomes a DEMO AUDIT rule with an injected-violation control):
+- BUG: duplicate ids `eh-eps` (slider + the relerr-eps readout) and `dr-hl` (slider + the
+  "half-life / lambda" readout). `$()` returns the first match, so `ehDom.eps` / `drDom.hl` write
+  textContent INTO THE `<input>` and both readouts stay at their placeholder. Rename the readout spans.
+- Per-frame closures: `adDraw` (`const y = (v) => ...`) and `fdDraw` (`const mapV = (v) => ...`) build a
+  closure every frame. Hoist them to module-level functions.
+- Layout thrash in `sizeCanvas`: read rect -> write `width` / `height` -> the next canvas reads again, so a
+  scene layout forces one synchronous reflow per canvas (4-6). Not per frame (resize / tab switch only).
+  Read all rects first, then write.
+- 15 `$('...')` lookups inside input handlers (the `*-v` slider labels and rebuild paths). Cache them at init.
+- `toFixed`: 75 sites, all in the `(frameN & 7) === 0` ticks (~7.5 Hz), rebuilds or input handlers --
+  compliant with the demo law. Upgrade: write-on-change (quantize to an integer key, skip the format AND the
+  DOM write when the key is unchanged). Do NOT use `((v * 100) | 0) / 100`: it truncates (0.29 -> 0.28,
+  1.13 -> 1.12), rounds negatives toward zero, wraps past 2^31 / 100, drops trailing zeros (width jitter),
+  and still allocates the string.
+- Not yet adopted: the DD scene does not read `dd.into` and the SHLL scene does not read `shll.countInto`
+  (1.11.0); the `dd_frame` todo stays until it does.
+
+### 11.1 Executable plan (coordinator, 2026-10-04; SETTLED -- maintainer may override on the ping)
+
+Measured 2026-10-04 at 0728d80 (facts, not plan):
+- **The full `npm run demo` is RED.** The QA `shll_render` lane is still classified `box` and the QA x10
+  test still demands the 1.8.0 band [12, 40]; 1.11.0 made `count()` 0-box, so it reads 0 ("the display box
+  must stay visible (>= 12 B/op), got 0"). The 1.11.0 cycle re-cut only `Demo.test.mjs`. `demo:check`
+  (FAST) skips this lane, which is why the release missed it.
+- **`dd_frame` / `dd_frame_nolatch` already read 0 B/op** (readings 0,0,0,0,0,0): 1.10.0 fixed the latched-PH
+  box. The two `todo` markers are stale (a passing todo never fails the run).
+- `dd_render` reads 48 B/op (the documented [44, 52] band: six getters, three box). `dd.into` removes it.
+- The library is DONE for this session: `Adaptive.js` must stay byte-identical (`git diff --quiet
+  Adaptive.js` is an exit gate). A demo finding in the library goes to the ledger, not into the code.
+
+SETTLED:
+- D-S1 Readers: `renderDdPrep` reads each detector through `dd.into(out)` into ONE module-scope
+  `Float64Array(5)` (reused across the 4 detectors); `renderShllPrep`'s display twin reads `countInto`.
+  `dd_render` becomes a `zero` lane (<= 0.5); add a MUST-BOX control `dd_getter_box` (sinks the six scalar
+  getters, >= 12) so the 0 has teeth. Every displayed slot `Object.is` its getter (faithfulness test).
+- D-S2 `shll_render` is a `zero` lane; the QA x10 test becomes "every one of 10 fresh pinned children reads
+  <= 0.5" (tier independence), teeth from the existing `mustbox` lane. DEMO.md D4 text: 0 B/tick since 1.11.0.
+- D-S3 Duplicate ids: the READOUT spans are renamed `eh-eps-r` / `dr-hl-r` (the sliders keep their ids, so
+  no handler changes).
+- D-S4 `toFixed` (RE-SETTLED 2026-10-04 during B4): write-on-change helpers in index.html. Numeric
+  readouts go through `putFixed(el, slot, f, idx, scale, digits, suffix)` / `putInt` / `putNum` / `putExp`
+  / `putSmi`: the key is the value quantized to the shown digits (or the int32 / raw value), kept in a
+  module `Float64Array` (+ a `Uint8Array` seen flag); an unchanged key = no format, no string, no DOM write.
+  The string is built FROM the key (`(q / 10^digits).toFixed(digits)`), so a skipped write cannot leave a
+  stale number; NaN renders "n/a". The helpers take `(f, idx)` and read the slot INSIDE, so no fractional
+  double crosses a call (the 1.11.0 lesson). Composite strings ("a / b", "x vs y") use `setText` /
+  `setClass` (string compare, write only on change) -- per-site multi-input keys were rejected as a
+  stale-display risk. The `|0` truncation trick is REJECTED (0.29 -> 0.28, negatives toward zero, wraps
+  past 2^31/100, still allocates the string). Index.html allocation is not probe-measurable in node, so
+  no B/op claim is made for it.
+- D-S5 `sizeCanvas` becomes two-phase: each `*Layout` reads every canvas rect first (into a module
+  `Float64Array`), then writes every `width` / `height`. One reflow per layout, not one per canvas.
+- D-S6 The DEMO AUDIT is its own file `demo/DemoAudit.test.mjs` (added to both `demo` scripts), reading
+  index.html as text. Rules = DEMO.md section 5-6 law PLUS: unique ids; every `$('x')` id exists; no
+  `$(` / `getElementById` / `querySelector` inside any function body (init only); no arrow / `function`
+  literal inside a `*Draw` / `*Step` / `loop` body; no layout READ after a layout WRITE in one function
+  body; no raw `.textContent =` / `.className =` in a `*Tick` (every write goes through put* / `setText` /
+  `setClass`), and `toFixed` in a `*Tick` only inside a `setText` composite ("a / b"). Each rule has an
+  injected-violation control (mutate a copy of the text, assert the rule fires). The write-on-change LAW
+  itself (no stale display, NaN <-> number, 0 first key) is already gated behaviorally by the B4-fix test
+  in Demo.test.mjs (review B5 MAJOR 5); D-S6 adds the static rules, incl. unique ids (B5 M3).
+- D-S7 SlidingAggregate scene (Scene 10, formerly D9). Numeric domain: a sim clock in ms from 0, dt = 1000/60,
+  W = 1000, B = 32 -> pw = 31.25 (normal), nowMax = pw * 2^42 = 1.37e14 (a session never nears it); values
+  lognormal latencies (mu = 3, sigma = 1) plus a 1% spike x50 toggle, all far under SA_X_MAX. Oracle = exact
+  covered-span sum over a typed ring (count / min / max exact, sum within the ADR 0012 bound). The EH `sum()`
+  on the same stream is drawn beside it (the F17 failure). Render through `sa.into(out)` at 0 B/tick. Pause
+  toggle uses `advance(now)` (idle-slide to empty -> mean / min / max "n/a", count 0, sum 0).
+- D-S8 The maintainer's own audit findings (in progress) are pasted on the ping; index.html items join B3,
+  kernel items join B2. They do not re-open this plan.
+
+Batches (ONE job per coder; coordinator runs the FULL `npm run demo` + `npm test` after every batch; every
+coder gets the standard no-history-git rule and must not touch Adaptive.js):
+- **B1 (coder; Demo.qa.test.mjs + Demo.test.mjs + DEMO.md only) -- re-baseline to 1.11.0.** D-S2; un-todo
+  `dd_frame` / `dd_frame_nolatch` (class `zero`, delete LANE_TODO + the `todo` option). Revert check: on a
+  scratch copy of the demo pointed at `git show dba0116:Adaptive.js`, the new `shll_render` gate is RED.
+  Gate: full `npm run demo` green, 0 todo.
+- **B2 (coder; kernels.mjs + DemoProbe.mjs + both demo tests) -- readers.** D-S1. Revert check: render
+  through the getters again on a scratch copy -> `dd_render` gate RED.
+- **B3 (coder; index.html only) -- static fixes.** D-S3, D-S5, hoist the `adDraw` / `fdDraw` closures to
+  module functions, cache the 15 handler lookups at init.
+- **B4 (coder; index.html only) -- D-S4** putFixed / putInt over every `*Tick` readout.
+- **B5 (reviewer)** -- P3 re-review (DD / SDD) + the B1-B4 diff. DIFF + mutant list, "report by turn 25".
+  Rework cap 2 rounds; fix rounds re-run by the coordinator.
+- **B6 (coder) -- P4:** SCM D7 (render through `estimateInto`; `total(w)` beside the ORACLE N; the band from
+  the oracle N; heavy-count mode) + D8 (the Truth Panel contracts line: bad sub-window -> NaN, typo'd option
+  -> did-you-mean, both live from the library).
+- **B7a (coder; DEMO.md + kernels.mjs + tests) -- the SA scene engine** (D-S7): createSaWorld / stepSa /
+  stepSaOracle / renderSaPrep; gates: faithfulness, frame 0 B/op, render 0 B/op + a must-box scalar
+  `sa.mean()` control, idle-slide to empty, oracle-off NaN writes.
+- **B7b (coder; index.html only) -- the SA scene UI** (tab, canvas, readouts through putFixed, pause).
+- **B8 (coder) -- P5:** D-S6 DemoAudit.test.mjs (every rule RED on its injected control, GREEN on the tree)
+  + the S11 Chromium-only key-magnitude readout (a meter self-test; "n/a" off-Chromium, never 0).
+- **B9 (reviewer)** -- B6-B8 diff + approve the DEMO AUDIT. **B10 (qa)** -- boundary pass over the scenes.
+  **B11 (coordinator)** -- repo-only CHANGELOG `[Unreleased]` demo note, this section -> SHIPPED.
+
+Exit: full `npm run demo` green with 0 todo; `DemoAudit.test.mjs` green with every control RED; `npm test`
+860/860; `git diff --quiet Adaptive.js`; reviewer approves the DEMO AUDIT; no npm release.
+
+### 11.2 What shipped vs the plan (2026-10-04)
+
+Exit met: `npm run demo` (Demo.test + Demo.qa.test + DemoAudit.test + DemoSession.qa.test) green, 0 todo;
+`demo:check` green; `npm test` 860/860; `Adaptive.js` byte-identical to 1.11.0. Review: B5 REJECTED (3
+blockers + 2 majors, all fixed and re-verified by the coordinator), B9 REJECTED (5 blockers + 1 major, all
+fixed; the reviewer's own harnesses re-run GREEN), QA B10: 26 boundary cases, 8 findings (QA-1..8) fixed and
+turned into gates. The rework cap (2 review rounds) was reached, so the final DEMO AUDIT sign-off is the
+COORDINATOR's, not a reviewer's: its rules now catch the B9 reviewer's own mutants (handler / toggle-callback
+lookups, the D-S5 revert) and QA-5..8, each kept as a control or gate. A fresh reviewer may re-audit.
+- Coordinator ran B1-B8 directly (no coder spawned): each batch was small and the full-suite run after it
+  was the gate. Subagents: 2 reviewers + 1 QA.
+- Found by the new readouts, not planned: the SCM demo oracle expired the oldest LIVE pane (`<=`), so its N
+  and every tracked true(W) ran one pane short -- the bound gate was weaker than claimed (DEMO.md D7).
+- Found by measurement: a `cond ? x / y : NaN` ternary boxes its phi (16 B), and a returned double > 2^31
+  boxes at the call boundary (renderScmPrep) -- both fixed; recorded as suite-wide patterns.
+- D-S4 RE-SETTLED during B4 (composites via setText / setClass; the numeric helpers take (f, idx)).
+- D-S7 refined: whole-ms latencies (exact-equality gate) and an EH `maxCount` of 8192.
+- S11 hardened after B9: no clamping, scavenged windows dropped, same window size for every lane, second-
+  largest clean window, fail-closed on a throwing / infinite / zero-ops meter. N6 CLOSED for HK addFrom
+  (raw: control 12.00 B/op, keys in [2^30, 2^31) 0.00 in 32/32 windows, headless Chrome, precise info).
+
+Ledger (open, for a later session):
+- N6 for the other key-hashing members (SlidingHyperLogLog, SlidingCountMin) is not yet measured in a
+  browser; the S11 lane only drives HeavyKeeper.addFrom.
+- `activate()` keeps ONE intentional forced reflow per tab switch (a hidden scene has no geometry to
+  pre-measure), documented in index.html; not a per-frame cost.
+- Still open from 1.10.0: H2-5 megamorphic-site boxing (state slab), the EH addFrom 0.95x residue.
 
 
