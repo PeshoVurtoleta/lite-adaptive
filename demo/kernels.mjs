@@ -2131,7 +2131,17 @@ export function createScmWorld(W, epsilon, panes, seed) {
         // oracle-derived slot in either state -- never a verdict on an unchecked state.
         oracleOn: true, resumeNow: -Infinity,
         hT: new Float64Array(SCM_HEAVY_RING), hMask: SCM_HEAVY_RING - 1, hHead: 0, hTail: 0,
+        // C_TOTAL source (2026-10-04): the library's OWN per-pane arrays, so the render sums total() in a
+        // LOCAL instead of calling it (see renderScmPrep). null -> the render falls back to scm.total().
+        libPaneEnd: null, libPaneTotal: null,
     };
+    // Bind the total() arrays only if their shape is exactly what total() sums (ctor-allocated, never
+    // reassigned: B + 1 Float64 slots each). Any other shape fails closed to the scm.total() call.
+    const lpe = scm._paneEnd, lpt = scm._paneTotal, ring = scm.panes + 1;
+    if (lpe instanceof Float64Array && lpt instanceof Float64Array && lpe.length === ring && lpt.length === ring &&
+        typeof scm._now === 'number' && scm._W === scm.W) {
+        world.libPaneEnd = lpe; world.libPaneTotal = lpt;
+    }
     fillScmStream(world);
     return world;
 }
@@ -2309,8 +2319,23 @@ export function renderScmPrep(world, allocState) {
     flat[C_SKETCH_ALLOC] = allocState.sketchCount;
     flat[C_ORACLE_ALLOC] = allocState.oracleCount;
     // D7: the library's own exact windowed N, displayed BESIDE the oracle N as its own faithfulness check.
-    const tot = scm.total();
-    flat[C_TOTAL] = tot;
+    // Summed HERE from the library's own per-pane arrays with total()'s exact loop (same live-pane rule
+    // paneEnd > now - W, same p order), so C_TOTAL is Object.is-identical to scm.total() -- an unset
+    // instance sums to 0 too (clear() zeroes paneTotal). Not a call: in heavy mode N > 2^31, and whenever
+    // TurboFan does not inline total() its returned double boxes 16 B/call (DemoProbe scm_render_heavy
+    // under --no-turbo-inlining). The sum lands in the flat slot in each branch, never in a phi.
+    const lpt = world.libPaneTotal;
+    if (lpt !== null) {
+        const lpe = world.libPaneEnd, ring = lpt.length, cut = scm._now - scm._W;
+        let sum = 0;
+        for (let p = 0; p < ring; p++) {
+            if (lpe[p] > cut) sum += lpt[p];
+        }
+        flat[C_TOTAL] = sum;
+    } else {
+        flat[C_TOTAL] = scm.total();
+    }
+    const tot = flat[C_TOTAL];
     flat[C_TOTALOK] = tot === nW ? 1 : 0;
     flat[C_HEAVY] = world.heavy ? 1 : 0;
     // Oracle off / refilling after a resume: NaN every oracle-derived slot (the estimates, total(),

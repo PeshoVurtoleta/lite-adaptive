@@ -47,6 +47,10 @@ The demo session (ROADMAP section 11). `Adaptive.js` is byte-identical to 1.11.0
 - Readouts: every ~10Hz readout is write-on-change (no format and no DOM write for an unchanged value; NaN
   renders "n/a"); a count above 2^31 no longer wraps through an int32 fold; `fmtNum(NaN)` renders "n/a".
 - The tab bar scrolls instead of clipping the last tabs; the space bar pauses every scene.
+- The SlidingCountMin render boxed 16 B per tick in heavy mode whenever V8 did not inline `scm.total()` (a
+  1-in-5 failure of the `scm_render_heavy` probe, 16 B in every window). The render now sums the library's
+  own per-pane totals in its body (the value is identical to `total()`), and the lane is also gated under
+  `--no-turbo-inlining`.
 
 ## [1.11.0] - 2026-09-28
 
