@@ -507,6 +507,12 @@
             padding: 3px 0;
         }
 
+        /* a long value under its label (the S11 per-member rows) */
+        .stat-row.stack {
+            flex-direction: column;
+            gap: 0.125rem;
+        }
+
         .stat-row .k {
             color: var(--text-faint);
         }
@@ -1235,15 +1241,18 @@
                                                                                              id="hk-heap">n/a</span>
                             </div>
                             <div class="secondary-label">secondary - 31-bit-Smi key lane (S11, Chromium-only)</div>
-                            <div class="stat-row"><span class="k">addFrom: small vs [2^30, 2^31) keys</span>
-                                <button class="btn" id="hk-smi31-run">measure</button>
+                            <div class="stat-row"><span class="k">addFrom B/op by key class, per member</span>
+                                <button class="btn" id="hk-smi31-run">measure all</button>
                             </div>
-                            <div class="stat-row"><span class="v" id="hk-smi31">not run</span></div>
+                            <div class="stat-row stack"><span class="k">HeavyKeeper</span><span class="v" id="hk-smi31">not run</span></div>
+                            <div class="stat-row stack"><span class="k">SlidingHyperLogLog</span><span class="v" id="hk-smi31-shll">not run</span></div>
+                            <div class="stat-row stack"><span class="k">SlidingCountMin</span><span class="v" id="hk-smi31-scm">not run</span></div>
                             <p class="help-line">
-                                On a 31-bit-Smi build a key in [2^30, 2^31) is a HeapNumber. Measured from
-                                <code>performance.memory</code> deltas, self-tested by a control that MUST box: a meter
-                                that cannot see it reads "n/a (meter blind)", never 0. Precise numbers need
-                                <code>--enable-precise-memory-info</code>.
+                                On a 31-bit-Smi build a key in [2^30, 2^31) is a HeapNumber. Every member that hashes an
+                                integer key is driven through its zero-box <code>addFrom</code> with small, [2^30, 2^31),
+                                &gt;= 2^31 and large negative (&lt;= -(2^30 + 1)) keys. Measured from <code>performance.memory</code> deltas,
+                                self-tested by a control that MUST box: a meter that cannot see it reads "n/a (meter
+                                blind)", never 0. Precise numbers need <code>--enable-precise-memory-info</code>.
                             </p>
                         </div>
                     </div>
@@ -2140,7 +2149,7 @@
         createScmWorld, stepScm, stepScmOracle, renderScmPrep,
         SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, SCM_DEFAULT_SEED, SCM_TRACKED, SCM_STRIDE,
         C_BOUNDOK, C_SATURATED, C_NLIVE, C_N, C_SKETCH_BYTES, C_ORACLE_BYTES, C_SKETCH_ALLOC, C_ORACLE_ALLOC,
-        C_TOTAL, C_TOTALOK, scmContracts, runKeyMagLane, keyMagText,
+        C_TOTAL, C_TOTALOK, scmContracts, runKeyMagLane, keyMagText, keyMagClass, KM_MEMBERS,
         createSaWorld, stepSa, stepSaOracle, renderSaPrep, renderSaEhPrep, SA_DEFAULT_W, SA_DEFAULT_PANES,
         L_COUNT, L_SUM, L_MEAN, L_MIN, L_MAX, L_TCOUNT, L_TSUM, L_TMEAN, L_EXACT, L_EHMEAN, L_EHREL, L_EHRELMAX,
         L_EHEPS, L_SKETCH_BYTES, L_ORACLE_BYTES, L_SKETCH_ALLOC, L_ORACLE_ALLOC,
@@ -4456,14 +4465,18 @@
         saDom.mem.textContent = (saWorld.sa.bytes / 1024).toFixed(2) + ' KB';
     }
 
-    // S11 (D8): the Chromium-only key-magnitude lane, run ON DEMAND (a click -- never the frame path). The
-    // meter closure and the result object are cold allocations by design.
-    const $hkSmi31 = $('hk-smi31');
+    // S11 (D8): the Chromium-only key-magnitude lane, run ON DEMAND (a click -- never the frame path), one row
+    // per hashed-key member (ROADMAP 13, in KM_MEMBERS order). The meter closure and the result objects are cold
+    // allocations by design.
+    const $KM_ROWS = [$('hk-smi31'), $('hk-smi31-shll'), $('hk-smi31-scm')];
     $('hk-smi31-run').addEventListener('click', () => {
         const pm = performance.memory;
-        const r = runKeyMagLane(pm && typeof pm.usedJSHeapSize === 'number' ? () => performance.memory.usedJSHeapSize : undefined);
-        $hkSmi31.textContent = keyMagText(r);
-        $hkSmi31.className = r.state === 'ok' ? 'v inband' : 'v';
+        const meter = pm && typeof pm.usedJSHeapSize === 'number' ? () => performance.memory.usedJSHeapSize : undefined;
+        for (let i = 0; i < $KM_ROWS.length; i++) {
+            const r = runKeyMagLane(meter, undefined, KM_MEMBERS[i]);
+            $KM_ROWS[i].textContent = keyMagText(r);
+            $KM_ROWS[i].className = keyMagClass(r);
+        }
     });
 
     const $saWV = $('sa-w-v');

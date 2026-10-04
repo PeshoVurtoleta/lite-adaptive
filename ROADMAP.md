@@ -496,7 +496,7 @@ witness `ok`. The gates are green on code that has every finding below.
 | F18 | NEW (found by QA, 2026-09-25; pre-existing in 1.6.0, missed by the audit) | ADWIN's range term R = max - min is a running min/max over ALL raw x that never shrinks after a cut. After one large level shift, the Bernstein range term stays inflated for the instance's lifetime. Measured, 5 seeds: a later +1 shift is caught in 87-99 items with no earlier jump, 921-988 items after an earlier jump of 100, and NEVER within 20000 items after an earlier jump of 1e4 or 1e6. A straddling mixed bucket also persists (a window variance of ~2.7e8 instead of 1 after a 1e6 jump). It fails open, and lite-hud M6 uses ADWIN. Identical output on 1.6.0. SETTLED (maintainer): fix in 1.7.0 with per-bucket min/max, so R is the live window's range. |
 | S1 | REPRODUCED | CUSUM(target 0, delta .5, threshold 8) with a +10 step: 5000 alarms in 5000 items. No `lastDriftIndex` / `lastDirection`. |
 | S2/S4/S5 | REPRODUCED | SCM has no `total`. SCM `seed` 2^32+1 reads 1 (HK throws). `lastNow` reads 0 before the first add (SHLL/SDD/SCM). The ADWIN/DD empty `mean` is 0. |
-| N6 | CLOSED for HK addFrom (2026-10-04, demo S11) | this Node (arm64) has 32-bit Smis: `%IsSmi(2**31-1)` true. Every Node 0 on a key in [2^30, 2^31) says nothing about Chrome. Measured in headless Chrome (`--enable-precise-memory-info`, self-tested meter, 4 runs x 8 windows of 12.5k ops, raw): control 12.00 B/op in every clean window; HeavyKeeper.addFrom 0.00 B/op in all 32 windows for keys in [2^30, 2^31) (DEMO.md item 6). Other members' key paths are not yet measured in-browser. |
+| N6 | CLOSED for every hashed-key member (HK 2026-10-04 demo S11; SHLL + SCM ROADMAP 13) | this Node (arm64) has 32-bit Smis: `%IsSmi(2**31-1)` true. Every Node 0 on a key in [2^30, 2^31) says nothing about Chrome. Measured in headless Chrome 154 (`--enable-precise-memory-info`, self-tested meter, 4 runs x 8 windows of 12.5k ops per member x class, raw): control 12.00 B/op in every clean window; HeavyKeeper / SlidingHyperLogLog / SlidingCountMin `addFrom` print 0.0 B/op (the lane's second-largest clean window) for small, [2^30, 2^31), >= 2^31 and <= -(2^30 + 1) keys in 4/4 runs; raw key windows 0.0013 - 0.0051, a per-window constant (it falls 4x at 4x ops; a box is 12 in every window); 3 of 384 raw key windows were single outliers (0.10 - 0.33), dropped by the aggregate. DEMO.md item 6. |
 
 **Method corrections (these change how the N gates are built):**
 1. **The scavenge-to-bytes ratio is not fixed.** Under `--max-semi-space-size=4`, 16 B/op reads 24
@@ -1477,10 +1477,65 @@ lookups, the D-S5 revert) and QA-5..8, each kept as a control or gate. A fresh r
   (raw: control 12.00 B/op, keys in [2^30, 2^31) 0.00 in 32/32 windows, headless Chrome, precise info).
 
 Ledger (open, for a later session):
-- N6 for the other key-hashing members (SlidingHyperLogLog, SlidingCountMin) is not yet measured in a
-  browser; the S11 lane only drives HeavyKeeper.addFrom.
+- ~~N6 for the other key-hashing members~~ -- CLOSED in section 13 (every member x key class 0.0 in Chrome).
 - `activate()` keeps ONE intentional forced reflow per tab switch (a hidden scene has no geometry to
   pre-measure), documented in index.html; not a per-frame cost.
 - Still open from 1.10.0: H2-5 megamorphic-site boxing (state slab), the EH addFrom 0.95x residue.
 
+## 13. Next session -- N6 completion (demo, repo-only) + ledger close-out  [SHIPPED 2026-10-04, uncommitted]
 
+State: 9487785 (demo session committed). Everything lite-hud / lite-pick waited on has shipped (HK drop-in
+1.8.0, EH, SlidingAggregate latency means 1.9.0, the 0-alloc readers 1.11.0). lite-adaptive is feature-
+complete for its consumers; this session is small and closes the ledger. No npm release (Adaptive.js
+byte-identical) unless a measurement finds a library box -- then it becomes a 1.11.x patch, re-planned.
+
+SETTLED (coordinator, 2026-10-04; maintainer may override on the ping):
+- N-S1 H2-5 (megamorphic-site double-field boxing) is WONTFIX-UNLESS-REPORTED. It needs 5+ subclass shapes
+  of one member at ONE call site (mega5 INFO: SCM 49, SDD 70.5 B); no consumer does that, and the fix (a
+  per-instance Float64Array state slab) changes `bytes` and rewrites every hot body of all ten members.
+  Re-open only on a consumer report, as its own minor. The mega5 INFO lanes stay as the documentation.
+- N-S2 The EH addFrom 0.95x residue is CLOSED (accepted in 10.2: the cost of the fail-closed `now` check).
+- N-S3 N6 for the other key-hashing members: extend the S11 lane, do not add a new instrument. Members with
+  a hashed integer KEY: HeavyKeeper (done), SlidingHyperLogLog (addFrom stride 2: [now, key]),
+  SlidingCountMin (addFrom stride 3: [now, key, count]). Key classes per member: small (i & 1023),
+  [2^30, 2^31), >= 2^31 (2^31 + i), negative -- RE-SETTLED in N4 to -(2^30 + 1 + i) (review: -(i + 1) is a
+  Smi on every build, so it measured nothing the small class did not). Same method as S11 (warm-up, key lanes first,
+  control last, same window size, scavenged windows dropped, second-largest clean, KM_MIN_CLEAN, blind ->
+  "n/a"). The explicit-time members get a monotone `now` (a running counter) and W = 1e9, so the pane ring
+  never rotates during a measurement (a rotation's bounded clear is not the per-key cost being measured).
+
+Batches (coordinator runs the full `npm run demo` + `npm test` after each; no coder needed -- each is small):
+- **N1 (kernels.mjs + tests)**: generalize `runKeyMagLane(meter, ops)` to `runKeyMagLane(meter, ops,
+  member)` with member in {'hk', 'shll', 'scm'} (default 'hk' -- the existing S11 tests stay byte-identical)
+  and return `{ state, control, lanes: { small, big31, big32, neg }, raw }`; `keyMagText` prints the four
+  classes. Node tests: the adversarial-meter + kmAggregate gates run per member; with the node heap meter
+  every class reads ~0 (two-sided) for all three members.
+- **N2 (index.html)**: the HK truth-panel button becomes "measure all": three rows (HK / SHLL / SCM), each
+  `keyMagText`; still ON CLICK only; DemoAudit + the Scene wiring tests stay green.
+- **N3 (measure + docs)**: headless Chrome with `--enable-precise-memory-info` (scratch cdp.mjs), 4 runs,
+  quote the RAW windows per member x class in DEMO.md item 6; ROADMAP 7.1 N6 -> CLOSED for every hashed-key
+  member, or -- if any class boxes -- a finding with the raw windows and a 1.11.x patch plan (not fixed in
+  this session). CHANGELOG [Unreleased] demo line.
+- **N4 (reviewer, one round)**: the N1-N3 diff + one mutant (a member lane that boxes must not print 0).
+Exit: `npm run demo` green, 0 todo; `npm test` 860/860; raw Chrome numbers recorded; ledger empty except
+N-S1 (wontfix-unless-reported).
+
+After this: switch sessions to a consumer package (lite-hud or lite-pick) -- `cd <package> && claude`.
+
+### 13.1 As built (2026-10-04)
+
+- N1-N3 as planned. Deviations: the result keeps FLAT fields (`small`, `big31`, `big32`, `neg`, plus
+  `member`) instead of a `lanes` object, so every existing S11 assertion on `r.small` / `r.big31` still holds;
+  the ok-text regex test changed (the text now prints four classes), and QA-2's meter-call threshold moved
+  54 -> 102 (two more classes) with new asserts pinning that arithmetic (review N4: the old number had no
+  teeth). New: `keyMagClass` (a boxing class is never green), the "nowork" state via `kmDidWork`.
+- N4 review: REJECTED on one doc blocker (the docs said "0.00 - 0.01 in every window"; 3 raw windows were
+  higher). Fixed, along with every minor: the no-work proof (mutants for hk / shll / scm and a single-class
+  hk mutant all read "nowork"); the large-negative class; the per-window-constant claim, which a 4x-ops run
+  now confirms; QA-2's teeth; the `$KM_ROWS` and rem nits. The rework cap was not reached.
+- Mutant (required by the plan): a SHLL key window boxing one HeapNumber per op for the >= 2^31 class reads
+  16.0 B/op, the row goes red, and the "S11 N1" Node gate fails.
+- "measure all" runs ~2M ops synchronously in one click (~0.3 s): a deliberate on-demand cost, never the
+  frame path.
+- Ledger: empty except N-S1 (H2-5, WONTFIX-UNLESS-REPORTED). lite-adaptive is done for its consumers; next
+  session switches to lite-hud or lite-pick.

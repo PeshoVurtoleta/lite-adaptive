@@ -2727,7 +2727,13 @@ export function renderSaEhPrep(world) {
 // =======================================================================================
 // On a 31-bit-Smi build (Chromium with pointer compression) an integer key in [2^30, 2^31) is a HeapNumber,
 // not a Smi; on this Node (arm64, 32-bit Smis) it is a Smi, so every Node 0 B/op says nothing about Chrome
-// (ROADMAP 7.1 N6). This lane measures it IN the browser, on demand (a button -- never the frame path), from
+// (ROADMAP 7.1 N6). The lane covers every member that hashes an integer KEY (ROADMAP 13 N-S3): HeavyKeeper
+// ([key, weight]), SlidingHyperLogLog ([now, key]) and SlidingCountMin ([now, key, count]), each through its
+// zero-box addFrom, over four key classes: small, [2^30, 2^31), >= 2^31 and negative <= -(2^30 + 1) (a
+// HeapNumber on a 31-bit-Smi build, like the [2^30, 2^31) class). The explicit-time
+// members get a running-counter `now` and W = KM_WINDOW_W, so the pane ring never rotates inside a
+// measurement (a rotation's bounded clear is not the per-key cost). It measures IN the browser, on demand
+// (a button -- never the frame path), from
 // the deltas of a caller-supplied heap meter (performance.memory.usedJSHeapSize). The meter is coarse, so
 // the result is SELF-TESTED: a control lane that boxes one HeapNumber per op must read >= KM_CONTROL_MIN
 // B/op, else the lane reports 'blind' -- a blind meter NEVER reads as a clean 0 (null is not zero). No
@@ -2740,17 +2746,50 @@ export const KM_OPS = 12500;
 export const KM_CONTROL_MIN = 8;
 /** Keys in [2^30, 2^31): Smi on a 32-bit-Smi build, HeapNumber on a 31-bit-Smi build. */
 export const KM_BIG31_BASE = 1073741824;
+/** Keys >= 2^31: a HeapNumber on every build (beyond any Smi range). */
+export const KM_BIG32_BASE = 2147483648;
+/** The members the lane measures (runKeyMagLane's `member`). */
+export const KM_MEMBERS = ['hk', 'shll', 'scm'];
+/** The four key classes, in lane order (lane 1..4; lane 0 is the boxing control). */
+export const KM_CLASSES = ['small', 'big31', 'big32', 'neg'];
+/** Negative keys start here and go DOWN: -(2^30 + 1) .. -(2^30 + 1024), below the 31-bit Smi minimum -2^30. */
+export const KM_NEG_BASE = -1073741825;
+/** The explicit-time members' W: far beyond the run's running-counter `now` (~6e5), so no pane rotates. */
+export const KM_WINDOW_W = 1e9;
 const KM_ROUNDS = 8;
 const KM_BOX = [{}, 0];
+// key = KM_KEY_BASE[c] + KM_KEY_SIGN[c] * (i & 1023): small 0.., big31 2^30.., big32 2^31.., neg -(2^30 + 1)..
+// (read from a Float64Array inside the window -- an unboxed double local, never a boxed argument)
+const KM_KEY_BASE = Float64Array.of(0, KM_BIG31_BASE, KM_BIG32_BASE, KM_NEG_BASE);
+const KM_KEY_SIGN = Float64Array.of(1, 1, 1, -1);
 
-function kmWindow(meter, lane, hk, buf, v, n) {
+// The boxing control: one HeapNumber per op (a double stored into a generic array).
+function kmControlWindow(meter, v, n) {
     const a = meter();
-    if (lane === 0) {
-        for (let i = 0; i < n; i++) { v[0] += 1; KM_BOX[1] = v[0]; }
-    } else {
-        const base = lane === 1 ? 0 : KM_BIG31_BASE;
-        for (let i = 0; i < n; i++) { buf[0] = base + (i & 1023); hk.addFrom(buf, 0); }
-    }
+    for (let i = 0; i < n; i++) { v[0] += 1; KM_BOX[1] = v[0]; }
+    return (meter() - a) / n;
+}
+
+// One key window per member: a SEPARATE function each, so every addFrom call site is MONOMORPHIC, the way a
+// consumer calls it (one shared site would be polymorphic -- not the shape being measured). `c` = class 0..3.
+function kmWindowHk(meter, c, hk, buf, n) {
+    const base = KM_KEY_BASE[c], sg = KM_KEY_SIGN[c];
+    const a = meter();
+    for (let i = 0; i < n; i++) { buf[0] = base + sg * (i & 1023); hk.addFrom(buf, 0); }        // [key, 1]
+    return (meter() - a) / n;
+}
+
+function kmWindowShll(meter, c, sl, buf, n) {
+    const base = KM_KEY_BASE[c], sg = KM_KEY_SIGN[c];
+    const a = meter();
+    for (let i = 0; i < n; i++) { buf[0] += 1; buf[1] = base + sg * (i & 1023); sl.addFrom(buf, 0); }   // [now, key]
+    return (meter() - a) / n;
+}
+
+function kmWindowScm(meter, c, scm, buf, n) {
+    const base = KM_KEY_BASE[c], sg = KM_KEY_SIGN[c];
+    const a = meter();
+    for (let i = 0; i < n; i++) { buf[0] += 1; buf[1] = base + sg * (i & 1023); scm.addFrom(buf, 0); }  // [now, key, 1]
     return (meter() - a) / n;
 }
 
@@ -2779,58 +2818,131 @@ export function kmAggregate(readings) {
 }
 
 /**
- * Run the S11 lane: the two key lanes FIRST (after unmeasured warm-up of every lane for the JIT tiers, then
- * KM_ROUNDS windows each) and the boxing control LAST (so its garbage is never collected inside a key-lane window).
- * EVERY window has the SAME size (KM_OPS), so a meter that resolves the control resolves the key lanes too.
- * Each lane is kmAggregate'd (scavenged windows dropped, the second-largest clean reading); any lane with fewer than
- * KM_MIN_CLEAN clean windows, or a control below KM_CONTROL_MIN, makes the whole result 'blind' -- never a
- * 0 from a meter that cannot see. COLD -- allocates its HeavyKeeper, scratch and result; never per frame.
+ * Run the S11 lane for one member: the four key-class lanes FIRST (after unmeasured warm-up of every lane for the
+ * JIT tiers, then KM_ROUNDS windows each) and the boxing control LAST (so its garbage is never collected inside a
+ * key-lane window). EVERY window has the SAME size (KM_OPS), so a meter that resolves the control resolves the
+ * key lanes too. Each lane is kmAggregate'd (scavenged windows dropped, the second-largest clean reading); any
+ * lane with fewer than KM_MIN_CLEAN clean windows, or a control below KM_CONTROL_MIN, makes the whole result
+ * 'blind' -- never a 0 from a meter that cannot see. COLD -- allocates its sketch, scratch and result; never
+ * per frame. Never throws on a meter fault (the click handler renders whatever comes back); an unknown
+ * `member` is a programming error and throws.
  * @param {(() => number) | undefined} meter  e.g. () => performance.memory.usedJSHeapSize
  * @param {number} [ops]
- * @returns {{ state: 'ok' | 'blind' | 'absent', control: number, small: number, big31: number,
- *             raw: { control: Float64Array, small: Float64Array, big31: Float64Array } | null }}
+ * @param {'hk' | 'shll' | 'scm'} [member]  default 'hk'
+ * @returns {{ state: 'ok' | 'blind' | 'absent' | 'nowork', member: string, control: number,
+ *             small: number, big31: number, big32: number, neg: number,
+ *             raw: { control: Float64Array, small: Float64Array, big31: Float64Array,
+ *                    big32: Float64Array, neg: Float64Array } | null }}
  */
-export function runKeyMagLane(meter, ops) {
+export function runKeyMagLane(meter, ops, member) {
+    const m = member === undefined ? 'hk' : member;
+    if (m !== 'hk' && m !== 'shll' && m !== 'scm') {
+        throw new RangeError('[demo] runKeyMagLane member must be one of ' + KM_MEMBERS.join(' / ') + ', got ' + String(member));
+    }
     const n = ops === undefined ? KM_OPS : ops;
     // fail closed: a bad window size (QA-3: 0 / null divided by zero into an 'ok' Infinity) is never measured
-    if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) return { state: 'blind', control: NaN, small: NaN, big31: NaN, raw: null };
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) return kmFail('blind', m, NaN, null);
     let probe;
     try { probe = typeof meter === 'function' ? meter() : undefined; } catch (e) { probe = undefined; }
-    if (typeof probe !== 'number' || probe !== probe) return { state: 'absent', control: NaN, small: NaN, big31: NaN, raw: null };
+    if (typeof probe !== 'number' || probe !== probe) return kmFail('absent', m, NaN, null);
     // a meter that THROWS mid-run (QA-1) is a blind meter: the result is 'blind', never a thrown click
     // handler that leaves a stale earlier reading on screen
     try {
-        return kmRun(meter, n);
+        return kmRun(meter, n, m);
     } catch (e) {
-        return { state: 'blind', control: NaN, small: NaN, big31: NaN, raw: null };
+        return kmFail('blind', m, NaN, null);
     }
 }
 
-function kmRun(meter, n) {
-    const hk = new HeavyKeeper(HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K);
-    const buf = new Float64Array(2); buf[1] = 1;
+/**
+ * Proof that the last key window did addFrom WORK (review N4: a window that skips addFrom reads a perfect 0).
+ * shll / scm: the sketch's lastNow equals the running-counter `now` the window ended on (a skipped window
+ * leaves it stale). hk (no clock): SOME key of class `c` has an estimate >= 1 -- a class that never reaches
+ * addFrom reads 0 on all 1024 (its keys are disjoint from every other class). Not "the LAST key": HeavyKeeper
+ * may decay any one light key to 0 (measured: a false 'nowork' at 4x KM_OPS). The scan exits on the first
+ * hit. COLD: once per window, outside the meter reads.
+ * @returns {boolean}
+ */
+export function kmDidWork(member, sk, buf, c) {
+    if (member === 'hk') {
+        const base = KM_KEY_BASE[c], sg = KM_KEY_SIGN[c];
+        for (let j = 0; j < 1024; j++) if (sk.estimate(base + sg * j) >= 1) return true;
+        return false;
+    }
+    return sk.lastNow === buf[0] && buf[0] > 0;
+}
+
+/** A non-ok result: every key lane NaN (null is not zero). */
+function kmFail(state, member, control, raw) {
+    return { state, member, control, small: NaN, big31: NaN, big32: NaN, neg: NaN, raw };
+}
+
+function kmRun(meter, n, member) {
+    // the member, its packed addFrom scratch, and its (monomorphic) key window
+    let sk, buf, win;
+    if (member === 'hk') {
+        sk = new HeavyKeeper(HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K);
+        buf = new Float64Array(2); buf[1] = 1;                              // [key, weight 1]
+        win = kmWindowHk;
+    } else if (member === 'shll') {
+        sk = new SlidingHyperLogLog(KM_WINDOW_W, { p: SHLL_DEFAULT_P, ringCap: SHLL_DEFAULT_RINGCAP, seed: SHLL_DEFAULT_SEED });
+        buf = new Float64Array(2);                                          // [now, key]
+        win = kmWindowShll;
+    } else {
+        sk = new SlidingCountMin(KM_WINDOW_W, { epsilon: SCM_DEFAULT_EPS, panes: SCM_DEFAULT_PANES, seed: SCM_DEFAULT_SEED });
+        buf = new Float64Array(3); buf[2] = 1;                              // [now, key, count 1]
+        win = kmWindowScm;
+    }
     const v = new Float64Array(1); v[0] = 0.5;
-    // warm-up (unmeasured): the control path first, then 4 rounds of both key lanes -- the first windows of a
+    // warm-up (unmeasured): the control path first, then 4 rounds of every key lane -- the first windows of a
     // fresh process carry JIT tier-up allocation (measured: 1.2 / 0.8 / 0.3 B/op on small keys, 43.7 on the
     // control), which is not the steady-state cost
-    for (let r = 0; r < 2; r++) kmWindow(meter, 0, hk, buf, v, n);
-    for (let r = 0; r < 4; r++) { kmWindow(meter, 1, hk, buf, v, n); kmWindow(meter, 2, hk, buf, v, n); }
-    const ss = new Float64Array(KM_ROUNDS), bs = new Float64Array(KM_ROUNDS), cs = new Float64Array(KM_ROUNDS);
-    for (let r = 0; r < KM_ROUNDS; r++) { ss[r] = kmWindow(meter, 1, hk, buf, v, n); bs[r] = kmWindow(meter, 2, hk, buf, v, n); }
-    for (let r = 0; r < KM_ROUNDS; r++) cs[r] = kmWindow(meter, 0, hk, buf, v, n);
-    const raw = { control: cs, small: ss, big31: bs };
-    const control = kmAggregate(cs), small = kmAggregate(ss), big31 = kmAggregate(bs);
-    if (!(control >= KM_CONTROL_MIN) || small !== small || big31 !== big31) return { state: 'blind', control, small: NaN, big31: NaN, raw };
-    return { state: 'ok', control, small, big31, raw };
+    for (let r = 0; r < 2; r++) kmControlWindow(meter, v, n);
+    for (let r = 0; r < 4; r++) {
+        for (let c = 0; c < 4; c++) {
+            win(meter, c, sk, buf, n);
+            if (!kmDidWork(member, sk, buf, c)) return kmFail('nowork', member, NaN, null);
+        }
+    }
+    const lanes = [new Float64Array(KM_ROUNDS), new Float64Array(KM_ROUNDS), new Float64Array(KM_ROUNDS), new Float64Array(KM_ROUNDS)];
+    for (let r = 0; r < KM_ROUNDS; r++) {
+        for (let c = 0; c < 4; c++) {
+            lanes[c][r] = win(meter, c, sk, buf, n);
+            if (!kmDidWork(member, sk, buf, c)) return kmFail('nowork', member, NaN, null);
+        }
+    }
+    const cs = new Float64Array(KM_ROUNDS);
+    for (let r = 0; r < KM_ROUNDS; r++) cs[r] = kmControlWindow(meter, v, n);
+    const raw = { control: cs, small: lanes[0], big31: lanes[1], big32: lanes[2], neg: lanes[3] };
+    const control = kmAggregate(cs);
+    const small = kmAggregate(lanes[0]), big31 = kmAggregate(lanes[1]), big32 = kmAggregate(lanes[2]), neg = kmAggregate(lanes[3]);
+    if (!(control >= KM_CONTROL_MIN) || small !== small || big31 !== big31 || big32 !== big32 || neg !== neg) {
+        return kmFail('blind', member, control, raw);
+    }
+    return { state: 'ok', member, control, small, big31, big32, neg, raw };
+}
+
+/** A key class reading above this (B/op) is a box: the control floor KM_CONTROL_MIN is 8, a HeapNumber 12-16. */
+export const KM_CLEAN_MAX = 2;
+
+/** The S11 readout class: 'v inband' ONLY when the result is ok AND every key class reads <= KM_CLEAN_MAX; an
+ *  ok result with a boxing class is 'v outband' (a box is never shown green); absent / blind is neutral 'v'. */
+export function keyMagClass(r) {
+    if (r.state !== 'ok') return 'v';
+    for (let c = 0; c < KM_CLASSES.length; c++) if (!(r[KM_CLASSES[c]] <= KM_CLEAN_MAX)) return 'v outband';
+    return 'v inband';
 }
 
 /** The S11 readout text: "n/a (...)" for absent / blind -- never a bare 0 from a meter that cannot see. */
 export function keyMagText(r) {
     if (r.state === 'absent') return 'n/a (no performance.memory: non-Chromium)';
+    if (r.state === 'nowork') return 'n/a (a key window did no addFrom work: nothing was measured)';
     if (r.state === 'blind') {
         if (!(r.control >= KM_CONTROL_MIN)) return 'n/a (meter blind: the boxing control read ' + (r.control === r.control ? r.control.toFixed(1) : 'too few clean windows') + (r.control === r.control ? ' B/op < ' + KM_CONTROL_MIN : '') + ')';
         return 'n/a (meter blind: too few scavenge-free key-lane windows)';
     }
-    // ok: every value is a max over >= KM_MIN_CLEAN clean (non-negative) windows -- never clamped
-    return 'small keys ' + r.small.toFixed(1) + ' B/op | [2^30, 2^31) keys ' + r.big31.toFixed(1) + ' B/op (control ' + r.control.toFixed(1) + ')';
+    // ok: every value is the second-largest of >= KM_MIN_CLEAN clean (non-negative) windows -- never clamped
+    return 'small keys ' + r.small.toFixed(1) + ' B/op | [2^30, 2^31) keys ' + r.big31.toFixed(1)
+        + ' B/op | >= 2^31 keys ' + r.big32.toFixed(1) + ' B/op | negative keys ' + r.neg.toFixed(1)
+        + ' B/op (control ' + r.control.toFixed(1) + ')';
 }

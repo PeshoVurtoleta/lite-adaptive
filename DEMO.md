@@ -446,6 +446,27 @@ lite-sketch verbatim); item 4 is the lite-adaptive family witness.
    lane prints 0.0 / 0.0. The 1.8.0 F19 register-local hash path holds on a 31-bit-Smi build: N6 is closed
    for HK addFrom. Default Chrome (quantized `performance.memory`) reads "n/a (meter blind)" (control 0.00 in
    every window), exactly as designed.
+   **Extended to every hashed-key member (ROADMAP 13, 2026-10-04)**: `runKeyMagLane(meter, ops, member)`,
+   member in `KM_MEMBERS` = hk / shll / scm, each driven through its zero-box `addFrom` (`[key, 1]`,
+   `[now, key]`, `[now, key, 1]`) from its own window function (a monomorphic call site, as a consumer calls
+   it) over four key classes: small (`i & 1023`), [2^30, 2^31), >= 2^31 and large negative (-(2^30 + 1) and
+   down -- below the 31-bit Smi minimum, so a HeapNumber in Chrome like the [2^30, 2^31) class). The
+   explicit-time members get a running-counter `now` and W = 1e9, so no pane rotates inside a run. After
+   every key window `kmDidWork` proves the window reached `addFrom` (shll / scm: `lastNow` equals the
+   counter; hk: some key of the class has an estimate >= 1), else the row reads "n/a (a key window did no
+   addFrom work)" -- review N4 showed a window that skips `addFrom` reads a perfect 0. The button is now
+   "measure all": one row per member, green ONLY when every class reads <= 2 B/op (`keyMagClass`; an ok
+   result with a boxing class is red). **Measured (headless Chrome 154, `--enable-precise-memory-info`,
+   raw)**: 4 runs x 3 members x 4 classes x 8 windows of 12.5k ops = 384 key windows. Control 12.00 B/op in
+   every clean window (scavenged windows -66.3 .. -94.0, dropped). Every row printed 0.0 for all four classes
+   in 4/4 runs. Raw key windows: HeavyKeeper 0.0032, SlidingHyperLogLog 0.0013 - 0.0051, SlidingCountMin
+   0.0022 - 0.0051 B/op, identical across classes within a run; 3 of 384 were single-window outliers (0.10,
+   0.22, 0.33) that the second-largest aggregate drops. The residue is per WINDOW, not per op: at 4x the
+   window size (50k ops, 2 runs) it falls 4x (HK 0.0008, SHLL / SCM 0.0013) -- a constant 40 - 64 B per
+   window (the meter reads), while a per-key box would read 12 in every window. One 50k HK window read 8.78
+   (every other window of that run 0.0008): a single-window event, dropped like the others. **N6 is closed
+   for every hashed-key member.**
+   Default Chrome: all three rows read "n/a (meter blind: the boxing control read 0.0 B/op < 8)".
 
 ---
 

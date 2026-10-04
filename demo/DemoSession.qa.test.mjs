@@ -22,7 +22,7 @@ import {
     createScmWorld, stepScm, stepScmOracle, renderScmPrep,
     SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, SCM_TRACKED, SCM_STRIDE, SCM_KEYS_PER_FRAME,
     C_BOUNDOK, C_TOTALOK, C_TOTAL, C_NLIVE, C_SATURATED,
-    runKeyMagLane, kmAggregate, keyMagText, KM_CONTROL_MIN, KM_MIN_CLEAN,
+    runKeyMagLane, kmAggregate, keyMagText, KM_CONTROL_MIN, KM_MIN_CLEAN, KM_MEMBERS,
 } from './kernels.mjs';
 
 const DEMO_DIR = dirname(fileURLToPath(import.meta.url));
@@ -329,12 +329,12 @@ function kmLawFailures(r, tag) {
     const out = [], t = keyMagText(r);
     if (r.state === 'ok') {
         if (!(r.control >= KM_CONTROL_MIN)) out.push(tag + ': ok with control ' + r.control);
-        for (const lane of ['control', 'small', 'big31']) if (clean(r.raw[lane]) < KM_MIN_CLEAN) out.push(tag + ': ok with ' + clean(r.raw[lane]) + ' clean ' + lane + ' windows');
+        for (const lane of ['control', 'small', 'big31', 'big32', 'neg']) if (clean(r.raw[lane]) < KM_MIN_CLEAN) out.push(tag + ': ok with ' + clean(r.raw[lane]) + ' clean ' + lane + ' windows');
         if (!/^small keys /.test(t)) out.push(tag + ': ok text ' + t);
     } else {
         if (!/^n\/a \(/.test(t)) out.push(tag + ': non-ok text ' + t);
         if (/keys -?\d|keys Inf|keys NaN|B\/op \|/.test(t)) out.push(tag + ': non-ok text prints a key-lane number: ' + t);
-        if (!Number.isNaN(r.small) || !Number.isNaN(r.big31)) out.push(tag + ': non-ok key lanes ' + r.small + ' / ' + r.big31);
+        if (!Number.isNaN(r.small) || !Number.isNaN(r.big31) || !Number.isNaN(r.big32) || !Number.isNaN(r.neg)) out.push(tag + ': non-ok key lanes ' + r.small + ' / ' + r.big31 + ' / ' + r.big32 + ' / ' + r.neg);
     }
     if (/NaN/.test(t)) out.push(tag + ': text shows NaN: ' + t);
     return out;
@@ -352,13 +352,16 @@ test('QA S11 adversarial synthetic meters (monotone junk, stutter-then-jump, saw
         alwaysNegInf: () => () => -Infinity,
         maxValueGrowth: () => { let c = 1e300; return () => (c *= 1e3); },
     };
-    for (const [name, make] of Object.entries(meters)) {
-        const r = runKeyMagLane(make(), 300);
-        assert.deepEqual(kmLawFailures(r, name), [], name + ' -> ' + r.state + ' ' + keyMagText(r));
+    // ROADMAP 13 N1: the law holds for EVERY hashed-key member, not just the default hk
+    for (const member of KM_MEMBERS) {
+        for (const [name, make] of Object.entries(meters)) {
+            const r = runKeyMagLane(make(), 300, member);
+            assert.deepEqual(kmLawFailures(r, member + ' ' + name), [], member + ' ' + name + ' -> ' + r.state + ' ' + keyMagText(r));
+        }
+        // and a monotone junk meter is reported 'ok' with a LARGE (non-zero) key-lane number -- fail-closed direction
+        const j = runKeyMagLane(meters.monotoneJunk(), 300, member);
+        assert.equal(j.state, 'ok'); assert.ok(j.small > 100 && j.big31 > 100 && j.big32 > 100 && j.neg > 100, member + ': junk never reads as a clean 0');
     }
-    // and a monotone junk meter is reported 'ok' with a LARGE (non-zero) key-lane number -- fail-closed direction
-    const j = runKeyMagLane(meters.monotoneJunk(), 300);
-    assert.equal(j.state, 'ok'); assert.ok(j.small > 100 && j.big31 > 100, 'junk never reads as a clean 0');
 });
 
 test('QA S11 kmAggregate boundaries: 0 / 1 / 2 / 3 clean windows, empty input, -0 windows, duplicates of the top value', () => {
@@ -383,9 +386,14 @@ test('QA-1 S11 a meter that THROWS must yield a non-ok result, not an exception 
 
 test('QA-2 S11 a +Infinity window is not a measurement: kmAggregate must not count it clean, and a BLIND meter (constant through the key lanes) that jumps to +Infinity at the control window ends must not be "ok" -- today it reports "small keys 0.0 B/op (control Infinity)", the fail-open 0 the self-test exists to prevent', () => {
     let i = 0;
-    const infAtControlEnds = () => (++i >= 54 && (i & 1) === 1 ? Infinity : 1e6);      // reads 0 through the key lanes
+    // the control windows start at meter call 102 = 1 probe + 2x2 control warm-up + (4 + 8) rounds x 4 key classes x 2
+    // (ROADMAP 13 N1 added the >= 2^31 and negative classes: was 54 with two classes)
+    const infAtControlEnds = () => (++i >= 102 && (i & 1) === 1 ? Infinity : 1e6);      // reads 0 through the key lanes
     const r = runKeyMagLane(infAtControlEnds, 300);
     assert.notEqual(r.state, 'ok', 'blind key lanes + Infinity control: ' + keyMagText(r));
+    // review N4: pin the call-order arithmetic -- every key window read 0 and every control window +Infinity
+    for (const c of ['small', 'big31', 'big32', 'neg']) assert.ok(r.raw[c].every((x) => x === 0), c + ' windows ' + Array.from(r.raw[c]));
+    assert.ok(r.raw.control.every((x) => x === Infinity), 'control windows ' + Array.from(r.raw.control));
     assert.ok(Number.isNaN(kmAggregate(Float64Array.of(Infinity, Infinity, Infinity, 0))), 'three +Infinity windows are not three clean windows');
 });
 

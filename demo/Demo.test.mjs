@@ -88,7 +88,8 @@ import {
     SA_SPIKE_MULT, SA_EH_EPS, L_COUNT, L_SUM, L_MEAN, L_MIN, L_MAX, L_TCOUNT, L_TSUM, L_TMEAN, L_TMIN, L_TMAX,
     L_EXACT, L_TSUMW, L_EHSUM, L_EHMEAN, L_EHREL, L_EHRELMAX,
     // S11 (D8) -- the Chromium-only key-magnitude lane
-    runKeyMagLane, keyMagText, kmAggregate, KM_CONTROL_MIN, KM_MIN_CLEAN,
+    runKeyMagLane, keyMagText, kmAggregate, KM_CONTROL_MIN, KM_MIN_CLEAN, KM_MEMBERS, KM_CLASSES, KM_WINDOW_W,
+    keyMagClass, KM_CLEAN_MAX, kmDidWork, KM_NEG_BASE,
 } from './kernels.mjs';
 
 // Dev-only peer (already a devDependency -- the same tool test/torture.mjs uses). Used ONLY by the
@@ -2711,10 +2712,89 @@ test('S11 key-magnitude lane with a real heap meter (node heapUsed): the control
     assert.ok(r.control >= KM_CONTROL_MIN, 'control >= 8 B/op, got ' + r.control);
     assert.ok(r.small >= 0 && r.small <= 2 && r.big31 >= 0 && r.big31 <= 2, 'addFrom must read ~0 B/op (two-sided: a negative reading is a scavenge, never a value) for both key classes here, got ' + r.small + ' / ' + r.big31);
     for (const lane of ['small', 'big31', 'control']) assert.equal(r.raw[lane].length, 8, 'raw windows are returned for the record');
-    assert.match(keyMagText(r), /^small keys \d+\.\d B\/op \| \[2\^30, 2\^31\) keys \d+\.\d B\/op \(control \d+\.\d\)$/, 'ok text format');
+    // ROADMAP 13 N1: the ok text prints all four key classes (the one deliberate S11 text change)
+    assert.match(keyMagText(r), /^small keys \d+\.\d B\/op \| \[2\^30, 2\^31\) keys \d+\.\d B\/op \| >= 2\^31 keys \d+\.\d B\/op \| negative keys \d+\.\d B\/op \(control \d+\.\d\)$/, 'ok text format');
     const html = readFileSync(join(DEMO_DIR, 'index.html'), 'utf8');
     assert.match(html, /\$\('hk-smi31-run'\)\.addEventListener\('click', \(\) => \{[\s\S]*?runKeyMagLane\([\s\S]*?keyMagText\(r\)/, 'index.html runs the lane ON CLICK only and renders keyMagText');
     assert.ok(!/runKeyMagLane/.test(extractFnBody(html, 'loop')), 'never on the frame path');
+});
+
+test('S11 N1 (ROADMAP 13): runKeyMagLane(meter, ops, member) measures every hashed-key member (hk / shll / scm) over four key classes; with the node heap meter the control is SEEN and every class reads ~0 B/op (two-sided) for every member; the default member is hk', () => {
+    assert.deepEqual(KM_MEMBERS, ['hk', 'shll', 'scm']);
+    assert.deepEqual(KM_CLASSES, ['small', 'big31', 'big32', 'neg']);
+    assert.ok(KM_WINDOW_W >= 1e9, 'the explicit-time members never rotate a pane inside a run');
+    for (const member of KM_MEMBERS) {
+        let r = null;
+        for (let attempt = 0; attempt < 4 && (!r || r.state !== 'ok'); attempt++) r = runKeyMagLane(() => process.memoryUsage().heapUsed, undefined, member);
+        assert.equal(r.state, 'ok', member + ': the node heap meter must see the control in >= 1 of 4 attempts (control read ' + r.control + ')');
+        assert.equal(r.member, member);
+        assert.ok(r.control >= KM_CONTROL_MIN, member + ': control >= 8 B/op, got ' + r.control);
+        for (const c of KM_CLASSES) {
+            assert.ok(r[c] >= 0 && r[c] <= 2, member + ' ' + c + ' keys: addFrom must read ~0 B/op (two-sided), got ' + r[c]);
+            assert.equal(r.raw[c].length, 8, member + ' ' + c + ': raw windows are returned for the record');
+        }
+    }
+    assert.equal(runKeyMagLane(undefined, 100).member, 'hk', 'default member');
+    for (const bad of ['HK', 'sld', null, 0]) assert.throws(() => runKeyMagLane(() => 1, 100, bad), /\[demo\] runKeyMagLane member/, 'unknown member ' + String(bad) + ' throws');
+});
+
+test('S11 N1 self-test per member: no meter -> "absent", a constant (blind) meter -> "blind", a meter whose every window is scavenged -> "blind"; every non-ok result NaNs all four key classes (null is not zero) and its text prints no key-lane number', () => {
+    for (const member of KM_MEMBERS) {
+        const a = runKeyMagLane(undefined, 300, member);
+        assert.equal(a.state, 'absent', member + ' absent');
+        let calls = 0, heap = 1e8;
+        const meters = [() => 1e6, () => { calls++; heap += (calls % 2 === 0) ? -50000 : 0; return heap; }];
+        const rs = [a];
+        for (const m of meters) rs.push(runKeyMagLane(m, 1000, member));
+        for (let i = 1; i < rs.length; i++) assert.equal(rs[i].state, 'blind', member + ' meter #' + i + ' -> ' + rs[i].state + ' ' + keyMagText(rs[i]));
+        for (const r of rs) {
+            for (const c of KM_CLASSES) assert.ok(Number.isNaN(r[c]), member + ' ' + r.state + ': ' + c + ' must be NaN, got ' + r[c]);
+            const t = keyMagText(r);
+            assert.match(t, /^n\/a \(/);
+            assert.ok(!/keys -?\d/.test(t), member + ': non-ok text prints a key-lane number: ' + t);
+        }
+    }
+});
+
+test('S11 N2 (ROADMAP 13): the "measure all" button renders one row per member in KM_MEMBERS order, ON CLICK only, each through keyMagText + keyMagClass; keyMagClass is green ONLY for an ok result whose every key class is <= KM_CLEAN_MAX (a box is never green, absent / blind is neutral)', () => {
+    const html = readFileSync(join(DEMO_DIR, 'index.html'), 'utf8');
+    assert.match(html, /const \$KM_ROWS = \[\$\('hk-smi31'\), \$\('hk-smi31-shll'\), \$\('hk-smi31-scm'\)\];/, 'rows cached at init, in KM_MEMBERS order');
+    for (const id of ['hk-smi31', 'hk-smi31-shll', 'hk-smi31-scm']) assert.equal(html.split('id="' + id + '"').length, 2, id + ': exactly one element');
+    assert.match(html, /\$\('hk-smi31-run'\)\.addEventListener\('click', \(\) => \{[\s\S]*?runKeyMagLane\(meter, undefined, KM_MEMBERS\[i\]\)[\s\S]*?\$KM_ROWS\[i\]\.textContent = keyMagText\(r\);\s*\$KM_ROWS\[i\]\.className = keyMagClass\(r\);/, 'one runKeyMagLane per member, rendered per row');
+    assert.match(html, />measure all</);
+    assert.equal(KM_CLEAN_MAX, 2);
+    const ok = { state: 'ok', control: 12, small: 0, big31: 0, big32: 0, neg: 0 };
+    assert.equal(keyMagClass(ok), 'v inband');
+    for (const c of KM_CLASSES) {
+        assert.equal(keyMagClass({ ...ok, [c]: 12 }), 'v outband', c + ' boxing (12 B/op) must be outband');
+        assert.equal(keyMagClass({ ...ok, [c]: NaN }), 'v outband', c + ' NaN in an ok result is never green');
+    }
+    assert.equal(keyMagClass({ state: 'blind', control: 0, small: NaN, big31: NaN, big32: NaN, neg: NaN }), 'v');
+    assert.equal(keyMagClass({ state: 'absent', control: NaN, small: NaN, big31: NaN, big32: NaN, neg: NaN }), 'v');
+});
+
+test('S11 N4 (review): kmDidWork proves a key window reached addFrom (a skipped window would read a perfect 0) -- false on a fresh sketch, true after one addFrom; a "nowork" result is non-ok, NaN in every class, and its text is n/a; the negative class is below the 31-bit Smi minimum', () => {
+    assert.equal(KM_NEG_BASE, -(2 ** 30) - 1, 'negative keys start at -(2^30 + 1): a HeapNumber on a 31-bit-Smi build');
+    const hk = new HeavyKeeper(4, 1024, 12), b2 = new Float64Array(2);
+    b2[0] = KM_NEG_BASE; b2[1] = 1;
+    assert.equal(kmDidWork('hk', hk, b2, 3), false, 'hk: no addFrom yet');
+    hk.addFrom(b2, 0);
+    assert.equal(kmDidWork('hk', hk, b2, 3), true, 'hk: after one addFrom in the negative class');
+    assert.equal(kmDidWork('hk', hk, b2, 1), false, 'hk: the [2^30, 2^31) class is disjoint -- still no work there');
+    const sl = new SlidingHyperLogLog(KM_WINDOW_W, { p: 11 }), s2 = new Float64Array(2);
+    s2[0] = 5; s2[1] = 7;
+    assert.equal(kmDidWork('shll', sl, s2, 0), false, 'shll: no addFrom yet');
+    sl.addFrom(s2, 0);
+    assert.equal(kmDidWork('shll', sl, s2, 0), true, 'shll: after addFrom');
+    s2[0] = 6;
+    assert.equal(kmDidWork('shll', sl, s2, 0), false, 'shll: a window that advanced now but skipped addFrom');
+    const scm = new SlidingCountMin(KM_WINDOW_W, { epsilon: 0.02, panes: 32 }), c3 = Float64Array.of(5, 7, 1);
+    assert.equal(kmDidWork('scm', scm, c3, 0), false, 'scm: no addFrom yet');
+    scm.addFrom(c3, 0);
+    assert.equal(kmDidWork('scm', scm, c3, 0), true, 'scm: after addFrom');
+    const nw = { state: 'nowork', control: NaN, small: NaN, big31: NaN, big32: NaN, neg: NaN, raw: null };
+    assert.match(keyMagText(nw), /^n\/a \(a key window did no addFrom work/);
+    assert.equal(keyMagClass(nw), 'v');
 });
 
 test('S11 kmAggregate (review B9 BLOCKER 1): a NEGATIVE window is a scavenge -- dropped, never clamped to 0; fewer than KM_MIN_CLEAN clean windows -> NaN (blind); a box present in every clean window shows in full; ONE outlier window is discarded', () => {

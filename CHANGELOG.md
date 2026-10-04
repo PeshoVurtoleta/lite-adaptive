@@ -21,9 +21,13 @@ The demo session (ROADMAP section 11). `Adaptive.js` is byte-identical to 1.11.0
 - New Scene 10 -- SlidingAggregate: whole-ms latencies, count / sum / min / max gated EXACTLY equal to an
   independent recount, next to ExponentialHistogram's `sum()` breaking its epsilon on spikes (measured up to
   ~14.6% vs 5%, F17). 0 B/op frame and render lanes.
-- S11: an on-demand, Chromium-only key-magnitude lane in the HeavyKeeper panel, self-tested against a
-  boxing control ("n/a (meter blind)", never 0). Measured in headless Chrome with precise memory info:
-  `HeavyKeeper.addFrom` reads 0.00 B/op for keys in [2^30, 2^31) (N6 closed for HK addFrom).
+- S11: an on-demand, Chromium-only key-magnitude lane in the HeavyKeeper panel ("measure all"),
+  self-tested against a boxing control ("n/a (meter blind)", never 0). It drives every hashed-key member's
+  `addFrom` (HeavyKeeper, SlidingHyperLogLog, SlidingCountMin) with small, [2^30, 2^31), >= 2^31 and
+  <= -(2^30 + 1) keys, and proves each window reached `addFrom`. Measured in headless Chrome 154 with
+  precise memory info (control 12.00 B/op): every member x key class reads 0.0 B/op in 4/4 runs; raw key
+  windows 0.0013 - 0.0051 B/op (a per-window constant), 3 of 384 single-window outliers (0.10 - 0.33)
+  dropped by the aggregate. N6 is closed for every hashed-key member.
 - `demo/DemoAudit.test.mjs`: the static DEMO AUDIT (unique ids, cached DOM lookups incl. handlers and toggle
   callbacks, no per-frame closure / format / string build over the call graph from `loop`, no layout read
   after a write, layout reads only in `measureScene`, tick writes only through the write-on-change helpers,
