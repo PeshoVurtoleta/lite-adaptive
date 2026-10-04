@@ -501,6 +501,19 @@ test('QA shll_render tier independence: DEMO.md D4 says 0 B/tick since 1.11.0 --
     assert.ok(c.steady >= 12, 'mustbox control must read >= 12 B/op (the probe can see a box), got ' + c.steady);
 });
 
+// fd_render (ROADMAP 11.2, closed): HEAD's renderFdPrep RETURNED the fractional decayed count -- a double
+// crossing a non-inlined call boundary boxes one ~16 B HeapNumber per call, yet measureAllocs read 0. The
+// render now returns an int32 fold (the count stays in flat[D_COUNT]). Sampled over fresh pinned children
+// (a tier-dependent box must not hide in one lucky child); the mustbox control gives the 0 its teeth.
+test('QA fd_render: renderFdPrep reads <= 0.5 B/op steady in EVERY fresh pinned child (HEAD boxed ~16 B/op returning the fractional count), with the mustbox control proving the probe still sees a box', async () => {
+    const seen = [];
+    for (let i = 0; i < (FAST ? 1 : 3); i++) { const r = await runDemoLane('fd_render'); seen.push(r.steady); }
+    process.stdout.write('  qa fd_render x' + seen.length + ': ' + seen.join(',') + ' B/op\n');
+    for (const v of seen) assert.ok(v <= 0.5, 'renderFdPrep must read <= 0.5 B/op steady (never return a fractional double), measured ' + seen.join(','));
+    const c = await runDemoLane('mustbox');
+    assert.ok(c.steady >= 12, 'mustbox control must read >= 12 B/op (the probe can see a box), got ' + c.steady);
+});
+
 test('QA 0-B/op + 0-major-GC over 200k ops with every P1/P2 control ENGAGED at once (failed dense10k EH, ADWIN 1.7e12 preset, HK neg keys at 2^32-1, SHLL cadence 7)', async (t) => {
     if (FAST) { t.skip('fast (demo:check skips the 200k-frame lanes)'); return; }
     if (typeof global.gc !== 'function') { t.skip('needs --expose-gc'); return; }
