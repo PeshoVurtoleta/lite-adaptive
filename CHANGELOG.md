@@ -51,6 +51,10 @@ The demo session (ROADMAP section 11). `Adaptive.js` is byte-identical to 1.11.0
   decayed count across its call boundary, which measureAllocs could not see. It now returns an int32 fold
   (`world.n | 0`); every flat slot is `Object.is`-identical to before. Gated by the new `fd_render`
   DemoProbe lane (16 -> 0 B/op; the gate fails on the old code).
+- The SlidingCountMin render boxed 16 B per tick in heavy mode whenever V8 did not inline `scm.total()` (a
+  1-in-5 failure of the `scm_render_heavy` probe, 16 B in every window). The render now sums the library's
+  own per-pane totals in its body (the value is identical to `total()`), and the lane is also gated under
+  `--no-turbo-inlining`.
 
 ## [1.11.0] - 2026-09-28
 

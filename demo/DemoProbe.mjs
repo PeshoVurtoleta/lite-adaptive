@@ -263,8 +263,10 @@ const dd_getter_box = {
 };
 
 // P4 (SCM D7) lanes, heavy-count mode ENGAGED (tracked key 0's windowed count > 2^31). Frame = stepScm (the
-// stream + one heavy addFrom per frame) + stepScmOracle; render = renderScmPrep through estimateInto +
-// total(): both GATED 0. MUST-BOX control scm_estimate_box sinks the scalar estimate() of the > 2^31 key
+// stream + one heavy addFrom per frame) + stepScmOracle; render = renderScmPrep through estimateInto + the
+// in-body total() sum: both GATED 0. scm_render_heavy is ALSO gated under --no-turbo-inlining (runDemoLane
+// flags): the pre-2026-10-04 render called scm.total() and boxed its > 2^31 return 16 B whenever TurboFan
+// did not inline it (1 of 5 full demo runs; every run under the flag). MUST-BOX control scm_estimate_box sinks the scalar estimate() of the > 2^31 key
 // into a PACKED array (its documented F6 boxed return), so the render's 0 is genuine estimateInto elision.
 function scmWorldBuilt() {
     const w = createScmWorld(4096, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0x5C40);
@@ -376,10 +378,13 @@ const ALL_LANES = Object.assign(Object.create(null), LANES);
  * @param {string} laneName key into LANES
  * @param {number} [K=4000] ops per window
  * @param {number} [windows=5] measurement windows (steady = min over windows 1..n-1)
+ * @param {string[]} [flags=[]] extra node flags for the child (e.g. ['--no-turbo-inlining'] to pin the
+ *   compiled state where no callee is inlined). The result's execArgv echoes what the child really got --
+ *   a gate that passes flags MUST assert they arrived (fail closed).
  * @returns {Promise<{lane:string, first:number, steady:number, readings:number[], execArgv:string[]}>}
  */
-export function runDemoLane(laneName, K = 4000, windows = 5) {
-    const argv = ['--expose-gc', '--min-semi-space-size=4', '--max-semi-space-size=4', SELF];
+export function runDemoLane(laneName, K = 4000, windows = 5, flags = []) {
+    const argv = ['--expose-gc', '--min-semi-space-size=4', '--max-semi-space-size=4'].concat(flags, SELF);
     return new Promise((resolve, reject) => {
         const child = spawn(process.execPath, argv,
             { env: Object.assign({}, process.env,

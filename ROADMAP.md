@@ -1493,6 +1493,25 @@ Ledger (open, for a later session):
 - `activate()` keeps ONE intentional forced reflow per tab switch (a hidden scene has no geometry to
   pre-measure), documented in index.html; not a per-frame cost.
 - Still open from 1.10.0: H2-5 megamorphic-site boxing (state slab), the EH addFrom 0.95x residue.
+- FIXED 2026-10-04 (demo flake, 1 in 5 full `npm run demo` runs): `P4 SCM heavy-count probe` read
+  `scm_render_heavy` 16,16,16,16,16 B/op -- a stable TurboFan state where renderScmPrep did NOT inline
+  `scm.total()`, so its heavy-mode N (> 2^31) boxed 16 B at the return (the returned-double pattern above).
+  Proven: `--no-turbo-inlining` / `--max-inlined-bytecode-size=0` read 16 every run; the sampling heap
+  profiler (includeObjectsCollectedByMinorGC) puts the only render-path site in `total` <- `renderScmPrep`.
+  Fix (demo only, `Adaptive.js` byte-identical): SlidingCountMin has no 0-alloc total reader, so the render
+  sums `total()`'s own loop in its body over the library's `_paneEnd` / `_paneTotal` (bound once at
+  createScmWorld behind a shape check; any other shape falls back to `scm.total()`), the sum landing in the
+  flat slot -- C_TOTAL Object.is-identical to `scm.total()` (parity vs HEAD: every flat slot + return over
+  192 configs / 47040 renders incl. 16088 heavy, unset, oracle off / resume, paused, after `clear()`).
+  New gates, both revert-checked (FAIL on HEAD): the render lane under `--no-turbo-inlining` (runDemoLane
+  `flags`, execArgv asserted; the scm_estimate_box control still boxes 16 under the flag) and a C_TOTAL ===
+  `scm.total()` source test (the bind must hold).
+- OPEN (library, a later release): `SlidingCountMin.totalInto(out, i, w?)` -- a 0 B/call total reader
+  (parity with SlidingHyperLogLog.countInto) so the demo can drop its read of the private `_paneEnd` /
+  `_paneTotal` / `_now` / `_W` (a coupling; the C_TOTAL source test catches drift).
+- OPEN (demo, measured 2026-10-04, pre-existing at HEAD): under `--max-opt=2` (Maglev only) renderScmPrep's
+  own body allocates ~2.6 KB/op in heavy mode (HEAD and fixed alike), so every probe window scavenges. Not
+  hit by the gated default-flags / no-inline states (TurboFan); a Maglev-tier render audit is unscheduled.
 
 ## 13. Next session -- N6 completion (demo, repo-only) + ledger close-out  [SHIPPED 2026-10-04, uncommitted]
 

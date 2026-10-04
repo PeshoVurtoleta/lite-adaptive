@@ -2516,6 +2516,20 @@ test('P4 SCM heavy-count probe: stepScm + stepScmOracle (one 2^30 heavy addFrom 
     assert.ok(c.steady >= 12, 'scm_estimate_box control must box >= 12 B/op, got ' + c.steady);
 });
 
+test('P4 SCM render probe under --no-turbo-inlining: renderScmPrep reads <= 0.5 B/op even when NO callee is inlined -- C_TOTAL is summed in the render body, never a scm.total() call whose > 2^31 return boxes 16 B at a non-inlined boundary (the 2026-10-04 1-in-5 flake: readings 16,16,16,16,16); the scm_estimate_box control boxes >= 12 under the same flag', async () => {
+    const NOINLINE = ['--no-turbo-inlining'];
+    const r = await runDemoLane('scm_render_heavy', 4000, 5, NOINLINE);
+    process.stdout.write('  scm_render_heavy (--no-turbo-inlining) steady: ' + r.steady + ' B/op (readings ' + r.readings.join(',') + ')\n');
+    // FAIL CLOSED: the flag must have reached the child, or this is the default-flags gate run twice.
+    assert.ok(Array.isArray(r.execArgv) && r.execArgv.includes('--no-turbo-inlining'),
+        'child did NOT receive --no-turbo-inlining (execArgv=' + JSON.stringify(r.execArgv) + ')');
+    assert.ok(r.steady <= 0.5, 'scm_render_heavy must read <= 0.5 B/op steady under --no-turbo-inlining, got ' + r.steady);
+    const c = await runDemoLane('scm_estimate_box', 4000, 5, NOINLINE);
+    process.stdout.write('  scm_estimate_box (--no-turbo-inlining) steady: ' + c.steady + ' B/op\n');
+    assert.ok(c.execArgv.includes('--no-turbo-inlining'), 'control child did NOT receive --no-turbo-inlining');
+    assert.ok(c.steady >= 12, 'scm_estimate_box control must box >= 12 B/op under --no-turbo-inlining, got ' + c.steady);
+});
+
 test('P3 DD render probe: renderDdPrep reads all four detectors through dd.into(row) (1.11.0) at <= 0.5 B/op, while the old six-getter render shape (dd_getter_box control) still boxes >= 12 B/op -- the 0 is the reader, not a blind probe', async () => {
     const r = await runDemoLane('dd_render');
     process.stdout.write('  dd_render steady: ' + r.steady + ' B/op (dd.into row)\n');
@@ -2840,4 +2854,31 @@ test('SCM oracle off / resume hold (review B9 BLOCKER 5): with the exact ring sk
     const html = readFileSync(join(DEMO_DIR, 'index.html'), 'utf8');
     assert.match(html, /if \(on && !scmWorld\.oracleOn\) scmWorld\.resumeNow = scmWorld\.now;/, 'the SCM oracle toggle starts the refill hold');
     assert.match(extractFnBody(html, 'scmTick'), /bk !== bk \? 'n\/a'/, 'scmTick renders a NaN verdict as "n/a"');
+});
+
+test('SCM C_TOTAL source (2026-10-04): renderScmPrep sums total() in its own body from the library\'s per-pane arrays (bound at createScmWorld, never the scm.total() fallback) and C_TOTAL is Object.is-identical to scm.total() on every render -- unset, heavy (> 2^31), oracle off / resume, paused to empty, after clear(), across W / panes', () => {
+    let heavySeen = 0;
+    for (const [W, P] of [[SCM_DEFAULT_W, SCM_DEFAULT_PANES], [4096, 32], [1000, 3], [333.5, 64], [16, 2]]) {
+        const world = createScmWorld(W, SCM_DEFAULT_EPS, P, 0x5C40);
+        const a = createAllocState(), fl = world.flat, tag = 'W=' + W + ' P=' + P;
+        assert.ok(world.libPaneTotal instanceof Float64Array && world.libPaneEnd instanceof Float64Array,
+            tag + ': the total() arrays must bind (a null here means the render fell back to the boxing scm.total() call)');
+        renderScmPrep(world, a);
+        assert.ok(Object.is(fl[C_TOTAL], 0) && Object.is(world.scm.total(), 0), tag + ': unset -> +0 both');
+        for (let f = 0; f < 600; f++) {
+            world.heavy = f >= 50 && f < 300;
+            world.paused = f >= 400 && f < 480;
+            const on = !(f >= 120 && f < 200);
+            if (on && !world.oracleOn) world.resumeNow = world.now;
+            world.oracleOn = on;
+            if (f === 520) world.scm.clear();
+            stepScm(world);
+            if (world.oracleOn) stepScmOracle(world, a);
+            renderScmPrep(world, a);
+            const t = world.scm.total();
+            assert.ok(Object.is(fl[C_TOTAL], t), tag + ' f=' + f + ': C_TOTAL ' + fl[C_TOTAL] + ' must be Object.is scm.total() ' + t);
+            if (t > 2 ** 31) heavySeen++;
+        }
+    }
+    assert.ok(heavySeen > 0, 'the heavy (> 2^31) regime must be exercised');
 });
