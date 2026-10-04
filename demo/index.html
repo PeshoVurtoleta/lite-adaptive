@@ -83,8 +83,8 @@
         header.top {
             display: flex;
             align-items: center;
-            gap: 24px;
-            padding: 14px 24px;
+            gap: 1.5rem;
+            padding: 14px 1.5rem;
             border-bottom: 1px solid var(--line);
             background: linear-gradient(to bottom, var(--bg-1), var(--bg-0));
         }
@@ -92,14 +92,14 @@
         .brand {
             display: flex;
             align-items: baseline;
-            gap: 12px;
+            gap: 0.75rem;
             font-family: 'Space Mono', 'JetBrains Mono', monospace;
         }
 
         .brand .mark {
             color: var(--accent);
             font-weight: 700;
-            font-size: 16px;
+            font-size: 1rem;
             letter-spacing: -0.02em;
             text-shadow: var(--glow-accent);
         }
@@ -160,8 +160,8 @@
             border: 0;
             color: var(--text-dim);
             font-family: inherit;
-            font-size: 12px;
-            padding: 12px 18px;
+            font-size: 0.75rem;
+            padding: 0.75rem 18px;
             cursor: pointer;
             flex: 0 0 auto;
             white-space: nowrap;
@@ -183,8 +183,8 @@
         nav.tabs button[aria-current="true"]::after {
             content: "";
             position: absolute;
-            left: 12px;
-            right: 12px;
+            left: 0.75rem;
+            right: 0.75rem;
             bottom: -1px;
             height: 2px;
             background: var(--accent);
@@ -193,7 +193,7 @@
 
         nav.tabs .scene-num {
             color: var(--text-faint);
-            margin-right: 8px;
+            margin-right: 0.5rem;
             font-weight: 300;
         }
 
@@ -238,7 +238,7 @@
         }
 
         .panel .panel-head {
-            padding: 16px 20px 8px;
+            padding: 1rem 1.25rem 0.5rem;
             font-size: 10px;
             letter-spacing: 0.18em;
             text-transform: uppercase;
@@ -247,12 +247,12 @@
         }
 
         .panel section {
-            padding: 16px 20px;
+            padding: 1rem 1.25rem;
             border-bottom: 1px solid var(--line);
         }
 
         .panel section h3 {
-            margin: 0 0 12px;
+            margin: 0 0 0.75rem;
             font-size: 10px;
             font-weight: 700;
             letter-spacing: 0.16em;
@@ -269,7 +269,7 @@
             background: var(--bg-3);
             color: var(--text);
             border: 1px solid var(--line-strong);
-            padding: 8px 14px;
+            padding: 0.5rem 14px;
             cursor: pointer;
             transition: all .12s;
         }
@@ -299,7 +299,7 @@
         }
 
         .field {
-            margin-bottom: 12px;
+            margin-bottom: 0.75rem;
         }
 
         .field label {
@@ -308,7 +308,7 @@
             letter-spacing: 0.08em;
             color: var(--text-faint);
             text-transform: uppercase;
-            margin-bottom: 4px;
+            margin-bottom: 0.25rem;
         }
 
         .field input[type="range"] {
@@ -322,7 +322,7 @@
             color: var(--text);
             border: 1px solid var(--line-strong);
             border-radius: 4px;
-            padding: 4px 6px;
+            padding: 0.25rem 6px;
             font-family: inherit;
             font-size: 11px;
         }
@@ -336,7 +336,7 @@
         /* Fail-closed banner: carries the library's OWN thrown message (never a hardcoded string). */
         .fail-banner {
             margin-top: 10px;
-            padding: 8px 10px;
+            padding: 0.5rem 10px;
             border-radius: 4px;
             font-size: 11px;
             line-height: 1.5;
@@ -365,7 +365,7 @@
         .help-line code {
             color: var(--accent);
             background: rgba(139, 124, 246, 0.08);
-            padding: 0 4px;
+            padding: 0 0.25rem;
             border-radius: 3px;
         }
 
@@ -379,7 +379,7 @@
         .toggle {
             position: relative;
             width: 46px;
-            height: 24px;
+            height: 1.5rem;
             border-radius: 12px;
             background: var(--bg-3);
             border: 1px solid var(--line-strong);
@@ -426,7 +426,7 @@
         .truth {
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 0.75rem;
         }
 
         .truth .primary-label {
@@ -465,7 +465,7 @@
         .jank-caption {
             font-size: 10px;
             color: var(--text-dim);
-            margin-top: 4px;
+            margin-top: 0.25rem;
         }
 
         .alloc-pair {
@@ -478,7 +478,7 @@
         }
 
         .alloc-big {
-            font-size: 24px;
+            font-size: 1.5rem;
             font-weight: 700;
             font-variant-numeric: tabular-nums;
             letter-spacing: -0.02em;
@@ -503,7 +503,7 @@
         .stat-row {
             display: flex;
             justify-content: space-between;
-            font-size: 12px;
+            font-size: 0.75rem;
             padding: 3px 0;
         }
 
@@ -543,7 +543,7 @@
             font-weight: 700;
             border: 1px solid var(--line-strong);
             border-radius: 3px;
-            padding: 0 4px;
+            padding: 0 0.25rem;
         }
 
         .sat-badge[data-on="true"] {
@@ -561,20 +561,20 @@
         /* Stage overlays ---------------------------------------------------- */
         .stage-overlay {
             position: absolute;
-            padding: 8px 12px;
+            padding: 0.5rem 0.75rem;
             font-size: 10px;
             pointer-events: none;
             z-index: 3;
         }
 
         .stage-overlay.tl {
-            top: 12px;
-            left: 16px;
+            top: 0.75rem;
+            left: 1rem;
         }
 
         .stage-overlay.tr {
-            top: 12px;
-            right: 16px;
+            top: 0.75rem;
+            right: 1rem;
             text-align: right;
         }
 
@@ -586,7 +586,7 @@
 
         .stage-overlay .big {
             color: var(--accent);
-            font-size: 20px;
+            font-size: 1.25rem;
             font-weight: 700;
             font-variant-numeric: tabular-nums;
         }
@@ -596,7 +596,7 @@
             display: flex;
             gap: 18px;
             align-items: center;
-            padding: 8px 24px;
+            padding: 0.5rem 1.5rem;
             border-top: 1px solid var(--line);
             background: var(--bg-1);
             font-size: 10px;

@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Demo (repo-only; `demo/` is not in the npm tarball, no library change)
+
+- The SlidingCountMin scene reads the windowed N through `totalInto` (1.12.0) instead of summing the
+  library's private per-pane arrays; a test forbids any private-field read from the demo.
+- Demo CSS: quarter-rem px values (4-32 px on a 4 px step) on font-size / spacing / size properties are rem;
+  borders, radii, shadows and off-grid values stay px.
+
 ## [1.12.0] - 2026-10-04
 
 The `totalInto` release (ROADMAP section 14; one feature). `SlidingCountMin.totalInto` is the 0-alloc render

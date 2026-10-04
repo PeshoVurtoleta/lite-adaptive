@@ -1506,9 +1506,9 @@ Ledger (open, for a later session):
   New gates, both revert-checked (FAIL on HEAD): the render lane under `--no-turbo-inlining` (runDemoLane
   `flags`, execArgv asserted; the scm_estimate_box control still boxes 16 under the flag) and a C_TOTAL ===
   `scm.total()` source test (the bind must hold).
-- OPEN (library, a later release): `SlidingCountMin.totalInto(out, i, w?)` -- a 0 B/call total reader
-  (parity with SlidingHyperLogLog.countInto) so the demo can drop its read of the private `_paneEnd` /
-  `_paneTotal` / `_now` / `_W` (a coupling; the C_TOTAL source test catches drift).
+- ~~OPEN (library, a later release): `SlidingCountMin.totalInto`~~ -- CLOSED: shipped in 1.12.0 as
+  `totalInto(out, w?)` (section 14, T-S1); the demo reads N through it (D1) and no longer touches
+  `_paneEnd` / `_paneTotal` / `_now` / `_W` -- the C_TOTAL source test now forbids any private-field read.
 - OPEN (demo, measured 2026-10-04, pre-existing at HEAD): under `--max-opt=2` (Maglev only) renderScmPrep's
   own body allocates ~2.6 KB/op in heavy mode (HEAD and fixed alike), so every probe window scavenges. Not
   hit by the gated default-flags / no-inline states (TurboFan); a Maglev-tier render audit is unscheduled.
@@ -1679,3 +1679,17 @@ no-inline gate revert-checked; README's `total` allocation claim corrected; demo
   (3) a write-then-throw mutant (bad-w NaN written before the container check) survived: the test now
   fills the rejected containers with 7s and checks them after every throw. The reviewer's 10 mutants
   (a1-a3, a6, b-g) re-run by the coordinator: all killed; the unmutated base passes.
+- Released as 1.12.0 (c169806, maintainer); catalog card + index synced to 1.12.0.
+
+### 14.2 D1 -- the demo reads totalInto (2026-10-04)
+
+- `renderScmPrep`: `scm.totalInto(SCM_TOT_ROW); flat[C_TOTAL] = SCM_TOT_ROW[0]` (a module-scope slot); the
+  `libPaneEnd` / `libPaneTotal` bind and its shape check are deleted from createScmWorld.
+- The C_TOTAL source test keeps the Object.is(C_TOTAL, scm.total()) run over 5 W / panes configs x 600
+  frames (heavy > 2^31, oracle off / resume, paused, clear) and now also asserts the render calls totalInto,
+  never `scm.total(`, and that kernels.mjs / index.html / DemoProbe.mjs read no private (underscore) field of
+  a library instance. Revert check: HEAD's kernels.mjs (the private-field sum) FAILS it.
+- `scm_render_heavy` stays gated under --no-turbo-inlining (must still read 0).
+- Demo CSS (maintainer call, same pass): px kept by default; only quarter-rem values (4 / 8 / 12 / 16 / 20 /
+  24 / 32 px) on font-size / padding / margin / gap / width / height / insets became rem (36 tokens); borders,
+  radii, shadows, hairlines, breakpoints and off-grid values stay px. Identical at the default 16 px root.

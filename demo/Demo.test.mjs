@@ -2814,13 +2814,11 @@ test('SCM oracle off / resume hold (review B9 BLOCKER 5): with the exact ring sk
     assert.match(extractFnBody(html, 'scmTick'), /bk !== bk \? 'n\/a'/, 'scmTick renders a NaN verdict as "n/a"');
 });
 
-test('SCM C_TOTAL source (2026-10-04): renderScmPrep sums total() in its own body from the library\'s per-pane arrays (bound at createScmWorld, never the scm.total() fallback) and C_TOTAL is Object.is-identical to scm.total() on every render -- unset, heavy (> 2^31), oracle off / resume, paused to empty, after clear(), across W / panes', () => {
+test('SCM C_TOTAL source (ROADMAP 14 D1): renderScmPrep reads N through the 1.12.0 render reader scm.totalInto (never the boxing scm.total() call), the demo reads NO private library field, and C_TOTAL is Object.is-identical to scm.total() on every render -- unset, heavy (> 2^31), oracle off / resume, paused to empty, after clear(), across W / panes', () => {
     let heavySeen = 0;
     for (const [W, P] of [[SCM_DEFAULT_W, SCM_DEFAULT_PANES], [4096, 32], [1000, 3], [333.5, 64], [16, 2]]) {
         const world = createScmWorld(W, SCM_DEFAULT_EPS, P, 0x5C40);
         const a = createAllocState(), fl = world.flat, tag = 'W=' + W + ' P=' + P;
-        assert.ok(world.libPaneTotal instanceof Float64Array && world.libPaneEnd instanceof Float64Array,
-            tag + ': the total() arrays must bind (a null here means the render fell back to the boxing scm.total() call)');
         renderScmPrep(world, a);
         assert.ok(Object.is(fl[C_TOTAL], 0) && Object.is(world.scm.total(), 0), tag + ': unset -> +0 both');
         for (let f = 0; f < 600; f++) {
@@ -2839,4 +2837,15 @@ test('SCM C_TOTAL source (2026-10-04): renderScmPrep sums total() in its own bod
         }
     }
     assert.ok(heavySeen > 0, 'the heavy (> 2^31) regime must be exercised');
+    // the source: the render calls totalInto and never total(); no file in the demo reads a private
+    // (underscore) field of a library instance -- the coupling D1 removed (comments excluded)
+    const body = extractFnBody(readFileSync(join(DEMO_DIR, 'kernels.mjs'), 'utf8'), 'renderScmPrep');
+    assert.match(body, /scm\.totalInto\(SCM_TOT_ROW\);\s*flat\[C_TOTAL\] = SCM_TOT_ROW\[0\];/, 'renderScmPrep reads N through totalInto into its slot');
+    const code0 = body.replace(/\/\/[^\n]*/g, '');   // comments name total() in prose; only code counts
+    assert.ok(!/scm\.total\(/.test(code0), 'renderScmPrep must not call the boxing scm.total()');
+    for (const f of ['kernels.mjs', 'index.html', 'DemoProbe.mjs']) {
+        const code = readFileSync(join(DEMO_DIR, f), 'utf8').split('\n').filter((l) => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+        const hits = code.match(/\b(scm|sl|slA|slB|slD|hk|eh|ad|fd|dd|sd|sld|dr|sa|world\.[a-zA-Z]+)\._[a-zA-Z]\w*/g);
+        assert.equal(hits, null, f + ' reads a private library field: ' + hits);
+    }
 });

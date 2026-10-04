@@ -263,8 +263,8 @@ const dd_getter_box = {
 };
 
 // P4 (SCM D7) lanes, heavy-count mode ENGAGED (tracked key 0's windowed count > 2^31). Frame = stepScm (the
-// stream + one heavy addFrom per frame) + stepScmOracle; render = renderScmPrep through estimateInto + the
-// in-body total() sum: both GATED 0. scm_render_heavy is ALSO gated under --no-turbo-inlining (runDemoLane
+// stream + one heavy addFrom per frame) + stepScmOracle; render = renderScmPrep through estimateInto +
+// totalInto (1.12.0; before it, an in-body sum over private pane arrays): both GATED 0. scm_render_heavy is ALSO gated under --no-turbo-inlining (runDemoLane
 // flags): the pre-2026-10-04 render called scm.total() and boxed its > 2^31 return 16 B whenever TurboFan
 // did not inline it (1 of 5 full demo runs; every run under the flag). MUST-BOX control scm_estimate_box sinks the scalar estimate() of the > 2^31 key
 // into a PACKED array (its documented F6 boxed return), so the render's 0 is genuine estimateInto elision.
