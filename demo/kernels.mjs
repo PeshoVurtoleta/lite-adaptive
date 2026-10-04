@@ -847,7 +847,7 @@ export function fdOracle(times, vals, head, tail, mask, lambda, now, out) {
  * fd.count / sum / mean / rate queries are O(1) 0-alloc; fdOracle writes into a reused 2-slot scratch. 0 B/op.
  * @param {object} world
  * @param {object} allocState
- * @returns {number} the decayed count (folded).
+ * @returns {number} an int32 fold of the add count (defeats DCE; never a boxed double).
  */
 export function renderFdPrep(world, allocState) {
     const fd = world.fd, flat = world.flat, now = world.now, lambda = world.lambda;
@@ -881,7 +881,7 @@ export function renderFdPrep(world, allocState) {
     flat[D_REBASED] = fd.landmark > world.firstNow ? 1 : 0;
     flat[D_SKETCH_ALLOC] = allocState.sketchCount;
     flat[D_ORACLE_ALLOC] = allocState.oracleCount;
-    return count;
+    return world.n | 0;   // int32 fold (defeats DCE); count lives in flat[D_COUNT], never RETURNED (boxed 16 B/call)
 }
 
 // =======================================================================================

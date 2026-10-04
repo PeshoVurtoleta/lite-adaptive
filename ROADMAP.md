@@ -1478,6 +1478,18 @@ lookups, the D-S5 revert) and QA-5..8, each kept as a control or gate. A fresh r
 
 Ledger (open, for a later session):
 - ~~N6 for the other key-hashing members~~ -- CLOSED in section 13 (every member x key class 0.0 in Chrome).
+- ~~OPEN: renderFdPrep boxes ~16 B/call~~ -- CLOSED 2026-10-04 (demo-only; Adaptive.js byte-identical).
+  Found by a new-space delta probe (49 B/call at 3k / 20k warm calls, 17 B/call at 100k / 250k) that
+  measureAllocs read as 0, and DemoProbe had no FD render lane. Bisected with scratch variants: the getter
+  reads and the ternary stores were NOT the site (each removed alone still read 16); the site was
+  `return count;` -- the fractional decayed count returned across the non-inlined render boundary (the
+  "returned double" pattern). Fix: `return world.n | 0` (the renderAdPrep shape; the count stays in
+  flat[D_COUNT]; no caller read the return as a count). New `fd_render` DemoProbe lane (pinned semi-space,
+  shape of eh_render_spike) + the QA gate "QA fd_render" (every fresh child <= 0.5, mustbox >= 12):
+  HEAD 16,16,16 B/op (gate FAILS, revert-checked), fix 0,0,0. Parity vs `git show HEAD:demo/kernels.mjs`:
+  every flat slot Object.is-identical over 40800 slot compares (30 worlds: halfLife 1 .. 1e6, 5 seeds,
+  empty world, rebase engaged, repeat + cross-applied renders); only the return value changed. Original
+  method re-run: HEAD 17 B/call steady, fix ~1 B/call (the method floor, same as renderEhPrep).
 - `activate()` keeps ONE intentional forced reflow per tab switch (a hidden scene has no geometry to
   pre-measure), documented in index.html; not a per-frame cost.
 - Still open from 1.10.0: H2-5 megamorphic-site boxing (state slab), the EH addFrom 0.95x residue.

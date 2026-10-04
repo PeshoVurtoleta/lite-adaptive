@@ -47,6 +47,10 @@ The demo session (ROADMAP section 11). `Adaptive.js` is byte-identical to 1.11.0
 - Readouts: every ~10Hz readout is write-on-change (no format and no DOM write for an unchanged value; NaN
   renders "n/a"); a count above 2^31 no longer wraps through an int32 fold; `fmtNum(NaN)` renders "n/a".
 - The tab bar scrolls instead of clipping the last tabs; the space bar pauses every scene.
+- `renderFdPrep` boxed one HeapNumber (~16 B) per call in the steady state: it returned the fractional
+  decayed count across its call boundary, which measureAllocs could not see. It now returns an int32 fold
+  (`world.n | 0`); every flat slot is `Object.is`-identical to before. Gated by the new `fd_render`
+  DemoProbe lane (16 -> 0 B/op; the gate fails on the old code).
 
 ## [1.11.0] - 2026-09-28
 

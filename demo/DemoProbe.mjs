@@ -32,6 +32,7 @@ import {
     // P1 (EH / ADWIN) lanes
     createEhWorld, stepEhGuarded, stepEhOracle, renderEhPrep, EH_DEFAULT_W, EH_DEFAULT_EPS,
     createAdWorld, stepAd, stepAdGhost, stepAdOracle, renderAdPrep, AD_DEFAULT_DELTA,
+    createFdWorld, stepFd, stepFdOracle, renderFdPrep, FD_DEFAULT_HALFLIFE,
     // P3 (DD / SLD) lanes
     createDdWorld, stepDd, stepDdOracle, renderDdPrep, DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD, G_PH_FIRES,
     createSldWorld, stepSld, stepSldOracle, renderSldPrep,
@@ -153,6 +154,20 @@ const eh_frame_dense10k = ehFrameLane(1024, 0.05, 3, { preset: 'dense10k' });
 const eh_frame_spike = ehFrameLane(1024, 0.1, 4, { values: 'spike' });
 const eh_render_spike = ehRenderLane(1024, 0.1, 4, { values: 'spike' });
 const eh_render_dense10k = ehRenderLane(1024, 0.05, 3, { preset: 'dense10k' });
+
+// GATED render lane: renderFdPrep (~10Hz) on the default half-life, pre-stepped (sketch + oracle ring)
+// to a realistic live ring. Same shape as eh_render_spike. Its fd.count / sum / mean / rate and the
+// lambda / landmark getter returns are fractional doubles; they must reach the flat slots unboxed.
+// HEAD read ~16 B/op here (one HeapNumber per call) while measureAllocs read 0. <= 0.5 B/op steady.
+const fd_render = {
+    setup() {
+        const w = createFdWorld(FD_DEFAULT_HALFLIFE);
+        const a = createAllocState();
+        for (let i = 0; i < 400; i++) { stepFd(w); stepFdOracle(w, a); }
+        return { w, a, acc: new Float64Array(1) };
+    },
+    hot(s, n) { const w = s.w, a = s.a, acc = s.acc; for (let i = 0; i < n; i++) { renderFdPrep(w, a); acc[0] += w.n; } },
+};
 
 function adFrameBuilt(delta, seed, offset, preset, warm) {
     const w = createAdWorld(delta, seed, offset, preset);
@@ -338,6 +353,8 @@ export const LANES = {
     shll_step_q1, shll_step_never, shll_render,
     // P1 EH / ADWIN
     eh_frame_default, eh_frame_dense10k, eh_frame_spike, eh_render_spike, eh_render_dense10k,
+    // P2 FD render (the ~16 B/call HeapNumber the measureAllocs gate could not see)
+    fd_render,
     ad_frame_default, ad_frame_offset, ad_frame_preset,
     ad_render_default, ad_render_offset, ad_render_preset,
     ad_mean_sink, ad_variance_sink,
