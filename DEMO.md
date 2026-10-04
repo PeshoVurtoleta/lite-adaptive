@@ -521,8 +521,10 @@ a violation (with an injected-violation control per rule, so the audit itself ha
   literal (so a release bump can never leave the demo pinned to a stale version -- the
   1.0.0-pin rot this update fixed).
 - **Zero-alloc gate**: every scene's `stepX` + `renderXPrep` measure 0 B/op
-  (`measureAllocs`) and trigger 0 major GC over ~200k ops (`GcProfiler` + `checkNoGc`,
-  `maxMajor: 0`), mirroring `test/torture.mjs`. A PAUSED `stepX` (the idle-slide
+  (`measureAllocs`) and trigger 0 GC over 200k ops (`GcProfiler` + `checkNoGc`,
+  `maxMajor: 0, maxMinor: 0, maxPauseMs: 4`), mirroring `test/torture.mjs`. Each 200k-frame lane
+  runs in its own fresh `node --expose-gc` child (`demo/DemoGcLane.mjs`), so earlier tests' garbage,
+  JIT state and queued GC entries cannot land in the window. A PAUSED `stepX` (the idle-slide
   `advanceFrom` branch) is also measured at 0 B/op. The oracle steps are the
   allowed-to-allocate contrast and are kept OUT of the measured loop.
 - **Retention + idle-slide**: 50 clear()/refill cycles -- `hk.size` returns to 0,
