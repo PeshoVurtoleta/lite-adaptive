@@ -93,10 +93,12 @@ import {
 
 // Dev-only peer (already a devDependency -- the same tool test/torture.mjs uses). Used ONLY by the
 // 0-B/op assertions below; each such test skips cleanly (t.skip) without --expose-gc.
-import { GcProfiler, checkNoGc, measureAllocs } from '@zakkster/lite-gc-profiler';
+import { measureAllocs } from '@zakkster/lite-gc-profiler';
 // The shared STEADY-STATE probe (D3/D4 blocker 2): a pinned-semi-space child-process lane runner that
 // SEES a transient box measureAllocs cannot. Demo tests may import package-internal test helpers.
 import { runDemoLane } from './DemoProbe.mjs';
+// The per-scene 0-major-GC lanes run one per FRESH child process (see gcGate below).
+import { runGcLane } from './DemoGcLane.mjs';
 
 const DEMO_DIR = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -1362,93 +1364,49 @@ test('0-B/op (measureAllocs): renderDrPrep alone measures 0 bytes/call', (t) => 
     measure0(t, 'renderDrPrep', 500, () => renderDrPrep(w, a));
 });
 
-// Per-scene combined 0-major-GC gate: stepX every frame + renderXPrep every 64th over ~200k stepX
+// Per-scene combined 0-major-GC gate: stepX every frame + renderXPrep every 64th over 200k stepX
 // ops (the DEMO.md "sketch path stays zero-GC while it runs" claim), mirroring test/torture.mjs's
-// `checkNoGc(s, { maxMajor: 0 })`. The oracle steps are NOT in this loop -- they are the
-// allowed-to-allocate contrast, and including them would poison the measurement (the planner's RISK).
-async function gcGate(t, name, world, alloc, step, render) {
+// `checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 })` and adding `maxMinor: 0`. The oracle steps are NOT in
+// the loop -- they are the allowed-to-allocate contrast (the planner's RISK).
+// Each lane runs in a FRESH `node --expose-gc` child (demo/DemoGcLane.mjs), never in this process:
+// in-process, after ~85 earlier tests, the window measured the test file (discarded optimized code ->
+// baseline-tier boxing, a ~740-entry 'gc' perf-entry backlog delivered in the tail, the in-loop
+// memoryUsage branch deopting the hot loop), and the 4-file parallel run stretched those minors past
+// 4 ms (2026-10-04: EH 15.87 ms, HK 9.57 ms). In a fresh isolate the window holds 0 GC events, so the
+// gate is deterministic AND can gate minors: the pre-2026-10-04 gate PASSED a 32 B/frame injected
+// allocation (minors were "reported, not gated"); this one fails it.
+const GC_RULES_CHECKED = ['maxMajor', 'maxMinor', 'maxPauseMs'];
+async function gcGate(t, name) {
     if (FAST) { t.skip('fast (demo:check skips the 200k-frame lanes)'); return; }
-    if (typeof global.gc !== 'function') { t.skip('needs --expose-gc'); return; }
-    for (let i = 0; i < 20000; i++) { step(); if ((i & 63) === 0) render(world, alloc); }
-    global.gc(); global.gc();
-    const gc = new GcProfiler().start();
-    const HOT = 200000;
-    let sink = 0;
-    for (let i = 0; i < HOT; i++) {
-        sink = (sink + step()) | 0;
-        if ((i & 63) === 0) sink = (sink + (render(world, alloc) | 0)) | 0;
-        if ((i & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
-    }
-    assert.ok(Number.isFinite(sink), 'sink keeps the swept work live');
-    await new Promise((r) => setTimeout(r, 50));   // GC entries arrive asynchronously
-    const s = gc.summary();
-    const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
-    gc.stop();
-    process.stdout.write('  ' + name + ' sketch-path gate: gc major=' + s.gc.major + ' minor=' + s.gc.minor +
-        ' (reported, not gated) maxMs=' + s.gc.maxMs.toFixed(2) + '\n');
-    assert.equal(s.gc.major, 0, name + ' 200k sketch-path frames must trigger 0 major GC, got ' + s.gc.major);
-    assert.ok(report.ok, name + ' checkNoGc must report ok: ' + JSON.stringify(report.violations));
-    assert.equal(alloc.sketchCount, 0, name + ' sketch-path owned allocation counter must stay pinned at 0');
-    assert.equal(world.flat[world.__sketchAllocIdx], 0, name + ' flat sketch-alloc slot must read 0');
+    const r = await runGcLane(name);
+    process.stdout.write('  ' + name + ' sketch-path gate (fresh child): gc major=' + r.major + ' minor=' + r.minor +
+        ' maxMs=' + r.maxMs.toFixed(2) + ' loop=' + r.loopMs.toFixed(0) + 'ms\n');
+    assert.equal(r.lane, name, 'the child must report the lane it was asked to run');
+    assert.equal(r.hot, 200000, name + ' window must be the full 200k sketch-path frames');
+    assert.ok(r.execArgv.includes('--expose-gc'), name + ' child must run with --expose-gc');
+    // fail closed: an unobserved GC channel or an undrained observer is NOT a pass.
+    assert.equal(r.observed, true, name + ' GC channel must have been observed (else the gate verified nothing)');
+    assert.equal(r.settled, true, name + ' GC observer must drain before the verdict (undrained = inconclusive = FAIL)');
+    assert.deepEqual(Object.keys(r.checked).sort(), GC_RULES_CHECKED, name + ' checkNoGc must evaluate exactly ' + GC_RULES_CHECKED.join('/'));
+    for (const k of GC_RULES_CHECKED) assert.equal(r.checked[k], true, name + ' rule ' + k + ' must be checkable on the gc source');
+    assert.ok(r.sinkFinite, 'sink keeps the swept work live');
+    assert.equal(r.major, 0, name + ' 200k sketch-path frames must trigger 0 major GC, got ' + r.major);
+    assert.equal(r.minor, 0, name + ' 200k sketch-path frames must trigger 0 minor GC in a fresh isolate, got ' + r.minor);
+    assert.equal(r.verdict, 'pass', name + ' checkNoGc must report pass: ' + JSON.stringify(r.violations));
+    assert.ok(r.ok, name + ' checkNoGc must report ok: ' + JSON.stringify(r.violations));
+    assert.equal(r.sketchCount, 0, name + ' sketch-path owned allocation counter must stay pinned at 0');
+    assert.equal(r.flatSlot, 0, name + ' flat sketch-alloc slot must read 0');
 }
 
-test('0-major-GC: EH sketch path (stepEh + renderEhPrep) over 200k frames', async (t) => {
-    const w = createEhWorld(EH_DEFAULT_W, EH_DEFAULT_EPS, 0x1A2B); const a = createAllocState();
-    w.__sketchAllocIdx = E_SKETCH_ALLOC;
-    await gcGate(t, 'EH', w, a, () => stepEh(w), renderEhPrep);
-});
-test('0-major-GC: ADWIN sketch path (stepAd + renderAdPrep) over 200k frames', async (t) => {
-    const w = createAdWorld(AD_DEFAULT_DELTA, 0x1A2B); const a = createAllocState();
-    w.__sketchAllocIdx = A_SKETCH_ALLOC;
-    await gcGate(t, 'ADWIN', w, a, () => stepAd(w), renderAdPrep);
-});
-test('0-major-GC: FD sketch path (stepFd + renderFdPrep) over 200k frames', async (t) => {
-    const w = createFdWorld(FD_DEFAULT_HALFLIFE, 0x1A2B); const a = createAllocState();
-    // seed the exact ring once so renderFdPrep has samples; the hot loop never calls the oracle step.
-    for (let i = 0; i < 120; i++) stepFdOracle(w, a);
-    a.oracleCount = 0;   // reset the contrast counter after seeding (sketchCount stays 0)
-    w.__sketchAllocIdx = D_SKETCH_ALLOC;
-    await gcGate(t, 'FD', w, a, () => stepFd(w), renderFdPrep);
-});
-test('0-major-GC: HK sketch path (stepHk + renderHkPrep) over 200k frames', async (t) => {
-    const w = createHkWorld(HK_DEFAULT_D, HK_DEFAULT_W, HK_DEFAULT_K, 0x1A2B); const a = createAllocState();
-    for (let i = 0; i < 40; i++) stepHkOracle(w, a);   // populate the Map once (read-only in the hot loop)
-    a.oracleCount = 0;
-    w.__sketchAllocIdx = H_SKETCH_ALLOC;
-    await gcGate(t, 'HK', w, a, () => stepHk(w), renderHkPrep);
-});
-
-test('0-major-GC: SHLL sketch path (stepShll + renderShllPrep) over 200k frames', async (t) => {
-    const w = createShllWorld(SHLL_DEFAULT_W, SHLL_DEFAULT_P, SHLL_DEFAULT_RINGCAP, 0x1A2B); const a = createAllocState();
-    for (let i = 0; i < 40; i++) { stepShll(w); stepShllOracle(w, a); }
-    a.oracleCount = 0;
-    w.__sketchAllocIdx = S_SKETCH_ALLOC;
-    await gcGate(t, 'SHLL', w, a, () => stepShll(w), renderShllPrep);
-});
-test('0-major-GC: DD sketch path (stepDd + renderDdPrep) over 200k frames', async (t) => {
-    const w = createDdWorld(DD_DEFAULT_DELTA, DD_DEFAULT_THRESHOLD); const a = createAllocState();
-    w.__sketchAllocIdx = G_SKETCH_ALLOC;
-    await gcGate(t, 'DD', w, a, () => stepDd(w), renderDdPrep);
-});
-test('0-major-GC: SLD sketch path (stepSld + renderSldPrep) over 200k frames', async (t) => {
-    const w = createSldWorld(SLD_DEFAULT_W, SLD_DEFAULT_ALPHA, SLD_DEFAULT_PANES); const a = createAllocState();
-    for (let i = 0; i < 40; i++) { stepSld(w); stepSldOracle(w, a); }
-    a.oracleCount = 0;
-    w.__sketchAllocIdx = Q_SKETCH_ALLOC;
-    await gcGate(t, 'SLD', w, a, () => stepSld(w), renderSldPrep);
-});
-test('0-major-GC: SCM sketch path (stepScm + renderScmPrep) over 200k frames', async (t) => {
-    const w = createScmWorld(SCM_DEFAULT_W, SCM_DEFAULT_EPS, SCM_DEFAULT_PANES, 0x1A2B); const a = createAllocState();
-    for (let i = 0; i < 40; i++) { stepScm(w); stepScmOracle(w, a); }
-    a.oracleCount = 0;
-    w.__sketchAllocIdx = C_SKETCH_ALLOC;
-    await gcGate(t, 'SCM', w, a, () => stepScm(w), renderScmPrep);
-});
-test('0-major-GC: DR sketch path (stepDr + renderDrPrep) over 200k frames', async (t) => {
-    const w = createDrWorld(DR_DEFAULT_K, DR_DEFAULT_HALFLIFE, 0x1A2B); const a = createAllocState();
-    w.__sketchAllocIdx = R_SKETCH_ALLOC;
-    await gcGate(t, 'DR', w, a, () => stepDr(w), renderDrPrep);
-});
+test('0-major-GC: EH sketch path (stepEh + renderEhPrep) over 200k frames', (t) => gcGate(t, 'EH'));
+test('0-major-GC: ADWIN sketch path (stepAd + renderAdPrep) over 200k frames', (t) => gcGate(t, 'ADWIN'));
+test('0-major-GC: FD sketch path (stepFd + renderFdPrep) over 200k frames', (t) => gcGate(t, 'FD'));
+test('0-major-GC: HK sketch path (stepHk + renderHkPrep) over 200k frames', (t) => gcGate(t, 'HK'));
+test('0-major-GC: SHLL sketch path (stepShll + renderShllPrep) over 200k frames', (t) => gcGate(t, 'SHLL'));
+test('0-major-GC: DD sketch path (stepDd + renderDdPrep) over 200k frames', (t) => gcGate(t, 'DD'));
+test('0-major-GC: SLD sketch path (stepSld + renderSldPrep) over 200k frames', (t) => gcGate(t, 'SLD'));
+test('0-major-GC: SCM sketch path (stepScm + renderScmPrep) over 200k frames', (t) => gcGate(t, 'SCM'));
+test('0-major-GC: DR sketch path (stepDr + renderDrPrep) over 200k frames', (t) => gcGate(t, 'DR'));
 
 /* ============================ non-vacuous contrast ========================== */
 

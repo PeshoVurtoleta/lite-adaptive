@@ -43,6 +43,14 @@ The demo session (ROADMAP section 11). `Adaptive.js` is byte-identical to 1.11.0
 - Readouts: every ~10Hz readout is write-on-change (no format and no DOM write for an unchanged value; NaN
   renders "n/a"); a count above 2^31 no longer wraps through an int32 fold; `fmtNum(NaN)` renders "n/a".
 - The tab bar scrolls instead of clipping the last tabs; the space bar pauses every scene.
+- The nine 0-major-GC sketch-path lanes were flaky under the full parallel `npm run demo` (EH 15.87 ms and
+  HK 9.57 ms over the 4 ms pause rule; 3/3 green when run alone). Run inside Demo.test.mjs, the lane
+  measured the earlier tests, not the sketch path: optimized render code dropped once their worlds were
+  collected, ~740 backlogged GC perf entries delivered inside the window, and an in-loop
+  `process.memoryUsage()` that deopted the hot loop. Each lane now runs in a fresh child process
+  (`demo/DemoGcLane.mjs`) with a drained, preallocated window and 0 GC events. The gate is stricter:
+  `maxMinor: 0` is added to `maxMajor: 0` / `maxPauseMs: 4`. The old gate passed an injected 32 B/frame
+  allocation; the new one fails it.
 
 ## [1.11.0] - 2026-09-28
 

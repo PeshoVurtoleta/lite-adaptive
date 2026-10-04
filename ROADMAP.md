@@ -1482,5 +1482,41 @@ Ledger (open, for a later session):
 - `activate()` keeps ONE intentional forced reflow per tab switch (a hidden scene has no geometry to
   pre-measure), documented in index.html; not a per-frame cost.
 - Still open from 1.10.0: H2-5 megamorphic-site boxing (state slab), the EH addFrom 0.95x residue.
+- OPEN: `renderFdPrep` boxes ~16 B/call (one HeapNumber) in the steady state -- still 17 B/call after
+  250k warm calls (EH settles to ~0 by 100k, as DEMO.md says). `measureAllocs` reads 0 and no DemoProbe
+  FD render lane exists. Too small to trip a scavenge in the GC lane (FD window: 180 KB of a >= 2.5 MB new
+  space), so only a pinned probe lane can gate it.
+- OPEN: `scm_render_heavy` (P4 SCM heavy-count probe) read 16 B/op in EVERY window in 1 of the 9 complete
+  full runs during the GC-lane work below. The other 8 runs, plus 27 standalone runs (12 of them under 14
+  CPU hogs), read 0. Maglev-only code scavenges every window, so 16 B is a TurboFan state with one call
+  left un-inlined. Suspect: `const tot = scm.total()` in renderScmPrep, a double > 2^31 returned across a
+  non-inlined call boundary. The gate is RIGHT to fail (that state really boxes), so the fix is a render
+  immune to the inlining decision, not a looser probe.
+
+GC-lane isolation (2026-10-04, after the 11.2 sign-off; demo-only, `Adaptive.js` untouched):
+- Symptom: one full `npm run demo` failed two 0-major-GC lanes on the 4 ms pause rule (EH 15.87 ms; HK
+  minor=3, 9.57 ms, 9.0 s vs 4.9 s). The lanes passed 3/3 with 0 minors when run alone.
+- Cause, measured in an instrumented copy (alone vs whole-file order vs the 4-file run): the in-process
+  lane measured the TEST FILE, not the sketch path. (1) JIT tier: earlier tests' worlds die, so V8 drops
+  the optimized renderEhPrep / count() / sum() code ("embedded weak objects cleared"). The 313-render
+  warm-up did not re-tier it, so the window ran baseline code boxing every double (heap sampler: ~870 B
+  per renderEhPrep, +3 MB per lane on EH / HK / DD / DR; 2..7 minors that read 0 alone). (2) About 740
+  queued 'gc' perf entries from the measureAllocs tests, plus node:test's own async work, were delivered
+  inside the 50 ms tail. (3) The in-loop `process.memoryUsage()` branch (~180 B/call) deopted the OSR'd
+  loop every 8192 frames (+2.6 MB total_allocated per lane, alone). CPU contention from the parallel
+  files only stretched those minors (0.1 ms -> 15.87 ms); it did not cause them.
+- Fix: `demo/DemoGcLane.mjs` runs each lane in a FRESH `node --expose-gc` child. Same world setup and
+  200k-frame / render-every-64th window. 80k-frame warm-up, the async backlog drained and collected
+  before `start()`, the hot loop in its own function, heap samples written to a preallocated
+  Float64Array and replayed after the window, `settle()` required to drain. The window now holds 0 GC
+  events on every lane (in-window new-space use 23..180 KB of a >= 2.5 MB new space), so wall-clock
+  contention has no pause to stretch.
+- Gate STRENGTHENED, not loosened: `{maxMajor: 0, maxPauseMs: 4}` is kept and `maxMinor: 0` added, plus
+  fail-closed asserts (observed, drained, all three rules checkable). Revert check: a 32 B/frame
+  `world.__inj = [now]` in stepEh PASSED the old in-process gate (minor=3, "reported, not gated") and
+  FAILS the new lane (`gc.minor 5 > 0`).
+- Proof: 5 consecutive full `npm run demo` runs, 223/223 each, every lane major=0 minor=0 maxMs=0.00. A
+  sixth (killed) run with 14 CPU hogs on 12 cores stretched the loops 4-5x (HK 22.9 s) and still read 0/0/0.
+  In-suite revert check: the injection fails the EH lane through node:test (`got 5`) and the other 8 stay green.
 
 
