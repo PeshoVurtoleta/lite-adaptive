@@ -1,6 +1,6 @@
 # @zakkster/lite-adaptive
 
-Version: 1.11.0
+Version: 1.12.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -295,7 +295,7 @@ BYTE-IDENTICAL (only the file header + VERSION change).
   never throws; a wrong CONTAINER type (into's `out` not a Float64Array or length < 5) throws. Getters:
   `W` / `panes` / `mode` / `lastNow` / `bytes` (= (B+1) * 48; 1584 B at B=32, 50 channels = 79,200 B).
 - `DRIFT_PH` / `DRIFT_CUSUM` -- the two DriftDetector mode consts (numeric, 0 / 1).
-- `VERSION` -- string, '1.11.0'.
+- `VERSION` -- string, '1.12.0'.
 
 ## ExponentialHistogram
 
@@ -595,7 +595,8 @@ door BEFORE any allocation.
                                  throws -- F12). Since 1.11.0 the estimator tail is 0-box (slSigma /
                                  slTau / the count write into SHLL-only module scratch, never
                                  returned): 0 B/call steady, bit-identical to 1.10.0.
-- countInto(out, w?) -> 1        COLD, 0 B/call (mono / poly-4; mega5 INFO 16 B). The 0-alloc render
+- countInto(out, w?) -> 1        COLD, 0 B/call (mono / poly-4, w omitted or integral; a fractional w
+                                 boxes 16 B as the argument; mega5 INFO 16 B). The 0-alloc render
                                  sibling: writes count(w) into out[0] (Object.is-identical), returns
                                  1. A bad w -> out[0] = NaN, returns 1 (F12, never a throw); an unset
                                  sketch -> 0. out is a Float64Array, length >= 1 -- a wrong TYPE
@@ -919,7 +920,7 @@ add(1.75e12, 7) x3 -> estimate 1, not 3); it now fails closed -- rebase the cloc
                                  ~16 B HeapNumber per call at a non-inlined call site (the honest return of a
                                  large double); a count < 2^31 is a Smi, 0 B/call. `estimateInto` (below)
                                  is the 0-alloc batch reader that replaces this boxed return on the render path.
-- total(w?) -> number            COLD, O(B+1), 0 B/call. The EXACT windowed item total N -- the eps x N
+- total(w?) -> number            COLD, O(B+1). The EXACT windowed item total N -- the eps x N
                                  denominator a consumer needs for the additive error term -- summed from a
                                  per-pane Float64 total over the SAME live panes as estimate (straddling
                                  oldest pane included, so N covers the span [W, W + W/B]). EXACT, not
@@ -927,7 +928,19 @@ add(1.75e12, 7) x3 -> estimate 1, not 3); it now fails closed -- rebase the cloc
                                  VALIDATED per-add count and the windowed sum across panes loses no unit until
                                  2^53. NEVER throws (F12 parity): NaN for a bad sub-window w (the w check
                                  PRECEDES the unset return, so an UNSET instance with a bad w also returns NaN),
-                                 0 when unset with a good/omitted w. `w` optional in (0, W].
+                                 0 when unset with a good/omitted w. `w` optional in (0, W]. ALLOC: 0 B/call
+                                 while N < 2^31; once N >= 2^31 the RETURNED double boxes ONE ~16 B
+                                 HeapNumber per call at a non-inlined call site (measured 16 B/op under
+                                 --no-turbo-inlining) -- use `totalInto` on a render path.
+- totalInto(out, w?) -> 1        COLD, O(B+1), 0 B/call with w omitted or integral, at every inlining state
+                                 (1.12.0; a FRACTIONAL w boxes 16 B as the call argument at a non-inlined
+                                 site -- measured under --no-turbo-inlining). The 0-alloc render
+                                 sibling of total(): writes total(w) into out[0] (Object.is-identical, the
+                                 same live-pane loop) and returns 1. The S1 / S2 COLD-reader contract (parity
+                                 with SlidingHyperLogLog.countInto): a non-Float64Array out throws TypeError
+                                 (intrinsic tag), out.length < 1 throws RangeError (intrinsic length, read
+                                 ONCE); out is untouched on a throw. A bad w writes out[0] = NaN and returns 1
+                                 (checked before the unset return); an unset instance writes 0.
 - estimateInto(keys, out, w?)    COLD, 0 B/op. The batch reader: keys / out caller-owned Float64Arrays
   -> number                      (out.length >= keys.length, else a tagged Type/RangeError BEFORE any
                                  write -- the container-type contract). Writes out[j] = estimate(keys[j], w)
@@ -1154,7 +1167,11 @@ at a non-inlined call site; the `xxxInto` / `forEach` readers are the 0-alloc re
 10-15 Hz render loop use `SlidingDDSketch.quantileInto` (0 B/call) not `quantile` (16 B/call), and
 `HeavyKeeper.forEach` / `topKInto` (0 B/call) not `topK`. `SlidingCountMin.estimate` boxes 16 B/call
 only when the windowed count is >= 2^31 (a Smi-range count returns 0 B/call; `estimateInto` is the
-0-alloc batch reader that fixes it). `ExponentialHistogram.sum()` and `HeavyKeeper.estimate` box only in
+0-alloc batch reader that fixes it), and `SlidingCountMin.total` boxes 16 B/call once the windowed N is
+>= 2^31 at a non-inlined site (`totalInto` writes it into a caller slot, 0 B/call). A FRACTIONAL sub-window
+`w` is itself a boxed argument at a non-inlined site (16 B/call: `countInto(out, 62.5)` at default flags,
+`totalInto(out, 62.5)` under --no-turbo-inlining); the reader 0 B/call figures assume `w` omitted or
+integral. `ExponentialHistogram.sum()` and `HeavyKeeper.estimate` box only in
 the early JIT tier (steady state 0). `count()` and integer-count returns are Smis, 0 B/call.
 
 ## Container arguments -- the HOT / COLD threat model (H2-4, 1.10.0; type-tag hardened, 1.11.0)
@@ -1163,7 +1180,7 @@ The two halves differ on BOTH the type check and the LENGTH read. A HOT entry po
 advanceFrom, per item) verifies the type with `ArrayBuffer.isView(x) && x instanceof Float64Array` (a Proxy
 passes instanceof alone but not isView) and reads `x.length` ONCE into the index bound -- a caller-defined
 subclass length getter may run at most once per call (the caller's own code; the zero-GC hot path is the
-product). A COLD render reader (countInto / into / estimateInto / quantileInto / topKInto / sampleInto)
+product). A COLD render reader (countInto / totalInto / into / estimateInto / quantileInto / topKInto / sampleInto)
 instead checks the INTRINSIC type tag -- `TA_TAG.call(x) === 'Float64Array'`, TA_TAG the
 %TypedArray%.prototype[@@toStringTag] getter captured at module init, which reads the element-kind of the
 internal slot and returns 'Float64Array' ONLY for a genuine Float64Array, undefined (never a throw) for a

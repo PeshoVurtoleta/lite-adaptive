@@ -215,7 +215,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.11.0';
+export const VERSION = '1.12.0';
 
 // ===========================================================================
 // The time source + the fixed bucket pool substrate (ADR 0001 -- LOCKED)
@@ -5913,6 +5913,52 @@ export class SlidingCountMin {
             if (paneEnd[p] > cut) sum += paneTotal[p];   // same live-pane rule as estimate (straddling pane kept)
         }
         return sum;
+    }
+
+    /**
+     * The 0-alloc render sibling of total() (1.12.0): writes total(w) into `out[0]` and returns 1. `total()`
+     * RETURNS its double, and in a long window N passes 2^31 -- at a non-inlined call site that return boxes a
+     * 16 B HeapNumber per call (measured: the demo's heavy-count render, 16 B/op under --no-turbo-inlining).
+     * Here the sum stays in a LOCAL and lands straight in the caller's Float64Array slot, so it never boxes.
+     * The COLD-reader contract (S1 / S2, parity with SlidingHyperLogLog.countInto): a non-Float64Array
+     * container throws TypeError (intrinsic @@toStringTag -- a prototype-swapped typed array / DataView /
+     * Proxy is rejected), a length < 1 throws RangeError (length read ONCE via the TA_LEN intrinsic, so a
+     * lying / re-entrant `length` getter never runs); `out` is untouched on a throw. A BAD sub-window `w`
+     * writes `out[0] = NaN` and returns 1 (F12, never a throw) -- checked BEFORE the unset return, so an
+     * unset instance with a bad `w` writes NaN too; an unset instance otherwise writes 0. Else `out[0]` is
+     * EXACTLY what total(w) returns (Object.is-identical: the same live-pane rule, the same pane order --
+     * the loop is DUPLICATED from total(), which stays byte-identical). 0 B/call with `w` omitted or
+     * integral (a fractional `w` is itself a non-Smi argument and boxes 16 B at a non-inlined site).
+     * @param {Float64Array} out a caller-owned Float64Array with length >= 1.
+     * @param {number} [w] an optional sub-window in (0, W] (omit for the full window W).
+     * @returns {1}
+     */
+    totalInto(out, w) {
+        if (TA_TAG.call(out) !== 'Float64Array') {
+            throw new TypeError('[lite-adaptive] SlidingCountMin.totalInto out must be a Float64Array, got ' + describeArg(out));
+        }
+        const n = TA_LEN.call(out);      // intrinsic length, read ONCE (a lying getter never runs)
+        if (!(n >= 1)) {
+            throw new RangeError('[lite-adaptive] SlidingCountMin.totalInto out must have length >= 1, got ' + describeArg(out));
+        }
+        let effW = this._W;
+        if (w !== undefined) {
+            // F12 parity with total(w): a bad sub-window is NaN, never a throw. null is not zero.
+            if (typeof w !== 'number' || w !== w || w === Infinity || w === -Infinity || w <= 0 || w > this._W) {
+                out[0] = NaN;
+                return 1;
+            }
+            effW = w;
+        }
+        if (this._mode === MODE_UNSET) { out[0] = 0; return 1; }
+        const B = this._ring, paneEnd = this._paneEnd, paneTotal = this._paneTotal;
+        const cut = this._now - effW;
+        let sum = 0;                                     // stays a LOCAL; never returned (no box)
+        for (let p = 0; p < B; p++) {
+            if (paneEnd[p] > cut) sum += paneTotal[p];   // total()'s live-pane rule, same order
+        }
+        out[0] = sum;
+        return 1;
     }
 
     /**

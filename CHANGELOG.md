@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-10-04
+
+The `totalInto` release (ROADMAP section 14; one feature). `SlidingCountMin.totalInto` is the 0-alloc render
+sibling of `total()`, for a windowed N >= 2^31; every pre-existing method is byte-identical (a pure
+insertion). Docs corrected where they overstated 0 B/call for `total()` and for a fractional sub-window `w`.
+Also carries the repo-only demo work done since 1.11.0 (not in the npm tarball). Gates: npm test 865/865;
+torture 0 B/op on every lane incl. `totalInto` (0 major GC); test:perf 33/33; test:perf:matrix 174/174 incl.
+the `--no-turbo-inlining` totalInto rows and their must-box control; test:types; witness ok.
+
+### Added
+
+- `SlidingCountMin.totalInto(out, w?) -> 1`: the 0-alloc render sibling of `total()`. Writes `total(w)` into
+  `out[0]` (`Object.is`-identical, the same live-pane loop) and returns 1, under the same reader contract as
+  `SlidingHyperLogLog.countInto`: a non-`Float64Array` `out` throws `TypeError`, `out.length < 1` throws
+  `RangeError`, `out` is untouched on a throw, a bad `w` writes `NaN` (also on an unset instance), an unset
+  instance writes 0. 0 B/call with a windowed N >= 2^31 at every inlining state, including
+  `--no-turbo-inlining`, with `w` omitted or integral (a fractional `w` boxes 16 B as the call argument at a
+  non-inlined site). `total()` is byte-identical.
+
+### Fixed (docs)
+
+- README and llms.txt said `total()` is 0 B/call. Once the windowed N is >= 2^31 its returned double boxes
+  16 B per call wherever the call is not inlined (measured 16 B/op under `--no-turbo-inlining`; the demo's
+  heavy-count render hit it in 1 of 5 runs). The docs now say so and point at `totalInto`.
+- The `SlidingHyperLogLog.countInto` docs said 0 B/call for any `w`. A FRACTIONAL sub-window `w` is itself a
+  non-Smi argument: `countInto(out, 62.5)` measures 16 B/op at default flags (omitted / integral `w`: 0).
+  The docs now limit the 0 B/call claim to an omitted or integral `w`; the same note covers `totalInto`.
+
 ### Demo (repo-only; `demo/` is not in the npm tarball, no library change)
 
 The demo session (ROADMAP section 11). `Adaptive.js` is byte-identical to 1.11.0. Gates: `npm run demo`

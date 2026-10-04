@@ -561,7 +561,14 @@ void cmEst; void cmEstW;
 // total returns a number (the exact windowed N), with an optional sub-window
 const cmTotal: number = cm.total();
 const cmTotalW: number = cm.total(500);
-void cmTotal; void cmTotalW;
+// totalInto (1.12.0): 0-alloc render sibling of total(); returns the literal 1; optional sub-window
+const cmTotalInto: 1 = cm.totalInto(new Float64Array(1));
+const cmTotalIntoW: 1 = cm.totalInto(new Float64Array(1), 500);
+// @ts-expect-error -- totalInto out must be a Float64Array.
+cm.totalInto([0]);
+// @ts-expect-error -- totalInto requires an out argument.
+cm.totalInto();
+void cmTotal; void cmTotalW; void cmTotalInto; void cmTotalIntoW;
 
 // estimateInto is a batch 0-alloc reader over Float64Arrays; returns n written
 const cmKeys = new Float64Array([42, 7, 9]);

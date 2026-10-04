@@ -34,7 +34,7 @@ function zipfKey(u, n, s, base) {
 }
 
 test('VERSION is the expected string', () => {
-    assert.equal(VERSION, '1.11.0');
+    assert.equal(VERSION, '1.12.0');
 });
 
 test('constructor validates d / w / k fail-closed BEFORE allocation', () => {

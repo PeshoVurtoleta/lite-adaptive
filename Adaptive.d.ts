@@ -501,7 +501,7 @@ export class SlidingHyperLogLog {
      * non-Float64Array `out` (TypeError, via the intrinsic @@toStringTag tag -- a prototype-swapped
      * typed array / DataView / Proxy is rejected) or `out.length < 1` (RangeError, length read ONCE
      * via the intrinsic getter, NaN-safe); `out` is untouched on a throw. 0 B/call at a monomorphic /
-     * poly-4 site.
+     * poly-4 site with `w` omitted or integral (a fractional `w` boxes 16 B as the call argument).
      */
     countInto(out: Float64Array, w?: number): 1;
 
@@ -933,7 +933,8 @@ export class SlidingCountMin {
 
     /**
      * The EXACT total number of items N observed over the last W (or a sub-window `w <= W`) -- the
-     * eps x N denominator for the additive error term. COLD, O(B+1), 0 alloc; NEVER throws. Summed
+     * eps x N denominator for the additive error term. COLD, O(B+1), NEVER throws; 0 B/call while N < 2^31
+     * (once N >= 2^31 the returned double boxes 16 B at a non-inlined site -- use totalInto). Summed
      * from a per-pane Float64 total over the SAME live panes as `estimate` (straddling oldest pane
      * included), so it is N over exactly the covered span [W, W + W/B]. EXACT even when the d x w
      * cells saturate at 2^32-1 (it sums validated per-add counts; the windowed sum across panes loses
@@ -942,6 +943,19 @@ export class SlidingCountMin {
      * NaN (an UNSET instance with a good/omitted `w` returns 0). `w` optional in (0, W]. null is not zero.
      */
     total(w?: number): number;
+
+    /**
+     * The 0-alloc render sibling of total() (1.12.0): writes total(w) into `out[0]` (the SAME value,
+     * Object.is-identical) and returns 1. Use it when N can pass 2^31: total() RETURNS a double, which
+     * boxes 16 B per call at a non-inlined site; this lands it in the caller's slot instead. A bad
+     * sub-window `w` writes `out[0] = NaN` and returns 1 (checked before the unset return, so an unset
+     * instance with a bad `w` writes NaN too); an unset instance writes 0. Throws [lite-adaptive] on a
+     * non-Float64Array `out` (TypeError, via the intrinsic @@toStringTag tag -- a prototype-swapped typed
+     * array / DataView / Proxy is rejected) or `out.length < 1` (RangeError, length read ONCE via the
+     * intrinsic getter); `out` is untouched on a throw. 0 B/call with `w` omitted or integral (a
+     * fractional `w` boxes 16 B as the call argument at a non-inlined site).
+     */
+    totalInto(out: Float64Array, w?: number): 1;
 
     /**
      * Batch 0-alloc reader (F6/R7): writes `estimate(keys[j], w)` into `out[j]` for every j in

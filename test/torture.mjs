@@ -1208,6 +1208,23 @@ async function main() {
     const scmIntoBytes = Math.max(0, Math.round(scmIntoBpc));
     const scmIntoOk = scmIntoRes.bytesPerCall !== null && scmIntoBytes === 0;   // null bytesPerCall FAILS closed
 
+    // SlidingCountMin totalInto (1.12.0): the 0-alloc render sibling of total(). The scmInto instance carries
+    // a windowed N >= 2^31 (the case total() RETURNS a non-Smi double), so the lane exercises the value
+    // totalInto exists for; full + sub-window branches, the sum landing in a caller-owned slot.
+    const SCM_TOT_OUT = new Float64Array(1);
+    if (!(scmInto.total() >= 2 ** 31)) throw new Error('torture scmTotInto setup: total() must read >= 2^31');   // fail closed
+    let scmTotIntoSink = 0, scmTotIntoI = 0;
+    const scmTotIntoStep = () => {
+        scmInto.totalInto(SCM_TOT_OUT);
+        let acc = SCM_TOT_OUT[0] >= 2 ** 31 ? 1 : 0;
+        if ((scmTotIntoI++ & 1) === 1) { scmInto.totalInto(SCM_TOT_OUT, 500); acc += SCM_TOT_OUT[0] >= 0 ? 1 : 0; }
+        scmTotIntoSink = (scmTotIntoSink + acc) | 0;   // observe both slots (defeat DCE)
+    };
+    const scmTotIntoRes = measureAllocs(scmTotIntoStep, { iterations: 50000, batches: 8 });
+    const scmTotIntoBpc = scmTotIntoRes.bytesPerCall === null ? 0 : scmTotIntoRes.bytesPerCall;
+    const scmTotIntoBytes = Math.max(0, Math.round(scmTotIntoBpc));
+    const scmTotIntoOk = scmTotIntoRes.bytesPerCall !== null && scmTotIntoBytes === 0;   // null bytesPerCall FAILS closed
+
     // SlidingCountMin advance: slide the pane ring forward (rotate + clear stale panes), re-primed each call.
     const scmAdv = new SlidingCountMin(1000, { panes: 32, w: 128, d: 4, seed: 9 });
     let scmAdvT = 0;
@@ -1662,7 +1679,7 @@ async function main() {
         sdOk && sdFromOk && sdStrictOk && sdRangeOk && sdReancOk && sdQOk && sdIntoOk && sdClearOk && sdRetOk &&
         ehAdvOk && ehAvfOk && slAdvOk && slAvfOk && sdAdvOk && sdAvfOk && advRetOk &&
         ehBigOk && slBigOk && sdBigOk && hugeOk &&
-        scmOk && scmPlainOk && scmRotOk && scmRotFromOk && sddRotFromOk && scmFromOk && scmEstOk && scmTotOk && scmIntoOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
+        scmOk && scmPlainOk && scmRotOk && scmRotFromOk && sddRotFromOk && scmFromOk && scmEstOk && scmTotOk && scmIntoOk && scmTotIntoOk && scmAdvOk && scmAvfOk && scmClearOk && scmBigOk && scmRetOk &&
         drOk && drRebOk && drFromOk && drSampOk && drClearOk && drRetOk &&
         saOk && saFromOk && saRotOk && saRotFromOk && saAdvOk && saAvfOk && saIntoOk && saClearOk && saBigOk && saRetOk &&
         report.ok && abOk;
@@ -1718,6 +1735,7 @@ async function main() {
         scmEstBytes + ' B/op (SlidingCountMin estimate sum-then-min) ' +
         scmTotBytes + ' B/op (SlidingCountMin total per-pane N) ' +
         scmIntoBytes + ' B/op (SlidingCountMin estimateInto batch) ' +
+        scmTotIntoBytes + ' B/op (SlidingCountMin totalInto N>=2^31) ' +
         scmAdvBytes + ' B/op (SlidingCountMin advance) ' +
         scmAvfBytes + ' B/op (SlidingCountMin advanceFrom) ' +
         scmClearBytes + ' B/op (SlidingCountMin clear) ' +
@@ -1792,6 +1810,7 @@ async function main() {
         if (!scmFromOk) console.error('  alloc ' + scmFromBytes + ' B/op SlidingCountMin addFrom (raw ' + scmFromBpc + ')');
         if (!scmEstOk) console.error('  alloc ' + scmEstBytes + ' B/op SlidingCountMin estimate (raw ' + scmEstBpc + ')');
         if (!scmTotOk) console.error('  alloc ' + scmTotBytes + ' B/op SlidingCountMin total (raw ' + scmTotBpc + ')');
+        if (!scmTotIntoOk) console.error('  alloc ' + scmTotIntoBytes + ' B/op SlidingCountMin totalInto (raw ' + scmTotIntoBpc + ')');
         if (!scmIntoOk) console.error('  alloc ' + scmIntoBytes + ' B/op SlidingCountMin estimateInto (raw ' + scmIntoBpc + ')');
         if (!scmAdvOk) console.error('  alloc ' + scmAdvBytes + ' B/op SlidingCountMin advance (raw ' + scmAdvBpc + ')');
         if (!scmAvfOk) console.error('  alloc ' + scmAvfBytes + ' B/op SlidingCountMin advanceFrom (raw ' + scmAvfBpc + ')');

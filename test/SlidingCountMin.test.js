@@ -21,7 +21,7 @@ function mulberry32(seed) {
 // version pin (the 8th pin -> 8 VERSION pins total)
 // ---------------------------------------------------------------------------
 test('VERSION is 1.7.0 (DecayedReservoir milestone)', () => {
-    assert.equal(VERSION, '1.11.0');
+    assert.equal(VERSION, '1.12.0');
 });
 
 // ---------------------------------------------------------------------------

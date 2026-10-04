@@ -1599,3 +1599,83 @@ After this: switch sessions to a consumer package (lite-hud or lite-pick) -- `cd
   frame path.
 - Ledger: empty except N-S1 (H2-5, WONTFIX-UNLESS-REPORTED). lite-adaptive is done for its consumers; next
   session switches to lite-hud or lite-pick.
+
+## 14. 1.12.0 -- SlidingCountMin.totalInto (library minor) + the demo drops its private reads  [L1-L4 DONE 2026-10-04, uncommitted; next /release 1.12.0, then D1]
+
+Origin: the 2026-10-04 `scm_render_heavy` flake (merged 82e83bd). `scm.total()` RETURNS a double; in heavy
+mode N > 2^31, so at a non-inlined call site it boxes 16 B/call (1 in 5 full demo runs; every run under
+`--no-turbo-inlining`). The demo fixed it by summing `total()`'s loop over the private `_paneEnd` /
+`_paneTotal` / `_now` / `_W` -- a coupling the ledger asked to remove with a 0-alloc reader. Every other
+member already has one (`countInto`, `into`, `estimateInto`, `quantileInto`, `topKInto`, `sampleInto`);
+SCM's `total` is the one scalar reader without a sibling. README line ~790 also claims "`total` returns
+0 B/call" -- true only below 2^31 or when inlined; the flake disproves it in general.
+
+SETTLED (coordinator, 2026-10-04; maintainer may override on the ping):
+- T-S1 Signature `totalInto(out, w?) -> 1`, writing `out[0]` -- exact parity with
+  `SlidingHyperLogLog.countInto` (the S1 / S2 COLD-reader contract): `TA_TAG` type check -> tagged
+  TypeError; length read ONCE via `TA_LEN`, `< 1` -> tagged RangeError; `out` untouched on a throw; a bad
+  `w` writes `out[0] = NaN` and returns 1 (F12, never a throw), validated BEFORE the unset return (so an
+  unset instance with a bad `w` is NaN, like `total`); an unset instance writes 0. NOT `(out, i, w?)` as the
+  ledger sketched: no reader in the library takes a destination index, and one reader shape across the
+  ten members beats saving the caller one typed-array copy (`flat[C_TOTAL] = row[0]` does not box).
+- T-S2 Body DUPLICATES `total()`'s loop (same live-pane rule `paneEnd > now - effW`, same `p` order, sum in
+  a LOCAL, landed straight in `out[0]`); `total()` stays BYTE-IDENTICAL -- no shared-helper refactor (the
+  `estimate` / `estimateInto` precedent). The `Object.is(out[0], total(w))` parity gate guards drift.
+- T-S3 1.12.0 (an additive public method = minor). Surfaces: `Adaptive.js`, `Adaptive.d.ts` (+ the
+  `test/types` tsd check), `llms.txt`, README (API reference, the allocation table, the readers list in
+  the H2-4 threat-model paragraph, and the line-790 correction: `total()` boxes 16 B when N >= 2^31 at a
+  non-inlined site -- use `totalInto`), CHANGELOG.
+- T-S4 Release FIRST, demo after (release-before-demo): the demo switch is batch D1, after `/release`.
+
+Numeric domain: the result is the same Float64 sum `total()` computes -- per-pane totals of validated
+counts (each <= 2^32-1), exact until 2^53, never -0 (starts at +0, adds non-negatives). Landing it in a
+Float64Array slot stores a > 2^31 value unboxed. Sub-window `w` in (0, W], including `w < pw` (one
+straddling pane), uses `total()`'s live-pane rule unchanged. Count-mode and explicit-time instances both
+supported (`total` reads `_now` in both).
+
+Batches (the coordinator runs the small ones; full `npm test` + `npm run torture` after each):
+- **L1 (Adaptive.js + Adaptive.d.ts)**: `totalInto` directly after `total()`, JSDoc in the countInto
+  shape. Parity check vs `git show HEAD:Adaptive.js`: every pre-existing method byte-identical (diff is
+  one inserted method).
+- **L2 (tests + gates)**: in `test/Readers111.test.js` style -- the contract (TypeError / RangeError,
+  container untouched, a lying `length` getter never runs, a prototype-swapped `Uint8Array` rejected,
+  bad-w NaN including unset, unset 0); `Object.is(out[0], scm.total(w))` over a fuzz (both modes,
+  explicit + count, sub-windows down to `w < pw`, after `clear()` / `advance()` / rotation, heavy
+  N > 2^31, saturated cells). Allocation: a torture lane (heavy N > 2^31, 0 B/op) plus an AllocProbe
+  lane under `--no-turbo-inlining` where `totalInto` reads 0 and a `total()` sink control boxes >= 12
+  (proves the probe sees the box). Revert checks: every new gate fails on HEAD; the mutant
+  `out[0] = this.total(w)` FAILS the no-inline gate.
+- **L3 (docs)**: llms.txt, README, CHANGELOG [Unreleased] -> the /release head. Run after L2 QA, so a
+  finding never forces a doc rewrite.
+- **L4 (reviewer, one round)**: the L1-L3 diff + mutants: delegate to `total()`; write `out[0]` before
+  validation; read `out.length`; bad `w` writes 0; skip the straddling pane (`>=` for `>`).
+- **/release 1.12.0** -> maintainer commits, tags, publishes; then `/sync-card lite-adaptive`.
+- **D1 (demo, after the release)**: `renderScmPrep` -> `scm.totalInto(SCM_TOT_ROW, ...)`;
+  `flat[C_TOTAL] = SCM_TOT_ROW[0]`; delete the `libPaneEnd` / `libPaneTotal` bind and shape check;
+  replace the C_TOTAL source test with an audit that kernels.mjs reads no `scm._` field; the
+  `scm_render_heavy` gate under `--no-turbo-inlining` stays and must still read 0. Full `npm run demo`
+  (not demo:check). Close the ledger OPEN item.
+
+Exit: `npm test` + torture + full `npm run demo` green, 0 todo; `Object.is` parity proven; the
+no-inline gate revert-checked; README's `total` allocation claim corrected; demo reads no private field.
+
+### 14.1 As built (L1-L4, 2026-10-04)
+
+- L1: `totalInto` is a pure 45-line insertion after `total()` (0 lines removed from Adaptive.js, so every
+  pre-existing method is byte-identical); `Adaptive.d.ts` + the `test/types` tsd assertions.
+- L2: `test/Readers112.test.js` (5 tests: Object.is parity over a 10k fuzz incl. w < pane width, N >= 2^31
+  with saturated cells, count mode, idle advance, clear; bad w on live + unset; the S2 container contract).
+  AllocProbe lanes `q_scm_totalInto_big` / `q_scm_total_big` / `q_scm_totalInto_wint` / `q_scm_totalInto_wfrac`;
+  matrix rows in queryLanes + noInlineLargeKey; torture lane "SlidingCountMin totalInto N>=2^31".
+  Measured: totalInto 0 B/op fresh + warmed, default AND --no-turbo-inlining; the total() control 16 B/op
+  under the flag (0 when inlined -- why only a no-inline row can see it). Revert checks: the delegate
+  mutant `out[0] = this.total(w)` reads 16 and FAILS both no-inline totalInto rows; HEAD fails Readers112
+  5/5 and torture throws.
+- L4 review (one round): REJECTED on docs, code correct. (1) README / d.ts still claimed `total()` 0 B/call
+  in three places -> fixed. (2) "0 B/call at every inlining state" was too broad: a FRACTIONAL `w` is
+  itself a non-Smi argument -- `totalInto(out, 62.5)` 16 B/op under --no-turbo-inlining, and the same
+  holds for 1.11.0's `SlidingHyperLogLog.countInto(out, 62.5)` (16 B/op even at default flags; its docs
+  said 0). Both claims now say "w omitted or integral"; a no-inline doc-box row (w = 62.5, >= 12) pins it.
+  (3) a write-then-throw mutant (bad-w NaN written before the container check) survived: the test now
+  fills the rejected containers with 7s and checks them after every throw. The reviewer's 10 mutants
+  (a1-a3, a6, b-g) re-run by the coordinator: all killed; the unmutated base passes.

@@ -182,6 +182,9 @@ test('queryLanes', async (t) => {
         { lane: 'q_scm_estimate_big', mode: 'fresh', label: 'SCM estimate(bigKey) [must-box control]', expected: '16 +-0.5', check: box16 },
         { lane: 'q_scm_total', mode: 'fresh', label: 'SCM total()', expected: '<=0.5', check: gate },
         { lane: 'q_scm_total', mode: 'warmed', label: 'SCM total() (warmed)', expected: '<=0.5', check: gate },
+        // 1.12.0: the 0-alloc total reader with N >= 2^31 (its no-inline rerun + must-box control: noInlineLargeKey)
+        { lane: 'q_scm_totalInto_big', mode: 'fresh', label: 'SCM totalInto (N>=2^31)', expected: '<=0.5', check: gate },
+        { lane: 'q_scm_totalInto_big', mode: 'warmed', label: 'SCM totalInto (warmed)', expected: '<=0.5', check: gate },
         { lane: 'q_eh_sum', mode: 'fresh', label: 'EH sum() (first-window box)', expected: '<=0.5', check: gate },
         { lane: 'q_hk_estimate', mode: 'fresh', label: 'HK estimate() (small count)', expected: '<=0.5', check: gate },
         { lane: 'q_hk_foreach', mode: 'fresh', label: 'HK forEach(fn)', expected: '<=0.5', check: gate },
@@ -287,6 +290,18 @@ test('noInlineLargeKey', async (t) => {
         rows.push({ lane, flags: NOINLINE, mode: 'fresh', label: lbl + ' [no-inline]', expected: '<=0.5' });
         rows.push({ lane, flags: NOINLINE, mode: 'warmed', label: lbl + ' [no-inline warm]', expected: '<=0.5' });
     }
+    // 1.12.0 SlidingCountMin.totalInto: N >= 2^31 lands in out[0], never RETURNED, so it is 0 B/op even
+    // with inlining off. Its CONTROL is total() over the same instance: it RETURNS N and boxes 16 B/op
+    // under the flag (the demo's 2026-10-04 heavy-count flake) -- if it ever reads < 12 the row is blind.
+    rows.push({ lane: 'q_scm_totalInto_big', flags: NOINLINE, mode: 'fresh', label: 'SCM totalInto N>=2^31 [no-inline]', expected: '<=0.5' });
+    rows.push({ lane: 'q_scm_totalInto_big', flags: NOINLINE, mode: 'warmed', label: 'SCM totalInto N>=2^31 [no-inline warm]', expected: '<=0.5' });
+    rows.push({ lane: 'q_scm_totalInto_wint', flags: NOINLINE, mode: 'fresh', label: 'SCM totalInto w=500 [no-inline]', expected: '<=0.5' });
+    const control = { lane: 'q_scm_total_big', flags: NOINLINE, mode: 'fresh', label: 'SCM total() N>=2^31 [no-inline must-box]', expected: '>=12' };
+    rows.push(control);
+    // DOCUMENTED BOX (review N4): a fractional w is a boxed ARGUMENT at a non-inlined site -- the docs'
+    // "w omitted or integral" qualifier. Gated >= 12 so the qualifier cannot silently go stale.
+    const wfrac = { lane: 'q_scm_totalInto_wfrac', flags: NOINLINE, mode: 'fresh', label: 'SCM totalInto w=62.5 [no-inline doc-box]', expected: '>=12' };
+    rows.push(wfrac);
     await measureGroup(rows);
     // FAIL CLOSED (F19 blocker 4): prove --no-turbo-inlining actually reached EVERY flagged child.
     // Without it the lane would silently measure the INLINED (0 B/op) path -- the deterministic box
@@ -297,8 +312,12 @@ test('noInlineLargeKey', async (t) => {
             JSON.stringify(r._execArgv) + '); the no-inline repro never ran, gate is blind');
     }
     printTable('F19 noInlineLargeKey (--no-turbo-inlining; steady B/op <= 0.5; pre-fix boxed 16-32):', rows,
-        (r) => (r._steady <= 0.5 ? 'GREEN' : 'NEW FINDING'));
-    for (const r of rows) await emit(t, r, gate);
+        (r) => ((r === control || r === wfrac) ? (r._steady >= 12 ? 'BOXES (documented)' : 'BLIND') : (r._steady <= 0.5 ? 'GREEN' : 'NEW FINDING')));
+    const teeth = (steady) => (steady >= 12 ? null :
+        'steady ' + steady + ' B/op < 12: total() returning N >= 2^31 did NOT box under --no-turbo-inlining -- the totalInto rows are blind');
+    const docBox = (steady) => (steady >= 12 ? null :
+        'steady ' + steady + ' B/op < 12: a fractional w no longer boxes under --no-turbo-inlining -- update the "w omitted or integral" docs');
+    for (const r of rows) await emit(t, r, r === control ? teeth : r === wfrac ? docBox : gate);
 });
 
 // ===========================================================================

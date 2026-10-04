@@ -414,6 +414,41 @@ function qScmTotal() {
         return { scm, acc: new Float64Array(1) }; },
         hot(s, n) { const scm = s.scm, acc = s.acc; for (let i = 0; i < n; i++) acc[0] += scm.total(); } };
 }
+// 1.12.0 totalInto: an SCM whose windowed total N is >= 2^31 (one add of count 2^31 plus a small stream),
+// so total() RETURNS a non-Smi double. Shared by the totalInto gate lane and the total() must-box control.
+function buildScmBigTotal() {
+    const scm = new SlidingCountMin(1000, { panes: 8, w: 128, d: 4, seed: 7 }); const buf = new Float64Array(3); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
+    clk[0] += 1.5; buf[0] = clk[0]; buf[1] = 12345; buf[2] = 2 ** 31; scm.addFrom(buf, 0);
+    for (let k = 0; k < 400; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = (k & 511) + 1; buf[2] = (k & 7) + 1; scm.addFrom(buf, 0); }
+    if (!(scm.total() >= 2 ** 31)) throw new Error('q_scm_total*_big setup: total() must read >= 2^31');   // fail closed
+    return scm;
+}
+function qScmTotalIntoBig() {
+    // SCM totalInto(out) (1.12.0) with N >= 2^31: the sum lands in out[0], nothing is returned as a double
+    // (returns 1, a Smi) -> 0 B/op at every inlining state (the noInlineLargeKey row re-runs it with
+    // --no-turbo-inlining).
+    return { setup() { const scm = buildScmBigTotal(); const out = new Float64Array(1); return { scm, out, acc: new Float64Array(1) }; },
+        hot(s, n) { const scm = s.scm, out = s.out, acc = s.acc; for (let i = 0; i < n; i++) { scm.totalInto(out); acc[0] += out[0]; } } };
+}
+function qScmTotalBig() {
+    // CONTROL (must BOX under --no-turbo-inlining): total() RETURNING N >= 2^31 boxes a ~16 B HeapNumber
+    // per call when the call is not inlined -- the demo's 2026-10-04 heavy-count flake, and the box
+    // totalInto exists to avoid. If this reads 0 under the flag, the probe has gone blind.
+    return { setup() { const scm = buildScmBigTotal(); return { scm, acc: new Float64Array(1) }; },
+        hot(s, n) { const scm = s.scm, acc = s.acc; for (let i = 0; i < n; i++) acc[0] += scm.total(); } };
+}
+function qScmTotalIntoWfrac() {
+    // DOCUMENTED BOX (must box under --no-turbo-inlining): a FRACTIONAL sub-window w (62.5) is itself a
+    // non-Smi ARGUMENT, so totalInto(out, 62.5) boxes 16 B/call at a non-inlined site even though nothing is
+    // returned (the README / llms.txt "w omitted or integral" qualifier; review N4). Integral w reads 0.
+    return { setup() { const scm = buildScmBigTotal(); return { scm, out: new Float64Array(1), wb: Float64Array.of(62.5), acc: new Float64Array(1) }; },
+        hot(s, n) { const scm = s.scm, out = s.out, wb = s.wb, acc = s.acc; for (let i = 0; i < n; i++) { scm.totalInto(out, wb[0]); acc[0] += out[0]; } } };
+}
+function qScmTotalIntoWint() {
+    // the integral sub-window (500) through the same slot: 0 B/op even with inlining off.
+    return { setup() { const scm = buildScmBigTotal(); return { scm, out: new Float64Array(1), wb: Float64Array.of(500), acc: new Float64Array(1) }; },
+        hot(s, n) { const scm = s.scm, out = s.out, wb = s.wb, acc = s.acc; for (let i = 0; i < n; i++) { scm.totalInto(out, wb[0]); acc[0] += out[0]; } } };
+}
 function qEhSum() {
     return { setup() { const eh = new ExponentialHistogram(1000, 0.01); const buf = new Float64Array(2); const clk = new Float64Array(1); clk[0] = CLK_EPOCH;
         for (let k = 0; k < 4000; k++) { clk[0] += 1.5; buf[0] = clk[0]; buf[1] = FRAC[k & 15]; eh.addFrom(buf, 0); } return { eh, acc: new Float64Array(1) }; },
@@ -834,6 +869,10 @@ export const LANES = {
     q_scm_estimateInto_big: qScmEstimateIntoBig(),
     q_scm_estimate_big: qScmEstimateBig(),
     q_scm_total: qScmTotal(),
+    q_scm_totalInto_big: qScmTotalIntoBig(),
+    q_scm_total_big: qScmTotalBig(),
+    q_scm_totalInto_wint: qScmTotalIntoWint(),
+    q_scm_totalInto_wfrac: qScmTotalIntoWfrac(),
     q_eh_sum: qEhSum(),
     q_hk_estimate: qHkEstimate(),
     q_hk_foreach: qHkForEach(),
